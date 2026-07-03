@@ -42,9 +42,7 @@ use crate::{
     runtime_plan::RuntimePlanHandle,
     runtime_reload::RuntimeReloadGate,
     shutdown,
-    storage_retention::{
-        StorageRetentionWorkerConfig, StorageRetentionWorkerHandle, spawn_storage_retention_workers,
-    },
+    storage_retention::{StorageRetentionWorkerHandle, spawn_storage_retention_workers},
     tls_plaintext::{TlsDecryptHintRuntimeState, TlsPlaintextRuntimeState},
     transparent_interception::{
         TransparentInterceptionActivationScope, TransparentInterceptionGuard,
@@ -209,7 +207,6 @@ pub(crate) async fn run_live_agent(
         }
     };
     let export_worker = export_worker.spawn(Arc::clone(&spool));
-    let storage_retention_config = storage_retention_worker_config_from_plan(plan_handle.clone());
     println!(
         "agent {} running config {} capture {:?} selected {:?}",
         plan.config.agent_id,
@@ -235,7 +232,6 @@ pub(crate) async fn run_live_agent(
         tls_plaintext_runtime,
         l7_mitm,
         runtime_generation,
-        storage_retention_config,
         shutdown_requested: Arc::clone(&shutdown_requested),
         max_events,
         readiness,
@@ -359,7 +355,6 @@ struct BlockingCaptureRun {
     tls_plaintext_runtime: TlsPlaintextRuntimeState,
     l7_mitm: L7MitmRuntime,
     runtime_generation: RuntimeGenerationState,
-    storage_retention_config: Option<StorageRetentionWorkerConfig>,
     shutdown_requested: shutdown::ShutdownFlag,
     max_events: Option<u64>,
     readiness: ReadinessSignal,
@@ -396,7 +391,6 @@ impl BlockingCaptureRun {
             tls_plaintext_runtime,
             l7_mitm,
             runtime_generation,
-            mut storage_retention_config,
             shutdown_requested,
             max_events,
             readiness,
@@ -424,9 +418,10 @@ impl BlockingCaptureRun {
             if shutdown::requested(&shutdown_requested) {
                 return Ok(summary);
             }
-            storage_retention_worker = storage_retention_config
-                .take()
-                .map(|config| spawn_storage_retention_workers(Arc::clone(&spool), config));
+            storage_retention_worker = Some(spawn_storage_retention_workers(
+                Arc::clone(&spool),
+                plan_handle.clone(),
+            ));
             let mut pipeline = pipeline.with_enforcement_planner(&mut enforcement_planner);
             active_interception_guard.l7_mitm_backend = start_backend_lifecycle(
                 &plan.enforcement.interception.mitm.backend,
@@ -682,12 +677,6 @@ fn merge_run_results(
         return Err(export_error.into());
     }
     Ok(summary)
-}
-
-fn storage_retention_worker_config_from_plan(
-    plan_handle: RuntimePlanHandle,
-) -> Option<StorageRetentionWorkerConfig> {
-    StorageRetentionWorkerConfig::from_plan_handle(plan_handle)
 }
 
 fn admin_server_config_from_plan(plan: &RuntimePlan) -> Option<AdminServerConfig> {

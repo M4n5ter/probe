@@ -47,7 +47,8 @@ pub use interception_scope::{
 pub use probe_config::RemoteEnforcementPolicyBodyLimitBytes;
 pub use registry::{PlatformProbeResults, ProviderRegistry, default_l7_mitm_unavailable_reason};
 pub use runtime_plan::{
-    OnlineReloadConfigUpdate, RuntimePlan, project_runtime_config, validate_static_runtime_config,
+    OnlineEnforcementPolicyConfigUpdate, OnlineExportConfigUpdate, OnlineReloadConfigUpdate,
+    RuntimePlan, project_runtime_config, validate_static_runtime_config,
 };
 pub use storage::{ExportRetentionPlan, IngressRetentionPlan, StoragePlan, StorageRetentionPlan};
 pub use tls::{

@@ -5,7 +5,10 @@ use probe_config::{
     AgentConfig, ConfigError, EnforcementConfig, EnforcementPolicyConfig,
     EnforcementPolicyReloadConfig, TlsConfig, TlsMaterialConfig, TlsMaterialKind,
 };
-use runtime::{OnlineReloadConfigUpdate, RuntimePlan, validate_static_runtime_config};
+use runtime::{
+    OnlineEnforcementPolicyConfigUpdate, OnlineExportConfigUpdate, OnlineReloadConfigUpdate,
+    RuntimePlan, validate_static_runtime_config,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::artifacts::normalize_embedded_artifact_paths_for_comparison;
@@ -35,11 +38,11 @@ const CONFIG_RELOAD_SECTIONS: [ConfigReloadSectionSpec; 12] = [
     },
     ConfigReloadSectionSpec {
         section: ConfigReloadSection::Storage,
-        reason: "durable spool path and retention workers are owned by the running process",
+        reason: "durable spool path is owned by the running process; retention changes can apply online only when the path is unchanged",
     },
     ConfigReloadSectionSpec {
         section: ConfigReloadSection::Export,
-        reason: "export worker lifecycle is present only when the running plan started an export worker",
+        reason: "export worker lifecycle reconciles the active export plan online",
     },
     ConfigReloadSectionSpec {
         section: ConfigReloadSection::RuntimeReload,
@@ -468,35 +471,34 @@ fn online_reload_config_update(
     plan: &ConfigReloadPlanSnapshot,
     candidate: &AgentConfig,
 ) -> Option<OnlineReloadConfigUpdate> {
-    let [change] = plan.changed_sections.as_slice() else {
-        return None;
-    };
-    match change.section {
-        ConfigReloadSection::Policies
-            if change.reload_mode == ConfigReloadSectionReloadMode::ApplyOnline =>
-        {
-            Some(OnlineReloadConfigUpdate::PipelinePolicies {
-                policies: candidate.policies.clone(),
-            })
+    let mut update = OnlineReloadConfigUpdate::default();
+    for change in &plan.changed_sections {
+        if change.reload_mode != ConfigReloadSectionReloadMode::ApplyOnline {
+            return None;
         }
-        ConfigReloadSection::Export
-            if change.reload_mode == ConfigReloadSectionReloadMode::ApplyOnline =>
-        {
-            Some(OnlineReloadConfigUpdate::Export {
-                export: candidate.export.clone(),
-                exporters: candidate.exporters.clone(),
-            })
+        match change.section {
+            ConfigReloadSection::Policies => {
+                update.policies = Some(candidate.policies.clone());
+            }
+            ConfigReloadSection::Export => {
+                update.export = Some(OnlineExportConfigUpdate {
+                    export: candidate.export.clone(),
+                    exporters: candidate.exporters.clone(),
+                });
+            }
+            ConfigReloadSection::Storage => {
+                update.storage_retention = Some(candidate.storage.retention.clone());
+            }
+            ConfigReloadSection::Enforcement => {
+                update.enforcement_policy = Some(OnlineEnforcementPolicyConfigUpdate {
+                    selector: candidate.enforcement.selector.clone(),
+                    source: candidate.enforcement.policy.source.clone(),
+                });
+            }
+            _ => return None,
         }
-        ConfigReloadSection::Enforcement
-            if change.reload_mode == ConfigReloadSectionReloadMode::ApplyOnline =>
-        {
-            Some(OnlineReloadConfigUpdate::EnforcementPolicy {
-                selector: candidate.enforcement.selector.clone(),
-                source: candidate.enforcement.policy.source.clone(),
-            })
-        }
-        _ => None,
     }
+    (!update.is_empty()).then_some(update)
 }
 
 fn online_applied_plan(
@@ -620,6 +622,9 @@ fn section_reload_mode(
         ConfigReloadSection::Policies if policies_can_apply_online(current, candidate) => {
             ConfigReloadSectionReloadMode::ApplyOnline
         }
+        ConfigReloadSection::Storage if storage_can_apply_online(current, candidate) => {
+            ConfigReloadSectionReloadMode::ApplyOnline
+        }
         ConfigReloadSection::Export => ConfigReloadSectionReloadMode::ApplyOnline,
         ConfigReloadSection::Tls if tls_can_use_runtime_generation(current, candidate) => {
             ConfigReloadSectionReloadMode::RuntimeGeneration
@@ -648,6 +653,9 @@ fn section_change_reason(
         }
         ConfigReloadSection::Policies => {
             "policy watcher or poller topology is still owned by startup background services"
+        }
+        ConfigReloadSection::Storage if storage_can_apply_online(current, candidate) => {
+            "durable spool path is setup-time; storage retention is reconciled by a plan-aware online worker"
         }
         ConfigReloadSection::Export => {
             "export worker lifecycle and export retention cursor owners reconcile the active export plan online"
@@ -684,10 +692,38 @@ fn config_reload_decision(changed_sections: &[ConfigReloadSectionChange]) -> Con
 }
 
 fn changed_sections_can_apply_online(changed_sections: &[ConfigReloadSectionChange]) -> bool {
-    matches!(
-        changed_sections,
-        [change] if change.reload_mode == ConfigReloadSectionReloadMode::ApplyOnline
-    )
+    let Some((first, rest)) = changed_sections.split_first() else {
+        return false;
+    };
+    let Some(first_owner) = online_reload_owner(first) else {
+        return false;
+    };
+    if first_owner == ConfigReloadOnlineOwner::ActionGated {
+        return rest.is_empty();
+    }
+    rest.iter()
+        .all(|change| online_reload_owner(change) == Some(ConfigReloadOnlineOwner::PlanOnly))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConfigReloadOnlineOwner {
+    PlanOnly,
+    ActionGated,
+}
+
+fn online_reload_owner(change: &ConfigReloadSectionChange) -> Option<ConfigReloadOnlineOwner> {
+    if change.reload_mode != ConfigReloadSectionReloadMode::ApplyOnline {
+        return None;
+    }
+    match change.section {
+        ConfigReloadSection::Export | ConfigReloadSection::Storage => {
+            Some(ConfigReloadOnlineOwner::PlanOnly)
+        }
+        ConfigReloadSection::Policies | ConfigReloadSection::Enforcement => {
+            Some(ConfigReloadOnlineOwner::ActionGated)
+        }
+        _ => None,
+    }
 }
 
 fn changed_sections_can_use_runtime_generation(
@@ -710,6 +746,11 @@ fn policies_can_apply_online(current: &AgentConfig, candidate: &AgentConfig) -> 
     current.policy_reload == candidate.policy_reload
         && !current.policy_reload.watch_local_bundles
         && !current.policy_reload.poll_remote_bundles
+}
+
+fn storage_can_apply_online(current: &AgentConfig, candidate: &AgentConfig) -> bool {
+    current.storage.path == candidate.storage.path
+        && current.storage.retention != candidate.storage.retention
 }
 
 fn enforcement_can_apply_online(current: &AgentConfig, candidate: &AgentConfig) -> bool {
@@ -890,9 +931,10 @@ mod tests {
     use probe_config::{
         AgentConfig, CaptureBackend, CaptureSelection, EnforcementConfig,
         EnforcementInterceptionConfig, EnforcementPolicyConfig, EnforcementPolicySourceConfig,
-        ExporterConfig, ExporterTransportConfig, LiveCaptureBackend, ObservationDataPathMode,
-        PolicyConfig, PolicySourceConfig, ProcessObservationConfig, StorageConfig, TlsConfig,
-        TlsMaterialConfig, TlsMaterialKind, TransparentInterceptionMitmBackendConfig,
+        ExporterConfig, ExporterTransportConfig, IngressJournalRetentionConfig, LiveCaptureBackend,
+        ObservationDataPathMode, PolicyConfig, PolicySourceConfig, ProcessObservationConfig,
+        StorageConfig, StorageRetentionConfig, TlsConfig, TlsMaterialConfig, TlsMaterialKind,
+        TransparentInterceptionMitmBackendConfig,
         TransparentInterceptionMitmBackendReadinessProbeConfig,
         TransparentInterceptionMitmClientTrustConfig,
         TransparentInterceptionMitmClientTrustModeConfig, TransparentInterceptionMitmConfig,
@@ -1121,6 +1163,188 @@ mod tests {
     }
 
     #[test]
+    fn config_reload_plan_can_apply_storage_retention_changes_online()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-storage-retention-online")?;
+        let current = runtime_plan(base_config(temp.join("spool")))?;
+        let mut candidate = current.config.clone();
+        candidate.storage.retention = StorageRetentionConfig {
+            ingress: IngressJournalRetentionConfig {
+                max_age_ms: None,
+                max_records: Some(100_000),
+                sweep_interval_ms: 5_000,
+                prune_batch_limit: 128,
+            },
+            ..StorageRetentionConfig::default()
+        };
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current.config, &candidate_path);
+
+        assert!(
+            matches!(plan.decision, ConfigReloadDecision::ApplyOnline { .. }),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.reload_mode))
+                .collect::<Vec<_>>(),
+            vec![(
+                ConfigReloadSection::Storage,
+                ConfigReloadSectionReloadMode::ApplyOnline,
+            )]
+        );
+        assert!(
+            plan.changed_sections[0]
+                .reason
+                .contains("storage retention")
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_keeps_storage_path_changes_restart_required()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-storage-path-restart")?;
+        let current = runtime_plan(base_config(temp.join("spool")))?;
+        let mut candidate = current.config.clone();
+        candidate.storage.path = temp.join("other-spool");
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current.config, &candidate_path);
+
+        assert!(
+            matches!(plan.decision, ConfigReloadDecision::RestartRequired { .. }),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.reload_mode))
+                .collect::<Vec<_>>(),
+            vec![(
+                ConfigReloadSection::Storage,
+                ConfigReloadSectionReloadMode::ProcessRestart,
+            )]
+        );
+        assert!(plan.changed_sections[0].reason.contains("spool path"));
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_can_apply_export_and_storage_retention_changes_online()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-plan-only-online")?;
+        let mut current_config = base_config(temp.join("spool"));
+        current_config.exporters = vec![webhook_exporter(
+            "collector",
+            "https://collector.example/probe/batches",
+        )];
+        let current = runtime_plan(current_config)?;
+        let mut candidate = current.config.clone();
+        candidate.storage.retention = StorageRetentionConfig {
+            ingress: IngressJournalRetentionConfig {
+                max_age_ms: None,
+                max_records: Some(100_000),
+                sweep_interval_ms: 5_000,
+                prune_batch_limit: 128,
+            },
+            ..StorageRetentionConfig::default()
+        };
+        candidate.exporters = vec![webhook_exporter(
+            "collector",
+            "https://collector.internal/probe/batches",
+        )];
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current.config, &candidate_path);
+
+        assert!(
+            matches!(plan.decision, ConfigReloadDecision::ApplyOnline { .. }),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.reload_mode))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    ConfigReloadSection::Storage,
+                    ConfigReloadSectionReloadMode::ApplyOnline,
+                ),
+                (
+                    ConfigReloadSection::Export,
+                    ConfigReloadSectionReloadMode::ApplyOnline,
+                ),
+            ]
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_keeps_action_gated_and_plan_only_online_changes_restart_required()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-online-action-plan-mixed")?;
+        let current = runtime_plan(base_config(temp.join("spool")))?;
+        let mut candidate = current.config.clone();
+        candidate.storage.retention = StorageRetentionConfig {
+            ingress: IngressJournalRetentionConfig {
+                max_age_ms: None,
+                max_records: Some(100_000),
+                sweep_interval_ms: 5_000,
+                prune_batch_limit: 128,
+            },
+            ..StorageRetentionConfig::default()
+        };
+        candidate.policies.push(PolicyConfig {
+            id: "guard".to_string(),
+            source: PolicySourceConfig::LocalDirectory {
+                path: temp.join("guard.bundle"),
+            },
+            ..PolicyConfig::default()
+        });
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current.config, &candidate_path);
+
+        assert!(
+            matches!(plan.decision, ConfigReloadDecision::RestartRequired { .. }),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.reload_mode))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    ConfigReloadSection::Storage,
+                    ConfigReloadSectionReloadMode::ApplyOnline,
+                ),
+                (
+                    ConfigReloadSection::Policies,
+                    ConfigReloadSectionReloadMode::ApplyOnline,
+                ),
+            ]
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
     fn config_reload_plan_can_apply_export_config_changes_online()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("config-reload-export-online")?;
@@ -1270,6 +1494,95 @@ mod tests {
         assert!(snapshot.actions.is_empty());
         assert_eq!(plan_handle.snapshot().config.exporters, candidate.exporters);
         assert_eq!(plan_handle.snapshot().export.sinks[0].id(), "collector");
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn complete_config_reload_apply_replaces_plan_for_storage_retention_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-storage-retention-apply")?;
+        let current = runtime_plan(base_config(temp.join("spool")))?;
+        let mut candidate = current.config.clone();
+        candidate.storage.retention = StorageRetentionConfig {
+            ingress: IngressJournalRetentionConfig {
+                max_age_ms: None,
+                max_records: Some(100_000),
+                sweep_interval_ms: 5_000,
+                prune_batch_limit: 128,
+            },
+            ..StorageRetentionConfig::default()
+        };
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+        let plan_handle = RuntimePlanHandle::new(Arc::new(current.clone()));
+
+        let outcome = apply_config_reload(
+            &current,
+            &PipelinePolicySet::default(),
+            &PolicyReloadGate::default(),
+            None,
+            &EnforcementReloadGate::default(),
+            &candidate_path,
+        )
+        .await;
+        let snapshot = complete_config_reload_apply(outcome, &plan_handle, None);
+
+        assert!(snapshot.active_plan_updated);
+        assert!(snapshot.actions.is_empty());
+        assert_eq!(
+            plan_handle.snapshot().storage.retention.ingress.max_records,
+            Some(100_000)
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn complete_config_reload_apply_replaces_plan_for_export_and_storage_retention_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-plan-only-apply")?;
+        let mut current_config = base_config(temp.join("spool"));
+        current_config.exporters = vec![webhook_exporter(
+            "collector",
+            "https://collector.example/probe/batches",
+        )];
+        let current = runtime_plan(current_config)?;
+        let mut candidate = current.config.clone();
+        candidate.storage.retention = StorageRetentionConfig {
+            ingress: IngressJournalRetentionConfig {
+                max_age_ms: None,
+                max_records: Some(100_000),
+                sweep_interval_ms: 5_000,
+                prune_batch_limit: 128,
+            },
+            ..StorageRetentionConfig::default()
+        };
+        candidate.exporters = vec![webhook_exporter(
+            "collector",
+            "https://collector.internal/probe/batches",
+        )];
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+        let plan_handle = RuntimePlanHandle::new(Arc::new(current.clone()));
+
+        let outcome = apply_config_reload(
+            &current,
+            &PipelinePolicySet::default(),
+            &PolicyReloadGate::default(),
+            None,
+            &EnforcementReloadGate::default(),
+            &candidate_path,
+        )
+        .await;
+        let snapshot = complete_config_reload_apply(outcome, &plan_handle, None);
+
+        assert!(snapshot.active_plan_updated);
+        assert!(snapshot.actions.is_empty());
+        let active = plan_handle.snapshot();
+        assert_eq!(active.config.exporters, candidate.exporters);
+        assert_eq!(active.export.sinks[0].id(), "collector");
+        assert_eq!(active.storage.retention.ingress.max_records, Some(100_000));
         fs::remove_dir_all(temp)?;
         Ok(())
     }

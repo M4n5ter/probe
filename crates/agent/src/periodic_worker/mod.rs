@@ -1,6 +1,6 @@
 use std::{
     fmt::Display,
-    future::{Future, ready},
+    future::Future,
     sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
@@ -10,23 +10,23 @@ use tokio::sync::Notify;
 
 const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Copy)]
-enum InitialTick {
-    Immediate,
-    Delayed,
-}
-
-pub(crate) struct PeriodicWorkerHandle {
+pub(crate) struct WorkerHandle {
     label: &'static str,
-    stop_requested: Arc<AtomicBool>,
-    stop_notify: Arc<Notify>,
+    context: WorkerContext,
     task: tokio::task::JoinHandle<()>,
 }
 
-impl PeriodicWorkerHandle {
+pub(crate) type PeriodicWorkerHandle = WorkerHandle;
+
+#[derive(Clone)]
+pub(crate) struct WorkerContext {
+    stop_requested: Arc<AtomicBool>,
+    stop_notify: Arc<Notify>,
+}
+
+impl WorkerHandle {
     pub(crate) async fn stop(mut self) {
-        self.stop_requested.store(true, Ordering::Relaxed);
-        self.stop_notify.notify_one();
+        self.context.request_stop();
         match tokio::time::timeout(WORKER_SHUTDOWN_TIMEOUT, &mut self.task).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) if !error.is_cancelled() => {
@@ -45,18 +45,71 @@ impl PeriodicWorkerHandle {
     }
 }
 
-pub(crate) fn spawn_periodic_worker<F, E>(
-    label: &'static str,
-    interval: Duration,
-    mut run_once: F,
-) -> PeriodicWorkerHandle
+impl WorkerContext {
+    fn new() -> Self {
+        Self {
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            stop_notify: Arc::new(Notify::new()),
+        }
+    }
+
+    pub(crate) fn stop_requested(&self) -> bool {
+        self.stop_requested.load(Ordering::Relaxed)
+    }
+
+    pub(crate) async fn sleep_or_stop(&self, duration: Duration) -> bool {
+        if self.stop_requested() {
+            return false;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(duration) => !self.stop_requested(),
+            () = self.stop_notify.notified() => false,
+        }
+    }
+
+    pub(crate) async fn wait_or_stop(&self, event: impl Future<Output = ()>) -> bool {
+        if self.stop_requested() {
+            return false;
+        }
+        tokio::select! {
+            () = event => !self.stop_requested(),
+            () = self.stop_notify.notified() => false,
+        }
+    }
+
+    pub(crate) async fn sleep_or_wait_or_stop(
+        &self,
+        duration: Duration,
+        event: impl Future<Output = ()>,
+    ) -> bool {
+        if self.stop_requested() {
+            return false;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(duration) => !self.stop_requested(),
+            () = event => !self.stop_requested(),
+            () = self.stop_notify.notified() => false,
+        }
+    }
+
+    fn request_stop(&self) {
+        self.stop_requested.store(true, Ordering::Relaxed);
+        self.stop_notify.notify_one();
+    }
+}
+
+pub(crate) fn spawn_worker<F, Fut>(label: &'static str, run: F) -> WorkerHandle
 where
-    F: FnMut() -> Result<(), E> + Send + 'static,
-    E: Display + Send + 'static,
+    F: FnOnce(WorkerContext) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
 {
-    spawn_async_periodic_worker(label, interval, InitialTick::Immediate, move || {
-        ready(run_once())
-    })
+    let context = WorkerContext::new();
+    let task = tokio::spawn(run(context.clone()));
+    WorkerHandle {
+        label,
+        context,
+        task,
+    }
 }
 
 pub(crate) fn spawn_delayed_async_periodic_worker<F, Fut, E>(
@@ -69,13 +122,12 @@ where
     Fut: Future<Output = Result<(), E>> + Send + 'static,
     E: Display,
 {
-    spawn_async_periodic_worker(label, interval, InitialTick::Delayed, run_once)
+    spawn_async_periodic_worker(label, interval, run_once)
 }
 
 fn spawn_async_periodic_worker<F, Fut, E>(
     label: &'static str,
     interval: Duration,
-    initial_tick: InitialTick,
     mut run_once: F,
 ) -> PeriodicWorkerHandle
 where
@@ -83,43 +135,17 @@ where
     Fut: Future<Output = Result<(), E>> + Send + 'static,
     E: Display,
 {
-    let stop_requested = Arc::new(AtomicBool::new(false));
-    let stop_notify = Arc::new(Notify::new());
-    let task_stop_requested = Arc::clone(&stop_requested);
-    let task_stop_notify = Arc::clone(&stop_notify);
-    let task = tokio::spawn(async move {
-        if matches!(initial_tick, InitialTick::Delayed)
-            && !sleep_or_stop(interval, &task_stop_requested, &task_stop_notify).await
-        {
+    spawn_worker(label, move |context| async move {
+        if !context.sleep_or_stop(interval).await {
             return;
         }
-        while !task_stop_requested.load(Ordering::Relaxed) {
+        while !context.stop_requested() {
             if let Err(error) = run_once().await {
                 eprintln!("{label} worker iteration failed: {error}");
             }
-            if !sleep_or_stop(interval, &task_stop_requested, &task_stop_notify).await {
-                break;
+            if !context.sleep_or_stop(interval).await {
+                return;
             }
         }
-    });
-    PeriodicWorkerHandle {
-        label,
-        stop_requested,
-        stop_notify,
-        task,
-    }
-}
-
-async fn sleep_or_stop(
-    duration: Duration,
-    stop_requested: &AtomicBool,
-    stop_notify: &Notify,
-) -> bool {
-    if stop_requested.load(Ordering::Relaxed) {
-        return false;
-    }
-    tokio::select! {
-        () = tokio::time::sleep(duration) => !stop_requested.load(Ordering::Relaxed),
-        () = stop_notify.notified() => false,
-    }
+    })
 }

@@ -1,5 +1,6 @@
 use probe_config::{
     AgentConfig, EnforcementPolicySourceConfig, ExportRuntimeConfig, ExporterConfig, PolicyConfig,
+    StorageRetentionConfig,
 };
 use probe_core::{CapabilityMatrix, Selector};
 use serde::{Deserialize, Serialize};
@@ -31,19 +32,33 @@ pub struct RuntimePlan {
     pub enforcement: EnforcementPlan,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OnlineReloadConfigUpdate {
+    pub policies: Option<Vec<PolicyConfig>>,
+    pub export: Option<OnlineExportConfigUpdate>,
+    pub storage_retention: Option<StorageRetentionConfig>,
+    pub enforcement_policy: Option<OnlineEnforcementPolicyConfigUpdate>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OnlineReloadConfigUpdate {
-    PipelinePolicies {
-        policies: Vec<PolicyConfig>,
-    },
-    Export {
-        export: ExportRuntimeConfig,
-        exporters: Vec<ExporterConfig>,
-    },
-    EnforcementPolicy {
-        selector: Option<Selector>,
-        source: EnforcementPolicySourceConfig,
-    },
+pub struct OnlineExportConfigUpdate {
+    pub export: ExportRuntimeConfig,
+    pub exporters: Vec<ExporterConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnlineEnforcementPolicyConfigUpdate {
+    pub selector: Option<Selector>,
+    pub source: EnforcementPolicySourceConfig,
+}
+
+impl OnlineReloadConfigUpdate {
+    pub fn is_empty(&self) -> bool {
+        self.policies.is_none()
+            && self.export.is_none()
+            && self.storage_retention.is_none()
+            && self.enforcement_policy.is_none()
+    }
 }
 
 impl RuntimePlan {
@@ -89,21 +104,26 @@ impl RuntimePlan {
     pub fn with_online_reload_update(&self, update: OnlineReloadConfigUpdate) -> Self {
         let mut config = self.config.clone();
         let mut update_export = false;
+        let mut update_storage = false;
         let mut update_enforcement = false;
-        match update {
-            OnlineReloadConfigUpdate::PipelinePolicies { policies } => {
-                config.policies = policies;
-            }
-            OnlineReloadConfigUpdate::Export { export, exporters } => {
-                config.export = export;
-                config.exporters = exporters;
-                update_export = true;
-            }
-            OnlineReloadConfigUpdate::EnforcementPolicy { selector, source } => {
-                config.enforcement.selector = selector;
-                config.enforcement.policy.source = source;
-                update_enforcement = true;
-            }
+        if let Some(policies) = update.policies {
+            config.policies = policies;
+        }
+        if let Some(OnlineExportConfigUpdate { export, exporters }) = update.export {
+            config.export = export;
+            config.exporters = exporters;
+            update_export = true;
+        }
+        if let Some(retention) = update.storage_retention {
+            config.storage.retention = retention;
+            update_storage = true;
+        }
+        if let Some(OnlineEnforcementPolicyConfigUpdate { selector, source }) =
+            update.enforcement_policy
+        {
+            config.enforcement.selector = selector;
+            config.enforcement.policy.source = source;
+            update_enforcement = true;
         }
         let effective_config = project_runtime_config(config.clone());
         let mut plan = self.clone();
@@ -111,6 +131,9 @@ impl RuntimePlan {
         plan.effective_config = effective_config;
         if update_export {
             plan.export = ExportPlan::resolve(&plan.effective_config);
+        }
+        if update_storage {
+            plan.storage = StoragePlan::resolve(&plan.effective_config);
         }
         if update_enforcement {
             plan.enforcement = EnforcementPlan::resolve(
@@ -138,8 +161,8 @@ pub fn validate_static_runtime_config(config: &AgentConfig) -> Result<(), Runtim
 mod tests {
     use probe_config::{
         AgentConfig, CaptureBackend, CaptureSelection, EnforcementPolicySourceConfig,
-        ExporterConfig, ExporterTransportConfig, ObservationDataPathMode, PolicyConfig,
-        ProcessObservationConfig,
+        ExporterConfig, ExporterTransportConfig, IngressJournalRetentionConfig,
+        ObservationDataPathMode, PolicyConfig, ProcessObservationConfig, StorageRetentionConfig,
     };
     use probe_core::{
         CapabilityKind, CapabilityState, Direction, ProcessSelector, RuntimeMode, Selector,
@@ -252,11 +275,12 @@ mod tests {
         config.capture.ebpf.object_path = Some("/runtime/generated-ebpf.o".into());
         let plan = RuntimePlan::build(config, &registry)?;
 
-        let updated = plan.with_online_reload_update(OnlineReloadConfigUpdate::PipelinePolicies {
-            policies: vec![PolicyConfig {
+        let updated = plan.with_online_reload_update(OnlineReloadConfigUpdate {
+            policies: Some(vec![PolicyConfig {
                 id: "guard".to_string(),
                 ..PolicyConfig::default()
-            }],
+            }]),
+            ..OnlineReloadConfigUpdate::default()
         });
 
         assert_eq!(updated.config.policies.len(), 1);
@@ -280,11 +304,14 @@ mod tests {
         );
         let plan = RuntimePlan::build(AgentConfig::default(), &registry)?;
 
-        let updated = plan.with_online_reload_update(OnlineReloadConfigUpdate::EnforcementPolicy {
-            selector: None,
-            source: EnforcementPolicySourceConfig::File {
-                path: "/tmp/enforcement.toml".into(),
-            },
+        let updated = plan.with_online_reload_update(OnlineReloadConfigUpdate {
+            enforcement_policy: Some(OnlineEnforcementPolicyConfigUpdate {
+                selector: None,
+                source: EnforcementPolicySourceConfig::File {
+                    path: "/tmp/enforcement.toml".into(),
+                },
+            }),
+            ..OnlineReloadConfigUpdate::default()
         });
 
         assert!(matches!(
@@ -328,8 +355,10 @@ mod tests {
             ..ExporterConfig::default()
         }];
 
-        let updated =
-            plan.with_online_reload_update(OnlineReloadConfigUpdate::Export { export, exporters });
+        let updated = plan.with_online_reload_update(OnlineReloadConfigUpdate {
+            export: Some(OnlineExportConfigUpdate { export, exporters }),
+            ..OnlineReloadConfigUpdate::default()
+        });
 
         assert_eq!(updated.config.exporters.len(), 1);
         assert_eq!(updated.export.sinks.len(), 1);
@@ -339,6 +368,48 @@ mod tests {
             crate::plan::ExportSinkPlan::Webhook(sink)
                 if sink.endpoint == "https://collector.internal/probe/batches"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn online_storage_retention_update_recomputes_storage_plan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ProviderRegistry::new(
+            vec![capture_provider(
+                CaptureBackend::Replay,
+                CaptureProviderBuilder::Replay,
+                RuntimeMode::Available,
+            )],
+            test_platform_capabilities(),
+        );
+        let plan = RuntimePlan::build(AgentConfig::default(), &registry)?;
+
+        let updated = plan.with_online_reload_update(OnlineReloadConfigUpdate {
+            storage_retention: Some(StorageRetentionConfig {
+                ingress: IngressJournalRetentionConfig {
+                    max_age_ms: None,
+                    max_records: Some(10_000),
+                    sweep_interval_ms: 5_000,
+                    prune_batch_limit: 128,
+                },
+                ..StorageRetentionConfig::default()
+            }),
+            ..OnlineReloadConfigUpdate::default()
+        });
+
+        assert_eq!(
+            updated.config.storage.retention.ingress.max_records,
+            Some(10_000)
+        );
+        assert_eq!(updated.storage.retention.ingress.max_records, Some(10_000));
+        assert_eq!(
+            updated.storage.retention.ingress.sweep_interval_ms.get(),
+            5_000
+        );
+        assert_eq!(
+            updated.storage.retention.ingress.prune_batch_limit.get(),
+            128
+        );
         Ok(())
     }
 

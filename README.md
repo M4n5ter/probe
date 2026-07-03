@@ -311,6 +311,12 @@ The main-config reload contract is owner-scoped:
   headers, codec, file path, Unix HTTP socket path, and per-sink batch quota
   changes. Export retention cursor owners are derived from the active plan on
   each retention sweep.
+- Storage retention changes apply online when `storage.path` is unchanged. The
+  ingress and export retention lanes reconcile max-age, max-records, sweep
+  interval, and prune batch limits from the active plan.
+- Export and storage retention changes can apply together because both are
+  plan-only active-plan updates. Action-gated owners such as policy and
+  enforcement reload remain single-owner apply operations.
 - Enforcement policy source and `enforcement.selector` changes apply online
   when enforcement reload watcher and poller topology is disabled and
   transparent interception is not owning setup-time host rules.
@@ -320,8 +326,9 @@ The main-config reload contract is owner-scoped:
 
 Top-level `[selectors]` registry changes, including entries referenced by
 `enforcement.selector`, still require restart until selector ownership has a
-lifecycle owner. Storage, admin socket, watcher topology, interception topology,
-and TLS material registry/source changes still require a process rebuild.
+lifecycle owner. Storage path, admin socket, watcher topology, interception
+topology, and TLS material registry/source changes still require a process
+rebuild.
 Online apply failures keep the old running agent alive and are reported in the
 status line instead of forcing a managed-agent restart. The same tab edits admin
 socket settings for future runs; the current TUI session keeps using the active
@@ -1125,8 +1132,9 @@ response. Candidate main configs can be parsed and statically validated with
 `plan-config-reload`, which reports `no_change`, `apply_online`,
 `queue_runtime_generation`, `restart_required`, or `invalid_candidate`. Each
 changed section carries a `reload_mode` of `apply_online`,
-`runtime_generation`, or `process_restart`. `apply-config-reload` updates the
-active plan only for a single online owner, or queues a pure data-path runtime
+`runtime_generation`, or `process_restart`. `apply-config-reload` can atomically
+replace the active plan for compatible plan-only online updates, runs a single
+action-gated online owner when required, or queues a pure data-path runtime
 generation request without replacing the active plan first.
 Policy-only config changes are online-applicable when local watcher and remote
 poller topology is disabled. Enforcement policy source and
@@ -1151,8 +1159,8 @@ candidate without partial commits. If a generation request cannot be queued, the
 old runtime stays active; a TUI-managed agent can restart to converge on the
 saved config, while an attached external agent reports that an explicit restart
 or retry is required. Selectors, TLS material registry/source changes,
-enforcement execution surface changes, storage, admin, agent id, and watcher
-topology changes are not silently applied by this path and remain
+enforcement execution surface changes, storage path, admin, agent id, and
+watcher topology changes are not silently applied by this path and remain
 `restart_required` until their lifecycle owners exist.
 The `[runtime_reload]` section controls the watcher topology itself, so changing
 it is also `restart_required`; the running watcher does not rebuild its own

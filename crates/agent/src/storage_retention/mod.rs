@@ -1,5 +1,3 @@
 mod worker;
 
-pub(crate) use worker::{
-    StorageRetentionWorkerConfig, StorageRetentionWorkerHandle, spawn_storage_retention_workers,
-};
+pub(crate) use worker::{StorageRetentionWorkerHandle, spawn_storage_retention_workers};

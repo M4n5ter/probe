@@ -8,29 +8,18 @@ use runtime::{ExportRetentionPlan, IngressRetentionPlan, RuntimePlan, StoragePla
 use storage::{DurableSpool, IngressCursorOwner};
 
 use crate::{
-    periodic_worker::{PeriodicWorkerHandle, spawn_periodic_worker},
+    periodic_worker::{WorkerHandle, spawn_worker},
     runtime_plan::RuntimePlanHandle,
 };
 
 pub(crate) struct StorageRetentionWorkerHandle {
-    ingress: Option<PeriodicWorkerHandle>,
-    export: Option<PeriodicWorkerHandle>,
-}
-
-pub(crate) struct StorageRetentionWorkerConfig {
-    ingress: Option<IngressRetentionLaneConfig>,
-    export: Option<ExportRetentionLaneConfig>,
+    ingress: WorkerHandle,
+    export: WorkerHandle,
 }
 
 struct IngressRetentionLaneConfig {
     cursor_owners: Vec<IngressCursorOwner>,
     retention: IngressRetentionPlan,
-    interval: Duration,
-}
-
-struct ExportRetentionLaneConfig {
-    plan_handle: RuntimePlanHandle,
-    interval: Duration,
 }
 
 #[derive(Clone)]
@@ -48,21 +37,8 @@ struct RetentionLimits {
 
 impl StorageRetentionWorkerHandle {
     pub(crate) async fn stop(self) {
-        if let Some(worker) = self.ingress {
-            worker.stop().await;
-        }
-        if let Some(worker) = self.export {
-            worker.stop().await;
-        }
-    }
-}
-
-impl StorageRetentionWorkerConfig {
-    pub(crate) fn from_plan_handle(plan_handle: RuntimePlanHandle) -> Option<Self> {
-        let plan = plan_handle.snapshot();
-        let ingress = IngressRetentionLaneConfig::from_storage_plan(&plan.storage);
-        let export = ExportRetentionLaneConfig::from_plan(plan.as_ref(), plan_handle.clone());
-        (ingress.is_some() || export.is_some()).then_some(Self { ingress, export })
+        self.ingress.stop().await;
+        self.export.stop().await;
     }
 }
 
@@ -71,47 +47,89 @@ impl IngressRetentionLaneConfig {
         let retention = &plan.retention.ingress;
         retention.enabled().then(|| Self {
             cursor_owners: vec![PARSER_INGRESS_CURSOR_OWNER],
-            interval: Duration::from_millis(retention.sweep_interval_ms.get()),
             retention: retention.clone(),
         })
     }
 }
 
-impl ExportRetentionLaneConfig {
-    fn from_plan(plan: &RuntimePlan, plan_handle: RuntimePlanHandle) -> Option<Self> {
-        let retention = &plan.storage.retention.export;
-        retention.enabled().then(|| Self {
-            plan_handle,
-            interval: Duration::from_millis(retention.sweep_interval_ms.get()),
-        })
-    }
-
-    fn snapshot(&self) -> Option<ExportRetentionLaneSnapshot> {
-        export_retention_lane_snapshot(self.plan_handle.snapshot().as_ref())
-    }
-}
-
 pub(crate) fn spawn_storage_retention_workers<S>(
     spool: Arc<S>,
-    config: StorageRetentionWorkerConfig,
+    plan_handle: RuntimePlanHandle,
 ) -> StorageRetentionWorkerHandle
 where
     S: DurableSpool + Send + Sync + 'static,
 {
-    let StorageRetentionWorkerConfig { ingress, export } = config;
-    let ingress = ingress.map(|config| {
-        let spool = Arc::clone(&spool);
-        spawn_periodic_worker("ingress retention", config.interval, move || {
-            prune_ingress_retention_once(spool.as_ref(), &config)
-        })
-    });
-    let export = export.map(|config| {
-        let spool = Arc::clone(&spool);
-        spawn_periodic_worker("export retention", config.interval, move || {
-            prune_export_retention_once(spool.as_ref(), &config)
-        })
-    });
+    let ingress = spawn_ingress_retention_worker(Arc::clone(&spool), plan_handle.clone());
+    let export = spawn_export_retention_worker(spool, plan_handle);
     StorageRetentionWorkerHandle { ingress, export }
+}
+
+fn spawn_ingress_retention_worker<S>(spool: Arc<S>, plan_handle: RuntimePlanHandle) -> WorkerHandle
+where
+    S: DurableSpool + Send + Sync + 'static,
+{
+    spawn_retention_lane_worker(
+        "ingress retention",
+        spool,
+        plan_handle,
+        |plan| IngressRetentionLaneConfig::from_storage_plan(&plan.storage),
+        |config| Duration::from_millis(config.retention.sweep_interval_ms.get()),
+        |spool, config| prune_ingress_retention_once(spool, config),
+    )
+}
+
+fn spawn_export_retention_worker<S>(spool: Arc<S>, plan_handle: RuntimePlanHandle) -> WorkerHandle
+where
+    S: DurableSpool + Send + Sync + 'static,
+{
+    spawn_retention_lane_worker(
+        "export retention",
+        spool,
+        plan_handle,
+        export_retention_lane_snapshot,
+        |snapshot| Duration::from_millis(snapshot.retention.sweep_interval_ms.get()),
+        |spool, snapshot| prune_export_retention_once(spool, snapshot),
+    )
+}
+
+fn spawn_retention_lane_worker<S, C, Snapshot, Interval, Prune>(
+    label: &'static str,
+    spool: Arc<S>,
+    plan_handle: RuntimePlanHandle,
+    snapshot: Snapshot,
+    interval: Interval,
+    prune: Prune,
+) -> WorkerHandle
+where
+    S: DurableSpool + Send + Sync + 'static,
+    C: Send + 'static,
+    Snapshot: Fn(&RuntimePlan) -> Option<C> + Send + 'static,
+    Interval: Fn(&C) -> Duration + Send + 'static,
+    Prune: Fn(&S, &C) -> Result<(), storage::StorageError> + Send + 'static,
+{
+    spawn_worker(label, move |context| async move {
+        let mut plan_changes = plan_handle.subscribe_changes();
+        loop {
+            if context.stop_requested() {
+                break;
+            }
+            let Some(config) = snapshot(plan_handle.snapshot().as_ref()) else {
+                if !context.wait_or_stop(plan_changes.changed()).await {
+                    break;
+                }
+                continue;
+            };
+            if let Err(error) = prune(spool.as_ref(), &config) {
+                eprintln!("{label} worker iteration failed: {error}");
+            }
+            if !context
+                .sleep_or_wait_or_stop(interval(&config), plan_changes.changed())
+                .await
+            {
+                break;
+            }
+        }
+    })
 }
 
 fn prune_ingress_retention_once(
@@ -149,12 +167,9 @@ fn prune_ingress_retention_once_at(
 
 fn prune_export_retention_once(
     spool: &impl DurableSpool,
-    config: &ExportRetentionLaneConfig,
+    snapshot: &ExportRetentionLaneSnapshot,
 ) -> Result<(), storage::StorageError> {
-    let Some(snapshot) = config.snapshot() else {
-        return Ok(());
-    };
-    prune_export_retention_once_at(spool, &snapshot, current_unix_time_ns())
+    prune_export_retention_once_at(spool, snapshot, current_unix_time_ns())
 }
 
 fn prune_export_retention_once_at(
@@ -277,8 +292,8 @@ mod tests {
     };
     use probe_core::{CapabilityKind, CapabilityState, SpoolPayloadSchema};
     use runtime::{
-        CaptureProviderBuilder, CaptureProviderDescriptor, OnlineReloadConfigUpdate,
-        ProviderRegistry, RuntimePlan,
+        CaptureProviderBuilder, CaptureProviderDescriptor, OnlineExportConfigUpdate,
+        OnlineReloadConfigUpdate, ProviderRegistry, RuntimePlan,
     };
     use storage::{FjallSpool, RetentionPrune, SpoolPayload};
     use tempfile::tempdir;
@@ -286,7 +301,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn storage_retention_worker_config_uses_storage_plan() -> Result<(), Box<dyn std::error::Error>>
+    fn storage_retention_lane_snapshot_uses_storage_plan() -> Result<(), Box<dyn std::error::Error>>
     {
         let temp = tempdir()?;
         let plan = runtime_plan(
@@ -307,29 +322,27 @@ mod tests {
             },
             vec![webhook_exporter("collector")],
         )?;
-        let plan_handle = RuntimePlanHandle::new(Arc::new(plan));
 
-        let config = StorageRetentionWorkerConfig::from_plan_handle(plan_handle)
-            .expect("configured max age should enable storage retention");
-        let ingress = config.ingress.expect("ingress retention should be enabled");
-        let export_config = config.export.expect("export retention should be enabled");
-        let export = export_config
-            .snapshot()
-            .expect("export retention snapshot should be enabled");
+        let ingress = IngressRetentionLaneConfig::from_storage_plan(&plan.storage)
+            .expect("ingress retention should be enabled");
+        let export =
+            export_retention_lane_snapshot(&plan).expect("export retention should be enabled");
 
         assert_eq!(ingress.cursor_owners, [PARSER_INGRESS_CURSOR_OWNER]);
-        assert_eq!(ingress.interval, Duration::from_millis(5_000));
         assert_eq!(ingress.retention.max_age_ms, Some(60_000));
         assert_eq!(ingress.retention.max_records, Some(10_000));
         assert_eq!(export.cursor_owners, ["collector"]);
-        assert_eq!(export_config.interval, Duration::from_millis(7_000));
+        assert_eq!(
+            export.retention.sweep_interval_ms,
+            NonZeroU64::new(7_000).expect("positive sweep interval")
+        );
         assert_eq!(export.retention.max_age_ms, Some(120_000));
         assert_eq!(export.retention.max_records, Some(50_000));
         Ok(())
     }
 
     #[test]
-    fn storage_retention_worker_config_is_disabled_without_retention_limit()
+    fn storage_retention_lane_snapshot_is_disabled_without_retention_limit()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
         let plan = runtime_plan(
@@ -337,14 +350,14 @@ mod tests {
             StorageRetentionConfig::default(),
             Vec::new(),
         )?;
-        let plan_handle = RuntimePlanHandle::new(Arc::new(plan));
 
-        assert!(StorageRetentionWorkerConfig::from_plan_handle(plan_handle).is_none());
+        assert!(IngressRetentionLaneConfig::from_storage_plan(&plan.storage).is_none());
+        assert!(export_retention_lane_snapshot(&plan).is_none());
         Ok(())
     }
 
     #[test]
-    fn storage_retention_worker_config_is_enabled_by_max_records_only()
+    fn storage_retention_lane_snapshot_is_enabled_by_max_records_only()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
         let plan = runtime_plan(
@@ -365,24 +378,16 @@ mod tests {
             },
             vec![webhook_exporter("collector")],
         )?;
-        let plan_handle = RuntimePlanHandle::new(Arc::new(plan));
-
-        let config = StorageRetentionWorkerConfig::from_plan_handle(plan_handle)
-            .expect("max-records retention should enable storage retention");
 
         assert_eq!(
-            config
-                .ingress
+            IngressRetentionLaneConfig::from_storage_plan(&plan.storage)
                 .expect("ingress retention should be enabled")
                 .retention
                 .max_records,
             Some(10)
         );
-        let export = config
-            .export
-            .expect("export retention should be enabled")
-            .snapshot()
-            .expect("export retention snapshot should be enabled");
+        let export =
+            export_retention_lane_snapshot(&plan).expect("export retention should be enabled");
         assert_eq!(export.cursor_owners, ["collector"]);
         assert_eq!(export.retention.max_records, Some(20));
         Ok(())
@@ -419,15 +424,17 @@ mod tests {
             vec![webhook_exporter("primary")],
         )?;
         let plan_handle = RuntimePlanHandle::new(Arc::new(plan.clone()));
-        let config = StorageRetentionWorkerConfig::from_plan_handle(plan_handle.clone())
-            .expect("export retention should be enabled");
-        let export = config.export.expect("export retention should be enabled");
 
-        let updated_plan = plan.with_online_reload_update(OnlineReloadConfigUpdate::Export {
-            export: plan.config.export.clone(),
-            exporters: vec![webhook_exporter("primary"), webhook_exporter("secondary")],
+        let updated_plan = plan.with_online_reload_update(OnlineReloadConfigUpdate {
+            export: Some(OnlineExportConfigUpdate {
+                export: plan.config.export.clone(),
+                exporters: vec![webhook_exporter("primary"), webhook_exporter("secondary")],
+            }),
+            ..OnlineReloadConfigUpdate::default()
         });
         plan_handle.replace(updated_plan);
+        let export = export_retention_lane_snapshot(plan_handle.snapshot().as_ref())
+            .expect("export retention should be enabled");
 
         prune_export_retention_once(&spool, &export)?;
 
@@ -438,6 +445,173 @@ mod tests {
                 .read_export_batch("secondary", 10)?
                 .iter()
                 .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn storage_retention_worker_enables_ingress_retention_after_plan_change()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = Arc::new(FjallSpool::open(temp.path().join("spool-data"))?);
+        spool.append_ingress(SpoolPayload::new(
+            SpoolPayloadSchema::CaptureEventOriginJson,
+            b"one",
+        ))?;
+        spool.append_ingress(SpoolPayload::new(
+            SpoolPayloadSchema::CaptureEventOriginJson,
+            b"two",
+        ))?;
+        spool.append_ingress(SpoolPayload::new(
+            SpoolPayloadSchema::CaptureEventOriginJson,
+            b"three",
+        ))?;
+        let plan = runtime_plan(
+            temp.path().join("spool"),
+            StorageRetentionConfig::default(),
+            Vec::new(),
+        )?;
+        let plan_handle = RuntimePlanHandle::new(Arc::new(plan));
+        let worker = spawn_storage_retention_workers(Arc::clone(&spool), plan_handle.clone());
+
+        plan_handle.replace(plan_handle.snapshot().with_online_reload_update(
+            OnlineReloadConfigUpdate {
+                storage_retention: Some(StorageRetentionConfig {
+                    ingress: IngressJournalRetentionConfig {
+                        max_age_ms: None,
+                        max_records: Some(1),
+                        sweep_interval_ms: 50,
+                        prune_batch_limit: 10,
+                    },
+                    ..StorageRetentionConfig::default()
+                }),
+                ..OnlineReloadConfigUpdate::default()
+            },
+        ));
+
+        let result =
+            wait_until_storage(|| Ok(spool.ingress_cursor(PARSER_INGRESS_CURSOR_OWNER)? == 2))
+                .await;
+        worker.stop().await;
+        result?;
+        assert_eq!(
+            spool
+                .read_ingress_batch(PARSER_INGRESS_CURSOR_OWNER, 10)?
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn storage_retention_worker_idles_ingress_lane_after_plan_disables_retention()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = Arc::new(FjallSpool::open(temp.path().join("spool-data"))?);
+        for payload in ["one", "two", "three"] {
+            spool.append_ingress(SpoolPayload::new(
+                SpoolPayloadSchema::CaptureEventOriginJson,
+                payload.as_bytes(),
+            ))?;
+        }
+        let plan = runtime_plan(
+            temp.path().join("spool"),
+            StorageRetentionConfig {
+                ingress: IngressJournalRetentionConfig {
+                    max_age_ms: None,
+                    max_records: Some(1),
+                    sweep_interval_ms: 50,
+                    prune_batch_limit: 10,
+                },
+                ..StorageRetentionConfig::default()
+            },
+            Vec::new(),
+        )?;
+        let plan_handle = RuntimePlanHandle::new(Arc::new(plan));
+        let worker = spawn_storage_retention_workers(Arc::clone(&spool), plan_handle.clone());
+
+        let result =
+            wait_until_storage(|| Ok(spool.ingress_cursor(PARSER_INGRESS_CURSOR_OWNER)? == 2))
+                .await;
+        result?;
+        plan_handle.replace(plan_handle.snapshot().with_online_reload_update(
+            OnlineReloadConfigUpdate {
+                storage_retention: Some(StorageRetentionConfig::default()),
+                ..OnlineReloadConfigUpdate::default()
+            },
+        ));
+        for payload in ["four", "five"] {
+            spool.append_ingress(SpoolPayload::new(
+                SpoolPayloadSchema::CaptureEventOriginJson,
+                payload.as_bytes(),
+            ))?;
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        worker.stop().await;
+
+        assert_eq!(
+            spool
+                .read_ingress_batch(PARSER_INGRESS_CURSOR_OWNER, 10)?
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn storage_retention_worker_enables_export_retention_after_plan_change()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = Arc::new(FjallSpool::open(temp.path().join("spool-data"))?);
+        spool.append_export(SpoolPayload::new(
+            SpoolPayloadSchema::EventEnvelopeSubjectOriginJson,
+            b"one",
+        ))?;
+        spool.append_export(SpoolPayload::new(
+            SpoolPayloadSchema::EventEnvelopeSubjectOriginJson,
+            b"two",
+        ))?;
+        spool.append_export(SpoolPayload::new(
+            SpoolPayloadSchema::EventEnvelopeSubjectOriginJson,
+            b"three",
+        ))?;
+        let plan = runtime_plan(
+            temp.path().join("spool"),
+            StorageRetentionConfig::default(),
+            vec![webhook_exporter("collector")],
+        )?;
+        let plan_handle = RuntimePlanHandle::new(Arc::new(plan));
+        let worker = spawn_storage_retention_workers(Arc::clone(&spool), plan_handle.clone());
+
+        plan_handle.replace(plan_handle.snapshot().with_online_reload_update(
+            OnlineReloadConfigUpdate {
+                storage_retention: Some(StorageRetentionConfig {
+                    export: ExportQueueRetentionConfig {
+                        max_age_ms: None,
+                        max_records: Some(1),
+                        sweep_interval_ms: 50,
+                        prune_batch_limit: 10,
+                    },
+                    ..StorageRetentionConfig::default()
+                }),
+                ..OnlineReloadConfigUpdate::default()
+            },
+        ));
+
+        let result = wait_until_storage(|| Ok(spool.export_cursor("collector")? == 2)).await;
+        worker.stop().await;
+        result?;
+        assert_eq!(
+            spool
+                .read_export_batch("collector", 10)?
+                .iter()
+                .map(|record| record.sequence)
                 .collect::<Vec<_>>(),
             vec![3]
         );
@@ -529,7 +703,6 @@ mod tests {
                 sweep_interval_ms: NonZeroU64::new(5_000).expect("positive sweep interval"),
                 prune_batch_limit: NonZeroU64::new(10).expect("positive prune limit"),
             },
-            interval: Duration::from_millis(5_000),
         };
 
         prune_ingress_retention_once_at(&spool, &config, u64::MAX)?;
@@ -589,7 +762,6 @@ mod tests {
                 sweep_interval_ms: NonZeroU64::new(5_000).expect("positive sweep interval"),
                 prune_batch_limit: NonZeroU64::new(10).expect("positive prune limit"),
             },
-            interval: Duration::from_millis(5_000),
         };
 
         prune_ingress_retention_once_at(&spool, &config, 42)?;
@@ -643,6 +815,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![3]
         );
+        Ok(())
+    }
+
+    async fn wait_until_storage(
+        mut condition: impl FnMut() -> Result<bool, storage::StorageError>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if condition()? {
+                    return Ok::<(), storage::StorageError>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| "timed out waiting for storage retention worker")??;
         Ok(())
     }
 
