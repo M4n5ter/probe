@@ -7,6 +7,7 @@ mod text;
 mod websocket;
 
 pub(crate) use state::{
-    TrafficDetailLoadRequest, TrafficDetailLoadResult, TrafficState, TrafficStatusKind,
-    load_traffic_detail,
+    TrafficDetailLoadRequest, TrafficDetailLoadResult, TrafficRefreshRequest, TrafficRefreshResult,
+    TrafficState, TrafficStatusKind, load_traffic_detail, load_traffic_refresh,
+    traffic_selector_key,
 };

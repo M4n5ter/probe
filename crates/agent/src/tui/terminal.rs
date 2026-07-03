@@ -17,7 +17,10 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use probe_config::default_config_path;
 
 use super::{
-    app::{TuiAction, TuiApp, TuiEffect, TuiTab},
+    app::{
+        TrafficRefreshLoadResult, TuiAction, TuiApp, TuiEffect, TuiTab,
+        load_traffic_refresh_with_diagnostics,
+    },
     config_edit::{TuiError, load_config, load_or_create_config, save_config},
     hit::HitMap,
     process_catalog_task::{
@@ -60,6 +63,7 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
             .unwrap_or_else(Instant::now);
         let mut last_agent_poll = Instant::now();
         let mut pending_traffic_detail: Option<PendingTrafficDetail> = None;
+        let mut pending_traffic_refresh: Option<PendingTrafficRefresh> = None;
 
         loop {
             if let Some(result) = take_finished_process_catalog(&mut pending_process_catalog).await
@@ -77,6 +81,13 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
             }
             if let Some(result) = take_finished_traffic_detail(&mut pending_traffic_detail).await {
                 app.apply_traffic_detail_result(result);
+            }
+            if let Some(result) = take_finished_traffic_refresh(&mut pending_traffic_refresh).await
+            {
+                match result {
+                    Ok(result) => app.apply_traffic_refresh_result(result),
+                    Err(error) => app.mark_warning(format!("Traffic refresh task failed: {error}")),
+                }
             }
             if last_agent_poll.elapsed() >= TRAFFIC_REFRESH_INTERVAL {
                 let agent_exit = match supervisor.as_mut() {
@@ -100,8 +111,13 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
             }
             if app.active_tab() == TuiTab::Traffic
                 && last_traffic_refresh.elapsed() >= TRAFFIC_REFRESH_INTERVAL
+                && pending_traffic_refresh.is_none()
             {
-                app.refresh_traffic().await;
+                if let Some(request) = app.begin_traffic_refresh() {
+                    pending_traffic_refresh = Some(PendingTrafficRefresh {
+                        task: tokio::spawn(load_traffic_refresh_with_diagnostics(request)),
+                    });
+                }
                 last_traffic_refresh = Instant::now();
             }
             let hit_map = terminal.draw(&mut app)?;
@@ -186,6 +202,9 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
         if let Some(pending) = pending_traffic_detail {
             pending.task.abort();
         }
+        if let Some(pending) = pending_traffic_refresh {
+            pending.task.abort();
+        }
         cancel_pending_runtime_reconcile(pending_runtime_reconcile).await;
         cancel_pending_process_catalog(pending_process_catalog).await;
 
@@ -202,6 +221,10 @@ struct PendingTrafficDetail {
     sequence: u64,
     request_id: u64,
     task: tokio::task::JoinHandle<TrafficDetailLoadResult>,
+}
+
+struct PendingTrafficRefresh {
+    task: tokio::task::JoinHandle<TrafficRefreshLoadResult>,
 }
 
 async fn take_finished_traffic_detail(
@@ -222,6 +245,19 @@ async fn take_finished_traffic_detail(
             format!("traffic detail task failed: {error}"),
         )),
     }
+}
+
+async fn take_finished_traffic_refresh(
+    pending: &mut Option<PendingTrafficRefresh>,
+) -> Option<Result<TrafficRefreshLoadResult, tokio::task::JoinError>> {
+    if !pending
+        .as_ref()
+        .is_some_and(|pending| pending.task.is_finished())
+    {
+        return None;
+    }
+    let pending = pending.take().expect("pending refresh task was checked");
+    Some(pending.task.await)
 }
 
 fn resolve_config_path(config: Option<PathBuf>) -> PathBuf {

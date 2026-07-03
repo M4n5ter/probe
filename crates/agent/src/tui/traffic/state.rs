@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeMap, path::PathBuf};
 
 use probe_core::Selector;
 
@@ -61,6 +58,88 @@ pub(crate) async fn load_traffic_detail(
     TrafficDetailLoadResult {
         sequence: request.sequence,
         request_id: request.request_id,
+        result,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrafficRefreshRequest {
+    socket_path: PathBuf,
+    selector: Selector,
+    selector_key: String,
+    after_sequence: u64,
+    latest_window: bool,
+    event_filter: TrafficEventFilter,
+}
+
+impl TrafficRefreshRequest {
+    pub(crate) fn selector_key(&self) -> &str {
+        &self.selector_key
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrafficRefreshResult {
+    selector_key: String,
+    event_filter: TrafficEventFilter,
+    attribution_mode: EventTailAttributionMode,
+    result: Result<TrafficRefreshSnapshot, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrafficRefreshSnapshot {
+    tail: EventTailSnapshot,
+    empty_filter_diagnostics: Option<EmptyFilterDiagnostics>,
+}
+
+pub(crate) async fn load_traffic_refresh(
+    request: TrafficRefreshRequest,
+    attribution_mode: EventTailAttributionMode,
+) -> TrafficRefreshResult {
+    let event_types = request
+        .event_filter
+        .event_type_filter()
+        .to_admin_event_types();
+    let tail = request_tail_events(
+        &request.socket_path,
+        request.after_sequence,
+        request.latest_window,
+        request.selector.clone(),
+        attribution_mode,
+        &event_types,
+    )
+    .await;
+    let result = match tail {
+        Ok(tail) => {
+            let empty_filter_diagnostics = if should_probe_empty_filter(request.event_filter, &tail)
+            {
+                request_tail_events(
+                    &request.socket_path,
+                    request.after_sequence,
+                    request.latest_window,
+                    request.selector,
+                    attribution_mode,
+                    &[],
+                )
+                .await
+                .ok()
+                .and_then(|snapshot| {
+                    EmptyFilterDiagnostics::from_snapshot(request.event_filter.label(), snapshot)
+                })
+            } else {
+                None
+            };
+            Ok(TrafficRefreshSnapshot {
+                tail,
+                empty_filter_diagnostics,
+            })
+        }
+        Err(error) => Err(traffic_refresh_error_message(&error)),
+    };
+    TrafficRefreshResult {
+        selector_key: request.selector_key,
+        event_filter: request.event_filter,
+        attribution_mode,
         result,
     }
 }
@@ -437,58 +516,45 @@ impl TrafficState {
             .unwrap_or_else(|| self.diagnostic_lines())
     }
 
-    pub(crate) async fn refresh(
+    pub(crate) fn begin_refresh(
         &mut self,
-        socket_path: &Path,
+        socket_path: PathBuf,
         selector: Selector,
-        attribution_mode: EventTailAttributionMode,
-    ) {
-        let selector_key = selector_key(&selector);
+    ) -> TrafficRefreshRequest {
+        let selector_key = traffic_selector_key(&selector);
         if Some(selector_key.clone()) != self.selector_key {
             self.reset_for_selector(selector_key);
         }
-        let event_types = self.event_filter.event_type_filter().to_admin_event_types();
-        let tail_after_sequence = self.after_sequence;
-        let tail_latest_window = self.latest_window;
-        let event_filter = self.event_filter;
-
-        self.attribution_mode = attribution_mode;
-        match request_tail_events(
+        TrafficRefreshRequest {
             socket_path,
-            tail_after_sequence,
-            tail_latest_window,
-            selector.clone(),
-            attribution_mode,
-            &event_types,
-        )
-        .await
+            selector,
+            selector_key: self
+                .selector_key
+                .clone()
+                .expect("selector key is set before building refresh request"),
+            after_sequence: self.after_sequence,
+            latest_window: self.latest_window,
+            event_filter: self.event_filter,
+        }
+    }
+
+    pub(crate) fn apply_refresh_result(&mut self, result: TrafficRefreshResult) -> bool {
+        if self.selector_key.as_deref() != Some(result.selector_key.as_str())
+            || self.event_filter != result.event_filter
         {
+            return false;
+        }
+        self.attribution_mode = result.attribution_mode;
+        match result.result {
             Ok(snapshot) => {
-                let empty_filter_diagnostics = if should_probe_empty_filter(event_filter, &snapshot)
-                {
-                    request_tail_events(
-                        socket_path,
-                        tail_after_sequence,
-                        tail_latest_window,
-                        selector,
-                        attribution_mode,
-                        &[],
-                    )
-                    .await
-                    .ok()
-                    .and_then(|snapshot| {
-                        EmptyFilterDiagnostics::from_snapshot(event_filter.label(), snapshot)
-                    })
-                } else {
-                    None
-                };
-                self.apply_snapshot(snapshot);
-                self.apply_empty_filter_diagnostics(empty_filter_diagnostics);
+                self.apply_snapshot(snapshot.tail);
+                self.apply_empty_filter_diagnostics(snapshot.empty_filter_diagnostics);
             }
             Err(error) => {
-                self.status = TrafficStatus::error(traffic_refresh_error_message(&error));
+                self.status = TrafficStatus::error(error);
             }
         }
+        true
     }
 
     pub(crate) fn mark_detail_loading(&mut self, sequence: u64, request_id: u64) {
@@ -1140,7 +1206,7 @@ fn scroll_position(current: usize, delta: isize, max_scroll: usize) -> usize {
     }
 }
 
-fn selector_key(selector: &Selector) -> String {
+pub(crate) fn traffic_selector_key(selector: &Selector) -> String {
     serde_json::to_string(selector).unwrap_or_else(|_| format!("{selector:?}"))
 }
 
@@ -1288,6 +1354,31 @@ mod tests {
         assert_eq!(traffic.event_filter_label(), "HTTP");
         assert!(traffic.rows().is_empty());
         assert_eq!(traffic.after_sequence, 0);
+        assert_eq!(
+            traffic.status().text,
+            "Traffic event filter changed to HTTP"
+        );
+    }
+
+    #[test]
+    fn stale_refresh_result_is_ignored_after_event_filter_changes() {
+        let mut traffic = TrafficState::default();
+        let request = traffic.begin_refresh(PathBuf::from("/tmp/admin.sock"), Selector::default());
+
+        traffic.cycle_event_filter();
+        let applied = traffic.apply_refresh_result(TrafficRefreshResult {
+            selector_key: request.selector_key,
+            event_filter: request.event_filter,
+            attribution_mode: EventTailAttributionMode::Strict,
+            result: Ok(TrafficRefreshSnapshot {
+                tail: tail_snapshot_with_gap_events(1..=1),
+                empty_filter_diagnostics: None,
+            }),
+        });
+
+        assert!(!applied);
+        assert!(traffic.rows().is_empty());
+        assert_eq!(traffic.event_filter_label(), "HTTP");
         assert_eq!(
             traffic.status().text,
             "Traffic event filter changed to HTTP"

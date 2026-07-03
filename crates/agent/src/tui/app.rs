@@ -16,10 +16,14 @@ use super::process_view::ProcessViewState;
 use super::processes::{ProcessCatalog, ProcessEntry, selector_for_exe_path};
 use super::runtime_attachment::RuntimeAttachment;
 use super::runtime_status::{
-    local_traffic_runtime_diagnostics, request_traffic_runtime_diagnostics,
+    TrafficRuntimeDiagnostics, local_traffic_runtime_diagnostics,
+    request_traffic_runtime_diagnostics,
 };
 use super::text::terminal_safe_inline_text;
-use super::traffic::{TrafficDetailLoadRequest, TrafficDetailLoadResult, TrafficState};
+use super::traffic::{
+    TrafficDetailLoadRequest, TrafficDetailLoadResult, TrafficRefreshRequest, TrafficRefreshResult,
+    TrafficState, load_traffic_refresh, traffic_selector_key,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TuiTab {
@@ -128,6 +132,45 @@ pub(crate) enum TuiEffect {
     ReloadConfig,
     ReloadRuntimeActions,
     LoadTrafficDetail { sequence: u64 },
+}
+
+#[derive(Debug)]
+struct TrafficRefreshIdentity {
+    runtime_epoch: u64,
+    socket_path: PathBuf,
+    selector_key: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct TrafficRefreshLoadRequest {
+    identity: TrafficRefreshIdentity,
+    traffic: TrafficRefreshRequest,
+}
+
+#[derive(Debug)]
+pub(crate) struct TrafficRefreshLoadResult {
+    identity: TrafficRefreshIdentity,
+    diagnostics: Result<TrafficRuntimeDiagnostics, String>,
+    traffic: TrafficRefreshResult,
+}
+
+pub(crate) async fn load_traffic_refresh_with_diagnostics(
+    request: TrafficRefreshLoadRequest,
+) -> TrafficRefreshLoadResult {
+    let identity = request.identity;
+    let diagnostics = request_traffic_runtime_diagnostics(&identity.socket_path)
+        .await
+        .map_err(|error| error.to_string());
+    let attribution_mode = diagnostics
+        .as_ref()
+        .map(TrafficRuntimeDiagnostics::tail_attribution_mode)
+        .unwrap_or(crate::admin::EventTailAttributionMode::Strict);
+    let traffic = load_traffic_refresh(request.traffic, attribution_mode).await;
+    TrafficRefreshLoadResult {
+        identity,
+        diagnostics,
+        traffic,
+    }
 }
 
 impl TuiEffect {
@@ -249,6 +292,7 @@ pub(crate) struct TuiApp {
     traffic_popup_content_rows: usize,
     traffic_popup_viewport_rows: usize,
     runtime_attachment: RuntimeAttachment,
+    runtime_epoch: u64,
     data_path_diagnostics: DataPathDiagnosticsView,
     dirty: bool,
     should_quit: bool,
@@ -286,6 +330,7 @@ impl TuiApp {
             traffic_popup_content_rows: 0,
             traffic_popup_viewport_rows: 1,
             runtime_attachment: RuntimeAttachment::default(),
+            runtime_epoch: 0,
             data_path_diagnostics: DataPathDiagnosticsView::unavailable(
                 "local config diagnostics have not been evaluated yet",
             ),
@@ -466,6 +511,7 @@ impl TuiApp {
     pub(crate) fn attach_agent(&mut self, attachment: RuntimeAttachment) {
         let status = attachment.status_text();
         self.runtime_attachment = attachment;
+        self.bump_runtime_epoch();
         self.invalidate_traffic_detail_requests();
         self.refresh_local_runtime_diagnostics();
         self.status = StatusMessage::info(status);
@@ -474,6 +520,7 @@ impl TuiApp {
     pub(crate) fn detach_agent(&mut self, message: impl Into<String>) {
         let status = StatusMessage::error(message);
         self.runtime_attachment = RuntimeAttachment::lost(status.text.clone());
+        self.bump_runtime_epoch();
         self.invalidate_traffic_detail_requests();
         self.status = status;
         self.refresh_local_runtime_diagnostics();
@@ -725,7 +772,7 @@ impl TuiApp {
         self.process_view.move_selection(delta, &self.processes);
     }
 
-    pub(crate) async fn refresh_traffic(&mut self) {
+    pub(crate) fn begin_traffic_refresh(&mut self) -> Option<TrafficRefreshLoadRequest> {
         let Some(socket_path) = self
             .runtime_attachment
             .active_socket_path()
@@ -738,7 +785,7 @@ impl TuiApp {
             self.refresh_local_runtime_diagnostics();
             self.traffic.mark_admin_unavailable(message);
             self.status = StatusMessage::warning(self.traffic.status().text.clone());
-            return;
+            return None;
         };
         let selector = match self.traffic_filter_selector() {
             Some(selector) => selector,
@@ -746,21 +793,31 @@ impl TuiApp {
                 let message = "No readable process is selected; traffic filter was not changed";
                 self.traffic.mark_filter_unavailable(message);
                 self.status = StatusMessage::warning(message);
-                return;
+                return None;
             }
             None => {
                 let message = "Selected process has no readable executable path; traffic filter was not changed";
                 self.traffic.mark_filter_unavailable(message);
                 self.status = StatusMessage::warning(message);
-                return;
+                return None;
             }
         };
-        let diagnostics_result = request_traffic_runtime_diagnostics(&socket_path).await;
-        let attribution_mode = diagnostics_result
-            .as_ref()
-            .map(|diagnostics| diagnostics.tail_attribution_mode())
-            .unwrap_or(crate::admin::EventTailAttributionMode::Strict);
-        match &diagnostics_result {
+        let traffic = self.traffic.begin_refresh(socket_path.clone(), selector);
+        Some(TrafficRefreshLoadRequest {
+            identity: TrafficRefreshIdentity {
+                runtime_epoch: self.runtime_epoch,
+                socket_path,
+                selector_key: traffic.selector_key().to_string(),
+            },
+            traffic,
+        })
+    }
+
+    pub(crate) fn apply_traffic_refresh_result(&mut self, result: TrafficRefreshLoadResult) {
+        if !self.is_current_traffic_refresh_result(&result) {
+            return;
+        }
+        match &result.diagnostics {
             Ok(diagnostics) => {
                 self.data_path_diagnostics =
                     DataPathDiagnosticsView::from_running_agent(diagnostics.clone());
@@ -770,10 +827,11 @@ impl TuiApp {
                 self.refresh_local_runtime_diagnostics_with_reason(message);
             }
         }
-        self.traffic
-            .refresh(&socket_path, selector, attribution_mode)
-            .await;
-        let diagnostics_error = match diagnostics_result {
+        let traffic_applied = self.traffic.apply_refresh_result(result.traffic);
+        if !traffic_applied {
+            return;
+        }
+        let diagnostics_error = match result.diagnostics {
             Ok(diagnostics) => {
                 let message = diagnostics.status_message(self.traffic.rows().is_empty());
                 self.traffic.apply_runtime_diagnostic_message(message);
@@ -803,6 +861,25 @@ impl TuiApp {
                 self.status = StatusMessage::info(traffic_status_text);
             }
         }
+    }
+
+    fn is_current_traffic_refresh_result(&self, result: &TrafficRefreshLoadResult) -> bool {
+        self.is_current_traffic_refresh_identity(&result.identity)
+    }
+
+    fn is_current_traffic_refresh_identity(&self, identity: &TrafficRefreshIdentity) -> bool {
+        self.runtime_epoch == identity.runtime_epoch
+            && self.runtime_attachment.active_socket_path() == Some(identity.socket_path.as_path())
+            && self
+                .traffic_filter_selector()
+                .is_some_and(|selector| traffic_selector_key(&selector) == identity.selector_key)
+    }
+
+    fn bump_runtime_epoch(&mut self) {
+        self.runtime_epoch = self
+            .runtime_epoch
+            .checked_add(1)
+            .expect("runtime epoch overflow");
     }
 
     pub(crate) fn begin_traffic_detail_load(
@@ -2000,8 +2077,8 @@ mod tests {
         assert!(app.is_hovered(HitTarget::TextEditSubmit));
     }
 
-    #[tokio::test]
-    async fn traffic_view_fails_closed_when_no_process_selector_is_available() {
+    #[test]
+    fn traffic_view_fails_closed_when_no_process_selector_is_available() {
         let config = AgentConfig::default();
         let mut app = TuiApp::new(
             PathBuf::from("/tmp/agent.toml"),
@@ -2013,8 +2090,9 @@ mod tests {
         )));
         app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Traffic)));
 
-        app.refresh_traffic().await;
+        let request = app.begin_traffic_refresh();
 
+        assert!(request.is_none());
         assert!(app.traffic().rows().is_empty());
         assert_eq!(app.status().kind, StatusKind::Warning);
         assert!(
@@ -2038,6 +2116,39 @@ mod tests {
         assert!(app.active_admin_socket_path().is_none());
         assert_eq!(app.runtime_agent_status(), "TUI managed agent unavailable");
         assert_eq!(app.status().kind, StatusKind::Error);
+    }
+
+    #[test]
+    fn pending_traffic_refresh_is_stale_after_focused_process_changes() {
+        let mut app = multi_process_app();
+        app.attach_agent(RuntimeAttachment::existing(PathBuf::from(
+            "/tmp/admin.sock",
+        )));
+
+        let request = app
+            .begin_traffic_refresh()
+            .expect("selected process should produce a traffic selector");
+        assert!(app.is_current_traffic_refresh_identity(&request.identity));
+
+        app.handle_action(TuiAction::Click(HitTarget::Process(1)));
+
+        assert!(!app.is_current_traffic_refresh_identity(&request.identity));
+    }
+
+    #[test]
+    fn pending_traffic_refresh_is_stale_after_same_socket_runtime_reattach() {
+        let socket_path = PathBuf::from("/tmp/admin.sock");
+        let mut app = test_app();
+        app.attach_agent(RuntimeAttachment::existing(socket_path.clone()));
+
+        let request = app
+            .begin_traffic_refresh()
+            .expect("selected process should produce a traffic selector");
+        assert!(app.is_current_traffic_refresh_identity(&request.identity));
+
+        app.attach_agent(RuntimeAttachment::existing(socket_path));
+
+        assert!(!app.is_current_traffic_refresh_identity(&request.identity));
     }
 
     #[test]
@@ -2178,8 +2289,8 @@ mod tests {
         assert!(app.dirty());
     }
 
-    #[tokio::test]
-    async fn traffic_refresh_without_admin_socket_keeps_local_data_path_diagnostics() {
+    #[test]
+    fn traffic_refresh_without_admin_socket_keeps_local_data_path_diagnostics() {
         let temp = tempfile::tempdir().expect("temp dir");
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Replay;
@@ -2190,8 +2301,9 @@ mod tests {
             ProcessCatalog::default(),
         );
 
-        app.refresh_traffic().await;
+        let request = app.begin_traffic_refresh();
 
+        assert!(request.is_none());
         assert_eq!(app.status().kind, StatusKind::Warning);
         assert!(app.status().text.contains("No active agent admin socket"));
         assert!(app.status().text.contains("No agent runtime attached"));
