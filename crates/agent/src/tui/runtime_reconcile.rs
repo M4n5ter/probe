@@ -13,7 +13,6 @@ use super::{
 pub(super) struct QueuedRuntimeReconcile {
     pub(super) config: AgentConfig,
     pub(super) config_path: PathBuf,
-    pub(super) active_socket_path: Option<PathBuf>,
     pub(super) saved_status: StatusMessage,
 }
 
@@ -109,11 +108,14 @@ async fn startup_runtime_reconcile(config: AgentConfig) -> RuntimeReconcileResul
 pub(super) fn spawn_saved_runtime_reconcile(
     supervisor: &mut Option<TuiAgentSupervisor>,
     queued: QueuedRuntimeReconcile,
+    active_socket_path: Option<PathBuf>,
 ) -> PendingRuntimeReconcile {
     let failure_context = RuntimeReconcileFailureContext::Saved(queued.saved_status.clone());
     let running = supervisor.take();
     PendingRuntimeReconcile {
-        task: tokio::spawn(async move { saved_runtime_reconcile(running, queued).await }),
+        task: tokio::spawn(async move {
+            saved_runtime_reconcile(running, queued, active_socket_path).await
+        }),
         failure_context,
     }
 }
@@ -121,11 +123,11 @@ pub(super) fn spawn_saved_runtime_reconcile(
 async fn saved_runtime_reconcile(
     supervisor: Option<TuiAgentSupervisor>,
     queued: QueuedRuntimeReconcile,
+    active_socket_path: Option<PathBuf>,
 ) -> RuntimeReconcileResult {
     let QueuedRuntimeReconcile {
         config,
         config_path,
-        active_socket_path,
         saved_status,
     } = queued;
     let plan_note = runtime_apply_plan_note(active_socket_path.as_deref(), &config_path).await;
