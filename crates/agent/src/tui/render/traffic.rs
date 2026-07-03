@@ -17,6 +17,10 @@ use crate::tui::{
 };
 
 const TRAFFIC_SUMMARY_WIDTH: usize = 96;
+const DATA_PATH_STATUS_WIDTH: usize = 38;
+const DATA_PATH_CAPTURE_WIDTH: usize = 38;
+const DATA_PATH_NEXT_WIDTH: usize = 44;
+const DATA_PATH_MITM_WIDTH: usize = 38;
 
 pub(super) fn render_traffic(
     frame: &mut Frame<'_>,
@@ -25,7 +29,7 @@ pub(super) fn render_traffic(
     hits: &mut Vec<HitArea>,
 ) {
     let [status_area, workspace] =
-        Layout::vertical([Constraint::Length(2), Constraint::Min(4)]).areas(area);
+        Layout::vertical([Constraint::Length(4), Constraint::Min(4)]).areas(area);
     let (process_area, right_area) = if workspace.width >= 100 {
         let [process_area, right_area] =
             Layout::horizontal([Constraint::Length(38), Constraint::Min(52)]).areas(workspace);
@@ -170,6 +174,7 @@ fn render_traffic_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, hits: 
     let status_area = Rect::new(area.x, area.y, area.width, 1);
     frame.render_widget(Paragraph::new(status), status_area);
     render_traffic_action_bar(frame, area, app, hits);
+    render_traffic_data_path_summary(frame, area, app);
 }
 
 fn render_traffic_action_bar(
@@ -251,6 +256,51 @@ fn render_action_button(
 fn action_area(area: Rect, x: u16, y: u16) -> Rect {
     let right = area.x.saturating_add(area.width);
     Rect::new(x, y, right.saturating_sub(x), 1)
+}
+
+fn render_traffic_data_path_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    if area.height < 4 {
+        return;
+    }
+    let [first_line, second_line] = traffic_data_path_summary(app);
+    frame.render_widget(
+        Paragraph::new(first_line),
+        Rect::new(area.x, area.y + 2, area.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(second_line),
+        Rect::new(area.x, area.y + 3, area.width, 1),
+    );
+}
+
+fn traffic_data_path_summary(app: &TuiApp) -> [Line<'static>; 2] {
+    let summary = app.traffic_data_path_summary();
+    [
+        Line::from(vec![
+            Span::styled("data path ", Style::default().fg(Color::Gray)),
+            Span::raw(truncate_to_width(&summary.status, DATA_PATH_STATUS_WIDTH)),
+            Span::raw("   "),
+            Span::styled("capture ", Style::default().fg(Color::Gray)),
+            Span::raw(truncate_to_width(&summary.capture, DATA_PATH_CAPTURE_WIDTH)),
+        ]),
+        Line::from(vec![
+            Span::styled("next ", Style::default().fg(Color::Gray)),
+            Span::raw(truncate_to_width(&summary.next, DATA_PATH_NEXT_WIDTH)),
+            Span::raw("   "),
+            Span::styled("MITM ", Style::default().fg(Color::Gray)),
+            Span::raw(truncate_to_width(&summary.mitm, DATA_PATH_MITM_WIDTH)),
+        ]),
+    ]
+}
+
+fn truncate_to_width(value: &str, max_width: usize) -> String {
+    if value.chars().count() <= max_width {
+        return value.to_string();
+    }
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+    super::truncate(value, max_width - 3)
 }
 
 fn render_traffic_process_picker(
@@ -506,5 +556,18 @@ fn traffic_status_color(kind: TrafficStatusKind) -> Color {
         TrafficStatusKind::Active => Color::Green,
         TrafficStatusKind::Warning => Color::Yellow,
         TrafficStatusKind::Error => Color::Yellow,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_to_width_counts_ellipsis_inside_the_width_budget() {
+        let value = truncate_to_width("abcdefghijklmnopqrstuvwxyz", 10);
+
+        assert_eq!(value, "abcdefg...");
+        assert_eq!(value.chars().count(), 10);
     }
 }

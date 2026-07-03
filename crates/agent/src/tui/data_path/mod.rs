@@ -48,6 +48,14 @@ impl DataPathOverviewLine {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DataPathCompactSummary {
+    pub(crate) status: String,
+    pub(crate) capture: String,
+    pub(crate) mitm: String,
+    pub(crate) next: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DataPathDiagnosticsView {
     source: DataPathDiagnosticsSource,
     diagnostics: Option<TrafficRuntimeDiagnostics>,
@@ -91,23 +99,26 @@ impl DataPathDiagnosticsView {
     }
 
     pub(crate) fn overview_lines(&self, traffic_empty: bool) -> Vec<DataPathOverviewLine> {
+        let summary = self.compact_summary(traffic_empty);
         let mut lines = vec![DataPathOverviewLine::new(
             DataPathOverviewLineKind::Source,
             "Data path source",
             self.source.label(),
         )];
-
-        match (&self.source, &self.diagnostics) {
-            (DataPathDiagnosticsSource::RunningAgent, Some(diagnostics)) => {
-                lines.extend(running_overview_lines(diagnostics, traffic_empty));
-            }
-            (DataPathDiagnosticsSource::LocalConfig, Some(diagnostics)) => {
-                lines.extend(local_overview_lines(diagnostics));
-            }
-            _ => {
-                lines.extend(unavailable_overview_lines());
-            }
-        }
+        lines.extend([
+            DataPathOverviewLine::new(
+                DataPathOverviewLineKind::Status,
+                "Data path",
+                summary.status,
+            ),
+            DataPathOverviewLine::new(DataPathOverviewLineKind::NextAction, "Next", summary.next),
+            DataPathOverviewLine::new(
+                DataPathOverviewLineKind::Capture,
+                "Capture",
+                summary.capture,
+            ),
+            DataPathOverviewLine::new(DataPathOverviewLineKind::Mitm, "MITM", summary.mitm),
+        ]);
 
         if let Some(reason) = &self.reason {
             lines.push(DataPathOverviewLine::new(
@@ -117,6 +128,33 @@ impl DataPathDiagnosticsView {
             ));
         }
         lines
+    }
+
+    pub(crate) fn compact_summary(&self, traffic_empty: bool) -> DataPathCompactSummary {
+        match (&self.source, &self.diagnostics) {
+            (DataPathDiagnosticsSource::RunningAgent, Some(diagnostics)) => {
+                DataPathCompactSummary {
+                    status: diagnostics.running_status_text(traffic_empty),
+                    capture: diagnostics.capture_overview_line(),
+                    mitm: diagnostics.mitm_overview_line(),
+                    next: diagnostics.mitm_next_step(),
+                }
+            }
+            (DataPathDiagnosticsSource::LocalConfig, Some(diagnostics)) => DataPathCompactSummary {
+                status: diagnostics.local_status_text(),
+                capture: diagnostics.capture_overview_line(),
+                mitm: diagnostics.mitm_overview_line(),
+                next: diagnostics.mitm_next_step(),
+            },
+            _ => DataPathCompactSummary {
+                status: "cannot evaluate capture or MITM readiness".to_string(),
+                capture: "not evaluated".to_string(),
+                mitm: format!(
+                    "not evaluated; {MITM_PROXY_FALLBACK_LABEL} can capture {MITM_PLAINTEXT_COVERAGE}"
+                ),
+                next: "fix runtime config; use Data Path".to_string(),
+            },
+        }
     }
 
     pub(crate) fn detail_lines(&self) -> Vec<String> {
@@ -149,77 +187,37 @@ impl DataPathDiagnosticsView {
     }
 }
 
-fn running_overview_lines(
-    diagnostics: &TrafficRuntimeDiagnostics,
-    traffic_empty: bool,
-) -> Vec<DataPathOverviewLine> {
-    vec![
-        DataPathOverviewLine::new(
-            DataPathOverviewLineKind::Status,
-            "Data path",
-            diagnostics.running_status_text(traffic_empty),
-        ),
-        DataPathOverviewLine::new(
-            DataPathOverviewLineKind::NextAction,
-            "Next",
-            diagnostics.mitm_next_step(),
-        ),
-        DataPathOverviewLine::new(
-            DataPathOverviewLineKind::Capture,
-            "Capture",
-            diagnostics.capture_overview_line(),
-        ),
-        DataPathOverviewLine::new(
-            DataPathOverviewLineKind::Mitm,
-            "MITM",
-            diagnostics.mitm_overview_line(),
-        ),
-    ]
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn local_overview_lines(diagnostics: &TrafficRuntimeDiagnostics) -> Vec<DataPathOverviewLine> {
-    vec![
-        DataPathOverviewLine::new(
-            DataPathOverviewLineKind::Status,
-            "Data path",
-            diagnostics.local_status_text(),
-        ),
-        DataPathOverviewLine::new(
-            DataPathOverviewLineKind::NextAction,
-            "Next",
-            diagnostics.mitm_next_step(),
-        ),
-        DataPathOverviewLine::new(
-            DataPathOverviewLineKind::Capture,
-            "Capture",
-            diagnostics.capture_overview_line(),
-        ),
-        DataPathOverviewLine::new(
-            DataPathOverviewLineKind::Mitm,
-            "MITM",
-            diagnostics.mitm_overview_line(),
-        ),
-    ]
-}
+    #[test]
+    fn unavailable_compact_summary_keeps_all_traffic_header_fields_explicit() {
+        let summary = DataPathDiagnosticsView::unavailable("startup failed").compact_summary(true);
 
-fn unavailable_overview_lines() -> Vec<DataPathOverviewLine> {
-    vec![
-        DataPathOverviewLine::new(
-            DataPathOverviewLineKind::Status,
-            "Data path",
-            "cannot evaluate capture or MITM readiness",
-        ),
-        DataPathOverviewLine::new(
-            DataPathOverviewLineKind::NextAction,
-            "Next",
-            "open Traffic and use Data Path after fixing runtime config validation",
-        ),
-        DataPathOverviewLine::new(
-            DataPathOverviewLineKind::Mitm,
-            "MITM",
-            format!(
-                "not evaluated; {MITM_PROXY_FALLBACK_LABEL} can capture {MITM_PLAINTEXT_COVERAGE}"
-            ),
-        ),
-    ]
+        assert_eq!(summary.status, "cannot evaluate capture or MITM readiness");
+        assert_eq!(summary.capture, "not evaluated");
+        assert!(summary.mitm.contains(
+            "reliable MITM proxy fallback can capture plain HTTP and TLS-decrypted HTTP"
+        ));
+        assert!(summary.next.contains("fix runtime config"));
+    }
+
+    #[test]
+    fn overview_lines_are_derived_from_the_compact_summary_projection() {
+        let lines = DataPathDiagnosticsView::unavailable("startup failed").overview_lines(true);
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.kind == DataPathOverviewLineKind::Capture
+                    && line.value == "not evaluated")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.kind == DataPathOverviewLineKind::NextAction
+                    && line.value == "fix runtime config; use Data Path")
+        );
+    }
 }

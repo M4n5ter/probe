@@ -862,6 +862,10 @@ mod tests {
         assert!(output.contains("[Watch]"));
         assert!(output.contains("[MITM Out]"));
         assert!(output.contains("[MITM In]"));
+        assert!(output.contains("data path Capture unavailable"));
+        assert!(output.contains("capture unavailable:"));
+        assert!(output.contains("next configure reliable MITM proxy fallback"));
+        assert!(output.contains("MITM not configured;"));
         assert!(scroll_target_exists(
             &hit_map,
             Some(ScrollTarget::TrafficProcessList),

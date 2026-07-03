@@ -4,7 +4,7 @@ use probe_config::AgentConfig;
 
 use super::controls::{ControlId, FocusTarget, focus_targets_for_tab};
 use super::copy::{MITM_PLAINTEXT_COVERAGE, MITM_PROXY_FALLBACK_LABEL, MITM_TLS_TRUST_ACTION};
-use super::data_path::{DataPathDiagnosticsView, DataPathOverviewLine};
+use super::data_path::{DataPathCompactSummary, DataPathDiagnosticsView, DataPathOverviewLine};
 use super::fields::{
     FieldApplyOutcome, FieldId, apply_field, apply_text_field, editable_text_value,
 };
@@ -416,6 +416,11 @@ impl TuiApp {
     pub(crate) fn overview_data_path_lines(&self) -> Vec<DataPathOverviewLine> {
         self.data_path_diagnostics
             .overview_lines(self.traffic.rows().is_empty())
+    }
+
+    pub(crate) fn traffic_data_path_summary(&self) -> DataPathCompactSummary {
+        self.data_path_diagnostics
+            .compact_summary(self.traffic.rows().is_empty())
     }
 
     pub(crate) fn active_admin_socket_path(&self) -> Option<&Path> {
