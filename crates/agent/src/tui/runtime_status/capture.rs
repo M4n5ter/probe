@@ -29,15 +29,8 @@ impl CaptureDiagnostics {
         mitm_next_step: &str,
     ) -> Option<CaptureDiagnosticMessage> {
         if self.using_mitm_plaintext_bridge() {
-            if let Some(summary) = self.open_failure_summary() {
-                return Some(CaptureDiagnosticMessage::Warning(format!(
-                    "Passive capture failed ({summary}); using {MITM_PROXY_FALLBACK_LABEL} for {MITM_PLAINTEXT_COVERAGE}"
-                )));
-            }
-            if let Some(summary) = self.passive_unavailable_summary() {
-                return Some(CaptureDiagnosticMessage::Warning(format!(
-                    "Passive capture unavailable ({summary}); using {MITM_PROXY_FALLBACK_LABEL} for {MITM_PLAINTEXT_COVERAGE}"
-                )));
+            if let Some(message) = self.mitm_bridge_passive_context_message() {
+                return Some(message);
             }
             return traffic_empty.then(|| {
                 CaptureDiagnosticMessage::Info(
@@ -183,8 +176,25 @@ impl CaptureDiagnostics {
                 && self.snapshot.selected_backend.is_some_and(live_backend))
     }
 
-    fn using_mitm_plaintext_bridge(&self) -> bool {
+    pub(super) fn using_mitm_plaintext_bridge(&self) -> bool {
         self.snapshot.selected_input_source == Some(CaptureInputSource::MitmPlaintextBridge)
+    }
+
+    pub(super) fn mitm_bridge_passive_context_message(&self) -> Option<CaptureDiagnosticMessage> {
+        if !self.using_mitm_plaintext_bridge() {
+            return None;
+        }
+        if let Some(summary) = self.open_failure_summary() {
+            return Some(CaptureDiagnosticMessage::Warning(format!(
+                "Passive capture failed ({summary}); using {MITM_PROXY_FALLBACK_LABEL} for {MITM_PLAINTEXT_COVERAGE}"
+            )));
+        }
+        if let Some(summary) = self.passive_unavailable_summary() {
+            return Some(CaptureDiagnosticMessage::Warning(format!(
+                "Passive capture unavailable ({summary}); using {MITM_PROXY_FALLBACK_LABEL} for {MITM_PLAINTEXT_COVERAGE}"
+            )));
+        }
+        None
     }
 
     pub(super) fn live_host_status_prefix(&self) -> Option<String> {

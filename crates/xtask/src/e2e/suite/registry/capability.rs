@@ -258,6 +258,11 @@ define_e2e_capabilities! {
         label: "managed MITM backend",
         category: Mitm,
     },
+    ProductMitmPlainHttp => {
+        id: "product_mitm_plain_http",
+        label: "product MITM plain HTTP",
+        category: Mitm,
+    },
     ProductMitmHttps => {
         id: "product_mitm_https",
         label: "product MITM HTTPS",

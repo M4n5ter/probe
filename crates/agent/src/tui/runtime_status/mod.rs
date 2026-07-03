@@ -87,11 +87,15 @@ impl TrafficRuntimeDiagnostics {
 
     pub(crate) fn status_message(&self, traffic_empty: bool) -> Option<CaptureDiagnosticMessage> {
         let mitm_next_step = self.mitm_next_step();
+        if self.capture.using_mitm_plaintext_bridge() {
+            return self.mitm_bridge_status_message(traffic_empty, mitm_next_step.as_str());
+        }
         let capture_message = self
             .capture
             .status_message(traffic_empty, mitm_next_step.as_str());
-        let mitm_message = self.live_mitm_side_channel_status_message(traffic_empty);
-        if matches!(capture_message, Some(CaptureDiagnosticMessage::Info(_)))
+        let mitm_message = self.mitm_data_path_status_message(traffic_empty);
+        if self.capture.using_live_host()
+            && matches!(capture_message, Some(CaptureDiagnosticMessage::Info(_)))
             && mitm_message.is_some()
         {
             let prefix = self
@@ -102,6 +106,17 @@ impl TrafficRuntimeDiagnostics {
             return mitm_message.map(|message| message.with_prefix(prefix));
         }
         combine_diagnostic_messages(capture_message, mitm_message)
+    }
+
+    fn mitm_bridge_status_message(
+        &self,
+        traffic_empty: bool,
+        mitm_next_step: &str,
+    ) -> Option<CaptureDiagnosticMessage> {
+        let capture_context = self.capture.mitm_bridge_passive_context_message();
+        let mitm_message = self.mitm_data_path_status_message(traffic_empty);
+        combine_diagnostic_messages(capture_context, mitm_message)
+            .or_else(|| self.capture.status_message(traffic_empty, mitm_next_step))
     }
 
     pub(crate) fn detail_lines(&self) -> Vec<String> {
@@ -166,11 +181,11 @@ impl TrafficRuntimeDiagnostics {
             .map_or_else(missing_mitm_next_step, MitmDiagnostics::next_step)
     }
 
-    fn live_mitm_side_channel_status_message(
+    fn mitm_data_path_status_message(
         &self,
         traffic_empty: bool,
     ) -> Option<CaptureDiagnosticMessage> {
-        if !self.capture.using_live_host() {
+        if !self.capture.using_live_host() && !self.capture.using_mitm_plaintext_bridge() {
             return None;
         }
         self.mitm
@@ -1183,7 +1198,7 @@ mod tests {
         assert_eq!(
             diagnostics.status_message(false),
             Some(CaptureDiagnosticMessage::Warning(format!(
-                "Passive capture failed (ebpf: object path is not configured; libpcap: libpcap is not installed); using reliable MITM proxy fallback for {MITM_PLAINTEXT_COVERAGE}"
+                "Passive capture failed (ebpf: object path is not configured; libpcap: libpcap is not installed); using reliable MITM proxy fallback for {MITM_PLAINTEXT_COVERAGE}; MITM proxy path ready for plain HTTP; TLS-decrypted HTTP status is unknown"
             )))
         );
         let lines = diagnostics.detail_lines();
@@ -1209,6 +1224,110 @@ mod tests {
         assert!(lines.iter().any(|line| {
             line == "auto reliable MITM proxy fallback candidate: capture_event_feed: runtime=available, capability=available, evidence=nominal"
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_surface_plain_and_tls_mitm_visibility_when_bridge_replaces_passive_capture()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "kind": "status",
+            "snapshot": {
+                "capture": {
+                    "selection": "auto",
+                    "selected_backend": "capture_event_feed",
+                    "selected_input_source": "mitm_plaintext_bridge",
+                    "mode": "capture_event_feed",
+                    "reason": null,
+                    "candidates": [],
+                    "open_failures": [
+                        {
+                            "backend": "ebpf",
+                            "reason": "object path is not configured"
+                        },
+                        {
+                            "backend": "libpcap",
+                            "reason": "libpcap is not installed"
+                        }
+                    ],
+                    "auto_mitm_plaintext_bridge_candidate": {
+                        "backend": "capture_event_feed",
+                        "runtime_mode": "available",
+                        "capability_mode": "available",
+                        "evidence_mode": "nominal",
+                        "reason": null,
+                        "evidence_reason": null
+                    }
+                },
+                "tls": mitm_tls_material_status_json("available", None, "available", None),
+                "enforcement": configured_mitm_enforcement_status_json()?
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+
+        assert_eq!(
+            diagnostics.status_message(true),
+            Some(CaptureDiagnosticMessage::Warning(format!(
+                "Passive capture failed (ebpf: object path is not configured; libpcap: libpcap is not installed); using reliable MITM proxy fallback for {MITM_PLAINTEXT_COVERAGE}; MITM proxy path ready for plain HTTP and TLS-decrypted HTTP after client trust; no matching events yet"
+            )))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mitm_bridge_ready_status_uses_data_path_message_once_without_passive_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "kind": "status",
+            "snapshot": {
+                "capture": mitm_bridge_capture_status_json(),
+                "tls": mitm_tls_material_status_json("available", None, "available", None),
+                "enforcement": configured_mitm_enforcement_status_json()?
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+
+        let Some(CaptureDiagnosticMessage::Info(message)) = diagnostics.status_message(true) else {
+            panic!("ready MITM bridge should report an info status");
+        };
+        assert!(message.starts_with(
+            "MITM proxy path ready for plain HTTP and TLS-decrypted HTTP after client trust"
+        ));
+        assert_eq!(message.matches("no matching events yet").count(), 1);
+        assert!(!message.contains("reliable MITM proxy fallback active"));
+        Ok(())
+    }
+
+    #[test]
+    fn mitm_bridge_blocked_status_does_not_claim_active_no_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut enforcement = configured_mitm_enforcement_status_json()?;
+        enforcement["interception"]["runtime_l7_mitm"]["plaintext_bridge"]["mode"] =
+            json!("disabled_after_error");
+        enforcement["interception"]["runtime_l7_mitm"]["plaintext_bridge"]["disable_reason"] =
+            json!("feed writer closed");
+        let response = json!({
+            "kind": "status",
+            "snapshot": {
+                "capture": mitm_bridge_capture_status_json(),
+                "enforcement": enforcement
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+
+        let Some(CaptureDiagnosticMessage::Warning(message)) = diagnostics.status_message(true)
+        else {
+            panic!("blocked MITM bridge should report a warning status");
+        };
+        assert_eq!(
+            message,
+            "MITM proxy event feed disabled: feed writer closed"
+        );
+        assert!(!message.contains("active"));
+        assert!(!message.contains("no matching events yet"));
         Ok(())
     }
 
@@ -1360,7 +1479,7 @@ mod tests {
         assert_eq!(
             diagnostics.status_message(true),
             Some(CaptureDiagnosticMessage::Warning(format!(
-                "Passive capture unavailable (ebpf: capture.ebpf.object_path is not configured; libpcap: libpcap is not available); using reliable MITM proxy fallback for {MITM_PLAINTEXT_COVERAGE}"
+                "Passive capture unavailable (ebpf: capture.ebpf.object_path is not configured; libpcap: libpcap is not available); using reliable MITM proxy fallback for {MITM_PLAINTEXT_COVERAGE}; MITM proxy path ready for plain HTTP; TLS-decrypted HTTP status is unknown"
             )))
         );
         Ok(())

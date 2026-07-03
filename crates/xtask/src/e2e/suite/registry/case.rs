@@ -249,6 +249,7 @@ pub(super) const E2E_CASES: &[E2eCase] = &[
             E2eCapability::HttpParsing,
             E2eCapability::DurableSpoolExport,
             E2eCapability::MitmPlaintextBridge,
+            E2eCapability::ProductMitmPlainHttp,
             E2eCapability::ProductMitmHttps,
         ],
         run: E2eCaseRun::ExitCode(run_product_mitm_proxy_local),
