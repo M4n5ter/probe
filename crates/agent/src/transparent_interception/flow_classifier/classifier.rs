@@ -97,7 +97,10 @@ impl TransparentInterceptionFlowClassifier {
             .filter(|listener| {
                 socket_addr_points_to_listener(
                     target,
-                    SocketAddr::new(listener.local.address, listener.local.port),
+                    SocketAddr::new(
+                        listener.observed.local.address,
+                        listener.observed.local.port,
+                    ),
                 )
             })
             .collect::<Vec<_>>();
@@ -108,7 +111,11 @@ impl TransparentInterceptionFlowClassifier {
         }
 
         for listener in relevant_listeners {
-            let flow = flow_context(listener.process, listener.confidence, connection);
+            let flow = flow_context(
+                listener.observed.process,
+                listener.observed.confidence,
+                connection,
+            );
             if !self.selector.matches_flow(&flow, Direction::Inbound) {
                 return Err(format!(
                     "resolved listener process pid={} name={} did not match selector",
@@ -251,7 +258,10 @@ mod tests {
         sync::Mutex,
     };
 
-    use attribution::TcpListenerProcessContext;
+    use attribution::{
+        TcpListenerObservedSocket, TcpListenerOwnerContext, TcpListenerOwnerSource,
+        TcpListenerProcessContext,
+    };
     use probe_core::{ProcessContext, ProcessIdentity, ProcessSelector, TrafficSelector};
 
     use super::*;
@@ -395,6 +405,39 @@ mod tests {
     }
 
     #[test]
+    fn inbound_flow_classifier_uses_observed_holder_not_logical_owner() {
+        let peer = SocketAddr::from(([203, 0, 113, 10], 51000));
+        let target = SocketAddr::from((Ipv4Addr::LOCALHOST, 8081));
+        let resolver =
+            FakeFlowOwnerResolver::with_listener_results([Ok(listener_lookup([listener_alias(
+                process_context(7, "docker-proxy"),
+                process_context(42, "sssa-backend"),
+                Ipv4Addr::UNSPECIFIED,
+                8081,
+            )]))]);
+        let classifier = classifier(
+            ProcessSelector {
+                names: vec!["sssa-backend".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector {
+                local_ports: vec![8081],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+            resolver,
+        );
+
+        let error = classifier
+            .classify_proxy_flow(peer, target, Direction::Inbound)
+            .expect_err("logical owner must not authorize transparent interception");
+
+        assert!(error.contains("listener process"));
+        assert!(error.contains("did not match selector"));
+        assert!(error.contains("docker-proxy"));
+    }
+
+    #[test]
     fn inbound_proxy_connection_uses_target_as_local_endpoint() {
         let peer = SocketAddr::from(([203, 0, 113, 10], 51000));
         let target = SocketAddr::from((Ipv4Addr::LOCALHOST, 8443));
@@ -529,12 +572,28 @@ mod tests {
         address: Ipv4Addr,
         port: u16,
     ) -> TcpListenerProcessContext {
-        TcpListenerProcessContext {
+        TcpListenerProcessContext::from_observed_socket(TcpListenerObservedSocket {
             process,
             confidence: 60,
             socket_inode: 123,
             local: TcpEndpoint::new(IpAddr::V4(address), port),
-        }
+        })
+    }
+
+    fn listener_alias(
+        observed_process: ProcessContext,
+        logical_owner_process: ProcessContext,
+        address: Ipv4Addr,
+        port: u16,
+    ) -> TcpListenerProcessContext {
+        listener_owner(observed_process, address, port).with_owner(TcpListenerOwnerContext {
+            process: logical_owner_process,
+            confidence: 55,
+            source: TcpListenerOwnerSource::DockerProxyTarget {
+                target_local: TcpEndpoint::new(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 3)), 8080),
+                target_socket_inode: 424_242,
+            },
+        })
     }
 
     fn process_context(pid: u32, name: &str) -> ProcessContext {

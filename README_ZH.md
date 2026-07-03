@@ -175,7 +175,9 @@ eBPF object 时，才设置 `capture.ebpf.object_path` 或
   接收 MITM bridge 或外部采集器输出的 typed `CaptureEvent` JSONL；
   `follow = true` 可以让 agent 保持在线。
 - `libpcap`：
-  eBPF 不可用或未配置时的 live packet capture；需要 root 或 CAP_NET_RAW。
+  eBPF 不可用或未配置时的 live packet capture；通过 procfs socket attribution
+  补充 process context，可在可用时覆盖 container network namespace 和
+  docker-proxy published-port logical ownership；需要 root 或 CAP_NET_RAW。
 - `ebpf`：
   kernel-assisted process-aware observation；需要 root/bpffs 和已构建 eBPF object。
   深度观测受 selector gate 约束；syscall payload bytes 是 degraded evidence，

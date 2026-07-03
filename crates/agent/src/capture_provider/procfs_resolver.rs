@@ -55,8 +55,8 @@ impl ProcessResolver for ProcfsTcpProcessResolver {
                     return None;
                 };
                 Some(ResolvedProcess {
-                    process: listener.process.clone(),
-                    confidence: listener.confidence,
+                    process: listener.owner.process.clone(),
+                    confidence: listener.owner.confidence,
                 })
             })
             .map_err(|error| CaptureError::provider("procfs_socket_attribution", error.to_string()))

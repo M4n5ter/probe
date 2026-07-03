@@ -96,18 +96,21 @@ impl TransparentInterceptionProcessClassifier {
 
         let mut ports = BTreeMap::<(u16, DerivedListenerRuleFamily), DerivedPortMatch>::new();
         for listener in lookup.listeners {
-            for family in DerivedListenerRuleFamily::from_listener_address(listener.local.address)
-                .iter()
-                .copied()
+            for family in
+                DerivedListenerRuleFamily::from_listener_address(listener.observed.local.address)
+                    .iter()
+                    .copied()
             {
-                let entry = ports.entry((listener.local.port, family)).or_default();
-                if matcher.matches(&listener.process) {
+                let entry = ports
+                    .entry((listener.observed.local.port, family))
+                    .or_default();
+                if matcher.matches(&listener.observed.process) {
                     entry.has_matching_holder = true;
                 } else {
                     entry.non_matching_holder.get_or_insert_with(|| {
                         format!(
                             "pid={}, name={}",
-                            listener.process.identity.pid, listener.process.name
+                            listener.observed.process.identity.pid, listener.observed.process.name
                         )
                     });
                 }
@@ -178,10 +181,10 @@ impl TransparentInterceptionProcessClassifier {
             )));
         }
         for listener in lookup.listeners {
-            if !matcher.matches(&listener.process) {
+            if !matcher.matches(&listener.observed.process) {
                 return Err(setup_error(format!(
                     "transparent process classifier found a TCP listener for local port {local_port} that does not match the process selector: pid={}, name={}",
-                    listener.process.identity.pid, listener.process.name
+                    listener.observed.process.identity.pid, listener.observed.process.name
                 )));
             }
         }
@@ -626,6 +629,62 @@ mod tests {
     }
 
     #[test]
+    fn process_classifier_uses_observed_holder_not_logical_owner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[tcp_line(0, "00000000:1F91", "00000000:0000", "0A", 909_090)])?;
+        proc.write_process_with_socket_and_cmdline(
+            123,
+            "docker-proxy",
+            909_090,
+            &[
+                "/usr/bin/docker-proxy",
+                "-proto",
+                "tcp",
+                "-host-ip",
+                "0.0.0.0",
+                "-host-port",
+                "8081",
+                "-container-ip",
+                "172.19.0.3",
+                "-container-port",
+                "8080",
+            ],
+        )?;
+        proc.write_process_with_socket(321, "sssa-backend", 424_242)?;
+        proc.write_process_tcp_table(
+            321,
+            "net:[4026532661]",
+            &[
+                tcp_line(0, "00000000:1F90", "00000000:0000", "0A", 424_242),
+                tcp_line(1, "030013AC:1F90", "010013AC:C001", "01", 111_111),
+            ],
+        )?;
+        let mut classifier = TransparentInterceptionProcessClassifier::with_resolver(
+            ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path()),
+        );
+
+        let error = classifier
+            .executable_host_rule_scope(
+                "needs process classifier".to_string(),
+                TransparentInterceptionHostRuleBoundary::HostRules(host_scope(8081)),
+                process_scope_from_selector(Selector::term(
+                    ProcessSelector {
+                        names: vec!["sssa-backend".to_string()],
+                        ..ProcessSelector::default()
+                    },
+                    inbound_local_port(8081),
+                ))?,
+                &CapabilityState::degraded(CapabilityKind::TransparentProcessClassifier, "procfs"),
+            )
+            .expect_err("logical owner must not authorize transparent host rules");
+
+        assert!(error.to_string().contains("does not match"));
+        assert!(error.to_string().contains("docker-proxy"));
+        Ok(())
+    }
+
+    #[test]
     fn process_classifier_rejects_non_matching_shared_listener_holder()
     -> Result<(), Box<dyn std::error::Error>> {
         let proc = FakeProc::new()?;
@@ -840,6 +899,16 @@ mod tests {
             name: &str,
             inode: u64,
         ) -> Result<(), Box<dyn std::error::Error>> {
+            self.write_process_with_socket_and_cmdline(pid, name, inode, &[name, "--serve"])
+        }
+
+        fn write_process_with_socket_and_cmdline(
+            &self,
+            pid: u32,
+            name: &str,
+            inode: u64,
+            cmdline: &[&str],
+        ) -> Result<(), Box<dyn std::error::Error>> {
             let process_root = self.root.path().join(pid.to_string());
             fs::create_dir(&process_root)?;
             fs::create_dir(process_root.join("fd"))?;
@@ -850,13 +919,34 @@ mod tests {
                     "Name:\t{name}\nTgid:\t{pid}\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n"
                 ),
             )?;
-            fs::write(process_root.join("cmdline"), format!("{name}\0--serve\0"))?;
+            fs::write(process_root.join("cmdline"), nul_joined(cmdline))?;
             fs::write(
                 process_root.join("cgroup"),
                 "0::/system.slice/demo.service\n",
             )?;
             symlink("/usr/bin/demo-listener", process_root.join("exe"))?;
             symlink(format!("socket:[{inode}]"), process_root.join("fd/7"))?;
+            Ok(())
+        }
+
+        fn write_process_tcp_table(
+            &self,
+            pid: u32,
+            network_namespace: &str,
+            lines: &[String],
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let process_root = self.root.path().join(pid.to_string());
+            fs::create_dir_all(process_root.join("net"))?;
+            fs::create_dir_all(process_root.join("ns"))?;
+            let namespace_path = process_root.join("ns/net");
+            if !namespace_path.exists() {
+                symlink(network_namespace, &namespace_path)?;
+            }
+            fs::write(
+                process_root.join("net/tcp"),
+                format!("{}{}", tcp_header(), lines.join("")),
+            )?;
+            fs::write(process_root.join("net/tcp6"), tcp_header())?;
             Ok(())
         }
     }
@@ -875,5 +965,12 @@ mod tests {
         format!(
             "{pid} ({name}) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 {start_time_ticks} 20\n"
         )
+    }
+
+    fn nul_joined(values: &[&str]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.as_bytes().iter().copied().chain([0]))
+            .collect()
     }
 }

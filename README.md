@@ -189,8 +189,10 @@ custom or externally managed eBPF object.
   accept typed `CaptureEvent` JSONL from MITM bridges or external collectors.
   `follow = true` can keep the agent online.
 - `libpcap`:
-  live packet capture when eBPF is unavailable or not configured. It needs root
-  or CAP_NET_RAW.
+  live packet capture when eBPF is unavailable or not configured. It uses
+  procfs socket attribution for process context, including container network
+  namespaces and docker-proxy published-port logical ownership when available.
+  It needs root or CAP_NET_RAW.
 - `ebpf`:
   kernel-assisted process-aware observation. It needs root/bpffs and a built
   eBPF object. Deep observation is selector-gated; syscall payload bytes are

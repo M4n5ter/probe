@@ -2197,8 +2197,10 @@ fallback 能力边界：
   否则注入 unavailable descriptor 并输出原因，`runtime` 只消费 descriptor 做 plan。
 - live `LibpcapProvider` 由 `agent` 注入 procfs TCP process resolver。resolver 通过共享 `TcpConnection`、`/proc/net/tcp`、
   可读取且可解析时的 `/proc/net/tcp6` 和 fd socket inode best-effort 归因；当完整四元组无法稳定匹配时，会按 observed local endpoint
-  解析 TCP listener，并扫描进程 network namespace 下的 TCP table 来处理容器、bridge 和 docker-proxy 场景。短 TTL socket snapshot 成功时提高
-  attribution confidence，失败时回退到 synthetic unknown identity。
+  解析 TCP listener，并扫描进程 network namespace 下的 TCP table 来处理容器、bridge 和 docker-proxy 场景。docker-proxy 发布端口会保留宿主
+  observed endpoint 和 socket holder，同时在 command line 暴露 container endpoint 且目标 listener 唯一可归因时，把 logical process owner 指向容器内应用进程。
+  capture fallback 可以使用 logical owner 改善用户看到的应用归因；透明拦截的安全决策必须使用 observed socket holder，不能把 docker-proxy
+  logical owner 当成授权事实。短 TTL socket snapshot 成功时提高 attribution confidence，失败时回退到 synthetic unknown identity。
 - 同一个 procfs resolver 也实现 eBPF socket flow bridge 所需的 TGID+thread PID+fd 反向解析：
   先从 `/proc/<thread_pid>/fd/<fd>` 读取 socket inode，线程 fd 消失时回退到 TGID fd。
 - live fd 在真实 `/proc` 上可通过 `pidfd_getfd` + `SO_COOKIE` 增强成功归因后的 flow identity。
