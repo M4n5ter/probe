@@ -99,10 +99,13 @@ async fn handle_connection(
 
     match request_target(&request) {
         RequestTarget::Metrics => {
-            let plan = plan.snapshot();
-            let snapshot =
-                build_admin_status_snapshot(plan.as_ref(), spool.as_ref(), &runtime_state);
-            let metrics = render_prometheus_metrics(&snapshot);
+            let metrics = {
+                let _config_apply_guard = runtime_state.config_apply_gate.lock().await;
+                let plan = plan.snapshot();
+                let snapshot =
+                    build_admin_status_snapshot(plan.as_ref(), spool.as_ref(), &runtime_state);
+                render_prometheus_metrics(&snapshot)
+            };
             write_response(
                 &mut stream,
                 "200 OK",

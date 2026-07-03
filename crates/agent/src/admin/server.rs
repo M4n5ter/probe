@@ -280,8 +280,6 @@ async fn handle_admin_request(
     spool: &FjallSpool,
     runtime_state: &AdminRuntimeState,
 ) -> AdminResponse {
-    let plan = plan_handle.snapshot();
-    let plan = plan.as_ref();
     match request {
         AdminRequest::ReloadPolicies => {
             let _config_apply_guard = runtime_state.config_apply_gate.lock().await;
@@ -309,32 +307,42 @@ async fn handle_admin_request(
             reload_runtime_actions_response(plan.as_ref(), runtime_state).await
         }
         AdminRequest::Status => {
-            let snapshot = build_admin_status_snapshot(plan, spool, runtime_state);
+            let _config_apply_guard = runtime_state.config_apply_gate.lock().await;
+            let plan = plan_handle.snapshot();
+            let snapshot = build_admin_status_snapshot(plan.as_ref(), spool, runtime_state);
             AdminResponse::Status {
                 snapshot: Box::new(snapshot),
             }
         }
         AdminRequest::TrafficStatus => {
-            let projection = build_admin_traffic_status_projection(plan, runtime_state);
+            let _config_apply_guard = runtime_state.config_apply_gate.lock().await;
+            let plan = plan_handle.snapshot();
+            let projection = build_admin_traffic_status_projection(plan.as_ref(), runtime_state);
             AdminResponse::TrafficStatus {
                 projection: Box::new(projection),
             }
         }
         AdminRequest::Metrics => {
-            let snapshot = build_admin_status_snapshot(plan, spool, runtime_state);
+            let _config_apply_guard = runtime_state.config_apply_gate.lock().await;
+            let plan = plan_handle.snapshot();
+            let snapshot = build_admin_status_snapshot(plan.as_ref(), spool, runtime_state);
             AdminResponse::Metrics {
                 metrics: Box::new(snapshot.metrics),
             }
         }
         AdminRequest::PrometheusMetrics => {
-            let snapshot = build_admin_status_snapshot(plan, spool, runtime_state);
+            let _config_apply_guard = runtime_state.config_apply_gate.lock().await;
+            let plan = plan_handle.snapshot();
+            let snapshot = build_admin_status_snapshot(plan.as_ref(), spool, runtime_state);
             AdminResponse::PrometheusMetrics {
                 content_type: PROMETHEUS_TEXT_CONTENT_TYPE,
                 metrics: render_prometheus_metrics(&snapshot),
             }
         }
         AdminRequest::DebugDump => {
-            let snapshot = build_admin_status_snapshot(plan, spool, runtime_state);
+            let _config_apply_guard = runtime_state.config_apply_gate.lock().await;
+            let plan = plan_handle.snapshot();
+            let snapshot = build_admin_status_snapshot(plan.as_ref(), spool, runtime_state);
             AdminResponse::DebugDump {
                 dump: Box::new(AdminDebugDump::new(snapshot)),
             }
@@ -377,7 +385,10 @@ async fn handle_admin_request(
                 },
             },
         },
-        AdminRequest::PlanConfigReload { path } => plan_config_reload_response(plan, path).await,
+        AdminRequest::PlanConfigReload { path } => {
+            let plan = plan_handle.snapshot();
+            plan_config_reload_response(plan.as_ref(), path).await
+        }
         AdminRequest::ApplyConfigReload { path } => {
             apply_config_reload_response(plan_handle, runtime_state, path).await
         }
@@ -854,6 +865,13 @@ mod tests {
         let mut candidate = config;
         candidate.config_version = "candidate".to_string();
         candidate.capture.fallback_backends = vec![LiveCaptureBackend::Libpcap];
+        candidate.exporters.push(ExporterConfig {
+            id: "file".to_string(),
+            transport: probe_config::ExporterTransportConfig::File {
+                path: temp.join("events.jsonl"),
+            },
+            ..ExporterConfig::default()
+        });
         let candidate_path = temp.join("candidate.toml");
         fs::write(&candidate_path, toml::to_string(&candidate)?)?;
 
@@ -888,6 +906,16 @@ mod tests {
                 .expect("changed sections should be an array")
                 .iter()
                 .any(|change| change["section"] == json!("capture"))
+        );
+        assert!(
+            response["plan"]["changed_sections"]
+                .as_array()
+                .expect("changed sections should be an array")
+                .iter()
+                .any(|change| {
+                    change["section"] == json!("export")
+                        && change["reload_mode"] == json!("process_restart")
+                })
         );
 
         server.stop().await;

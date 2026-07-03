@@ -12,7 +12,10 @@ use crate::{
     runtime_plan::RuntimePlanHandle,
     runtime_reload::{
         RuntimeReloadGate,
-        config_reload::{plan_config_reload_for_candidate, runtime_generation_reload_request},
+        config_reload::{
+            ConfigReloadDecision, ConfigReloadPlanSnapshot, plan_config_reload_for_candidate,
+            runtime_generation_reload_request,
+        },
     },
     tls_plaintext::{TlsDecryptHintRuntimeState, TlsPlaintextRuntimeState},
 };
@@ -27,6 +30,13 @@ pub(crate) struct RuntimeGenerationExecutor {
     tls_decrypt_hint_runtime: TlsDecryptHintRuntimeState,
     tls_plaintext_runtime: TlsPlaintextRuntimeState,
     l7_mitm_runtime: L7MitmRuntimeHandle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RuntimeGenerationProcessResult {
+    NoPendingReload,
+    Applied { config_version: String },
+    Failed,
 }
 
 impl RuntimeGenerationExecutor {
@@ -54,11 +64,11 @@ impl RuntimeGenerationExecutor {
         &self,
         active_plan: &mut RuntimePlan,
         provider: &mut Box<dyn CaptureProvider>,
-    ) {
+        on_applied_config_version: impl FnOnce(&str),
+    ) -> RuntimeGenerationProcessResult {
         let Some(request) = self.runtime_generation.begin_pending_reload() else {
-            return;
+            return RuntimeGenerationProcessResult::NoPendingReload;
         };
-        let _apply_guard = self.config_apply_gate.blocking_lock();
         let shared_plan = self.plan_handle.snapshot();
         *active_plan = shared_plan.as_ref().clone();
         let reload_plan = plan_config_reload_for_candidate(
@@ -66,36 +76,88 @@ impl RuntimeGenerationExecutor {
             &request.snapshot.candidate_path,
             &request.candidate_config,
         );
-        if runtime_generation_reload_request(&reload_plan, &request.candidate_config).is_none() {
+        if !reload_plan_allows_runtime_generation(&reload_plan, &request.candidate_config) {
             self.runtime_generation.record_reload_failed(
                 request.snapshot.request_id,
                 "candidate no longer contains only supported runtime generation changes against the active plan",
             );
-            return;
+            return RuntimeGenerationProcessResult::Failed;
         }
         match build_runtime_generation_candidate(request.candidate_config) {
-            Ok(candidate) => match self.build_capture_provider(&candidate.plan) {
-                Ok(next_provider) => {
-                    *provider = next_provider;
-                    self.plan_handle.replace(candidate.plan.clone());
-                    *active_plan = candidate.plan;
-                    self.runtime_generation.record_reload_applied(
+            Ok(candidate) => {
+                let _apply_guard = self.config_apply_gate.blocking_lock();
+                let shared_plan = self.plan_handle.snapshot();
+                *active_plan = shared_plan.as_ref().clone();
+                let reload_plan = plan_config_reload_for_candidate(
+                    &active_plan.config,
+                    &request.snapshot.candidate_path,
+                    &candidate.plan.config,
+                );
+                if !reload_plan_allows_runtime_generation(&reload_plan, &candidate.plan.config) {
+                    self.runtime_generation.record_reload_failed(
                         request.snapshot.request_id,
-                        active_plan.config.config_version.clone(),
+                        "candidate no longer contains only supported runtime generation changes against the active plan",
                     );
+                    return RuntimeGenerationProcessResult::Failed;
                 }
-                Err(message) => {
-                    self.runtime_generation
-                        .record_reload_failed(request.snapshot.request_id, message);
+                match self.build_capture_provider(&candidate.plan) {
+                    Ok(next_provider) => {
+                        let config_version = candidate.plan.config.config_version.clone();
+                        on_applied_config_version(&config_version);
+                        *provider = next_provider;
+                        self.plan_handle.replace(candidate.plan.clone());
+                        *active_plan = candidate.plan;
+                        self.runtime_generation.record_reload_applied(
+                            request.snapshot.request_id,
+                            config_version.clone(),
+                        );
+                        RuntimeGenerationProcessResult::Applied { config_version }
+                    }
+                    Err(message) => {
+                        self.runtime_generation
+                            .record_reload_failed(request.snapshot.request_id, message);
+                        RuntimeGenerationProcessResult::Failed
+                    }
                 }
-            },
-            Err(message) => self
-                .runtime_generation
-                .record_reload_failed(request.snapshot.request_id, message),
+            }
+            Err(message) => {
+                self.runtime_generation
+                    .record_reload_failed(request.snapshot.request_id, message);
+                RuntimeGenerationProcessResult::Failed
+            }
         }
     }
 
     fn build_capture_provider(
+        &self,
+        plan: &RuntimePlan,
+    ) -> Result<Box<dyn CaptureProvider>, String> {
+        self.with_runtime_snapshot_rollback(plan, || self.try_build_capture_provider(plan))
+    }
+
+    fn with_runtime_snapshot_rollback<T>(
+        &self,
+        plan: &RuntimePlan,
+        build: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let tls_decrypt_hint_snapshot = self.tls_decrypt_hint_runtime.snapshot();
+        let tls_plaintext_snapshot = self.tls_plaintext_runtime.snapshot();
+        let l7_mitm_plaintext_bridge_snapshot =
+            self.l7_mitm_runtime.snapshot().plaintext_bridge.clone();
+        self.tls_decrypt_hint_runtime.record_plan_reconfigured(plan);
+        let result = build();
+        if result.is_err() {
+            self.tls_decrypt_hint_runtime
+                .restore_snapshot(tls_decrypt_hint_snapshot);
+            self.tls_plaintext_runtime
+                .restore_snapshot(tls_plaintext_snapshot);
+            self.l7_mitm_runtime
+                .restore_plaintext_bridge_snapshot(l7_mitm_plaintext_bridge_snapshot);
+        }
+        result
+    }
+
+    fn try_build_capture_provider(
         &self,
         plan: &RuntimePlan,
     ) -> Result<Box<dyn CaptureProvider>, String> {
@@ -117,6 +179,16 @@ impl RuntimeGenerationExecutor {
             .capture_runtime
             .observe_capture_input(built_provider.provider))
     }
+}
+
+fn reload_plan_allows_runtime_generation(
+    reload_plan: &ConfigReloadPlanSnapshot,
+    candidate_config: &AgentConfig,
+) -> bool {
+    matches!(
+        reload_plan.decision,
+        ConfigReloadDecision::QueueRuntimeGeneration { .. }
+    ) && runtime_generation_reload_request(reload_plan, candidate_config).is_some()
 }
 
 struct RuntimeGenerationCandidate {
@@ -145,12 +217,17 @@ fn require_runtime_artifacts(config: &mut AgentConfig) -> Result<(), crate::erro
 mod tests {
     use std::{path::PathBuf, sync::Arc};
 
-    use probe_config::{CaptureBackend, CaptureSelection, PolicyConfig, PolicySourceConfig};
+    use probe_config::{
+        CaptureBackend, CaptureSelection, PolicyConfig, PolicySourceConfig, TlsMaterialConfig,
+        TlsMaterialKind,
+    };
 
     use super::*;
     use crate::{
         error::AgentError,
+        l7_mitm::L7MitmPlaintextBridgeMode,
         runtime_generation::{RuntimeGenerationReloadRequestInput, RuntimeGenerationState},
+        tls_plaintext::TlsPlaintextInstrumentationBuild,
     };
 
     #[test]
@@ -237,6 +314,178 @@ mod tests {
                 .selected_backend,
             CaptureBackend::CaptureEventFeed
         );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_generation_reload_returns_applied_config_version_for_live_handoff()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let feed_path = temp.path().join("events.jsonl");
+        std::fs::write(&feed_path, "")?;
+        let mut candidate = AgentConfig {
+            config_version: "candidate".to_string(),
+            ..AgentConfig::default()
+        };
+        candidate.capture.selection = CaptureSelection::CaptureEventFeed;
+        candidate.capture.capture_event_feed.path = Some(feed_path);
+        candidate.capture.capture_event_feed.follow = Some(false);
+        let runtime_generation = RuntimeGenerationState::for_config_version("local");
+        runtime_generation.request_reload(RuntimeGenerationReloadRequestInput {
+            candidate_path: temp.path().join("candidate.toml"),
+            candidate_config: candidate,
+            current_config_version: "local".to_string(),
+            candidate_config_version: Some("candidate".to_string()),
+            changed_sections: vec!["agent_identity".to_string(), "capture".to_string()],
+        })?;
+        let mut runtime = RuntimeGenerationReloadTestRuntime::new(AgentConfig::default())?;
+
+        let mut handoff_config_version = None;
+        let result = runtime.process_reload_with(&runtime_generation, |config_version| {
+            handoff_config_version = Some(config_version.to_string());
+        });
+
+        assert_eq!(
+            result,
+            RuntimeGenerationProcessResult::Applied {
+                config_version: "candidate".to_string()
+            }
+        );
+        assert_eq!(handoff_config_version.as_deref(), Some("candidate"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_generation_reload_updates_tls_decrypt_hint_runtime_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let feed_path = temp.path().join("events.jsonl");
+        std::fs::write(&feed_path, "")?;
+        let mut candidate = AgentConfig::default();
+        candidate.capture.selection = CaptureSelection::CaptureEventFeed;
+        candidate.capture.capture_event_feed.path = Some(feed_path);
+        candidate.capture.capture_event_feed.follow = Some(false);
+        candidate.tls.plaintext.decrypt_hints.key_log_refs = vec!["ssl-key-log".to_string()];
+        candidate.tls.materials = vec![TlsMaterialConfig {
+            id: Some("ssl-key-log".to_string()),
+            kind: TlsMaterialKind::KeyLogFile,
+            path: temp.path().join("sslkeys.log"),
+        }];
+        let runtime_generation = RuntimeGenerationState::for_config_version("local");
+        runtime_generation.request_reload(RuntimeGenerationReloadRequestInput {
+            candidate_path: temp.path().join("candidate.toml"),
+            candidate_config: candidate,
+            current_config_version: "local".to_string(),
+            candidate_config_version: Some("local".to_string()),
+            changed_sections: vec!["capture".to_string(), "tls".to_string()],
+        })?;
+        let mut runtime = RuntimeGenerationReloadTestRuntime::new(AgentConfig::default())?;
+
+        runtime.process_reload(&runtime_generation);
+
+        let refresh = runtime
+            .tls_decrypt_hint_runtime
+            .snapshot()
+            .session_secret_refresh;
+        assert_eq!(refresh.configured_ref_count, 1);
+        assert_eq!(refresh.enabled_ref_count, 0);
+        assert_eq!(runtime.provider.name(), "capture_event_feed_jsonl");
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_generation_reload_rolls_back_tls_decrypt_hint_runtime_state_after_provider_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let mut candidate = AgentConfig::default();
+        candidate.capture.selection = CaptureSelection::CaptureEventFeed;
+        candidate.capture.capture_event_feed.path = Some(temp.path().join("missing.jsonl"));
+        candidate.capture.capture_event_feed.follow = Some(false);
+        candidate.tls.plaintext.decrypt_hints.key_log_refs = vec!["ssl-key-log".to_string()];
+        candidate.tls.materials = vec![TlsMaterialConfig {
+            id: Some("ssl-key-log".to_string()),
+            kind: TlsMaterialKind::KeyLogFile,
+            path: temp.path().join("sslkeys.log"),
+        }];
+        let runtime_generation = RuntimeGenerationState::for_config_version("local");
+        runtime_generation.request_reload(RuntimeGenerationReloadRequestInput {
+            candidate_path: temp.path().join("candidate.toml"),
+            candidate_config: candidate,
+            current_config_version: "local".to_string(),
+            candidate_config_version: Some("local".to_string()),
+            changed_sections: vec!["capture".to_string(), "tls".to_string()],
+        })?;
+        let mut runtime = RuntimeGenerationReloadTestRuntime::new(AgentConfig::default())?;
+        let before = runtime.tls_decrypt_hint_runtime.snapshot();
+
+        runtime.process_reload(&runtime_generation);
+
+        assert_eq!(runtime.tls_decrypt_hint_runtime.snapshot(), before);
+        assert_eq!(runtime.provider.name(), "finished");
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_generation_snapshot_rollback_restores_l7_mitm_plaintext_bridge_after_candidate_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base_plan = build_runtime_composition(AgentConfig::default())?.into_plan();
+        let l7_mitm_runtime = L7MitmRuntimeHandle::for_test(
+            crate::l7_mitm::L7MitmBackendHealthSnapshot::disabled(),
+            crate::l7_mitm::L7MitmPlaintextBridgeSnapshot {
+                mode: L7MitmPlaintextBridgeMode::Configured,
+                disable_reason: None,
+            },
+            1,
+        );
+        let executor = RuntimeGenerationExecutor::new(
+            RuntimeGenerationState::for_config_version("local"),
+            RuntimePlanHandle::new(Arc::new(base_plan.clone())),
+            RuntimeReloadGate::default(),
+            CaptureProviderRuntimeState::default(),
+            TlsDecryptHintRuntimeState::for_plan(&base_plan),
+            TlsPlaintextRuntimeState::for_plan(&base_plan),
+            l7_mitm_runtime.clone(),
+        );
+        let before = l7_mitm_runtime.snapshot().plaintext_bridge;
+        assert_eq!(before.mode, L7MitmPlaintextBridgeMode::Configured);
+
+        let result: Result<(), String> =
+            executor.with_runtime_snapshot_rollback(&base_plan, || {
+                l7_mitm_runtime.record_plaintext_bridge_ready();
+                Err("candidate provider failed".to_string())
+            });
+
+        assert!(result.is_err());
+        assert_eq!(l7_mitm_runtime.snapshot().plaintext_bridge, before);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_generation_snapshot_rollback_restores_tls_plaintext_runtime_after_candidate_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base_plan = build_runtime_composition(AgentConfig::default())?.into_plan();
+        let runtime = RuntimeGenerationReloadTestRuntime::new(AgentConfig::default())?;
+        let before = runtime.tls_plaintext_runtime.snapshot();
+        let executor = RuntimeGenerationExecutor::new(
+            RuntimeGenerationState::for_config_version("local"),
+            runtime.plan_handle.clone(),
+            RuntimeReloadGate::default(),
+            CaptureProviderRuntimeState::default(),
+            runtime.tls_decrypt_hint_runtime.clone(),
+            runtime.tls_plaintext_runtime.clone(),
+            runtime.l7_mitm_runtime.clone(),
+        );
+
+        let result: Result<(), String> =
+            executor.with_runtime_snapshot_rollback(&base_plan, || {
+                runtime.tls_plaintext_runtime.record_instrumentation_build(
+                    &TlsPlaintextInstrumentationBuild::Enabled(Box::new(FinishedProvider)),
+                );
+                Err("candidate provider failed".to_string())
+            });
+
+        assert!(result.is_err());
+        assert_eq!(runtime.tls_plaintext_runtime.snapshot(), before);
         Ok(())
     }
 
@@ -347,7 +596,18 @@ mod tests {
             })
         }
 
-        fn process_reload(&mut self, runtime_generation: &RuntimeGenerationState) {
+        fn process_reload(
+            &mut self,
+            runtime_generation: &RuntimeGenerationState,
+        ) -> RuntimeGenerationProcessResult {
+            self.process_reload_with(runtime_generation, |_| {})
+        }
+
+        fn process_reload_with(
+            &mut self,
+            runtime_generation: &RuntimeGenerationState,
+            on_applied_config_version: impl FnOnce(&str),
+        ) -> RuntimeGenerationProcessResult {
             let executor = RuntimeGenerationExecutor::new(
                 runtime_generation.clone(),
                 self.plan_handle.clone(),
@@ -357,7 +617,11 @@ mod tests {
                 self.tls_plaintext_runtime.clone(),
                 self.l7_mitm_runtime.clone(),
             );
-            executor.process_capture_safe_point(&mut self.active_plan, &mut self.provider);
+            executor.process_capture_safe_point(
+                &mut self.active_plan,
+                &mut self.provider,
+                on_applied_config_version,
+            )
         }
     }
 

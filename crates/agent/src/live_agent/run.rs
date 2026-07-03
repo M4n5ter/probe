@@ -35,8 +35,7 @@ use crate::{
         drain_planned_sinks_with_webhook_connection,
     },
     l7_mitm::{
-        DurableL7MitmAuditSink, L7MitmAuditSink, L7MitmBackendLifecycleGuard, L7MitmRuntime,
-        start_backend_lifecycle,
+        DurableL7MitmAuditSink, L7MitmBackendLifecycleGuard, L7MitmRuntime, start_backend_lifecycle,
     },
     policy_reload::ReloadablePolicySet,
     policy_reload_poller::{self, PolicyReloadPollerHandle},
@@ -383,9 +382,9 @@ impl BlockingCaptureRun {
         let mut storage_retention_worker = None;
         let l7_mitm_runtime = l7_mitm.handle();
         let export_event_metrics = pipeline_metrics.clone();
-        let l7_mitm_audit: Arc<dyn L7MitmAuditSink> = Arc::new(DurableL7MitmAuditSink::new(
+        let l7_mitm_audit = Arc::new(DurableL7MitmAuditSink::new(
             Arc::clone(&spool),
-            plan.config.config_version.clone(),
+            plan_handle.clone(),
             pipeline_metrics.clone(),
         ));
         let summary_result = (|| {
@@ -409,7 +408,7 @@ impl BlockingCaptureRun {
             active_interception_guard.l7_mitm_backend = start_backend_lifecycle(
                 &plan.enforcement.interception.mitm.backend,
                 l7_mitm_runtime.clone(),
-                Arc::clone(&l7_mitm_audit),
+                l7_mitm_audit.clone(),
                 &shutdown_requested,
             )
             .map_err(AgentError::L7MitmRuntime)?;
@@ -443,7 +442,10 @@ impl BlockingCaptureRun {
                 let provider_finished = capture_summary.capture_provider_finished;
                 summary.merge(capture_summary);
                 runtime_generation.record_capture_safe_point();
-                runtime_generation_executor.process_capture_safe_point(&mut plan, &mut provider);
+                let _runtime_generation_result = runtime_generation_executor
+                    .process_capture_safe_point(&mut plan, &mut provider, |config_version| {
+                        pipeline.set_config_version(config_version);
+                    });
                 if provider_finished || shutdown::requested(&shutdown_requested) {
                     break;
                 }

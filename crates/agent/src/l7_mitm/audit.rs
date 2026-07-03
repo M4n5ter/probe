@@ -20,7 +20,7 @@ use super::{
     backend::L7MitmBackendHealthProbe,
     state::{L7MitmBackendHealthTransition, L7MitmRuntimeHandle},
 };
-use crate::tcp_health::TcpHealthProbeObserver;
+use crate::{runtime_plan::RuntimePlanHandle, tcp_health::TcpHealthProbeObserver};
 
 pub(crate) trait L7MitmAuditSink: Send + Sync {
     fn record(&self, event: L7MitmAuditEvent) -> Result<(), String>;
@@ -323,9 +323,28 @@ impl TcpHealthProbeObserver for L7MitmBackendHealthAuditObserver {
 
 pub(crate) struct DurableL7MitmAuditSink<S> {
     spool: Arc<S>,
-    config_version: String,
+    config_version: DurableL7MitmAuditConfigVersion,
     metrics: PipelineRuntimeMetrics,
     clock: AtomicU64,
+}
+
+enum DurableL7MitmAuditConfigVersion {
+    RuntimePlan(RuntimePlanHandle),
+    #[cfg(test)]
+    Static(std::sync::RwLock<String>),
+}
+
+impl DurableL7MitmAuditConfigVersion {
+    fn current(&self) -> String {
+        match self {
+            Self::RuntimePlan(plan_handle) => plan_handle.snapshot().config.config_version.clone(),
+            #[cfg(test)]
+            Self::Static(config_version) => config_version
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        }
+    }
 }
 
 impl<S> DurableL7MitmAuditSink<S>
@@ -334,12 +353,12 @@ where
 {
     pub(crate) fn new(
         spool: Arc<S>,
-        config_version: impl Into<String>,
+        plan_handle: RuntimePlanHandle,
         metrics: PipelineRuntimeMetrics,
     ) -> Self {
         Self {
             spool,
-            config_version: config_version.into(),
+            config_version: DurableL7MitmAuditConfigVersion::RuntimePlan(plan_handle),
             metrics,
             clock: AtomicU64::new(audit_clock_seed()),
         }
@@ -354,7 +373,24 @@ where
     ) -> Self {
         Self {
             spool,
-            config_version: config_version.into(),
+            config_version: DurableL7MitmAuditConfigVersion::Static(std::sync::RwLock::new(
+                config_version.into(),
+            )),
+            metrics,
+            clock: AtomicU64::new(clock_seed),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_plan_handle_clock_seed(
+        spool: Arc<S>,
+        plan_handle: RuntimePlanHandle,
+        metrics: PipelineRuntimeMetrics,
+        clock_seed: u64,
+    ) -> Self {
+        Self {
+            spool,
+            config_version: DurableL7MitmAuditConfigVersion::RuntimePlan(plan_handle),
             metrics,
             clock: AtomicU64::new(clock_seed),
         }
@@ -364,7 +400,7 @@ where
         EventEnvelope::from_provider(
             self.next_timestamp(),
             CaptureOrigin::from_source(CaptureSource::L7MitmControlPlane),
-            self.config_version.clone(),
+            self.config_version.current(),
             EventKind::L7MitmAudit(event),
         )
     }
@@ -421,6 +457,7 @@ fn wall_time_unix_ns() -> i64 {
 mod tests {
     use std::sync::Mutex;
 
+    use probe_config::AgentConfig;
     use probe_core::{
         EventKind, EventSubject, L7MitmAuditEvent, L7MitmAuditPhase, L7MitmExternalBackendAudit,
         L7MitmReadinessProbeAudit,
@@ -429,8 +466,12 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::l7_mitm::{
-        L7MitmBackendHealthSnapshot, L7MitmPlaintextBridgeSnapshot, L7MitmRuntimeHandle,
+    use crate::{
+        l7_mitm::{
+            L7MitmBackendHealthSnapshot, L7MitmPlaintextBridgeSnapshot, L7MitmRuntimeHandle,
+        },
+        runtime_composition::build_runtime_composition,
+        runtime_plan::RuntimePlanHandle,
     };
 
     #[test]
@@ -454,6 +495,42 @@ mod tests {
         assert!(matches!(envelope.subject(), EventSubject::Provider));
         assert!(matches!(envelope.kind(), EventKind::L7MitmAudit(_)));
         assert_eq!(metrics.snapshot().export_events_written, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn durable_audit_sink_runtime_config_version_update_affects_later_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = Arc::new(FjallSpool::open(temp.path())?);
+        let mut current = AgentConfig {
+            config_version: "current".to_string(),
+            ..AgentConfig::default()
+        };
+        let plan_handle = RuntimePlanHandle::new(Arc::new(
+            build_runtime_composition(current.clone())?.into_plan(),
+        ));
+        let sink = DurableL7MitmAuditSink::new_with_plan_handle_clock_seed(
+            Arc::clone(&spool),
+            plan_handle.clone(),
+            PipelineRuntimeMetrics::default(),
+            100,
+        );
+
+        sink.record(external_health_probe_started_event())?;
+        current.config_version = "candidate".to_string();
+        plan_handle.replace(build_runtime_composition(current)?.into_plan());
+        sink.record(external_health_probe_started_event())?;
+
+        let config_versions = spool
+            .read_export_batch("sink", 10)?
+            .into_iter()
+            .map(|event| serde_json::from_slice::<EventEnvelope>(event.payload.bytes()))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|envelope| envelope.config_version().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(config_versions, ["current", "candidate"]);
         Ok(())
     }
 

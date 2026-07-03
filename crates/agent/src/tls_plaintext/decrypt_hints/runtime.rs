@@ -47,31 +47,25 @@ pub(super) enum TlsSessionSecretRefreshRuntimeTransition {
 
 impl TlsDecryptHintRuntimeState {
     pub(crate) fn for_plan(plan: &RuntimePlan) -> Self {
-        let configured_ref_count =
-            TlsSessionSecretAutoBindingPlan::configured_ref_count(plan) as u64;
-        let enabled_ref_count = match TlsSessionSecretAutoBindingPlan::for_runtime(plan) {
-            TlsSessionSecretAutoBindingPlan::Disabled => 0,
-            TlsSessionSecretAutoBindingPlan::Enabled(materials) => materials.len() as u64,
-        };
-        let mode = match (configured_ref_count, enabled_ref_count) {
-            (0, _) => TlsSessionSecretRefreshRuntimeMode::NotConfigured,
-            (_, 0) => TlsSessionSecretRefreshRuntimeMode::Disabled,
-            _ => TlsSessionSecretRefreshRuntimeMode::Pending,
-        };
         Self {
-            inner: Arc::new(Mutex::new(TlsDecryptHintRuntimeSnapshot {
-                session_secret_refresh: TlsSessionSecretRefreshRuntimeSnapshot {
-                    mode,
-                    configured_ref_count,
-                    enabled_ref_count,
-                    generation: 0,
-                    attempts: 0,
-                    pending: 0,
-                    failures: 0,
-                    last_failure: None,
-                },
-            })),
+            inner: Arc::new(Mutex::new(snapshot_for_plan(plan))),
         }
+    }
+
+    pub(crate) fn record_plan_reconfigured(&self, plan: &RuntimePlan) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *inner = snapshot_for_plan(plan);
+    }
+
+    pub(crate) fn restore_snapshot(&self, snapshot: TlsDecryptHintRuntimeSnapshot) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *inner = snapshot;
     }
 
     pub(crate) fn snapshot(&self) -> TlsDecryptHintRuntimeSnapshot {
@@ -110,6 +104,31 @@ impl TlsDecryptHintRuntimeState {
                 record_failed_refresh(refresh, reason);
             }
         }
+    }
+}
+
+fn snapshot_for_plan(plan: &RuntimePlan) -> TlsDecryptHintRuntimeSnapshot {
+    let configured_ref_count = TlsSessionSecretAutoBindingPlan::configured_ref_count(plan) as u64;
+    let enabled_ref_count = match TlsSessionSecretAutoBindingPlan::for_runtime(plan) {
+        TlsSessionSecretAutoBindingPlan::Disabled => 0,
+        TlsSessionSecretAutoBindingPlan::Enabled(materials) => materials.len() as u64,
+    };
+    let mode = match (configured_ref_count, enabled_ref_count) {
+        (0, _) => TlsSessionSecretRefreshRuntimeMode::NotConfigured,
+        (_, 0) => TlsSessionSecretRefreshRuntimeMode::Disabled,
+        _ => TlsSessionSecretRefreshRuntimeMode::Pending,
+    };
+    TlsDecryptHintRuntimeSnapshot {
+        session_secret_refresh: TlsSessionSecretRefreshRuntimeSnapshot {
+            mode,
+            configured_ref_count,
+            enabled_ref_count,
+            generation: 0,
+            attempts: 0,
+            pending: 0,
+            failures: 0,
+            last_failure: None,
+        },
     }
 }
 

@@ -263,6 +263,14 @@ impl L7MitmRuntimeHandle {
         state.snapshot.plaintext_bridge.record_active();
     }
 
+    pub(crate) fn restore_plaintext_bridge_snapshot(
+        &self,
+        snapshot: L7MitmPlaintextBridgeSnapshot,
+    ) {
+        let mut state = self.lock();
+        state.snapshot.plaintext_bridge = snapshot;
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, L7MitmRuntimeState> {
         self.inner
             .lock()

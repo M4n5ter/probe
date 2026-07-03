@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use pipeline::PipelinePolicySet;
 use probe_config::{
     AgentConfig, ConfigError, EnforcementConfig, EnforcementPolicyConfig,
-    EnforcementPolicyReloadConfig,
+    EnforcementPolicyReloadConfig, TlsConfig, TlsMaterialConfig, TlsMaterialKind,
 };
 use runtime::{OnlineReloadConfigUpdate, RuntimePlan, validate_static_runtime_config};
 use serde::{Deserialize, Serialize};
@@ -87,7 +87,7 @@ pub(crate) enum ConfigReloadDecision {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) struct ConfigReloadSectionChange {
     pub section: ConfigReloadSection,
-    pub restart_required: bool,
+    pub reload_mode: ConfigReloadSectionReloadMode,
     pub reason: String,
 }
 
@@ -105,6 +105,14 @@ pub(crate) enum ConfigReloadSection {
     Tls,
     Enforcement,
     Admin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ConfigReloadSectionReloadMode {
+    ApplyOnline,
+    RuntimeGeneration,
+    ProcessRestart,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -196,24 +204,7 @@ pub(crate) fn plan_config_reload_for_candidate(
     normalize_embedded_artifact_paths_for_comparison(&mut comparable_current);
     normalize_embedded_artifact_paths_for_comparison(&mut comparable_candidate);
     let changed_sections = changed_sections(&comparable_current, &comparable_candidate);
-    let decision = if changed_sections.is_empty() {
-        ConfigReloadDecision::NoChange
-    } else if changed_sections_can_apply_online(&changed_sections) {
-        ConfigReloadDecision::ApplyOnline {
-            reason: "changed sections are owned by runtime reload gates".to_string(),
-        }
-    } else if changed_sections
-        .iter()
-        .all(section_can_use_runtime_generation)
-    {
-        ConfigReloadDecision::QueueRuntimeGeneration {
-            reason: "changed sections are owned by capture provider generation swaps".to_string(),
-        }
-    } else {
-        ConfigReloadDecision::RestartRequired {
-            reason: "candidate config passed static validation, but at least one changed runtime resource is still owned by setup-time services".to_string(),
-        }
-    };
+    let decision = config_reload_decision(&changed_sections);
     ConfigReloadPlanSnapshot {
         candidate_path: candidate_path.to_path_buf(),
         current_config_version: current.config_version.clone(),
@@ -251,7 +242,6 @@ pub(crate) async fn apply_config_reload(
         candidate,
     } = loaded;
     match &plan.decision {
-        ConfigReloadDecision::ApplyOnline { .. } => {}
         ConfigReloadDecision::QueueRuntimeGeneration { .. } => {
             let runtime_generation_request = runtime_generation_reload_request(&plan, &candidate);
             return ConfigReloadApplyOutcome {
@@ -264,6 +254,7 @@ pub(crate) async fn apply_config_reload(
                 runtime_generation_request,
             };
         }
+        ConfigReloadDecision::ApplyOnline { .. } => {}
         ConfigReloadDecision::NoChange
         | ConfigReloadDecision::RestartRequired { .. }
         | ConfigReloadDecision::InvalidCandidate { .. } => {
@@ -279,21 +270,18 @@ pub(crate) async fn apply_config_reload(
         }
     }
 
-    let online_update = match online_reload_config_update(&plan, &candidate) {
-        Some(update) => update,
-        None => {
-            return ConfigReloadApplyOutcome {
-                snapshot: ConfigReloadApplySnapshot {
-                    plan,
-                    actions: Vec::new(),
-                    active_plan_updated: false,
-                },
-                applied_plan: None,
-                runtime_generation_request: None,
-            };
-        }
+    let Some(online_update) = online_reload_config_update(&plan, &candidate) else {
+        return ConfigReloadApplyOutcome {
+            snapshot: ConfigReloadApplySnapshot {
+                plan,
+                actions: Vec::new(),
+                active_plan_updated: false,
+            },
+            applied_plan: None,
+            runtime_generation_request: None,
+        };
     };
-    let applied_plan = online_applied_plan(current_plan, online_update.clone());
+    let applied_plan = online_applied_plan(current_plan, online_update);
 
     let mut actions = Vec::new();
     if plan
@@ -364,9 +352,6 @@ pub(crate) async fn apply_config_reload(
                 | ConfigReloadApplyAction::ReloadEnforcementPolicy(
                     ConfigReloadApplyActionOutcome::Failed { .. }
                 )
-                | ConfigReloadApplyAction::RequestRuntimeGeneration(
-                    ConfigReloadRuntimeGenerationActionOutcome::Failed { .. }
-                )
         )
     }) {
         return ConfigReloadApplyOutcome {
@@ -399,12 +384,16 @@ fn online_reload_config_update(
         return None;
     };
     match change.section {
-        ConfigReloadSection::Policies if !change.restart_required => {
+        ConfigReloadSection::Policies
+            if change.reload_mode == ConfigReloadSectionReloadMode::ApplyOnline =>
+        {
             Some(OnlineReloadConfigUpdate::PipelinePolicies {
                 policies: candidate.policies.clone(),
             })
         }
-        ConfigReloadSection::Enforcement if !change.restart_required => {
+        ConfigReloadSection::Enforcement
+            if change.reload_mode == ConfigReloadSectionReloadMode::ApplyOnline =>
+        {
             Some(OnlineReloadConfigUpdate::EnforcementPolicy {
                 selector: candidate.enforcement.selector.clone(),
                 source: candidate.enforcement.policy.source.clone(),
@@ -511,22 +500,37 @@ fn changed_sections(
         .filter(|spec| section_changed(spec.section, current, candidate))
         .map(|spec| ConfigReloadSectionChange {
             section: spec.section,
-            restart_required: section_restart_required(spec.section, current, candidate),
+            reload_mode: section_reload_mode(spec.section, current, candidate),
             reason: section_change_reason(spec.section, current, candidate, spec.reason)
                 .to_string(),
         })
         .collect()
 }
 
-fn section_restart_required(
+fn section_reload_mode(
     section: ConfigReloadSection,
     current: &AgentConfig,
     candidate: &AgentConfig,
-) -> bool {
+) -> ConfigReloadSectionReloadMode {
     match section {
-        ConfigReloadSection::Policies => !policies_can_apply_online(current, candidate),
-        ConfigReloadSection::Enforcement => !enforcement_can_apply_online(current, candidate),
-        _ => true,
+        ConfigReloadSection::AgentIdentity
+            if agent_identity_can_use_runtime_generation(current, candidate) =>
+        {
+            ConfigReloadSectionReloadMode::RuntimeGeneration
+        }
+        ConfigReloadSection::Capture | ConfigReloadSection::Observations => {
+            ConfigReloadSectionReloadMode::RuntimeGeneration
+        }
+        ConfigReloadSection::Policies if policies_can_apply_online(current, candidate) => {
+            ConfigReloadSectionReloadMode::ApplyOnline
+        }
+        ConfigReloadSection::Tls if tls_can_use_runtime_generation(current, candidate) => {
+            ConfigReloadSectionReloadMode::RuntimeGeneration
+        }
+        ConfigReloadSection::Enforcement if enforcement_can_apply_online(current, candidate) => {
+            ConfigReloadSectionReloadMode::ApplyOnline
+        }
+        _ => ConfigReloadSectionReloadMode::ProcessRestart,
     }
 }
 
@@ -537,11 +541,19 @@ fn section_change_reason(
     default_reason: &'static str,
 ) -> &'static str {
     match section {
+        ConfigReloadSection::AgentIdentity
+            if agent_identity_can_use_runtime_generation(current, candidate) =>
+        {
+            "config_version is applied by runtime generation swaps while agent_id remains setup-time"
+        }
         ConfigReloadSection::Policies if policies_can_apply_online(current, candidate) => {
             "pipeline policy set is owned by an online reload gate"
         }
         ConfigReloadSection::Policies => {
             "policy watcher or poller topology is still owned by startup background services"
+        }
+        ConfigReloadSection::Tls if tls_can_use_runtime_generation(current, candidate) => {
+            "TLS plaintext instrumentation and decrypt hint materials are rebuilt by runtime generation swaps"
         }
         ConfigReloadSection::Enforcement if enforcement_can_apply_online(current, candidate) => {
             "enforcement policy source and enforcement.selector are owned by an online reload gate"
@@ -553,16 +565,45 @@ fn section_change_reason(
     }
 }
 
+fn config_reload_decision(changed_sections: &[ConfigReloadSectionChange]) -> ConfigReloadDecision {
+    if changed_sections.is_empty() {
+        ConfigReloadDecision::NoChange
+    } else if changed_sections_can_apply_online(changed_sections) {
+        ConfigReloadDecision::ApplyOnline {
+            reason: "changed sections are owned by runtime reload gates".to_string(),
+        }
+    } else if changed_sections_can_use_runtime_generation(changed_sections) {
+        ConfigReloadDecision::QueueRuntimeGeneration {
+            reason: "changed sections are owned by capture provider generation swaps".to_string(),
+        }
+    } else {
+        ConfigReloadDecision::RestartRequired {
+            reason: "candidate config passed static validation, but at least one changed runtime resource is still owned by setup-time services".to_string(),
+        }
+    }
+}
+
 fn changed_sections_can_apply_online(changed_sections: &[ConfigReloadSectionChange]) -> bool {
     matches!(
         changed_sections,
-        [change]
-            if !change.restart_required
-                && matches!(
-                    change.section,
-                    ConfigReloadSection::Policies | ConfigReloadSection::Enforcement
-                )
+        [change] if change.reload_mode == ConfigReloadSectionReloadMode::ApplyOnline
     )
+}
+
+fn changed_sections_can_use_runtime_generation(
+    changed_sections: &[ConfigReloadSectionChange],
+) -> bool {
+    !changed_sections.is_empty()
+        && changed_sections
+            .iter()
+            .all(section_can_use_runtime_generation)
+}
+
+fn agent_identity_can_use_runtime_generation(
+    current: &AgentConfig,
+    candidate: &AgentConfig,
+) -> bool {
+    current.agent_id == candidate.agent_id && current.config_version != candidate.config_version
 }
 
 fn policies_can_apply_online(current: &AgentConfig, candidate: &AgentConfig) -> bool {
@@ -627,6 +668,36 @@ fn enforcement_reload_topology_can_apply_online(
         && !*current_poll_remote_manifest
 }
 
+fn tls_can_use_runtime_generation(current: &AgentConfig, candidate: &AgentConfig) -> bool {
+    tls_setup_time_view(&current.tls) == tls_setup_time_view(&candidate.tls)
+}
+
+fn tls_setup_time_view(tls: &TlsConfig) -> TlsSetupTimeView<'_> {
+    let setup_time_materials = tls
+        .materials
+        .iter()
+        .filter(|material| tls_material_has_setup_time_owner(material))
+        .collect::<Vec<_>>();
+    let material_store = (!setup_time_materials.is_empty()).then_some(&tls.material_store);
+    TlsSetupTimeView {
+        material_store,
+        setup_time_materials,
+    }
+}
+
+fn tls_material_has_setup_time_owner(material: &TlsMaterialConfig) -> bool {
+    !matches!(
+        material.kind,
+        TlsMaterialKind::KeyLogFile | TlsMaterialKind::SessionSecretFile
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TlsSetupTimeView<'a> {
+    material_store: Option<&'a probe_config::TlsMaterialStoreConfig>,
+    setup_time_materials: Vec<&'a TlsMaterialConfig>,
+}
+
 fn section_changed(
     section: ConfigReloadSection,
     current: &AgentConfig,
@@ -664,10 +735,19 @@ pub(crate) fn runtime_generation_reload_request(
     plan: &ConfigReloadPlanSnapshot,
     candidate: &AgentConfig,
 ) -> Option<RuntimeGenerationReloadRequestInput> {
-    let ConfigReloadDecision::QueueRuntimeGeneration { .. } = &plan.decision else {
+    if !matches!(
+        plan.decision,
+        ConfigReloadDecision::QueueRuntimeGeneration { .. }
+    ) {
         return None;
-    };
-    (!plan.changed_sections.is_empty()
+    }
+    let changed_sections = plan
+        .changed_sections
+        .iter()
+        .filter(|change| section_can_use_runtime_generation(change))
+        .map(|change| section_name(change.section).to_string())
+        .collect::<Vec<_>>();
+    (!changed_sections.is_empty()
         && plan
             .changed_sections
             .iter()
@@ -677,19 +757,12 @@ pub(crate) fn runtime_generation_reload_request(
         candidate_config: candidate.clone(),
         current_config_version: plan.current_config_version.clone(),
         candidate_config_version: plan.candidate_config_version.clone(),
-        changed_sections: plan
-            .changed_sections
-            .iter()
-            .map(|change| section_name(change.section).to_string())
-            .collect(),
+        changed_sections,
     })
 }
 
 fn section_can_use_runtime_generation(change: &ConfigReloadSectionChange) -> bool {
-    matches!(
-        change.section,
-        ConfigReloadSection::Capture | ConfigReloadSection::Observations
-    )
+    change.reload_mode == ConfigReloadSectionReloadMode::RuntimeGeneration
 }
 
 fn section_name(section: ConfigReloadSection) -> &'static str {
@@ -839,10 +912,25 @@ mod tests {
                 ConfigReloadSection::Export,
             ]
         );
-        assert!(
+        assert_eq!(
             plan.changed_sections
                 .iter()
-                .all(|change| change.restart_required)
+                .map(|change| (change.section, change.reload_mode))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    ConfigReloadSection::AgentIdentity,
+                    ConfigReloadSectionReloadMode::RuntimeGeneration,
+                ),
+                (
+                    ConfigReloadSection::Capture,
+                    ConfigReloadSectionReloadMode::RuntimeGeneration,
+                ),
+                (
+                    ConfigReloadSection::Export,
+                    ConfigReloadSectionReloadMode::ProcessRestart,
+                ),
+            ]
         );
         fs::remove_dir_all(temp)?;
         Ok(())
@@ -886,9 +974,9 @@ mod tests {
             vec![ConfigReloadSection::Observations]
         );
         assert!(
-            plan.changed_sections
-                .iter()
-                .all(|change| change.restart_required)
+            plan.changed_sections.iter().all(
+                |change| change.reload_mode == ConfigReloadSectionReloadMode::RuntimeGeneration
+            )
         );
         fs::remove_dir_all(temp)?;
         Ok(())
@@ -931,9 +1019,135 @@ mod tests {
     }
 
     #[test]
-    fn config_reload_plan_keeps_mixed_policy_and_data_path_changes_out_of_generation_queue()
+    fn config_reload_plan_queues_config_version_with_data_path_generation()
     -> Result<(), Box<dyn std::error::Error>> {
-        let temp = test_dir("config-reload-generation-request-mixed-policy")?;
+        let temp = test_dir("config-reload-version-generation-request")?;
+        let current = runtime_plan(base_config(temp.join("spool")))?;
+        let mut candidate = current.config.clone();
+        candidate.config_version = "candidate".to_string();
+        candidate.capture.fallback_backends = vec![LiveCaptureBackend::Libpcap];
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current.config, &candidate_path);
+
+        assert!(
+            matches!(
+                plan.decision,
+                ConfigReloadDecision::QueueRuntimeGeneration { .. }
+            ),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.reload_mode))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    ConfigReloadSection::AgentIdentity,
+                    ConfigReloadSectionReloadMode::RuntimeGeneration,
+                ),
+                (
+                    ConfigReloadSection::Capture,
+                    ConfigReloadSectionReloadMode::RuntimeGeneration,
+                ),
+            ]
+        );
+        let request = runtime_generation_reload_request(&plan, &candidate)
+            .expect("config version and capture rebuild should queue together");
+        assert_eq!(request.changed_sections, ["agent_identity", "capture"]);
+        assert_eq!(
+            request.candidate_config_version,
+            Some("candidate".to_string())
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_queues_tls_decrypt_hint_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-tls-decrypt-hints")?;
+        let current = runtime_plan(base_config(temp.join("spool")))?;
+        let mut candidate = current.config.clone();
+        candidate.tls.plaintext.decrypt_hints.key_log_refs = vec!["ssl-key-log".to_string()];
+        candidate.tls.materials = vec![TlsMaterialConfig {
+            id: Some("ssl-key-log".to_string()),
+            kind: TlsMaterialKind::KeyLogFile,
+            path: temp.join("sslkeys.log"),
+        }];
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current.config, &candidate_path);
+
+        assert!(
+            matches!(
+                plan.decision,
+                ConfigReloadDecision::QueueRuntimeGeneration { .. }
+            ),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.reload_mode))
+                .collect::<Vec<_>>(),
+            vec![(
+                ConfigReloadSection::Tls,
+                ConfigReloadSectionReloadMode::RuntimeGeneration,
+            )]
+        );
+        let request = runtime_generation_reload_request(&plan, &candidate)
+            .expect("TLS decrypt hints should rebuild the capture generation");
+        assert_eq!(request.changed_sections, ["tls"]);
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_keeps_setup_time_tls_materials_restart_required()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-setup-time-tls-material")?;
+        let current = runtime_plan(base_config(temp.join("spool")))?;
+        let mut candidate = current.config.clone();
+        candidate.tls.materials = vec![TlsMaterialConfig {
+            id: Some("mitm-ca".to_string()),
+            kind: TlsMaterialKind::MitmCaCertificate,
+            path: temp.join("mitm-ca.pem"),
+        }];
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current.config, &candidate_path);
+
+        assert!(
+            matches!(plan.decision, ConfigReloadDecision::RestartRequired { .. }),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.reload_mode))
+                .collect::<Vec<_>>(),
+            vec![(
+                ConfigReloadSection::Tls,
+                ConfigReloadSectionReloadMode::ProcessRestart,
+            )]
+        );
+        assert!(runtime_generation_reload_request(&plan, &candidate).is_none());
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_keeps_mixed_online_and_generation_owner_changes_restart_required()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-online-then-generation")?;
         let current = runtime_plan(base_config(temp.join("spool")))?;
         let mut candidate = current.config.clone();
         candidate.capture.fallback_backends = vec![LiveCaptureBackend::Libpcap];
@@ -949,10 +1163,27 @@ mod tests {
 
         let plan = plan_config_reload(&current.config, &candidate_path);
 
-        assert!(matches!(
-            plan.decision,
-            ConfigReloadDecision::RestartRequired { .. }
-        ));
+        assert!(
+            matches!(plan.decision, ConfigReloadDecision::RestartRequired { .. }),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.reload_mode))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    ConfigReloadSection::Capture,
+                    ConfigReloadSectionReloadMode::RuntimeGeneration,
+                ),
+                (
+                    ConfigReloadSection::Policies,
+                    ConfigReloadSectionReloadMode::ApplyOnline,
+                ),
+            ]
+        );
         assert!(runtime_generation_reload_request(&plan, &candidate).is_none());
         fs::remove_dir_all(temp)?;
         Ok(())
@@ -1002,9 +1233,12 @@ mod tests {
         assert_eq!(
             plan.changed_sections
                 .iter()
-                .map(|change| (change.section, change.restart_required))
+                .map(|change| (change.section, change.reload_mode))
                 .collect::<Vec<_>>(),
-            vec![(ConfigReloadSection::Policies, false)]
+            vec![(
+                ConfigReloadSection::Policies,
+                ConfigReloadSectionReloadMode::ApplyOnline
+            )]
         );
         fs::remove_dir_all(temp)?;
         Ok(())
@@ -1039,9 +1273,12 @@ mod tests {
         assert_eq!(
             plan.changed_sections
                 .iter()
-                .map(|change| (change.section, change.restart_required))
+                .map(|change| (change.section, change.reload_mode))
                 .collect::<Vec<_>>(),
-            vec![(ConfigReloadSection::Enforcement, false)]
+            vec![(
+                ConfigReloadSection::Enforcement,
+                ConfigReloadSectionReloadMode::ApplyOnline
+            )]
         );
         fs::remove_dir_all(temp)?;
         Ok(())
@@ -1070,9 +1307,12 @@ mod tests {
         assert_eq!(
             plan.changed_sections
                 .iter()
-                .map(|change| (change.section, change.restart_required))
+                .map(|change| (change.section, change.reload_mode))
                 .collect::<Vec<_>>(),
-            vec![(ConfigReloadSection::Enforcement, true)]
+            vec![(
+                ConfigReloadSection::Enforcement,
+                ConfigReloadSectionReloadMode::ProcessRestart
+            )]
         );
         fs::remove_dir_all(temp)?;
         Ok(())
@@ -1146,9 +1386,12 @@ mod tests {
         assert_eq!(
             plan.changed_sections
                 .iter()
-                .map(|change| (change.section, change.restart_required))
+                .map(|change| (change.section, change.reload_mode))
                 .collect::<Vec<_>>(),
-            vec![(ConfigReloadSection::Policies, true)]
+            vec![(
+                ConfigReloadSection::Policies,
+                ConfigReloadSectionReloadMode::ProcessRestart
+            )]
         );
         fs::remove_dir_all(temp)?;
         Ok(())

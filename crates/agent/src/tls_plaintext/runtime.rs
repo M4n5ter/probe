@@ -559,6 +559,14 @@ impl TlsPlaintextRuntimeState {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
+
+    pub(crate) fn restore_snapshot(&self, snapshot: TlsPlaintextRuntimeSnapshot) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *inner = snapshot;
+    }
 }
 
 fn next_reconcile_attempt_sequence(snapshot: &TlsPlaintextRuntimeSnapshot) -> u64 {
@@ -887,6 +895,20 @@ mod tests {
         assert_eq!(reconcile.targets.active.targets.len(), 5);
         assert_eq!(reconcile.targets.active.omitted, 0);
         assert_eq!(reconcile.targets.active.targets[0].pid, 3_000);
+    }
+
+    #[test]
+    fn tls_plaintext_runtime_state_restores_previous_snapshot() {
+        let runtime = TlsPlaintextRuntimeState::pending();
+        let before = runtime.snapshot();
+        runtime.record_instrumentation_build(&TlsPlaintextInstrumentationBuild::Enabled(Box::new(
+            NoopCaptureProvider,
+        )));
+        assert_eq!(runtime.snapshot().mode, TlsPlaintextRuntimeMode::Enabled);
+
+        runtime.restore_snapshot(before.clone());
+
+        assert_eq!(runtime.snapshot(), before);
     }
 
     #[test]

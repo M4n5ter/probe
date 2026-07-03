@@ -304,11 +304,12 @@ policy source and `enforcement.selector` changes are applied online when
 enforcement reload watcher and poller topology is disabled and transparent
 interception is not owning setup-time host rules. Top-level `[selectors]`
 registry changes, including entries referenced by `enforcement.selector`, still
-require restart until selector ownership has a lifecycle owner. Capture and
-observation data-path rebuild verdicts are queued as runtime generation requests
-and swapped by the live agent at capture safe points. The queued response
-includes a generation request id; the TUI follows status until that request is
-applied, fails, or remains pending beyond the background wait window.
+require restart until selector ownership has a lifecycle owner. Capture,
+observation, config version, TLS plaintext instrumentation, and TLS decrypt-hint
+material rebuild verdicts are queued as runtime generation requests and swapped
+by the live agent at capture safe points. The queued response includes a
+generation request id; the TUI follows status until that request is applied,
+fails, or remains pending beyond the background wait window.
 Online apply failures keep the old running agent alive and are reported in the
 status line instead of forcing a managed-agent restart. Setup topology such as
 export, storage, admin socket, and watcher topology still requires a process
@@ -1098,8 +1099,11 @@ enforcement reload does not hide a successful policy reload. The CLI exits
 non-zero when any action outcome is `failed` after printing the full JSON
 response. Candidate main configs can be parsed and statically validated with
 `plan-config-reload`, which reports `no_change`, `apply_online`,
-`restart_required`, or `invalid_candidate`. `apply-config-reload` executes the
-online subset and updates the active plan when every online action succeeds.
+`queue_runtime_generation`, `restart_required`, or `invalid_candidate`. Each
+changed section carries a `reload_mode` of `apply_online`,
+`runtime_generation`, or `process_restart`. `apply-config-reload` updates the
+active plan only for a single online owner, or queues a pure data-path runtime
+generation request without replacing the active plan first.
 Policy-only config changes are online-applicable when local watcher and remote
 poller topology is disabled. Enforcement policy source and
 `enforcement.selector` changes are online-applicable when enforcement reload
@@ -1110,15 +1114,18 @@ restart-required, even when an updated entry is referenced by
 Data-path rebuild verdicts can queue a `request_runtime_generation` action with
 a request id and appear as a pending runtime generation in status; the live agent
 consumes queued requests at capture safe points and records a runtime generation
-outcome. Capture and observation changes rebuild a candidate capture provider,
-swap it into the live loop, update capture runtime status, and replace the
-shared active plan only after the candidate opens. If a generation request cannot
-be queued, the old runtime stays active; a TUI-managed agent can restart to
-converge on the saved config, while an attached external agent reports that an
-explicit restart or retry is required. Selectors, TLS, enforcement execution
-surface changes, export, storage, admin, agent identity, and watcher topology
-changes are not silently applied by this path and remain `restart_required`
-until their lifecycle owners exist.
+outcome. Capture, observation, config version, TLS plaintext instrumentation,
+and TLS decrypt-hint material changes rebuild a candidate capture generation,
+swap it into the live loop, update runtime status, and replace the shared active
+plan only after the candidate opens. Mixed online/data-path changes remain
+`restart_required` until a transactional generation owner can apply the whole
+candidate without partial commits. If a generation request cannot be queued, the
+old runtime stays active; a TUI-managed agent can restart to converge on the
+saved config, while an attached external agent reports that an explicit restart
+or retry is required. Selectors, MITM/export TLS materials, enforcement
+execution surface changes, export, storage, admin, agent id, and watcher
+topology changes are not silently applied by this path and remain
+`restart_required` until their lifecycle owners exist.
 Candidate config reads require a regular file, reject symlinks and oversized
 files, and do not echo raw config lines in parse errors.
 

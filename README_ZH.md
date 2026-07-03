@@ -257,9 +257,9 @@ Runtime tab 可以调用在线 admin `reload_runtime_actions` 命令，重载 ac
 在线应用；enforcement policy source 和 `enforcement.selector` 变更在 enforcement reload watcher/poller topology
 未启用且 transparent interception 未持有 setup-time host rules 时在线应用。顶层 `[selectors]`
 registry 变更，包括被 `enforcement.selector` 引用的条目变更，仍需要重启，直到 selector ownership
-具备独立 lifecycle owner。capture 和 observation
-data-path rebuild verdict 会排入 runtime generation request，并由 live agent 在 capture safe point 交换。
-queued response 会携带 generation request id；TUI 会跟踪 status，直到该 request applied、failed，
+具备独立 lifecycle owner。capture、observation、config version、TLS plaintext instrumentation 和 TLS
+decrypt-hint material rebuild verdict 会排入 runtime generation request，并由 live agent 在 capture safe
+point 交换。queued response 会携带 generation request id；TUI 会跟踪 status，直到该 request applied、failed，
 或超过后台等待窗口后仍 pending。在线 apply 失败、已入队 generation failed 或仍 pending 时，旧
 running agent 继续保留，TUI 在状态行报告结果。generation request 无法入队时，TUI-managed agent
 可以重启以收敛到保存配置；attached external agent 会提示显式重启或重试。export、storage、admin
@@ -968,17 +968,25 @@ admin reload 会先校验新 policy 或 enforcement state，再替换 runtime st
 `reload-runtime-actions` 会执行 active `RuntimePlan` 下安全的 runtime action，并独立报告每个
 action 的结果，因此 enforcement reload 失败不会掩盖 policy reload 成功。CLI 会先打印完整 JSON response，
 再在任一 action outcome 为 `failed` 时以非零状态退出。候选主配置可以通过
-`plan-config-reload` 解析并做静态校验，报告 `no_change`、`apply_online`、`restart_required`
-或 `invalid_candidate`。`apply-config-reload` 执行在线子集，所有在线 action 成功后更新 active plan。
+`plan-config-reload` 解析并做静态校验，报告 `no_change`、`apply_online`、
+`queue_runtime_generation`、`restart_required` 或 `invalid_candidate`。每个 changed section
+携带 `reload_mode`：`apply_online`、`runtime_generation` 或 `process_restart`。
+`apply-config-reload` 只会对单个 online owner 更新 active plan，或提交纯 data-path runtime
+generation request；后者不会提前替换 active plan。
 policy-only 主配置变更在本地 watcher 和远程 poller topology 未启用时可在线应用；enforcement
 policy source 和 `enforcement.selector` 变更在 enforcement reload watcher/poller topology 未启用且
 transparent interception 未持有 setup-time host rules 时可在线应用。顶层 `[selectors]` registry 变更，
 包括被 `enforcement.selector` 引用的条目变更，仍需要重启。
 Data-path rebuild verdict 会提交带 request id 的 `request_runtime_generation` action，并在 status 中表现为
 pending runtime generation；live agent 在 capture safe point 消费该 request 并记录 runtime generation outcome。
-capture 和 observation 变更会构建候选 capture provider，只有候选 provider 打开成功后才交换到 live loop、
-更新 capture runtime status 并替换共享 active plan。generation request 无法入队时，旧 runtime 保持活跃；
-TUI-managed agent 可以通过重启收敛到保存配置，attached external agent 会提示显式重启或重试。
+capture、observation、config version、TLS plaintext instrumentation 和 TLS decrypt-hint material
+变更会构建候选 capture generation，只有候选 provider 打开成功后才交换到 live loop、更新 runtime
+status 并替换共享 active plan。online/data-path 混合变更保持 `restart_required`，直到存在能整体
+应用候选配置且不会产生 partial commit 的事务型 generation owner。generation request 无法入队时，
+旧 runtime 保持活跃；TUI-managed agent 可以通过重启收敛到保存配置，attached external agent 会提示
+显式重启或重试。selectors、MITM/export TLS materials、enforcement execution surface、export、
+storage、admin、agent id 和 watcher topology 变更不会被该路径静默应用，在对应 lifecycle owner
+存在前保持 `restart_required`。
 
 Prometheus listener 是只读、loopback-only 的 `GET /metrics` surface；控制命令仍留在私有 Unix
 socket。runtime status 和 metrics 会暴露 capture input activity、pipeline progress、

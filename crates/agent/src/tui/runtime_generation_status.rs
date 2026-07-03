@@ -69,7 +69,17 @@ where
 {
     let deadline = Instant::now() + wait_timeout;
     loop {
-        let response = fetch_status(RUNTIME_GENERATION_STATUS_TIMEOUT).await?;
+        let response = match fetch_status(RUNTIME_GENERATION_STATUS_TIMEOUT).await {
+            Ok(response) => response,
+            Err(RuntimeGenerationStatusError::AdminClient(AdminClientError::Timeout)) => {
+                if Instant::now() >= deadline {
+                    return Ok(RuntimeGenerationWaitOutcome::StillPending);
+                }
+                sleep_for(poll_interval).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         match parse_runtime_generation_status(&response, request_id)? {
             RuntimeGenerationPollStatus::Applied {
                 generation,
@@ -315,6 +325,39 @@ mod tests {
         )
         .await
         .expect("wait should finish successfully");
+
+        assert_eq!(
+            outcome,
+            RuntimeGenerationWaitOutcome::Applied {
+                generation: 2,
+                config_version: "candidate".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_generation_wait_treats_status_timeout_as_transient_pending() {
+        let mut responses = VecDeque::from([
+            Err(RuntimeGenerationStatusError::AdminClient(
+                AdminClientError::Timeout,
+            )),
+            Ok(applied_status_response(7, 2, "candidate")),
+        ]);
+
+        let outcome = wait_for_runtime_generation_outcome_with(
+            7,
+            Duration::from_secs(1),
+            Duration::ZERO,
+            |_| {
+                let response = responses
+                    .pop_front()
+                    .expect("test should provide enough status responses");
+                async move { response }
+            },
+            |_| async {},
+        )
+        .await
+        .expect("transient timeout should not fail the wait");
 
         assert_eq!(
             outcome,

@@ -12,9 +12,9 @@ pub(crate) use crate::tcp_health::{
     TcpHealthMode as L7MitmBackendHealthMode, TcpHealthProbeGuard as L7MitmBackendHealthProbeGuard,
     TcpHealthSnapshot as L7MitmBackendHealthSnapshot,
 };
+pub(crate) use audit::DurableL7MitmAuditSink;
 #[cfg(test)]
 pub(crate) use audit::NoopL7MitmAuditSink;
-pub(crate) use audit::{DurableL7MitmAuditSink, L7MitmAuditSink};
 pub(crate) use lifecycle::{L7MitmBackendLifecycleGuard, start_backend_lifecycle};
 pub(crate) use policy_hook::{
     L7MitmPolicyHookConnectionOptions, L7MitmPolicyHookError,

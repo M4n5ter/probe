@@ -477,8 +477,8 @@ mod tests {
                     "reason": "capture provider ownership is fixed"
                 }),
                 json!([
-                    { "section": "observations", "restart_required": true, "reason": "process observation profiles changed" },
-                    { "section": "capture", "restart_required": true, "reason": "capture provider changed" }
+                    { "section": "observations", "reload_mode": "process_restart", "reason": "process observation profiles changed" },
+                    { "section": "capture", "reload_mode": "process_restart", "reason": "capture provider changed" }
                 ])
             )
         });
@@ -504,7 +504,7 @@ mod tests {
                     "reason": "changed sections are owned by runtime reload gates"
                 }),
                 json!([
-                    { "section": "policies", "restart_required": false, "reason": "pipeline policy set is reloadable" }
+                    { "section": "policies", "reload_mode": "apply_online", "reason": "pipeline policy set is reloadable" }
                 ])
             )
         });
@@ -531,7 +531,7 @@ mod tests {
                         "reason": "changed sections are owned by runtime reload gates"
                     }),
                     json!([
-                        { "section": "policies", "restart_required": false, "reason": "pipeline policy set is reloadable" }
+                        { "section": "policies", "reload_mode": "apply_online", "reason": "pipeline policy set is reloadable" }
                     ])
                 ),
                 "active_plan_updated": true,
@@ -571,7 +571,7 @@ mod tests {
                         "reason": "changed sections are owned by runtime reload gates"
                     }),
                     json!([
-                        { "section": "enforcement", "restart_required": false, "reason": "enforcement policy source and enforcement.selector are owned by an online reload gate" }
+                        { "section": "enforcement", "reload_mode": "apply_online", "reason": "enforcement policy source and enforcement.selector are owned by an online reload gate" }
                     ])
                 ),
                 "active_plan_updated": true,
@@ -611,7 +611,7 @@ mod tests {
                         "reason": "changed sections are owned by runtime reload gates"
                     }),
                     json!([
-                        { "section": "policies", "restart_required": false, "reason": "pipeline policy set is reloadable" }
+                        { "section": "policies", "reload_mode": "apply_online", "reason": "pipeline policy set is reloadable" }
                     ])
                 ),
                 "active_plan_updated": false,
@@ -651,7 +651,7 @@ mod tests {
                         "reason": "changed sections are owned by capture provider generation swaps"
                     }),
                     json!([
-                        { "section": "capture", "restart_required": true, "reason": "capture provider changed" }
+                        { "section": "capture", "reload_mode": "runtime_generation", "reason": "capture provider changed" }
                     ])
                 ),
                 "active_plan_updated": false,
@@ -692,7 +692,7 @@ mod tests {
                         "reason": "changed sections are owned by capture provider generation swaps"
                     }),
                     json!([
-                        { "section": "capture", "restart_required": true, "reason": "capture provider changed" }
+                        { "section": "capture", "reload_mode": "runtime_generation", "reason": "capture provider changed" }
                     ])
                 ),
                 "active_plan_updated": false,

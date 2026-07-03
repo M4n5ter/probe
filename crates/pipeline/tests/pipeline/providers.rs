@@ -54,6 +54,45 @@ fn replay_provider_writes_ingress_and_export_lanes() -> Result<(), Box<dyn std::
     Ok(())
 }
 
+#[test]
+fn pipeline_runtime_config_version_update_affects_later_events()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let spool = storage::FjallSpool::open(temp.path())?;
+    let mut parser_factory = Http1ParserFactory::default();
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "current");
+    let mut current_provider = ReplayProvider::new(
+        demo_flow_with_ports(50_000, 80, 1),
+        Direction::Outbound,
+        b"GET /current HTTP/1.1\r\nHost: example.test\r\n\r\n",
+        Timestamp {
+            monotonic_ns: 1,
+            wall_time_unix_ns: 1,
+        },
+    );
+    pipeline.run_provider(&mut current_provider)?;
+
+    pipeline.set_config_version("candidate");
+    let mut candidate_provider = ReplayProvider::new(
+        demo_flow_with_ports(50_001, 80, 2),
+        Direction::Outbound,
+        b"GET /candidate HTTP/1.1\r\nHost: example.test\r\n\r\n",
+        Timestamp {
+            monotonic_ns: 2,
+            wall_time_unix_ns: 2,
+        },
+    );
+    pipeline.run_provider(&mut candidate_provider)?;
+
+    let config_versions = exported_envelopes(&spool)?
+        .into_iter()
+        .filter(|envelope| matches!(envelope.kind(), EventKind::HttpRequestHeaders(_)))
+        .map(|envelope| envelope.config_version().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(config_versions, ["current", "candidate"]);
+    Ok(())
+}
+
 fn demo_flow() -> probe_core::FlowContext {
     demo_flow_with_ports(50_000, 80, 1)
 }

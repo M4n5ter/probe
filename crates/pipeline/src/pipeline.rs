@@ -388,6 +388,10 @@ where
         self
     }
 
+    pub fn set_config_version(&mut self, config_version: impl Into<String>) {
+        self.config_version = config_version.into();
+    }
+
     pub fn with_enforcement_planner(
         mut self,
         enforcement_planner: &'a mut dyn EnforcementPlanner,
