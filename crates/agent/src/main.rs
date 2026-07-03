@@ -26,6 +26,7 @@ mod policy_reload_watcher;
 mod reload_watcher;
 mod remote_source;
 mod runtime_composition;
+mod runtime_config_watcher;
 mod runtime_generation;
 mod runtime_plan;
 mod runtime_reload;

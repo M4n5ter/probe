@@ -3650,8 +3650,10 @@ WSL2 或受限内核即使支持 sock_diag 查询，也可能无法实际销毁 
   hot reload owner 中证明。
 - 本地 policy bundle watcher 触发当前配置引用的全量 enabled policy source reload，不重读主配置。
 - 本地 enforcement manifest watcher 触发当前 plan 的 enforcement policy source reload，不重读主配置。
-- 文件变更触发主配置 validate-then-swap 是后续 config watcher reload 目标；运行中的 agent 不会动态切换 active config。
-- 目标形态中，新配置验证失败时不切换当前 active config，并输出错误。
+- `[runtime_reload] watch_config = true` 触发主 TOML 文件 watcher。watcher 观察 `agent run --config`
+  文件和父目录，支持常见编辑器 atomic replace，经 debounce 后复用 `apply_config_reload`。
+- 主配置 watcher 只应用现有 reload planning 支持的变更。新配置验证失败、在线 action 失败或 generation queue 失败时保留当前
+  active config，并输出 reload outcome。
 
 配置源抽象：
 
@@ -4861,8 +4863,8 @@ Config reload planning：
 - 返回 `config_reload_plan`，其中 decision 为 `no_change`、`apply_online`、
   `queue_runtime_generation`、`restart_required` 或 `invalid_candidate`。
 - `invalid_candidate` 区分 `read`、`parse` 和 `validate` 阶段。
-- changed sections 按 agent identity、capture、observations、storage、export、policy reload、policies、selectors、TLS、
-  enforcement 和 admin 拆分。
+- changed sections 按 agent identity、capture、observations、storage、export、runtime reload、policy reload、
+  policies、selectors、TLS、enforcement 和 admin 拆分。
 - 每个 changed section 携带 `reload_mode`：
   `apply_online`、`runtime_generation` 或 `process_restart`。
 - `apply_online` 表示 changed section 由单个在线 runtime owner 管理。
@@ -4874,6 +4876,7 @@ Config reload planning：
   `restart_required`，直到存在能整体应用候选配置且不会产生 partial commit 的事务型 generation owner。
 - `restart_required` 表示至少一个 changed section 仍由 setup-time service、background topology 或
   one-shot runtime owner 管理。
+- `[runtime_reload]` 控制主配置 watcher topology；该 section 变化保持 `process_restart`。
 - `observations` 作为独立 section 表示进程观察 profile 变化；这些 profile 会投影到 capture backend 选择、
   deep observation selector 和进程级 data path ownership，不能被折叠成普通 `[capture]` diff。
 - 每个 changed section 携带 reason，说明该 top-level 配置域绑定的运行时 owner。
@@ -4891,6 +4894,17 @@ Config reload planning：
 - `reload_runtime_actions` 可执行 active `RuntimePlan` 下可安全在线切换的 runtime actions。
 - `reload_runtime_actions` 不替换 active config。
 - `reload_runtime_actions` 不启动、停止或重建 capture/export/TLS/admin/interception owner。
+
+Runtime config watcher：
+
+- `[runtime_reload] watch_config = true` 会为 `agent run --config` 指向的主 TOML 文件建立后台 watcher。
+- watcher 同时监听配置文件和父目录，以覆盖原地写入和 atomic replace。
+- watcher 使用 `runtime_reload.debounce_ms` 合并短时间文件事件；默认 500ms，配置校验范围是 50ms 到 60s。
+- watcher 触发后复用 `apply_config_reload` 的 validate-then-swap / request-generation 语义。
+- runtime generation queue busy 时，watcher 等待 generation idle，随后重读同一主配置文件并重试，以收敛到最新文件内容。
+- watcher 不建立第二套 TOML 解释器，不绕过 admin reload planning，也不隐式重启进程。
+- watcher reload 失败时保持当前 active plan、active policy set、active enforcement policy 和 active capture generation。
+- `agent run` 没有配置路径时，即使配置启用了 watcher，也不会启动主配置 watcher。
 
 Admin reload：
 
@@ -4910,7 +4924,7 @@ Admin reload：
 | Command | Runtime owner | Success response | Failure behavior |
 | --- | --- | --- | --- |
 | `plan_config_reload` | 无 mutation；候选配置 validator | `config_reload_plan` | `invalid_candidate` 描述 read/parse/validate 阶段 |
-| `apply_config_reload` | 候选配置中单个 online owner 或纯 data-path generation owner | `config_reload_apply`，包含 plan、actions、`active_plan_updated` | 在线 action 失败时保留旧 active plan；runtime generation queue 失败时返回 failed action；setup-time 或 mixed-owner section 返回 restart verdict |
+| `apply_config_reload` | 候选配置中单个 online owner 或纯 data-path generation owner | `config_reload_apply`，包含 plan、actions、`active_plan_updated` | 在线 action 失败时保留旧 active plan；runtime generation queue busy 时返回 busy action；runtime generation owner 缺失时返回 failed action；setup-time 或 mixed-owner section 返回 restart verdict |
 | `request_runtime_generation` | live agent runtime generation owner | 带 `request_id` 的 `queued` action outcome，status 中出现 pending generation request | active plan 不提前替换；TUI 可跟踪 applied/failed/pending outcome；queue submission 失败返回 failed action；不覆盖 setup-time service topology |
 | `reload_runtime_actions` | 当前可在线切换的 runtime owner 集合 | 每个 action 的独立 outcome | 返回 `runtime_actions_reload`，失败 action 进入 `failed` outcome |
 | `reload_policies` | active pipeline policy set | `loaded_count`、policy sources、`active_set_updated` | 返回 error，保留旧 active policy set |
@@ -4966,6 +4980,8 @@ Full config hot reload：
   在无事件时返回 `Idle` 或 `Finished`。
 - runtime generation status 已暴露 active generation、pending request、applying request、last outcome 和 capture control safe point。
 - pending request 由 `apply_config_reload` 针对 data path generation rebuild verdict 产生。
+- 主配置 watcher 由 `[runtime_reload] watch_config = true` 启动，监听 `agent run --config`
+  指向的主 TOML 文件和父目录。它不解释 TOML，而是复用 `apply_config_reload` 的 planning/apply contract。
 - runtime generation request 由 admin apply 阶段基于已读取、已解析的 typed candidate config 创建；
   executor 消费 pending request 后执行 artifact hydration、static runtime validation 和 runtime composition build。
 - capture、observations、config version、TLS plaintext instrumentation 和 TLS decrypt-hint material 变更会在
@@ -4985,17 +5001,20 @@ Full config hot reload：
 | enforcement policy manifest | 已有 validate-then-swap owner；支持 admin 手动 reload、本地 watcher 和 remote poller。 |
 | main TOML policy-only config | `apply_config_reload` 可在无 watcher/poller topology 变更时应用，并更新 active plan。 |
 | main TOML enforcement policy config | `apply_config_reload` 可在无 enforcement reload watcher/poller topology、无 transparent interception setup-time rules 时应用 policy source 和主配置 `enforcement.selector` 变更，并更新 active plan；顶层 `[selectors]` registry 变更仍为 restart-required。 |
+| main TOML file watcher | `[runtime_reload] watch_config = true` 为 `agent run --config` 文件建立后台 watcher；文件事件经 debounce 后复用 `apply_config_reload`。 |
 | capture/observations/TLS plaintext generation | `apply_config_reload` 提交 `request_runtime_generation`；live agent 在 capture safe point validate-then-swap capture provider、TLS plaintext/decrypt-hint runtime state 和 active plan。 |
 | mixed online/data-path config | 当前保持 `restart_required`；需要完整事务型 generation owner 后才能整体 validate-then-swap。 |
 | selectors/MITM TLS/enforcement execution generation | 当前缺少对应 lifecycle owner；config reload planning 保持 `restart_required`，不提交 runtime generation request。 |
-| setup-time service topology | 需要对应 lifecycle owner；admin socket、exporter topology 和 storage path 不随 data path generation 隐式切换。 |
+| setup-time service topology | 需要对应 lifecycle owner；runtime reload watcher、admin socket、exporter topology 和 storage path 不随 data path generation 隐式切换。 |
 
 当前实现边界：
 
 - 当前 runtime generation queue 接收 capture、observations、agent `config_version`、TLS plaintext instrumentation
   和 TLS decrypt-hint material 变更。
+- 当前主配置 watcher 可触发 policy-only 在线应用、enforcement policy source / `enforcement.selector`
+  在线应用和纯 data-path runtime generation queue。
 - selectors、MITM/export TLS material、enforcement execution surface、MITM bridge、transparent interception、storage、export
-  和 admin topology 仍由 startup/setup-time owner 持有；planning 必须保持 `restart_required`，
+  和 runtime/admin topology 仍由 startup/setup-time owner 持有；planning 必须保持 `restart_required`，
   不能因为目标模型存在 data path generation 概念而提前排队。
 
 目标运行时约束：
@@ -5008,7 +5027,7 @@ Full config hot reload：
   当前实现不得把它们放入 runtime generation queue。
 - setup-time host rules 不能被 planner-only enforcement reload 隐式改变。
 - exporter cursor 和 durable spool path 不能被 capture generation swap 偷换；涉及存储路径或 exporter topology 的配置需要独立 owner。
-- 主配置 watcher 与手动 `apply_config_reload` 应共享同一个 planning/apply contract，不能各自解释 TOML。
+- 主配置 watcher 与手动 `apply_config_reload` 共享同一个 planning/apply contract，不能各自解释 TOML。
 
 能力：
 
@@ -5019,7 +5038,7 @@ Full config hot reload：
 - spool status。
 - policy bundle reload。
 - config reload planning。
-- full config hot reload gap。
+- full config hot reload watcher。
 - debug dump。
 - exporter status。
 

@@ -1094,6 +1094,19 @@ enabled = true
 listen_addr = "127.0.0.1:9464"
 ```
 
+Daemon deployments can also enable a main-config watcher. The watcher observes
+the `--config` file and its parent directory, debounces editor writes and atomic
+replaces, then runs the same `apply-config-reload` contract used by the admin
+socket and TUI. If a data-path generation request is already pending or
+applying, the watcher waits for that generation to become idle, rereads the
+config file, and retries against the latest file contents:
+
+```toml
+[runtime_reload]
+watch_config = true
+debounce_ms = 500
+```
+
 Admin reloads validate new policy or enforcement state before swapping runtime
 state. `reload-runtime-actions` runs every runtime action that is safe under the
 active `RuntimePlan` and reports each outcome independently, so a failed
@@ -1128,6 +1141,9 @@ or retry is required. Selectors, MITM/export TLS materials, enforcement
 execution surface changes, export, storage, admin, agent id, and watcher
 topology changes are not silently applied by this path and remain
 `restart_required` until their lifecycle owners exist.
+The `[runtime_reload]` section controls the watcher topology itself, so changing
+it is also `restart_required`; the running watcher does not rebuild its own
+lifecycle.
 Candidate config reads require a regular file, reject symlinks and oversized
 files, and do not echo raw config lines in parse errors.
 

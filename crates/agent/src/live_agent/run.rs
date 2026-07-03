@@ -41,6 +41,7 @@ use crate::{
     policy_reload_poller::{self, PolicyReloadPollerHandle},
     policy_reload_watcher::{self, PolicyReloadWatcherHandle},
     runtime_composition::build_runtime_composition,
+    runtime_config_watcher::{self, RuntimeConfigWatcherContext, RuntimeConfigWatcherHandle},
     runtime_generation::{RuntimeGenerationExecutor, RuntimeGenerationState},
     runtime_plan::RuntimePlanHandle,
     runtime_reload::RuntimeReloadGate,
@@ -61,6 +62,7 @@ const LIVE_CAPTURE_HANDOFF_DRAIN_POLLS: u64 = 1_024;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RunOptions {
     pub max_events: Option<u64>,
+    pub config_path: Option<PathBuf>,
     pub readiness: ReadinessSignal,
 }
 
@@ -77,6 +79,7 @@ pub(crate) async fn run_live_agent(
 ) -> Result<(), AgentError> {
     let RunOptions {
         max_events,
+        config_path,
         readiness,
     } = options;
     require_runtime_artifacts(&mut agent_config)?;
@@ -141,6 +144,26 @@ pub(crate) async fn run_live_agent(
         })
         .transpose()?;
     let mut background_services = BackgroundServices::new(admin_server);
+    match runtime_config_watcher::spawn_watcher(
+        config_path,
+        RuntimeConfigWatcherContext {
+            plan: plan_handle.clone(),
+            policy_set: policy_set.clone(),
+            policy_reload_gate: admin_runtime_state.policy_reload_gate.clone(),
+            config_apply_gate: config_apply_gate.clone(),
+            enforcement_runtime: Some(enforcement_runtime.clone()),
+            enforcement_reload_gate: admin_runtime_state.enforcement_reload_gate.clone(),
+            runtime_generation: runtime_generation.clone(),
+        },
+    ) {
+        Ok(watcher) => {
+            background_services.runtime_config_watcher = watcher;
+        }
+        Err(error) => {
+            background_services.stop().await;
+            return Err(error.into());
+        }
+    };
     match policy_reload_watcher::spawn_watcher(
         plan_handle.clone(),
         policy_set.clone(),
@@ -287,6 +310,7 @@ struct BackgroundServices {
     admin_server: Option<AdminServerHandle>,
     policy_reload_poller: Option<PolicyReloadPollerHandle>,
     policy_reload_watcher: Option<PolicyReloadWatcherHandle>,
+    runtime_config_watcher: Option<RuntimeConfigWatcherHandle>,
     enforcement_reload_poller: Option<EnforcementReloadPollerHandle>,
     enforcement_reload_watcher: Option<EnforcementReloadWatcherHandle>,
 }
@@ -297,6 +321,7 @@ impl BackgroundServices {
             admin_server,
             policy_reload_poller: None,
             policy_reload_watcher: None,
+            runtime_config_watcher: None,
             enforcement_reload_poller: None,
             enforcement_reload_watcher: None,
         }
@@ -307,6 +332,9 @@ impl BackgroundServices {
             poller.stop().await;
         }
         if let Some(watcher) = self.enforcement_reload_watcher.take() {
+            watcher.stop().await;
+        }
+        if let Some(watcher) = self.runtime_config_watcher.take() {
             watcher.stop().await;
         }
         if let Some(poller) = self.policy_reload_poller.take() {
@@ -767,6 +795,7 @@ mod tests {
                             config,
                             RunOptions {
                                 max_events: None,
+                                config_path: None,
                                 readiness,
                             },
                         ))
@@ -808,6 +837,7 @@ mod tests {
             config,
             RunOptions {
                 max_events: Some(0),
+                config_path: None,
                 readiness: ReadinessSignal::UnixSocket(ready_path),
             },
         )

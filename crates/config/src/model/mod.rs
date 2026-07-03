@@ -6,6 +6,7 @@ mod export;
 mod observation;
 mod paths;
 mod policy;
+mod runtime_reload;
 mod storage;
 mod tls;
 
@@ -106,6 +107,10 @@ pub use policy::{
     MIN_POLICY_RELOAD_WATCH_DEBOUNCE_MS, PolicyConfig, PolicyReloadConfig, PolicySourceConfig,
     RemotePolicyBundleBodyLimitBytes, RemotePolicyBundleBodyLimitError,
     has_enabled_remote_policy_bundle_source,
+};
+pub use runtime_reload::{
+    DEFAULT_RUNTIME_RELOAD_WATCH_DEBOUNCE_MS, MAX_RUNTIME_RELOAD_WATCH_DEBOUNCE_MS,
+    MIN_RUNTIME_RELOAD_WATCH_DEBOUNCE_MS, RuntimeReloadConfig,
 };
 pub use storage::{
     DEFAULT_EXPORT_RETENTION_PRUNE_BATCH_LIMIT, DEFAULT_EXPORT_RETENTION_SWEEP_INTERVAL_MS,

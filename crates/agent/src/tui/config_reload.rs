@@ -335,6 +335,9 @@ impl ConfigReloadApplyActionOutcomeSummary {
             ConfigReloadRuntimeGenerationActionOutcome::Queued { detail, request_id } => {
                 Self::QueuedGeneration { detail, request_id }
             }
+            ConfigReloadRuntimeGenerationActionOutcome::Busy { message } => {
+                Self::Failed { message }
+            }
             ConfigReloadRuntimeGenerationActionOutcome::Failed { message } => {
                 Self::Failed { message }
             }
@@ -410,6 +413,7 @@ fn section_label(section: ConfigReloadSection) -> &'static str {
         ConfigReloadSection::Observations => "observations",
         ConfigReloadSection::Storage => "storage",
         ConfigReloadSection::Export => "export",
+        ConfigReloadSection::RuntimeReload => "runtime_reload",
         ConfigReloadSection::PolicyReload => "policy_reload",
         ConfigReloadSection::Policies => "policies",
         ConfigReloadSection::Selectors => "selectors",
@@ -700,7 +704,7 @@ mod tests {
                     {
                         "action": "request_runtime_generation",
                         "outcome": {
-                            "result": "failed",
+                            "result": "busy",
                             "message": "runtime generation reload is busy: pending request 1"
                         }
                     }

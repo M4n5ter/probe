@@ -36,10 +36,7 @@ use crate::runtime_generation::RuntimeGenerationState;
 use crate::runtime_plan::RuntimePlanHandle;
 use crate::runtime_reload::{
     RuntimeReloadGate,
-    config_reload::{
-        ConfigReloadApplyAction, ConfigReloadRuntimeGenerationActionOutcome, apply_config_reload,
-        plan_config_reload,
-    },
+    config_reload::{ConfigReloadApplyRuntime, apply_config_reload_to_runtime, plan_config_reload},
 };
 use crate::status::{
     AgentStatusSnapshot, EnforcementRuntimeStatusInput, PROMETHEUS_TEXT_CONTENT_TYPE,
@@ -412,55 +409,21 @@ async fn apply_config_reload_response(
     runtime_state: &AdminRuntimeState,
     path: PathBuf,
 ) -> AdminResponse {
-    let _apply_guard = runtime_state.config_apply_gate.lock().await;
-    let plan = plan_handle.snapshot();
-    let plan = plan.as_ref();
-    let mut outcome = apply_config_reload(
-        plan,
-        &runtime_state.policy_set,
-        &runtime_state.policy_reload_gate,
-        runtime_state.enforcement.as_ref(),
-        &runtime_state.enforcement_reload_gate,
+    let apply = apply_config_reload_to_runtime(
+        ConfigReloadApplyRuntime {
+            plan_handle,
+            config_apply_gate: &runtime_state.config_apply_gate,
+            policy_set: &runtime_state.policy_set,
+            policy_reload_gate: &runtime_state.policy_reload_gate,
+            enforcement_runtime_state: runtime_state.enforcement.as_ref(),
+            enforcement_reload_gate: &runtime_state.enforcement_reload_gate,
+            runtime_generation: runtime_state.runtime_generation.as_ref(),
+        },
         &path,
     )
     .await;
-    if let Some(applied_plan) = outcome.applied_plan {
-        plan_handle.replace(applied_plan);
-    } else if let Some(request) = outcome.runtime_generation_request.take() {
-        outcome.snapshot.actions.push(
-            match runtime_state
-                .runtime_generation
-                .as_ref()
-                .map(|runtime_generation| runtime_generation.request_reload(request))
-            {
-                Some(Ok(request)) => ConfigReloadApplyAction::RequestRuntimeGeneration(
-                    ConfigReloadRuntimeGenerationActionOutcome::Queued {
-                        request_id: request.request_id,
-                        detail: format!(
-                            "runtime generation reload request {} queued for {}",
-                            request.request_id,
-                            request
-                                .candidate_config_version
-                                .as_deref()
-                                .unwrap_or("<unknown config_version>")
-                        ),
-                    },
-                ),
-                Some(Err(error)) => ConfigReloadApplyAction::RequestRuntimeGeneration(
-                    ConfigReloadRuntimeGenerationActionOutcome::Failed {
-                        message: error.to_string(),
-                    },
-                ),
-                None => ConfigReloadApplyAction::RequestRuntimeGeneration(
-                    ConfigReloadRuntimeGenerationActionOutcome::Failed {
-                        message: "runtime generation owner is unavailable".to_string(),
-                    },
-                ),
-            },
-        );
-    }
     AdminResponse::ConfigReloadApply {
-        apply: Box::new(outcome.snapshot),
+        apply: Box::new(apply),
     }
 }
 

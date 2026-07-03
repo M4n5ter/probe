@@ -159,9 +159,12 @@ fn admin_action_error_message(response: &Value) -> Option<String> {
 
 fn runtime_action_failure(action: &Value) -> Option<String> {
     let outcome = action.get("outcome")?;
-    if outcome.get("result").and_then(Value::as_str) != Some("failed") {
-        return None;
-    }
+    let result = outcome.get("result").and_then(Value::as_str)?;
+    let default_message = match result {
+        "busy" => "busy",
+        "failed" => "failed",
+        _ => return None,
+    };
     let action_name = action
         .get("action")
         .and_then(Value::as_str)
@@ -169,7 +172,7 @@ fn runtime_action_failure(action: &Value) -> Option<String> {
     let message = outcome
         .get("message")
         .and_then(Value::as_str)
-        .unwrap_or("failed");
+        .unwrap_or(default_message);
     Some(format!("{action_name}: {message}"))
 }
 
@@ -292,7 +295,7 @@ mod tests {
                     {
                         "action": "request_runtime_generation",
                         "outcome": {
-                            "result": "failed",
+                            "result": "busy",
                             "message": "runtime generation reload is busy: pending request 1"
                         }
                     }

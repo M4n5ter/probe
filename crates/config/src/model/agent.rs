@@ -4,8 +4,8 @@ use probe_core::SelectorRegistry;
 
 use crate::{
     AdminConfig, CaptureConfig, ConfigError, EnforcementConfig, ExportRuntimeConfig,
-    ExporterConfig, PolicyConfig, PolicyReloadConfig, ProcessObservationConfig, StorageConfig,
-    TlsConfig, validation,
+    ExporterConfig, PolicyConfig, PolicyReloadConfig, ProcessObservationConfig,
+    RuntimeReloadConfig, StorageConfig, TlsConfig, validation,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,6 +18,7 @@ pub struct AgentConfig {
     pub storage: StorageConfig,
     pub export: ExportRuntimeConfig,
     pub exporters: Vec<ExporterConfig>,
+    pub runtime_reload: RuntimeReloadConfig,
     pub policy_reload: PolicyReloadConfig,
     pub policies: Vec<PolicyConfig>,
     pub selectors: SelectorRegistry,
@@ -50,6 +51,7 @@ impl Default for AgentConfig {
             storage: StorageConfig::default(),
             export: ExportRuntimeConfig::default(),
             exporters: Vec::new(),
+            runtime_reload: RuntimeReloadConfig::default(),
             policy_reload: PolicyReloadConfig::default(),
             policies: Vec::new(),
             selectors: SelectorRegistry::default(),

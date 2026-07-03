@@ -188,8 +188,9 @@ fn product_proxy_cli_args_from_agent_args(args: &[OsString]) -> Option<Vec<OsStr
 async fn run(cli: Cli) -> Result<(), AgentError> {
     match cli.command {
         Command::Run { config, max_events } => {
+            let config_path = config.clone();
             let agent_config = read_config_or_default(config.as_ref())?;
-            run_live_agent(agent_config, run_options_from_env(max_events)?).await?;
+            run_live_agent(agent_config, run_options_from_env(max_events, config_path)?).await?;
         }
         Command::Check { config } => {
             run_check_command(&config).await?;
@@ -245,9 +246,13 @@ fn resolve_admin_socket(socket: Option<PathBuf>) -> PathBuf {
     socket.unwrap_or_else(default_admin_socket_path)
 }
 
-fn run_options_from_env(max_events: Option<u64>) -> Result<RunOptions, AgentError> {
+fn run_options_from_env(
+    max_events: Option<u64>,
+    config_path: Option<PathBuf>,
+) -> Result<RunOptions, AgentError> {
     Ok(RunOptions {
         max_events,
+        config_path,
         readiness: readiness_from_env()?,
     })
 }

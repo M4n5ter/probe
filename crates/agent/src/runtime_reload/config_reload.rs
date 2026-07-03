@@ -13,11 +13,14 @@ use crate::configured_enforcement::EnforcementRuntimeState;
 use crate::control_plane_http::policy_source_load_context_from_plan;
 use crate::enforcement_reload::{EnforcementReloadGate, reload_enforcement_policy};
 use crate::policy_reload::{PolicyReloadGate, reload_policies_from_config};
-use crate::runtime_generation::RuntimeGenerationReloadRequestInput;
+use crate::runtime_generation::{RuntimeGenerationReloadRequestInput, RuntimeGenerationState};
+use crate::runtime_plan::RuntimePlanHandle;
+
+use super::RuntimeReloadGate;
 
 const MAX_CANDIDATE_CONFIG_BYTES: u64 = 1024 * 1024;
 
-const CONFIG_RELOAD_SECTIONS: [ConfigReloadSectionSpec; 11] = [
+const CONFIG_RELOAD_SECTIONS: [ConfigReloadSectionSpec; 12] = [
     ConfigReloadSectionSpec {
         section: ConfigReloadSection::AgentIdentity,
         reason: "agent identity and event config_version are bound into status, audit, and durable event metadata",
@@ -37,6 +40,10 @@ const CONFIG_RELOAD_SECTIONS: [ConfigReloadSectionSpec; 11] = [
     ConfigReloadSectionSpec {
         section: ConfigReloadSection::Export,
         reason: "export sinks and worker cursors are planned before the export worker starts",
+    },
+    ConfigReloadSectionSpec {
+        section: ConfigReloadSection::RuntimeReload,
+        reason: "runtime config reload watcher topology is created from the startup plan",
     },
     ConfigReloadSectionSpec {
         section: ConfigReloadSection::PolicyReload,
@@ -99,6 +106,7 @@ pub(crate) enum ConfigReloadSection {
     Observations,
     Storage,
     Export,
+    RuntimeReload,
     PolicyReload,
     Policies,
     Selectors,
@@ -126,8 +134,14 @@ pub(crate) enum ConfigReloadRuntimeAction {
 #[derive(Debug)]
 pub(crate) struct ConfigReloadApplyOutcome {
     pub snapshot: ConfigReloadApplySnapshot,
-    pub applied_plan: Option<RuntimePlan>,
-    pub runtime_generation_request: Option<RuntimeGenerationReloadRequestInput>,
+    completion: ConfigReloadApplyCompletion,
+}
+
+#[derive(Debug)]
+enum ConfigReloadApplyCompletion {
+    None,
+    ReplacePlan(Box<RuntimePlan>),
+    RequestRuntimeGeneration(Box<RuntimeGenerationReloadRequestInput>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -156,7 +170,82 @@ pub(crate) enum ConfigReloadApplyActionOutcome {
 #[serde(rename_all = "snake_case", tag = "result")]
 pub(crate) enum ConfigReloadRuntimeGenerationActionOutcome {
     Queued { detail: String, request_id: u64 },
+    Busy { message: String },
     Failed { message: String },
+}
+
+pub(crate) fn complete_config_reload_apply(
+    mut outcome: ConfigReloadApplyOutcome,
+    plan_handle: &RuntimePlanHandle,
+    runtime_generation: Option<&RuntimeGenerationState>,
+) -> ConfigReloadApplySnapshot {
+    match outcome.completion {
+        ConfigReloadApplyCompletion::None => {}
+        ConfigReloadApplyCompletion::ReplacePlan(applied_plan) => {
+            plan_handle.replace(*applied_plan);
+            outcome.snapshot.active_plan_updated = true;
+        }
+        ConfigReloadApplyCompletion::RequestRuntimeGeneration(request) => {
+            outcome.snapshot.actions.push(
+                match runtime_generation
+                    .map(|runtime_generation| runtime_generation.request_reload(*request))
+                {
+                    Some(Ok(request)) => ConfigReloadApplyAction::RequestRuntimeGeneration(
+                        ConfigReloadRuntimeGenerationActionOutcome::Queued {
+                            request_id: request.request_id,
+                            detail: format!(
+                                "runtime generation reload request {} queued for {}",
+                                request.request_id,
+                                request
+                                    .candidate_config_version
+                                    .as_deref()
+                                    .unwrap_or("<unknown config_version>")
+                            ),
+                        },
+                    ),
+                    Some(Err(error)) => ConfigReloadApplyAction::RequestRuntimeGeneration(
+                        ConfigReloadRuntimeGenerationActionOutcome::Busy {
+                            message: error.to_string(),
+                        },
+                    ),
+                    None => ConfigReloadApplyAction::RequestRuntimeGeneration(
+                        ConfigReloadRuntimeGenerationActionOutcome::Failed {
+                            message: "runtime generation owner is unavailable".to_string(),
+                        },
+                    ),
+                },
+            );
+        }
+    }
+    outcome.snapshot
+}
+
+pub(crate) struct ConfigReloadApplyRuntime<'a> {
+    pub(crate) plan_handle: &'a RuntimePlanHandle,
+    pub(crate) config_apply_gate: &'a RuntimeReloadGate,
+    pub(crate) policy_set: &'a PipelinePolicySet,
+    pub(crate) policy_reload_gate: &'a PolicyReloadGate,
+    pub(crate) enforcement_runtime_state: Option<&'a EnforcementRuntimeState>,
+    pub(crate) enforcement_reload_gate: &'a EnforcementReloadGate,
+    pub(crate) runtime_generation: Option<&'a RuntimeGenerationState>,
+}
+
+pub(crate) async fn apply_config_reload_to_runtime(
+    runtime: ConfigReloadApplyRuntime<'_>,
+    candidate_path: &Path,
+) -> ConfigReloadApplySnapshot {
+    let _apply_guard = runtime.config_apply_gate.lock().await;
+    let plan = runtime.plan_handle.snapshot();
+    let outcome = apply_config_reload(
+        plan.as_ref(),
+        runtime.policy_set,
+        runtime.policy_reload_gate,
+        runtime.enforcement_runtime_state,
+        runtime.enforcement_reload_gate,
+        candidate_path,
+    )
+    .await;
+    complete_config_reload_apply(outcome, runtime.plan_handle, runtime.runtime_generation)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -232,8 +321,7 @@ pub(crate) async fn apply_config_reload(
                     actions: Vec::new(),
                     active_plan_updated: false,
                 },
-                applied_plan: None,
-                runtime_generation_request: None,
+                completion: ConfigReloadApplyCompletion::None,
             };
         }
     };
@@ -250,8 +338,12 @@ pub(crate) async fn apply_config_reload(
                     actions: Vec::new(),
                     active_plan_updated: false,
                 },
-                applied_plan: None,
-                runtime_generation_request,
+                completion: runtime_generation_request.map_or(
+                    ConfigReloadApplyCompletion::None,
+                    |request| {
+                        ConfigReloadApplyCompletion::RequestRuntimeGeneration(Box::new(request))
+                    },
+                ),
             };
         }
         ConfigReloadDecision::ApplyOnline { .. } => {}
@@ -264,8 +356,7 @@ pub(crate) async fn apply_config_reload(
                     actions: Vec::new(),
                     active_plan_updated: false,
                 },
-                applied_plan: None,
-                runtime_generation_request: None,
+                completion: ConfigReloadApplyCompletion::None,
             };
         }
     }
@@ -277,8 +368,7 @@ pub(crate) async fn apply_config_reload(
                 actions: Vec::new(),
                 active_plan_updated: false,
             },
-            applied_plan: None,
-            runtime_generation_request: None,
+            completion: ConfigReloadApplyCompletion::None,
         };
     };
     let applied_plan = online_applied_plan(current_plan, online_update);
@@ -360,8 +450,7 @@ pub(crate) async fn apply_config_reload(
                 actions,
                 active_plan_updated: false,
             },
-            applied_plan: None,
-            runtime_generation_request: None,
+            completion: ConfigReloadApplyCompletion::None,
         };
     }
 
@@ -369,10 +458,9 @@ pub(crate) async fn apply_config_reload(
         snapshot: ConfigReloadApplySnapshot {
             plan,
             actions,
-            active_plan_updated: true,
+            active_plan_updated: false,
         },
-        applied_plan: Some(applied_plan),
-        runtime_generation_request: None,
+        completion: ConfigReloadApplyCompletion::ReplacePlan(Box::new(applied_plan)),
     }
 }
 
@@ -714,6 +802,7 @@ fn section_changed(
         ConfigReloadSection::Export => {
             current.export != candidate.export || current.exporters != candidate.exporters
         }
+        ConfigReloadSection::RuntimeReload => current.runtime_reload != candidate.runtime_reload,
         ConfigReloadSection::PolicyReload => current.policy_reload != candidate.policy_reload,
         ConfigReloadSection::Policies => current.policies != candidate.policies,
         ConfigReloadSection::Selectors => current.selectors != candidate.selectors,
@@ -772,6 +861,7 @@ fn section_name(section: ConfigReloadSection) -> &'static str {
         ConfigReloadSection::Observations => "observations",
         ConfigReloadSection::Storage => "storage",
         ConfigReloadSection::Export => "export",
+        ConfigReloadSection::RuntimeReload => "runtime_reload",
         ConfigReloadSection::PolicyReload => "policy_reload",
         ConfigReloadSection::Policies => "policies",
         ConfigReloadSection::Selectors => "selectors",
@@ -783,7 +873,7 @@ fn section_name(section: ConfigReloadSection) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, net::TcpListener, path::PathBuf};
+    use std::{fs, net::TcpListener, path::PathBuf, sync::Arc};
 
     use probe_config::{
         AgentConfig, CaptureBackend, CaptureSelection, EnforcementConfig,
@@ -1014,6 +1104,53 @@ mod tests {
         );
         assert_eq!(request.changed_sections, ["capture"]);
         assert_eq!(request.candidate_config, candidate);
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn complete_config_reload_apply_reports_busy_generation_without_replacing_plan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-busy-generation")?;
+        let current = runtime_plan(base_config(temp.join("spool")))?;
+        let mut candidate = current.config.clone();
+        candidate.capture.fallback_backends = vec![LiveCaptureBackend::Libpcap];
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+        let plan_handle = RuntimePlanHandle::new(Arc::new(current.clone()));
+        let runtime_generation =
+            RuntimeGenerationState::for_config_version(current.config.config_version.clone());
+        runtime_generation.request_reload(RuntimeGenerationReloadRequestInput {
+            candidate_path: candidate_path.clone(),
+            candidate_config: candidate.clone(),
+            current_config_version: current.config.config_version.clone(),
+            candidate_config_version: Some(candidate.config_version.clone()),
+            changed_sections: vec!["capture".to_string()],
+        })?;
+
+        let outcome = apply_config_reload(
+            &current,
+            &PipelinePolicySet::default(),
+            &PolicyReloadGate::default(),
+            None,
+            &EnforcementReloadGate::default(),
+            &candidate_path,
+        )
+        .await;
+        let snapshot =
+            complete_config_reload_apply(outcome, &plan_handle, Some(&runtime_generation));
+
+        assert!(!snapshot.active_plan_updated);
+        assert!(matches!(
+            snapshot.actions.as_slice(),
+            [ConfigReloadApplyAction::RequestRuntimeGeneration(
+                ConfigReloadRuntimeGenerationActionOutcome::Busy { .. },
+            )]
+        ));
+        assert_eq!(
+            plan_handle.snapshot().config.capture.fallback_backends,
+            current.config.capture.fallback_backends
+        );
         fs::remove_dir_all(temp)?;
         Ok(())
     }
@@ -1390,6 +1527,38 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(
                 ConfigReloadSection::Policies,
+                ConfigReloadSectionReloadMode::ProcessRestart
+            )]
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_keeps_runtime_reload_topology_changes_restart_required()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-runtime-watcher")?;
+        let current = runtime_plan(base_config(temp.join("spool")))?;
+        let mut candidate = current.config.clone();
+        candidate.runtime_reload.watch_config = true;
+        candidate.runtime_reload.debounce_ms = 250;
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current.config, &candidate_path);
+
+        assert!(
+            matches!(plan.decision, ConfigReloadDecision::RestartRequired { .. }),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.reload_mode))
+                .collect::<Vec<_>>(),
+            vec![(
+                ConfigReloadSection::RuntimeReload,
                 ConfigReloadSectionReloadMode::ProcessRestart
             )]
         );

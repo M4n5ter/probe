@@ -65,6 +65,10 @@ batches_per_tick = 2
 [exporters.tls]
 trust_anchor_refs = ["collector-ca"]
 
+[runtime_reload]
+watch_config = true
+debounce_ms = 750
+
 [[tls.materials]]
 id = "collector-ca"
 kind = "trust_anchor"
@@ -147,6 +151,8 @@ listen_addr = "127.0.0.1:9464"
     );
     assert_eq!(config.exporters[0].codec, CompressionCodecName::Zstd);
     assert_eq!(config.exporters[0].worker.batches_per_tick, Some(2));
+    assert!(config.runtime_reload.watch_config);
+    assert_eq!(config.runtime_reload.debounce_ms, 750);
     let ExporterTransportConfig::Webhook { tls, .. } = &config.exporters[0].transport else {
         panic!("expected webhook exporter");
     };
