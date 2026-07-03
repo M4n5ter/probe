@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
-use probe_core::{ProcessSelector, Selector, SelectorTerm, TrafficSelector};
+use probe_core::{EventType, ProcessSelector, Selector, SelectorTerm, TrafficSelector};
 use serde_json::Value;
 
 use crate::{
@@ -22,6 +22,10 @@ pub(super) enum AdminCliCommand {
         limit: usize,
         #[arg(long)]
         process_exe_glob: Option<String>,
+        #[arg(long)]
+        http: bool,
+        #[arg(long = "event-type")]
+        event_types: Vec<EventType>,
     },
     EventDetail {
         #[arg(long)]
@@ -73,10 +77,13 @@ fn admin_request(command: AdminCliCommand) -> AdminRequest {
             after_sequence,
             limit,
             process_exe_glob,
+            http,
+            event_types,
         } => AdminRequest::TailEvents {
             after_sequence,
             limit,
             selector: process_exe_glob.map(process_exe_selector),
+            event_types: tail_event_types(http, event_types),
         },
         AdminCliCommand::EventDetail { sequence } => AdminRequest::EventDetail { sequence },
         AdminCliCommand::PlanConfigReload { config } => {
@@ -86,6 +93,23 @@ fn admin_request(command: AdminCliCommand) -> AdminRequest {
         AdminCliCommand::ReloadPolicies => AdminRequest::ReloadPolicies,
         AdminCliCommand::ReloadEnforcementPolicy => AdminRequest::ReloadEnforcementPolicy,
     }
+}
+
+fn tail_event_types(http: bool, mut event_types: Vec<EventType>) -> Vec<EventType> {
+    if http {
+        event_types.extend(http_event_types());
+    }
+    event_types.sort_by_key(|event_type| event_type.as_str());
+    event_types.dedup();
+    event_types
+}
+
+fn http_event_types() -> [EventType; 3] {
+    [
+        EventType::HttpRequestHeaders,
+        EventType::HttpResponseHeaders,
+        EventType::HttpBodyChunk,
+    ]
 }
 
 fn process_exe_selector(exe_path_glob: String) -> Selector {
@@ -153,11 +177,19 @@ mod tests {
                 after_sequence: 7,
                 limit: 10,
                 process_exe_glob: Some("/usr/bin/curl".to_string()),
+                http: true,
+                event_types: vec![EventType::Gap, EventType::HttpRequestHeaders],
             }),
             AdminRequest::TailEvents {
                 after_sequence: 7,
                 limit: 10,
                 selector: Some(process_exe_selector("/usr/bin/curl".to_string())),
+                event_types: vec![
+                    EventType::Gap,
+                    EventType::HttpBodyChunk,
+                    EventType::HttpRequestHeaders,
+                    EventType::HttpResponseHeaders,
+                ],
             }
         );
         assert_eq!(

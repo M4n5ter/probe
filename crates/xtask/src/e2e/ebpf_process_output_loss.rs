@@ -110,6 +110,7 @@ fn run_at(
         EbpfProcessObservationProbeConfig::new(ebpf_object_path),
         Box::<ProcfsEbpfFlowResolver>::default(),
         Some(selector),
+        None,
     )?;
 
     start_http1_loopback_fixture(&fixture_start_path, &fixture_ready.start_nonce)?;

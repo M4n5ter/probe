@@ -319,12 +319,14 @@ async fn handle_admin_request(
             after_sequence,
             limit,
             selector,
+            event_types,
         } => match read_event_tail(
             spool,
             EventTailRequest {
                 after_sequence,
                 limit,
                 selector,
+                event_types,
             },
         ) {
             Ok(tail) => AdminResponse::EventTail {
@@ -526,6 +528,7 @@ mod tests {
                         ..TrafficSelector::default()
                     },
                 )),
+                event_types: Vec::new(),
             },
         )
         .await?;

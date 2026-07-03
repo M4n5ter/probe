@@ -393,9 +393,10 @@ mod tests {
 
     use probe_config::{
         AgentConfig, CaptureSelection, CompressionCodecName, ExporterConfig,
-        ExporterTransportConfig, LiveCaptureBackend, TransparentInterceptionStrategyConfig,
+        ExporterTransportConfig, ObservationDataPathMode, ProcessObservationConfig,
+        TransparentInterceptionStrategyConfig,
     };
-    use probe_core::{EnforcementMode, ProcessSelector, Selector, TrafficSelector};
+    use probe_core::{Direction, EnforcementMode, ProcessSelector, Selector, TrafficSelector};
     use tempfile::TempDir;
 
     use super::super::{
@@ -403,10 +404,6 @@ mod tests {
         fields::{
             FieldApplyOutcome, FieldId, apply_field, apply_text_field, editable_text_value,
             fields_for_tab,
-        },
-        mitm_setup::{
-            MitmQuickSetupDirection, MitmQuickSetupOutcome, MitmQuickSetupWarning,
-            apply_mitm_quick_setup_with_profile,
         },
     };
     use super::*;
@@ -849,117 +846,26 @@ exporters = [{ id = "default", transport = "file", path = "/tmp/events.jsonl", c
     }
 
     #[test]
-    fn mitm_quick_setup_persists_full_contract_through_save_and_reload()
+    fn process_observation_persists_through_save_and_reload()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = TempDir::new()?;
         let path = temp.path().join("agent.toml");
         let source = field_persistence_base_source();
         fs::write(&path, source)?;
         let mut config = AgentConfig::from_toml_str(source)?;
-        let profile = LocalProbeProfile::with_root(temp.path());
+        config.observations.push(ProcessObservationConfig {
+            id: "curl".to_string(),
+            selector: exe_selector("/usr/bin/curl"),
+            data_path: ObservationDataPathMode::Libpcap,
+            directions: vec![Direction::Inbound, Direction::Outbound],
+        });
 
-        let outcome = apply_mitm_quick_setup_with_profile(
-            &mut config,
-            MitmQuickSetupDirection::Inbound,
-            Some(exe_selector("/usr/bin/curl")),
-            &profile.mitm,
-        );
-
-        assert_eq!(
-            outcome,
-            MitmQuickSetupOutcome::Changed {
-                direction: MitmQuickSetupDirection::Inbound,
-                warnings: vec![MitmQuickSetupWarning::MissingProxyExecutable {
-                    path: profile
-                        .mitm
-                        .proxy_program()
-                        .expect("test profile should configure a proxy program")
-                        .to_path_buf(),
-                }],
-            }
-        );
-        let rendered = save_config_with_local_profile(&path, source, &config, &profile)?;
-        assert!(rendered.contains("[enforcement.interception.mitm]"));
-        assert!(rendered.contains("mode = \"product_proxy\""));
-        assert!(rendered.contains("[enforcement.policy.source]"));
-        assert!(rendered.contains("[[tls.materials]]"));
-        assert!(profile.mitm.enforcement_policy_file.is_file());
-        assert!(
-            profile
-                .mitm
-                .plaintext_feed
-                .parent()
-                .expect("feed parent")
-                .is_dir()
-        );
-        assert!(profile.mitm.ca_certificate.is_file());
-        assert!(profile.mitm.ca_private_key.is_file());
+        let rendered = save_config(&path, source, &config)?;
         let reloaded = AgentConfig::from_toml_str(&rendered)?;
 
-        assert_eq!(reloaded, config);
-        Ok(())
-    }
-
-    #[test]
-    fn mitm_quick_setup_persists_repaired_empty_capture_fallbacks()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temp = TempDir::new()?;
-        let path = temp.path().join("agent.toml");
-        let source =
-            mitm_quick_setup_source_with_capture_fallbacks("libpcap", "fallback_backends = []");
-        fs::write(&path, &source)?;
-        let mut config = AgentConfig::from_toml_str(&source)?;
-        let profile = LocalProbeProfile::with_root(temp.path());
-
-        apply_mitm_quick_setup_with_profile(
-            &mut config,
-            MitmQuickSetupDirection::Inbound,
-            Some(exe_selector("/usr/bin/curl")),
-            &profile.mitm,
-        );
-
-        let rendered = save_config_with_local_profile(&path, &source, &config, &profile)?;
-        let reloaded = AgentConfig::from_toml_str(&rendered)?;
-
-        assert!(rendered.contains("selection = \"auto\""));
-        assert!(rendered.contains("fallback_backends = [\"ebpf\", \"libpcap\"]"));
-        assert_eq!(
-            reloaded.capture.fallback_backends,
-            vec![LiveCaptureBackend::Ebpf, LiveCaptureBackend::Libpcap]
-        );
-        assert_eq!(reloaded, config);
-        Ok(())
-    }
-
-    #[test]
-    fn mitm_quick_setup_persists_deduplicated_capture_fallbacks()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temp = TempDir::new()?;
-        let path = temp.path().join("agent.toml");
-        let source = mitm_quick_setup_source_with_capture_fallbacks(
-            "libpcap",
-            "fallback_backends = [\"libpcap\", \"libpcap\", \"ebpf\"]",
-        );
-        fs::write(&path, &source)?;
-        let mut config = AgentConfig::from_toml_str(&source)?;
-        let profile = LocalProbeProfile::with_root(temp.path());
-
-        apply_mitm_quick_setup_with_profile(
-            &mut config,
-            MitmQuickSetupDirection::Inbound,
-            Some(exe_selector("/usr/bin/curl")),
-            &profile.mitm,
-        );
-
-        let rendered = save_config_with_local_profile(&path, &source, &config, &profile)?;
-        let reloaded = AgentConfig::from_toml_str(&rendered)?;
-
-        assert!(rendered.contains("selection = \"auto\""));
-        assert!(rendered.contains("fallback_backends = [\"libpcap\", \"ebpf\"]"));
-        assert_eq!(
-            reloaded.capture.fallback_backends,
-            vec![LiveCaptureBackend::Libpcap, LiveCaptureBackend::Ebpf]
-        );
+        assert!(rendered.contains("[[observations]]"));
+        assert!(rendered.contains("data_path = \"libpcap\""));
+        assert!(rendered.contains("directions = [\"inbound\", \"outbound\"]"));
         assert_eq!(reloaded, config);
         Ok(())
     }
@@ -1147,28 +1053,6 @@ transport = "file"
 path = "/tmp/events.jsonl"
 codec = "zstd"
 "#
-    }
-
-    fn mitm_quick_setup_source_with_capture_fallbacks(
-        selection: &str,
-        fallback_line: &str,
-    ) -> String {
-        format!(
-            r#"
-agent_id = "probe"
-config_version = "local"
-
-[capture]
-selection = "{selection}"
-{fallback_line}
-
-[[exporters]]
-id = "default"
-transport = "file"
-path = "/tmp/events.jsonl"
-codec = "zstd"
-"#
-        )
     }
 
     fn exe_selector(path: &str) -> Selector {

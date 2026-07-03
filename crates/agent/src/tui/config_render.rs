@@ -7,7 +7,8 @@ use std::{
 use probe_config::{
     AgentConfig, EnforcementPolicyConfig, EnforcementPolicyReloadConfig,
     EnforcementPolicySourceConfig, ExporterConfig, ExporterTlsConfig, ExporterTransportConfig,
-    LiveCaptureBackend, TlsMaterialConfig, TransparentInterceptionProxyConfig,
+    LiveCaptureBackend, ProcessObservationConfig, TlsMaterialConfig,
+    TransparentInterceptionProxyConfig,
 };
 use probe_core::{Direction, Selector, SelectorTerm};
 use serde::Serialize;
@@ -58,6 +59,7 @@ pub(super) fn render_preserving_config(
         "deep_observe_selector",
         config.capture.deep_observe_selector.as_ref(),
     )?;
+    sync_observations(&mut document, &config.observations)?;
     set_value(
         &mut document,
         &["export", "worker"],
@@ -187,6 +189,40 @@ fn sync_exporters(
         };
         sync_exporter_table(table, exporter)?;
     }
+    Ok(())
+}
+
+fn sync_observations(
+    document: &mut DocumentMut,
+    observations: &[ProcessObservationConfig],
+) -> Result<(), TuiError> {
+    let root = document.as_table_mut();
+    if observations.is_empty() {
+        root.remove("observations");
+        return Ok(());
+    }
+    let mut array = ArrayOfTables::new();
+    for observation in observations {
+        let mut table = Table::new();
+        set_table_item(&mut table, "id", value(&observation.id));
+        set_table_item(
+            &mut table,
+            "data_path",
+            value(observation.data_path.label()),
+        );
+        set_table_item(
+            &mut table,
+            "directions",
+            value(array_directions(&observation.directions)),
+        );
+        set_table_item(
+            &mut table,
+            "selector",
+            selector_item(&observation.selector)?,
+        );
+        array.push(table);
+    }
+    root.insert("observations", Item::ArrayOfTables(array));
     Ok(())
 }
 
@@ -615,9 +651,9 @@ mod tests {
 
     use probe_config::{
         AgentConfig, CaptureSelection, CompressionCodecName, ExporterTlsConfig,
-        ExporterTransportConfig,
+        ExporterTransportConfig, ObservationDataPathMode, ProcessObservationConfig,
     };
-    use probe_core::{ProcessSelector, Selector, TrafficSelector};
+    use probe_core::{Direction, ProcessSelector, Selector, TrafficSelector};
 
     use super::*;
 
@@ -733,6 +769,44 @@ selection = "auto"
         assert!(rendered.contains("[capture.deep_observe_selector.term.process]"));
         assert!(rendered.contains("exe_path_globs = [\"/usr/bin/curl\"]"));
         AgentConfig::from_toml_str(&rendered)?.validate_basic()?;
+        Ok(())
+    }
+
+    #[test]
+    fn observations_are_written_as_process_data_path_profiles()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"
+agent_id = "probe"
+config_version = "local"
+
+[capture]
+selection = "auto"
+"#;
+        let mut config = AgentConfig::from_toml_str(source)?;
+        config.observations.push(ProcessObservationConfig {
+            id: "curl".to_string(),
+            selector: Selector::term(
+                ProcessSelector {
+                    exe_path_globs: vec!["/usr/bin/curl".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            ),
+            data_path: ObservationDataPathMode::Libpcap,
+            directions: vec![Direction::Inbound, Direction::Outbound],
+        });
+
+        let rendered = render_preserving_config(source, &config, Path::new("/tmp/agent.toml"))?;
+        let reloaded = AgentConfig::from_toml_str(&rendered)?;
+
+        assert!(rendered.contains("[[observations]]"));
+        assert!(rendered.contains("id = \"curl\""));
+        assert!(rendered.contains("data_path = \"libpcap\""));
+        assert!(rendered.contains("directions = [\"inbound\", \"outbound\"]"));
+        assert!(rendered.contains("[observations.selector]"));
+        assert!(rendered.contains("[observations.selector.term.process]"));
+        assert_eq!(reloaded.observations, config.observations);
+        reloaded.validate_basic()?;
         Ok(())
     }
 

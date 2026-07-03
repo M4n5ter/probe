@@ -1,6 +1,44 @@
-use probe_core::{CompiledSelector, Direction, FlowContext};
+use probe_core::{CompiledSelector, Direction, FlowContext, ProcessContext};
 
 use super::{descriptor_lease::DescriptorLease, payload_direction::PayloadDirections};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessPayloadSampleAuthorization {
+    tgid: u32,
+    payload_directions: PayloadDirections,
+}
+
+impl ProcessPayloadSampleAuthorization {
+    pub fn from_unattributed_selector(
+        tgid: u32,
+        process: &ProcessContext,
+        selector: &CompiledSelector,
+    ) -> Option<Self> {
+        let mut payload_directions = PayloadDirections::empty();
+        if selector.matches_unattributed_flow(process, Direction::Inbound) {
+            payload_directions.insert(Direction::Inbound);
+        }
+        if selector.matches_unattributed_flow(process, Direction::Outbound) {
+            payload_directions.insert(Direction::Outbound);
+        }
+        Self::new(tgid, payload_directions)
+    }
+
+    fn new(tgid: u32, payload_directions: PayloadDirections) -> Option<Self> {
+        (tgid != 0 && !payload_directions.is_empty()).then_some(Self {
+            tgid,
+            payload_directions,
+        })
+    }
+
+    pub(super) fn tgid(self) -> u32 {
+        self.tgid
+    }
+
+    pub(super) fn payload_directions(self) -> PayloadDirections {
+        self.payload_directions
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SocketPayloadSampleAuthorization {
@@ -176,6 +214,80 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn process_authorization_projects_unattributed_direction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let selector = process_direction_selector([Direction::Inbound])?;
+        let authorization = ProcessPayloadSampleAuthorization::from_unattributed_selector(
+            100,
+            &flow().process,
+            &selector,
+        )
+        .expect("expected process authorization");
+
+        assert_eq!(authorization.tgid(), 100);
+        assert!(
+            authorization
+                .payload_directions()
+                .allows(Direction::Inbound)
+        );
+        assert!(
+            !authorization
+                .payload_directions()
+                .allows(Direction::Outbound)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn process_authorization_rejects_flow_only_selector() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let selector = selector([Direction::Outbound], 443)?;
+
+        let authorization = ProcessPayloadSampleAuthorization::from_unattributed_selector(
+            100,
+            &flow().process,
+            &selector,
+        );
+
+        assert!(authorization.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn process_authorization_rejects_flow_dependent_process_selector()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let selector = Selector::All {
+            selectors: vec![
+                Selector::term(
+                    ProcessSelector {
+                        names: vec!["curl".to_string()],
+                        ..ProcessSelector::default()
+                    },
+                    TrafficSelector::default(),
+                ),
+                Selector::term(
+                    ProcessSelector::default(),
+                    TrafficSelector {
+                        remote_ports: vec![443],
+                        directions: vec![Direction::Outbound],
+                        ..TrafficSelector::default()
+                    },
+                ),
+            ],
+        }
+        .compile()?;
+
+        let authorization = ProcessPayloadSampleAuthorization::from_unattributed_selector(
+            100,
+            &flow().process,
+            &selector,
+        );
+
+        assert!(authorization.is_none());
+        Ok(())
+    }
+
     fn authorization_for_directions(
         directions: impl IntoIterator<Item = Direction>,
     ) -> Result<Option<SocketPayloadSampleAuthorization>, Box<dyn std::error::Error>> {
@@ -195,6 +307,22 @@ mod tests {
             ProcessSelector::default(),
             TrafficSelector {
                 remote_ports: vec![remote_port],
+                directions: directions.into_iter().collect(),
+                ..TrafficSelector::default()
+            },
+        )
+        .compile()?)
+    }
+
+    fn process_direction_selector(
+        directions: impl IntoIterator<Item = Direction>,
+    ) -> Result<CompiledSelector, Box<dyn std::error::Error>> {
+        Ok(Selector::term(
+            ProcessSelector {
+                names: vec!["curl".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector {
                 directions: directions.into_iter().collect(),
                 ..TrafficSelector::default()
             },

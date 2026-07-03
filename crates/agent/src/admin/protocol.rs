@@ -50,6 +50,7 @@ admin_requests! {
         after_sequence: u64,
         limit: usize,
         selector: Option<probe_core::Selector>,
+        event_types: Vec<probe_core::EventType>,
     } => ("tail_events", false),
     EventDetail {
         sequence: u64,

@@ -3,6 +3,7 @@ mod agent;
 mod capture;
 mod enforcement;
 mod export;
+mod observation;
 mod paths;
 mod policy;
 mod storage;
@@ -89,6 +90,7 @@ pub use export::{
     ExportWorkerRuntimeConfig, ExportWorkerScheduleConfig, ExporterConfig, ExporterTlsConfig,
     ExporterTransportConfig, ExporterWorkerConfig,
 };
+pub use observation::{ObservationDataPathMode, ProcessObservationConfig};
 pub use paths::{
     DEFAULT_PROBE_HOME_STATE_DIR, FALLBACK_PROBE_HOME, PROBE_HOME_ENV, default_admin_socket_path,
     default_config_path, default_enforcement_policy_path, default_export_file_path,

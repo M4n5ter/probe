@@ -1,8 +1,9 @@
 use crate::{CaptureError, EbpfProcessObservationTracepointFiring};
 
 use super::{
-    EbpfProcessObservation, EbpfProcessObservationProbe, descriptor_lease::DescriptorLeaseKey,
-    payload_authorization::SocketPayloadSampleAuthorization,
+    EbpfProcessObservation, EbpfProcessObservationProbe,
+    descriptor_lease::DescriptorLeaseKey,
+    payload_authorization::{ProcessPayloadSampleAuthorization, SocketPayloadSampleAuthorization},
 };
 
 pub(super) trait EbpfObservationSource {
@@ -12,6 +13,13 @@ pub(super) trait EbpfObservationSource {
         &mut self,
         authorization: SocketPayloadSampleAuthorization,
     ) -> Result<(), CaptureError>;
+
+    fn allow_process_payload_sample(
+        &mut self,
+        authorization: ProcessPayloadSampleAuthorization,
+    ) -> Result<(), CaptureError>;
+
+    fn revoke_process_payload_sample(&mut self, tgid: u32) -> Result<(), CaptureError>;
 
     fn revoke_socket_payload_sample(
         &mut self,
@@ -48,6 +56,21 @@ impl EbpfObservationSource for ProbeObservationSource {
     ) -> Result<(), CaptureError> {
         self.probe
             .allow_socket_payload_sample(authorization)
+            .map_err(|error| CaptureError::provider("ebpf", error.to_string()))
+    }
+
+    fn allow_process_payload_sample(
+        &mut self,
+        authorization: ProcessPayloadSampleAuthorization,
+    ) -> Result<(), CaptureError> {
+        self.probe
+            .allow_process_payload_sample(authorization)
+            .map_err(|error| CaptureError::provider("ebpf", error.to_string()))
+    }
+
+    fn revoke_process_payload_sample(&mut self, tgid: u32) -> Result<(), CaptureError> {
+        self.probe
+            .revoke_process_payload_sample(tgid)
             .map_err(|error| CaptureError::provider("ebpf", error.to_string()))
     }
 

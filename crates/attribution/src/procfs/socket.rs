@@ -187,6 +187,10 @@ impl ProcfsSocketResolver {
             .identify_tcp_fd_in_snapshot(lookup, snapshot)
     }
 
+    pub fn resolve_process(&self, pid: u32) -> Result<Option<ProcessContext>, AttributionError> {
+        self.attributor.identify_process(pid)
+    }
+
     fn refresh_snapshot_if_needed(&mut self) -> Result<(), AttributionError> {
         if self.snapshot_needs_refresh() {
             self.snapshot = Some(CachedProcfsSocketSnapshot {
@@ -363,6 +367,10 @@ impl ProcfsSocketAttributor {
             return Err(error);
         }
         self.identify_hinted_fd_in_snapshot(&lookup, snapshot)
+    }
+
+    fn identify_process(&self, pid: u32) -> Result<Option<ProcessContext>, AttributionError> {
+        self.process_attributor.identify_if_present(pid)
     }
 
     fn identify_fd_candidates_in_snapshot(

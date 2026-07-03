@@ -3,7 +3,7 @@ mod rows;
 
 use std::path::{Path, PathBuf};
 
-use probe_core::Selector;
+use probe_core::{EventType, Selector};
 
 use self::{
     client::{request_event_detail, request_tail_events},
@@ -11,9 +11,12 @@ use self::{
 };
 use crate::{
     admin::{AdminClientError, EventDetailSnapshot, EventTailOmission, EventTailSnapshot},
-    tui::runtime_status::{
-        CaptureDiagnosticMessage, missing_mitm_quick_setup_action, mitm_fallback_coverage_line,
-        mitm_visibility_lines,
+    tui::{
+        runtime_status::{
+            CaptureDiagnosticMessage, missing_mitm_configuration_action,
+            mitm_data_path_coverage_line, mitm_visibility_lines,
+        },
+        text::terminal_safe_inline_text,
     },
 };
 
@@ -40,7 +43,7 @@ impl TrafficDetailLoadResult {
         Self {
             sequence,
             request_id,
-            result: Err(message.into()),
+            result: Err(terminal_safe_inline_text(message)),
         }
     }
 }
@@ -62,12 +65,14 @@ pub(crate) async fn load_traffic_detail(
 pub(crate) struct TrafficState {
     after_sequence: u64,
     selector_key: Option<String>,
+    anchor_to_latest: bool,
     rows: Vec<TrafficRow>,
     selected_index: usize,
     scroll: usize,
     status: TrafficStatus,
     last_export_sequence: u64,
     detail_state: TrafficDetailState,
+    event_filter: TrafficEventFilter,
 }
 
 impl Default for TrafficState {
@@ -75,12 +80,14 @@ impl Default for TrafficState {
         Self {
             after_sequence: 0,
             selector_key: None,
+            anchor_to_latest: true,
             rows: Vec::new(),
             selected_index: 0,
             scroll: 0,
             status: TrafficStatus::idle("Traffic view uses the running admin socket"),
             last_export_sequence: 0,
             detail_state: TrafficDetailState::Idle,
+            event_filter: TrafficEventFilter::Http,
         }
     }
 }
@@ -151,14 +158,21 @@ impl TrafficState {
         self.last_export_sequence
     }
 
+    pub(crate) fn event_filter_label(&self) -> &'static str {
+        self.event_filter.label()
+    }
+
     pub(crate) fn diagnostic_lines(&self) -> Vec<String> {
         let mut lines = vec![
             "Select a traffic row to inspect details".to_string(),
             "Open Data Path diagnostics for capture and MITM readiness".to_string(),
-            mitm_fallback_coverage_line(),
+            mitm_data_path_coverage_line(),
         ];
         lines.extend(mitm_visibility_lines());
-        lines.push(format!("MITM setup: {}", missing_mitm_quick_setup_action()));
+        lines.push(format!(
+            "configuration: {}",
+            missing_mitm_configuration_action()
+        ));
         lines
     }
 
@@ -173,8 +187,19 @@ impl TrafficState {
         if Some(selector_key.clone()) != self.selector_key {
             self.reset_for_selector(selector_key);
         }
+        let event_types = self.event_filter.event_types();
 
-        match request_tail_events(socket_path, self.after_sequence, selector).await {
+        if self.anchor_to_latest {
+            match request_tail_events(socket_path, u64::MAX, selector.clone(), &event_types).await {
+                Ok(snapshot) => self.apply_anchor_snapshot(snapshot),
+                Err(error) => {
+                    self.status = TrafficStatus::error(traffic_refresh_error_message(&error));
+                    return;
+                }
+            }
+        }
+
+        match request_tail_events(socket_path, self.after_sequence, selector, &event_types).await {
             Ok(snapshot) => self.apply_snapshot(snapshot),
             Err(error) => {
                 self.status = TrafficStatus::error(traffic_refresh_error_message(&error));
@@ -220,6 +245,15 @@ impl TrafficState {
         self.status = TrafficStatus::error(message);
     }
 
+    pub(crate) fn cycle_event_filter(&mut self) {
+        self.event_filter = self.event_filter.next();
+        self.reset_tail();
+        self.status = TrafficStatus::idle(format!(
+            "Traffic event filter changed to {}",
+            self.event_filter.label()
+        ));
+    }
+
     pub(crate) fn apply_runtime_diagnostic_message(
         &mut self,
         message: Option<CaptureDiagnosticMessage>,
@@ -262,13 +296,28 @@ impl TrafficState {
     }
 
     fn reset_for_selector(&mut self, selector_key: String) {
-        self.after_sequence = 0;
+        self.reset_tail();
         self.selector_key = Some(selector_key);
+        self.status = TrafficStatus::idle("Traffic filter changed");
+    }
+
+    fn reset_tail(&mut self) {
+        self.after_sequence = 0;
+        self.anchor_to_latest = true;
         self.rows.clear();
         self.selected_index = 0;
         self.scroll = 0;
         self.detail_state = TrafficDetailState::Idle;
-        self.status = TrafficStatus::idle("Traffic filter changed");
+    }
+
+    fn apply_anchor_snapshot(&mut self, snapshot: EventTailSnapshot) {
+        self.after_sequence = snapshot.last_export_sequence;
+        self.last_export_sequence = snapshot.last_export_sequence;
+        self.anchor_to_latest = false;
+        self.status = TrafficStatus::idle(format!(
+            "Watching new matching events after export sequence {}",
+            snapshot.last_export_sequence
+        ));
     }
 
     fn apply_snapshot(&mut self, snapshot: EventTailSnapshot) {
@@ -297,7 +346,10 @@ impl TrafficState {
     }
 
     fn mark_detail_error(&mut self, sequence: u64, message: String) {
-        self.detail_state = TrafficDetailState::Failed { sequence, message };
+        self.detail_state = TrafficDetailState::Failed {
+            sequence,
+            message: terminal_safe_inline_text(message),
+        };
         self.status =
             TrafficStatus::warning(format!("Failed to load full event detail {sequence}"));
     }
@@ -322,6 +374,39 @@ impl TrafficState {
                     .selected_index
                     .saturating_sub(visible_rows.saturating_sub(1));
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrafficEventFilter {
+    Http,
+    All,
+}
+
+impl TrafficEventFilter {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Http => "HTTP",
+            Self::All => "All",
+        }
+    }
+
+    fn event_types(self) -> Vec<EventType> {
+        match self {
+            Self::Http => vec![
+                EventType::HttpRequestHeaders,
+                EventType::HttpResponseHeaders,
+                EventType::HttpBodyChunk,
+            ],
+            Self::All => Vec::new(),
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Http => Self::All,
+            Self::All => Self::Http,
         }
     }
 }
@@ -352,28 +437,28 @@ impl TrafficStatus {
     fn idle(text: impl Into<String>) -> Self {
         Self {
             kind: TrafficStatusKind::Idle,
-            text: text.into(),
+            text: terminal_safe_inline_text(text),
         }
     }
 
     fn active(text: impl Into<String>) -> Self {
         Self {
             kind: TrafficStatusKind::Active,
-            text: text.into(),
+            text: terminal_safe_inline_text(text),
         }
     }
 
     fn warning(text: impl Into<String>) -> Self {
         Self {
             kind: TrafficStatusKind::Warning,
-            text: text.into(),
+            text: terminal_safe_inline_text(text),
         }
     }
 
     fn error(text: impl Into<String>) -> Self {
         Self {
             kind: TrafficStatusKind::Error,
-            text: text.into(),
+            text: terminal_safe_inline_text(text),
         }
     }
 }
@@ -474,8 +559,89 @@ mod tests {
         status::{
             CaptureCandidateStatusSnapshot, CaptureOpenFailureStatusSnapshot, CaptureStatusSnapshot,
         },
-        tui::runtime_status::TrafficRuntimeDiagnostics,
+        tui::{runtime_status::TrafficRuntimeDiagnostics, text::INLINE_TEXT_MAX_CHARS},
     };
+
+    #[test]
+    fn traffic_status_text_is_terminal_safe() {
+        let raw = format!(
+            "tail_events failed\nstderr: \x1b[32m{}",
+            "x".repeat(INLINE_TEXT_MAX_CHARS * 2)
+        );
+
+        let status = TrafficStatus::error(raw);
+
+        assert_eq!(status.kind, TrafficStatusKind::Error);
+        assert!(!status.text.chars().any(char::is_control));
+        assert!(status.text.chars().count() <= INLINE_TEXT_MAX_CHARS);
+        assert!(status.text.contains("tail_events failed stderr:"));
+        assert!(status.text.ends_with("..."));
+    }
+
+    #[test]
+    fn traffic_detail_error_text_is_terminal_safe() {
+        let mut traffic = TrafficState::default();
+        traffic.apply_snapshot(tail_snapshot_with_response_budget_omission());
+        traffic.mark_detail_loading(2, 11);
+        traffic.apply_detail_load_result(TrafficDetailLoadResult::failed(
+            2,
+            11,
+            format!(
+                "admin error\nstderr: \x1b[31m{}",
+                "x".repeat(INLINE_TEXT_MAX_CHARS * 2)
+            ),
+        ));
+
+        let lines = traffic
+            .selected_detail_lines()
+            .expect("selected detail should remain visible")
+            .into_iter()
+            .filter(|line| line.starts_with("Reason: "))
+            .collect::<Vec<_>>();
+        let detail_error = lines
+            .iter()
+            .find(|line| line.contains("admin error"))
+            .expect("detail error reason should be visible");
+
+        assert!(!detail_error.chars().any(char::is_control));
+        assert!(detail_error.chars().count() <= INLINE_TEXT_MAX_CHARS + "Reason: ".len());
+    }
+
+    #[test]
+    fn filter_reset_anchors_live_tail_to_latest_export_sequence() {
+        let mut traffic = TrafficState::default();
+
+        traffic.reset_for_selector("exe:/app/backend".to_string());
+        assert!(traffic.anchor_to_latest);
+
+        traffic.apply_anchor_snapshot(empty_tail_snapshot(12_345));
+
+        assert!(!traffic.anchor_to_latest);
+        assert_eq!(traffic.after_sequence, 12_345);
+        assert_eq!(traffic.last_export_sequence(), 12_345);
+        assert!(traffic.rows().is_empty());
+        assert_eq!(traffic.status().kind, TrafficStatusKind::Idle);
+        assert_eq!(
+            traffic.status().text,
+            "Watching new matching events after export sequence 12345"
+        );
+    }
+
+    #[test]
+    fn event_filter_defaults_to_http_and_cycles_with_tail_reset() {
+        let mut traffic = TrafficState::default();
+        traffic.apply_snapshot(tail_snapshot_with_response_budget_omission());
+
+        assert_eq!(traffic.event_filter_label(), "HTTP");
+        assert!(!traffic.rows().is_empty());
+
+        traffic.cycle_event_filter();
+
+        assert_eq!(traffic.event_filter_label(), "All");
+        assert!(traffic.rows().is_empty());
+        assert!(traffic.anchor_to_latest);
+        assert_eq!(traffic.status().text, "Traffic event filter changed to All");
+    }
 
     #[test]
     fn diagnostics_preserve_warning_severity() {
@@ -522,14 +688,14 @@ mod tests {
         let traffic = TrafficState::default();
         let lines = traffic.diagnostic_lines();
 
-        assert!(lines.contains(&mitm_fallback_coverage_line()));
+        assert!(lines.contains(&mitm_data_path_coverage_line()));
         for expected in mitm_visibility_lines() {
             assert!(lines.contains(&expected), "missing {expected}");
         }
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("MITM Out") && line.contains("MITM In"))
+                .any(|line| line.contains("MITM") && line.contains("bidirectional"))
         );
     }
 
@@ -786,6 +952,24 @@ mod tests {
                 payload_bytes: 4096,
                 reason: EventTailOmissionReason::ResponseBudgetExceeded,
             }],
+        }
+    }
+
+    fn empty_tail_snapshot(last_export_sequence: u64) -> EventTailSnapshot {
+        EventTailSnapshot {
+            after_sequence: u64::MAX,
+            next_after_sequence: u64::MAX,
+            last_export_sequence,
+            limit: 64,
+            scanned: 0,
+            budget: EventTailBudgetSnapshot {
+                max_event_payload_bytes: 512,
+                max_response_payload_bytes: 256,
+                included_payload_bytes: 0,
+                truncated: false,
+            },
+            events: Vec::new(),
+            omissions: Vec::new(),
         }
     }
 

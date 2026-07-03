@@ -1,4 +1,4 @@
-use probe_core::{EventEnvelope, Selector, SpoolPayloadSchema};
+use probe_core::{EventEnvelope, EventType, Selector, SpoolPayloadSchema};
 use serde::{Deserialize, Serialize};
 use storage::{FjallSpool, StoredEvent};
 use thiserror::Error;
@@ -15,6 +15,7 @@ pub(super) struct EventTailRequest {
     pub(super) after_sequence: u64,
     pub(super) limit: usize,
     pub(super) selector: Option<Selector>,
+    pub(super) event_types: Vec<EventType>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,13 +93,15 @@ pub(super) fn read_event_tail(
     request: EventTailRequest,
 ) -> Result<EventTailSnapshot, EventTailError> {
     let limit = normalize_limit(request.limit);
-    let scan_limit = scan_limit(limit, request.selector.is_some());
+    let filtered = request.selector.is_some() || !request.event_types.is_empty();
+    let scan_limit = scan_limit(limit, filtered);
     let selector = request
         .selector
         .as_ref()
         .map(Selector::compile)
         .transpose()
         .map_err(EventTailError::Selector)?;
+    let event_type_filter = EventTypeFilter::new(&request.event_types);
     let stored = spool.read_export_batch_after(request.after_sequence, scan_limit)?;
     let last_export_sequence = spool.snapshot()?.last_export_sequence;
     let mut next_after_sequence = request.after_sequence;
@@ -113,7 +116,7 @@ pub(super) fn read_event_tail(
         next_after_sequence = stored_event.sequence;
         let payload_bytes = stored_event.payload.bytes().len();
         if payload_bytes > MAX_TAIL_EVENT_PAYLOAD_BYTES {
-            if selector.is_none() {
+            if !filtered {
                 omissions.push(omission_for(
                     &stored_event,
                     EventTailOmissionReason::EventTooLarge,
@@ -122,9 +125,10 @@ pub(super) fn read_event_tail(
             continue;
         }
         let record = decode_tail_record(stored_event)?;
-        if selector
-            .as_ref()
-            .is_none_or(|selector| selector.matches_event(&record.event))
+        if event_type_filter.matches(&record.event)
+            && selector
+                .as_ref()
+                .is_none_or(|selector| selector.matches_event(&record.event))
         {
             if included_payload_bytes.saturating_add(payload_bytes)
                 > MAX_TAIL_RESPONSE_PAYLOAD_BYTES
@@ -163,6 +167,20 @@ pub(super) fn read_event_tail(
         events,
         omissions,
     })
+}
+
+struct EventTypeFilter<'a> {
+    event_types: &'a [EventType],
+}
+
+impl<'a> EventTypeFilter<'a> {
+    fn new(event_types: &'a [EventType]) -> Self {
+        Self { event_types }
+    }
+
+    fn matches(&self, event: &EventEnvelope) -> bool {
+        self.event_types.is_empty() || self.event_types.contains(&event.kind().event_type())
+    }
 }
 
 pub(super) fn read_event_detail(
@@ -312,6 +330,7 @@ mod tests {
                 after_sequence: 0,
                 limit: 16,
                 selector: Some(exe_selector("/usr/bin/nginx")),
+                event_types: Vec::new(),
             },
         )?;
 
@@ -333,6 +352,36 @@ mod tests {
     }
 
     #[test]
+    fn tail_events_filters_by_event_type() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        ExportEventWriter::new(&spool).append_occurrence(&event_with_kind(
+            "/usr/bin/curl",
+            EventKind::ConnectionOpened,
+        ))?;
+        ExportEventWriter::new(&spool).append_occurrence(&event_for_exe("/usr/bin/curl"))?;
+
+        let tail = read_event_tail(
+            &spool,
+            EventTailRequest {
+                after_sequence: 0,
+                limit: 16,
+                selector: None,
+                event_types: vec![EventType::HttpRequestHeaders],
+            },
+        )?;
+
+        assert_eq!(tail.scanned, 2);
+        assert_eq!(tail.next_after_sequence, 2);
+        assert_eq!(tail.events.len(), 1);
+        assert_eq!(
+            tail.events[0].event.kind().event_type(),
+            EventType::HttpRequestHeaders
+        );
+        Ok(())
+    }
+
+    #[test]
     fn tail_events_clamps_zero_limit_to_one() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
         let spool = FjallSpool::open(temp.path())?;
@@ -345,6 +394,7 @@ mod tests {
                 after_sequence: 0,
                 limit: 0,
                 selector: None,
+                event_types: Vec::new(),
             },
         )?;
 
@@ -371,6 +421,7 @@ mod tests {
                 after_sequence: 0,
                 limit: 16,
                 selector: None,
+                event_types: Vec::new(),
             },
         )?;
 
@@ -405,6 +456,7 @@ mod tests {
                 after_sequence: 0,
                 limit: 16,
                 selector: Some(exe_selector("/usr/bin/curl")),
+                event_types: Vec::new(),
             },
         )?;
 
@@ -428,6 +480,7 @@ mod tests {
                 after_sequence: 0,
                 limit: 16,
                 selector: None,
+                event_types: Vec::new(),
             },
         )?;
         assert!(tail.events.is_empty());
@@ -478,14 +531,8 @@ mod tests {
     }
 
     fn event_for_exe(exe_path: &str) -> EventEnvelope {
-        EventEnvelope::from_flow(
-            Timestamp {
-                monotonic_ns: 1,
-                wall_time_unix_ns: 1,
-            },
-            flow_for_exe(exe_path),
-            CaptureOrigin::from_source(CaptureSource::Replay),
-            "test",
+        event_with_kind(
+            exe_path,
             EventKind::HttpRequestHeaders(HttpHeaders {
                 direction: Direction::Outbound,
                 stream_sequence: 1,
@@ -496,6 +543,19 @@ mod tests {
                 version: "HTTP/1.1".to_string(),
                 headers: Vec::new(),
             }),
+        )
+    }
+
+    fn event_with_kind(exe_path: &str, kind: EventKind) -> EventEnvelope {
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            flow_for_exe(exe_path),
+            CaptureOrigin::from_source(CaptureSource::Replay),
+            "test",
+            kind,
         )
     }
 

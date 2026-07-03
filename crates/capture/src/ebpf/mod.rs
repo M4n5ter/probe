@@ -19,5 +19,5 @@ pub use process_observation::{
     EbpfProcessObservationProvider, EbpfProcessObservationRuntimeDiagnostics,
     EbpfProcessObservationTracepointDiagnostics, EbpfProcessObservationTracepointFiring,
     EbpfResolvedSocketFlow, EbpfSocketEndpoint, EbpfSocketFlowLookup, EbpfSocketFlowResolver,
-    EbpfSocketReadObservation, EbpfSocketWriteObservation,
+    EbpfSocketReadObservation, EbpfSocketWriteObservation, ProcessPayloadSampleAuthorization,
 };

@@ -25,7 +25,7 @@ pub use ebpf::{
     EbpfProcessObservationTracepointDiagnostics, EbpfProcessObservationTracepointFiring,
     EbpfProcessOptionalTracepointPairSpec, EbpfResolvedSocketFlow, EbpfSocketEndpoint,
     EbpfSocketFlowLookup, EbpfSocketFlowResolver, EbpfSocketReadObservation,
-    EbpfSocketWriteObservation, UnprivilegedBpfStatus,
+    EbpfSocketWriteObservation, ProcessPayloadSampleAuthorization, UnprivilegedBpfStatus,
 };
 pub use event::{
     CaptureEvent, CapturedBytes, CapturedGap, CapturedLoss, EnforcementEvidencePropagation,

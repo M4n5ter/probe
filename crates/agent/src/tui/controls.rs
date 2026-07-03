@@ -2,11 +2,6 @@ use probe_config::AgentConfig;
 
 use super::{
     app::TuiTab,
-    copy::{
-        INBOUND_MITM_PROXY_FALLBACK_SETUP_LABEL, MITM_IN_ACTION_LABEL, MITM_OUT_ACTION_LABEL,
-        MITM_PLAINTEXT_COVERAGE, MITM_PROXY_FALLBACK_LABEL,
-        OUTBOUND_MITM_PROXY_FALLBACK_SETUP_LABEL,
-    },
     fields::{FieldId, field_value, fields_for_tab},
 };
 
@@ -14,8 +9,10 @@ use super::{
 pub(crate) enum ControlId {
     ReloadRuntimeActions,
     OpenTrafficDiagnostics,
-    ConfigureOutboundMitm,
-    ConfigureInboundMitm,
+    TrafficEventFilter,
+    ObserveAuto,
+    ObserveEbpf,
+    ObserveLibpcap,
     SearchProcesses,
     ClearProcessSearch,
 }
@@ -25,8 +22,10 @@ impl ControlId {
         match self {
             Self::ReloadRuntimeActions => "Reload runtime actions",
             Self::OpenTrafficDiagnostics => "Show data path",
-            Self::ConfigureOutboundMitm => OUTBOUND_MITM_PROXY_FALLBACK_SETUP_LABEL,
-            Self::ConfigureInboundMitm => INBOUND_MITM_PROXY_FALLBACK_SETUP_LABEL,
+            Self::TrafficEventFilter => "Cycle traffic event filter",
+            Self::ObserveAuto => "Observe selected process with auto data path",
+            Self::ObserveEbpf => "Observe selected process with eBPF",
+            Self::ObserveLibpcap => "Observe selected process with libpcap",
             Self::SearchProcesses => "Search",
             Self::ClearProcessSearch => "Clear",
         }
@@ -36,7 +35,8 @@ impl ControlId {
         match self {
             Self::ReloadRuntimeActions => "run action",
             Self::OpenTrafficDiagnostics => "open diagnostics",
-            Self::ConfigureOutboundMitm | Self::ConfigureInboundMitm => "apply selected process",
+            Self::TrafficEventFilter => "cycle filter",
+            Self::ObserveAuto | Self::ObserveEbpf | Self::ObserveLibpcap => "observe process",
             Self::SearchProcesses => "search",
             Self::ClearProcessSearch => "clear",
         }
@@ -45,8 +45,10 @@ impl ControlId {
     pub(crate) fn traffic_action_label(self) -> &'static str {
         match self {
             Self::OpenTrafficDiagnostics => "Data Path",
-            Self::ConfigureOutboundMitm => MITM_OUT_ACTION_LABEL,
-            Self::ConfigureInboundMitm => MITM_IN_ACTION_LABEL,
+            Self::TrafficEventFilter => "Events",
+            Self::ObserveAuto => "Auto",
+            Self::ObserveEbpf => "eBPF",
+            Self::ObserveLibpcap => "libpcap",
             _ => self.label(),
         }
     }
@@ -55,14 +57,12 @@ impl ControlId {
         match self {
             Self::ReloadRuntimeActions => "uses active TUI runtime".to_string(),
             Self::OpenTrafficDiagnostics => "capture and MITM runtime diagnostics".to_string(),
-            Self::ConfigureOutboundMitm => {
-                format!("process-scoped {MITM_PROXY_FALLBACK_LABEL} for {MITM_PLAINTEXT_COVERAGE}")
+            Self::TrafficEventFilter => "HTTP events or all capture events".to_string(),
+            Self::ObserveAuto => {
+                "selected process, inbound and outbound, auto data path".to_string()
             }
-            Self::ConfigureInboundMitm => {
-                format!(
-                    "process-scoped server {MITM_PROXY_FALLBACK_LABEL} for {MITM_PLAINTEXT_COVERAGE}"
-                )
-            }
+            Self::ObserveEbpf => "selected process, inbound and outbound, eBPF".to_string(),
+            Self::ObserveLibpcap => "selected process, inbound and outbound, libpcap".to_string(),
             Self::SearchProcesses | Self::ClearProcessSearch => String::new(),
         }
     }
@@ -109,8 +109,9 @@ fn controls_for_tab(tab: TuiTab) -> Vec<ControlId> {
     match tab {
         TuiTab::Runtime => vec![ControlId::ReloadRuntimeActions],
         TuiTab::Enforcement => vec![
-            ControlId::ConfigureOutboundMitm,
-            ControlId::ConfigureInboundMitm,
+            ControlId::ObserveAuto,
+            ControlId::ObserveEbpf,
+            ControlId::ObserveLibpcap,
         ],
         _ => Vec::new(),
     }

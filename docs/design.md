@@ -5192,7 +5192,8 @@ benchmark 参数：
     `mitm-http` 标记进入 traffic 视图；TLS 终止后的 HTTP 以 `mitm-tls` 标记进入同一视图，
     但 TLS 侧需要 operator 配置 client trust。
   - eBPF observation：已有 `aya-obj` strict process artifact preflight、shared ABI、最小内核 object scaffold、高层用户态 `aya` loader、
-    ringbuf decoder、procfs socket attribution 依赖检查、result-gated connect/accept observation 到 `ConnectionOpened` 的 bridge、
+    ringbuf decoder、procfs socket attribution 依赖检查、connect/accept observation 到 `ConnectionOpened` 的 bridge、
+    procfs socket metadata 优先解析，以及 remote endpoint 可用时的 degraded observed flow fallback、
     selector-authorized outbound single-buffer/bounded multi-iovec prefix syscall argument sample 与 inbound
     single-buffer/bounded multi-iovec prefix syscall result sample 到 always-degraded `CapturedBytes`/`Gap` 的 payload
     bridge、descriptor-generation close/close_range 到 best-effort `ConnectionClosed` lifecycle event、TGID-level

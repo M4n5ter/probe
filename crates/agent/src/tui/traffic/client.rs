@@ -1,6 +1,6 @@
 use std::{path::Path, time::Duration};
 
-use probe_core::Selector;
+use probe_core::{EventType, Selector};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -9,7 +9,7 @@ use crate::admin::{
     EventTailSnapshot, send_admin_json_request_with_timeout,
 };
 
-const ADMIN_TIMEOUT: Duration = Duration::from_millis(150);
+const TAIL_TIMEOUT: Duration = Duration::from_secs(1);
 const DETAIL_TIMEOUT: Duration = Duration::from_secs(2);
 const TAIL_LIMIT: usize = 64;
 
@@ -17,6 +17,7 @@ pub(super) async fn request_tail_events(
     socket_path: &Path,
     after_sequence: u64,
     selector: Selector,
+    event_types: &[EventType],
 ) -> Result<EventTailSnapshot, TrafficClientError> {
     let response = send_admin_json_request_with_timeout(
         socket_path,
@@ -24,8 +25,9 @@ pub(super) async fn request_tail_events(
             after_sequence,
             limit: TAIL_LIMIT,
             selector: Some(selector),
+            event_types: event_types.to_vec(),
         },
-        ADMIN_TIMEOUT,
+        TAIL_TIMEOUT,
     )
     .await?;
     match response.get("kind").and_then(Value::as_str) {

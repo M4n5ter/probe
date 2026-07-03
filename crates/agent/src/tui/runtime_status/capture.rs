@@ -6,7 +6,7 @@ use crate::{
         CaptureCandidateStatusSnapshot, CaptureOpenFailureStatusSnapshot, CaptureStatusSnapshot,
     },
     tui::{
-        copy::{MITM_PLAINTEXT_COVERAGE, MITM_PROXY_FALLBACK_LABEL},
+        copy::{MITM_PLAINTEXT_COVERAGE, MITM_PROXY_DATA_PATH_LABEL},
         wire::capture_selection_name,
     },
 };
@@ -35,7 +35,7 @@ impl CaptureDiagnostics {
             return traffic_empty.then(|| {
                 CaptureDiagnosticMessage::Info(
                     format!(
-                        "{MITM_PROXY_FALLBACK_LABEL} active for {MITM_PLAINTEXT_COVERAGE}; no matching events yet"
+                        "{MITM_PROXY_DATA_PATH_LABEL} active for {MITM_PLAINTEXT_COVERAGE}; no matching events yet"
                     ),
                 )
             });
@@ -68,16 +68,16 @@ impl CaptureDiagnostics {
         if self.using_mitm_plaintext_bridge() {
             if let Some(summary) = self.open_failure_summary() {
                 return Some(CaptureDiagnosticMessage::Warning(format!(
-                    "Passive capture would fail ({summary}); local config uses {MITM_PROXY_FALLBACK_LABEL} for {MITM_PLAINTEXT_COVERAGE}"
+                    "Passive capture would fail ({summary}); local config uses {MITM_PROXY_DATA_PATH_LABEL} for {MITM_PLAINTEXT_COVERAGE}"
                 )));
             }
             if let Some(summary) = self.passive_unavailable_summary() {
                 return Some(CaptureDiagnosticMessage::Warning(format!(
-                    "Passive capture is unavailable ({summary}); local config uses {MITM_PROXY_FALLBACK_LABEL} for {MITM_PLAINTEXT_COVERAGE}"
+                    "Passive capture is unavailable ({summary}); local config uses {MITM_PROXY_DATA_PATH_LABEL} for {MITM_PLAINTEXT_COVERAGE}"
                 )));
             }
             return Some(CaptureDiagnosticMessage::Info(format!(
-                "local config uses {MITM_PROXY_FALLBACK_LABEL} for {MITM_PLAINTEXT_COVERAGE}"
+                "local config uses {MITM_PROXY_DATA_PATH_LABEL} for {MITM_PLAINTEXT_COVERAGE}"
             )));
         }
         if self.unavailable() {
@@ -113,7 +113,7 @@ impl CaptureDiagnostics {
                     capture_backend_name(backend)
                 ));
             }
-            lines.push(self.mitm_fallback_ladder_line());
+            lines.push(self.mitm_data_path_priority_line());
             lines.push(format!("coverage: {MITM_PLAINTEXT_COVERAGE}"));
         }
         if let Some(reason) = &self.snapshot.reason {
@@ -131,7 +131,7 @@ impl CaptureDiagnostics {
         }
         if let Some(candidate) = &self.snapshot.auto_mitm_plaintext_bridge_candidate {
             lines.push(format!(
-                "auto {MITM_PROXY_FALLBACK_LABEL} candidate: {}: {}",
+                "auto {MITM_PROXY_DATA_PATH_LABEL} candidate: {}: {}",
                 capture_backend_name(candidate.backend),
                 capture_candidate_details(candidate).join(", ")
             ));
@@ -186,12 +186,12 @@ impl CaptureDiagnostics {
         }
         if let Some(summary) = self.open_failure_summary() {
             return Some(CaptureDiagnosticMessage::Warning(format!(
-                "Passive capture failed ({summary}); using {MITM_PROXY_FALLBACK_LABEL} for {MITM_PLAINTEXT_COVERAGE}"
+                "Passive capture failed ({summary}); using {MITM_PROXY_DATA_PATH_LABEL} for {MITM_PLAINTEXT_COVERAGE}"
             )));
         }
         if let Some(summary) = self.passive_unavailable_summary() {
             return Some(CaptureDiagnosticMessage::Warning(format!(
-                "Passive capture unavailable ({summary}); using {MITM_PROXY_FALLBACK_LABEL} for {MITM_PLAINTEXT_COVERAGE}"
+                "Passive capture unavailable ({summary}); using {MITM_PROXY_DATA_PATH_LABEL} for {MITM_PLAINTEXT_COVERAGE}"
             )));
         }
         None
@@ -204,7 +204,7 @@ impl CaptureDiagnostics {
 
     fn selected_backend_label(&self) -> &'static str {
         if self.using_mitm_plaintext_bridge() {
-            return MITM_PROXY_FALLBACK_LABEL;
+            return MITM_PROXY_DATA_PATH_LABEL;
         }
         self.snapshot
             .selected_backend
@@ -252,15 +252,15 @@ impl CaptureDiagnostics {
         (!reasons.is_empty()).then(|| reasons.join("; "))
     }
 
-    fn mitm_fallback_ladder_line(&self) -> String {
+    fn mitm_data_path_priority_line(&self) -> String {
         let live_backends = self.live_fallback_backend_names();
         if live_backends.is_empty() {
             return format!(
-                "fallback ladder: passive capture, then scoped {MITM_PROXY_FALLBACK_LABEL}"
+                "data path priority: scoped {MITM_PROXY_DATA_PATH_LABEL}; passive capture unavailable"
             );
         }
         format!(
-            "fallback ladder: passive capture ({}), then scoped {MITM_PROXY_FALLBACK_LABEL}",
+            "data path priority: passive capture ({}), scoped {MITM_PROXY_DATA_PATH_LABEL}",
             live_backends.join(" -> ")
         )
     }

@@ -164,6 +164,9 @@ fn render_traffic_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, hits: 
         Span::styled("filter ", Style::default().fg(Color::Gray)),
         Span::raw(app.traffic_filter_label()),
         Span::raw("   "),
+        Span::styled("events ", Style::default().fg(Color::Gray)),
+        Span::raw(traffic.event_filter_label()),
+        Span::raw("   "),
         Span::styled("tail ", Style::default().fg(Color::Gray)),
         Span::raw(traffic.rows().len().to_string()),
         Span::raw("   "),
@@ -196,6 +199,15 @@ fn render_traffic_action_bar(
         app.is_hovered(HitTarget::Control(ControlId::OpenTrafficDiagnostics)),
     )
     .unwrap_or(x);
+    x = render_action_button(
+        frame,
+        hits,
+        action_area(area, x, y),
+        ControlId::TrafficEventFilter.traffic_action_label(),
+        HitTarget::Control(ControlId::TrafficEventFilter),
+        app.is_hovered(HitTarget::Control(ControlId::TrafficEventFilter)),
+    )
+    .unwrap_or(x);
     if let Some(index) = app
         .selected_process_index()
         .filter(|index| app.processes().entries().get(*index).is_some())
@@ -216,23 +228,22 @@ fn render_traffic_action_bar(
         )
         .unwrap_or(x);
     }
-    x = render_action_button(
-        frame,
-        hits,
-        action_area(area, x, y),
-        ControlId::ConfigureOutboundMitm.traffic_action_label(),
-        HitTarget::Control(ControlId::ConfigureOutboundMitm),
-        app.is_hovered(HitTarget::Control(ControlId::ConfigureOutboundMitm)),
-    )
-    .unwrap_or(x);
-    let _ = render_action_button(
-        frame,
-        hits,
-        action_area(area, x, y),
-        ControlId::ConfigureInboundMitm.traffic_action_label(),
-        HitTarget::Control(ControlId::ConfigureInboundMitm),
-        app.is_hovered(HitTarget::Control(ControlId::ConfigureInboundMitm)),
-    );
+    for control in [
+        ControlId::ObserveAuto,
+        ControlId::ObserveEbpf,
+        ControlId::ObserveLibpcap,
+    ] {
+        x = render_action_button(
+            frame,
+            hits,
+            action_area(area, x, y),
+            control.traffic_action_label(),
+            HitTarget::Control(control),
+            app.is_hovered(HitTarget::Control(control)),
+        )
+        .unwrap_or(x);
+    }
+    let _ = x;
 }
 
 fn render_action_button(
@@ -401,12 +412,11 @@ fn render_traffic_events(
 
 fn render_traffic_detail_preview(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let lines = preview_lines_for_render(
-        app.traffic()
-            .detail_preview_lines(area.height.saturating_sub(2).max(1) as usize),
+        app.traffic_preview_lines(area.height.saturating_sub(2).max(1) as usize),
     );
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::bordered().title("Selected Traffic"))
+            .block(Block::bordered().title(app.traffic_preview_title()))
             .wrap(Wrap { trim: false }),
         area,
     );

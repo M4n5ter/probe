@@ -16,8 +16,10 @@ use crate::configured_enforcement::validate_enforcement_policy_manifest;
 use super::{
     config_edit::{TuiError, sync_directory},
     local_profile::LocalProbeProfile,
-    mitm_setup::{MITM_CA_CERTIFICATE_ID, MITM_CA_PRIVATE_KEY_ID},
 };
+
+const MITM_CA_CERTIFICATE_ID: &str = "mitm-ca";
+const MITM_CA_PRIVATE_KEY_ID: &str = "mitm-ca-key";
 
 pub(super) fn ensure_generated_local_paths(
     config: &AgentConfig,
@@ -446,11 +448,10 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use exporter::FileExporter;
-    use probe_config::{ExporterConfig, TransparentInterceptionStrategyConfig};
-    use probe_core::{ProcessSelector, Selector, TrafficSelector};
+    use probe_config::{ExporterConfig, TlsMaterialConfig, TransparentInterceptionStrategyConfig};
     use tempfile::TempDir;
 
-    use super::super::mitm_setup::{MitmQuickSetupDirection, apply_mitm_quick_setup_with_profile};
+    use super::super::local_profile::LocalMitmProfile;
     use super::*;
 
     #[test]
@@ -478,12 +479,7 @@ mod tests {
         let temp = TempDir::new()?;
         let profile = LocalProbeProfile::with_root(temp.path());
         let mut config = AgentConfig::default();
-        apply_mitm_quick_setup_with_profile(
-            &mut config,
-            MitmQuickSetupDirection::Inbound,
-            Some(exe_selector("/usr/bin/curl")),
-            &profile.mitm,
-        );
+        configure_managed_mitm_resources(&mut config, &profile.mitm);
 
         ensure_generated_local_paths(&config, &profile)?;
 
@@ -550,12 +546,7 @@ mod tests {
         let temp = TempDir::new()?;
         let profile = LocalProbeProfile::with_root(temp.path());
         let mut config = AgentConfig::default();
-        apply_mitm_quick_setup_with_profile(
-            &mut config,
-            MitmQuickSetupDirection::Inbound,
-            Some(exe_selector("/usr/bin/curl")),
-            &profile.mitm,
-        );
+        configure_managed_mitm_resources(&mut config, &profile.mitm);
 
         ensure_generated_local_paths(&config, &profile)?;
 
@@ -584,12 +575,7 @@ mod tests {
         let temp = TempDir::new()?;
         let profile = LocalProbeProfile::with_root(temp.path());
         let mut config = AgentConfig::default();
-        apply_mitm_quick_setup_with_profile(
-            &mut config,
-            MitmQuickSetupDirection::Inbound,
-            Some(exe_selector("/usr/bin/curl")),
-            &profile.mitm,
-        );
+        configure_managed_mitm_resources(&mut config, &profile.mitm);
         let tls_parent = profile.mitm.ca_certificate.parent().expect("tls parent");
         fs::create_dir_all(tls_parent)?;
         fs::set_permissions(tls_parent, fs::Permissions::from_mode(0o755))?;
@@ -637,12 +623,7 @@ mod tests {
         let temp = TempDir::new()?;
         let profile = LocalProbeProfile::with_root(temp.path());
         let mut config = AgentConfig::default();
-        apply_mitm_quick_setup_with_profile(
-            &mut config,
-            MitmQuickSetupDirection::Inbound,
-            Some(exe_selector("/usr/bin/curl")),
-            &profile.mitm,
-        );
+        configure_managed_mitm_resources(&mut config, &profile.mitm);
         ensure_private_directory(profile.mitm.ca_certificate.parent().expect("tls parent"))?;
         fs::write(&profile.mitm.ca_certificate, "partial\n")?;
 
@@ -691,13 +672,27 @@ mod tests {
         Ok(())
     }
 
-    fn exe_selector(path: &str) -> Selector {
-        Selector::term(
-            ProcessSelector {
-                exe_path_globs: vec![path.to_string()],
-                ..ProcessSelector::default()
-            },
-            TrafficSelector::default(),
-        )
+    fn configure_managed_mitm_resources(config: &mut AgentConfig, profile: &LocalMitmProfile) {
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: profile.enforcement_policy_file.clone(),
+        };
+        config.enforcement.interception.mitm.plaintext_bridge.mode =
+            TransparentInterceptionMitmPlaintextBridgeModeConfig::CaptureEventFeed;
+        config.enforcement.interception.mitm.plaintext_bridge.path =
+            Some(profile.plaintext_feed.clone());
+        config.enforcement.interception.mitm.ca_certificate_ref =
+            Some(MITM_CA_CERTIFICATE_ID.to_string());
+        config.enforcement.interception.mitm.ca_private_key_ref =
+            Some(MITM_CA_PRIVATE_KEY_ID.to_string());
+        config.tls.materials.push(TlsMaterialConfig {
+            id: Some(MITM_CA_CERTIFICATE_ID.to_string()),
+            kind: TlsMaterialKind::MitmCaCertificate,
+            path: profile.ca_certificate.clone(),
+        });
+        config.tls.materials.push(TlsMaterialConfig {
+            id: Some(MITM_CA_PRIVATE_KEY_ID.to_string()),
+            kind: TlsMaterialKind::MitmCaPrivateKey,
+            path: profile.ca_private_key.clone(),
+        });
     }
 }

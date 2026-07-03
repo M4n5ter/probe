@@ -8,6 +8,7 @@ use super::{
     EbpfAcceptTracepointObservation, EbpfConnectTracepointObservation, EbpfProcessLifecycleKind,
     EbpfSocketFlowResolver, accept_opened_event_from_observation,
     connect_opened_event_from_observation, descriptor_lease::DescriptorLease,
+    observed_accept_opened_event_from_observation, observed_connect_opened_event_from_observation,
     unresolved_accept_gap_from_observation, unresolved_connect_gap_from_observation,
 };
 
@@ -50,13 +51,38 @@ impl PendingEbpfFlowStart {
         }
     }
 
-    pub(super) fn unresolved_gap(&self, timestamp: Timestamp, reason: String) -> CaptureEvent {
+    pub(super) fn observed_opened_event(
+        &self,
+        timestamp: Timestamp,
+        resolver: &mut dyn EbpfSocketFlowResolver,
+    ) -> Option<CaptureEvent> {
+        let resolved_process = resolver.resolve_process(self.tgid()).ok().flatten();
         match self {
             Self::Connect(connect) => {
-                unresolved_connect_gap_from_observation(connect, timestamp, reason)
+                observed_connect_opened_event_from_observation(connect, timestamp, resolved_process)
             }
             Self::Accept(accept) => {
-                unresolved_accept_gap_from_observation(accept, timestamp, reason)
+                observed_accept_opened_event_from_observation(accept, timestamp, resolved_process)
+            }
+        }
+    }
+
+    pub(super) fn unresolved_gap(
+        &self,
+        timestamp: Timestamp,
+        reason: String,
+        resolver: &mut dyn EbpfSocketFlowResolver,
+    ) -> CaptureEvent {
+        let resolved_process = resolver.resolve_process(self.tgid()).ok().flatten();
+        match self {
+            Self::Connect(connect) => unresolved_connect_gap_from_observation(
+                connect,
+                timestamp,
+                reason,
+                resolved_process,
+            ),
+            Self::Accept(accept) => {
+                unresolved_accept_gap_from_observation(accept, timestamp, reason, resolved_process)
             }
         }
     }
@@ -74,14 +100,19 @@ impl PendingEbpfFlowStart {
         }
     }
 
-    pub(super) fn invalid_descriptor_lease_gap(&self, timestamp: Timestamp) -> CaptureEvent {
-        self.unresolved_gap(timestamp, self.invalid_descriptor_lease_reason())
+    pub(super) fn invalid_descriptor_lease_gap(
+        &self,
+        timestamp: Timestamp,
+        resolver: &mut dyn EbpfSocketFlowResolver,
+    ) -> CaptureEvent {
+        self.unresolved_gap(timestamp, self.invalid_descriptor_lease_reason(), resolver)
     }
 
     pub(super) fn lifecycle_boundary_gap(
         &self,
         timestamp: Timestamp,
         kind: EbpfProcessLifecycleKind,
+        resolver: &mut dyn EbpfSocketFlowResolver,
     ) -> CaptureEvent {
         self.unresolved_gap(
             timestamp,
@@ -92,6 +123,7 @@ impl PendingEbpfFlowStart {
                 self.thread_pid(),
                 self.fd()
             ),
+            resolver,
         )
     }
 

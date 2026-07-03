@@ -17,17 +17,18 @@ use aya_ebpf::{
     programs::TracePointContext,
 };
 use ebpf_abi::{
-    EBPF_ALLOWED_SOCKET_FDS_MAX_ENTRIES, EBPF_FD_TABLE_EPOCHS_MAX_ENTRIES,
-    EBPF_PENDING_ACCEPTS_MAX_ENTRIES, EBPF_PENDING_CONNECTS_MAX_ENTRIES,
-    EBPF_PENDING_READS_MAX_ENTRIES, EBPF_PENDING_WRITE_SCRATCH_MAX_ENTRIES,
-    EBPF_PENDING_WRITES_MAX_ENTRIES, EBPF_PROCESS_EVENT_SCRATCH_MAX_ENTRIES,
-    EBPF_PROCESS_OUTPUT_LOSSES_MAX_ENTRIES, EBPF_PROCESS_READ_EVENT_SCRATCH_MAX_ENTRIES,
-    EBPF_PROCESS_TRACEPOINT_FIRINGS_MAX_ENTRIES, EBPF_RING_BUFFER_BYTES,
-    EBPF_SOCKET_FD_GENERATIONS_MAX_ENTRIES, EBPF_SOCKET_PAYLOAD_ALLOW_READ,
-    EBPF_SOCKET_PAYLOAD_ALLOW_WRITE, EbpfAcceptTracepointRecord, EbpfCloseObservation,
-    EbpfCloseRangeTracepointRecord, EbpfCloseTracepointRecord, EbpfConnectTracepointRecord,
-    EbpfPendingSocketAcceptAttempt, EbpfPendingSocketConnectAttempt, EbpfPendingSocketReadAttempt,
-    EbpfPendingSocketWriteSample, EbpfProcessLifecycleRecord, EbpfProcessProbeMetadata,
+    EBPF_ALLOWED_PROCESS_TGIDS_MAX_ENTRIES, EBPF_ALLOWED_SOCKET_FDS_MAX_ENTRIES,
+    EBPF_FD_TABLE_EPOCHS_MAX_ENTRIES, EBPF_PENDING_ACCEPTS_MAX_ENTRIES,
+    EBPF_PENDING_CONNECTS_MAX_ENTRIES, EBPF_PENDING_READS_MAX_ENTRIES,
+    EBPF_PENDING_WRITE_SCRATCH_MAX_ENTRIES, EBPF_PENDING_WRITES_MAX_ENTRIES,
+    EBPF_PROCESS_EVENT_SCRATCH_MAX_ENTRIES, EBPF_PROCESS_OUTPUT_LOSSES_MAX_ENTRIES,
+    EBPF_PROCESS_READ_EVENT_SCRATCH_MAX_ENTRIES, EBPF_PROCESS_TRACEPOINT_FIRINGS_MAX_ENTRIES,
+    EBPF_RING_BUFFER_BYTES, EBPF_SOCKET_FD_GENERATIONS_MAX_ENTRIES,
+    EBPF_SOCKET_PAYLOAD_ALLOW_READ, EBPF_SOCKET_PAYLOAD_ALLOW_WRITE,
+    EbpfAcceptTracepointRecord, EbpfCloseObservation, EbpfCloseRangeTracepointRecord,
+    EbpfCloseTracepointRecord, EbpfConnectTracepointRecord, EbpfPendingSocketAcceptAttempt,
+    EbpfPendingSocketConnectAttempt, EbpfPendingSocketReadAttempt, EbpfPendingSocketWriteSample,
+    EbpfProcessLifecycleRecord, EbpfProcessPayloadAllowance, EbpfProcessProbeMetadata,
     EbpfProcessTracepointRole, EbpfSocketFdKey, EbpfSocketPayloadAllowance,
     EbpfSocketReadSampleRecord, EbpfSocketWriteSampleRecord,
 };
@@ -55,6 +56,10 @@ static TRAFFIC_PROBE_EVENTS: RingBuf = RingBuf::with_byte_size(EBPF_RING_BUFFER_
 #[map(name = "TRAFFIC_PROBE_ALLOWED_SOCKET_FDS")]
 static TRAFFIC_PROBE_ALLOWED_SOCKET_FDS: LruHashMap<EbpfSocketFdKey, EbpfSocketPayloadAllowance> =
     LruHashMap::with_max_entries(EBPF_ALLOWED_SOCKET_FDS_MAX_ENTRIES, 0);
+
+#[map(name = "TRAFFIC_PROBE_ALLOWED_PROCESS_TGIDS")]
+static TRAFFIC_PROBE_ALLOWED_PROCESS_TGIDS: LruHashMap<u32, EbpfProcessPayloadAllowance> =
+    LruHashMap::with_max_entries(EBPF_ALLOWED_PROCESS_TGIDS_MAX_ENTRIES, 0);
 
 #[map(name = "TRAFFIC_PROBE_FD_TABLE_EPOCHS")]
 static TRAFFIC_PROBE_FD_TABLE_EPOCHS: HashMap<u32, u64> =
@@ -190,6 +195,7 @@ pub fn traffic_probe_sys_enter_close_range(ctx: TracePointContext) -> u32 {
 pub fn traffic_probe_sched_process_exit(ctx: TracePointContext) -> u32 {
     record_tracepoint_firing(EbpfProcessTracepointRole::ProcessExit);
     if current_pid() == current_tgid() {
+        revoke_current_process_payload_allowance();
         invalidate_current_fd_table();
         emit_process_exit(ctx);
     }
@@ -199,6 +205,7 @@ pub fn traffic_probe_sched_process_exit(ctx: TracePointContext) -> u32 {
 #[tracepoint(name = "sched_process_exec", category = "sched")]
 pub fn traffic_probe_sched_process_exec(ctx: TracePointContext) -> u32 {
     record_tracepoint_firing(EbpfProcessTracepointRole::ProcessExec);
+    revoke_current_process_payload_allowance();
     invalidate_current_fd_table();
     emit_process_exec(ctx);
     0
@@ -702,20 +709,37 @@ fn allowed_socket_payload_lease(fd: i32, direction: u8) -> Option<SocketFdLease>
     }
     let tgid = current_tgid();
     let key = EbpfSocketFdKey::new(tgid, fd);
-    let allowance = (unsafe { TRAFFIC_PROBE_ALLOWED_SOCKET_FDS.get(&key).copied() })?;
-    if allowance.fd_table_epoch == 0
-        || allowance.fd_generation == 0
-        || !allowance.allows(direction)
-        || current_fd_table_epoch(tgid).is_none_or(|epoch| epoch != allowance.fd_table_epoch)
-        || current_active_socket_fd_generation(tgid, fd)
-            .is_none_or(|generation| generation != allowance.fd_generation)
-    {
+    if let Some(allowance) = unsafe { TRAFFIC_PROBE_ALLOWED_SOCKET_FDS.get(&key).copied() } {
+        if allowance.fd_table_epoch != 0
+            && allowance.fd_generation != 0
+            && allowance.allows(direction)
+            && current_fd_table_epoch(tgid).is_some_and(|epoch| epoch == allowance.fd_table_epoch)
+            && current_active_socket_fd_generation(tgid, fd)
+                .is_some_and(|generation| generation == allowance.fd_generation)
+        {
+            return Some(SocketFdLease {
+                fd_table_epoch: allowance.fd_table_epoch,
+                fd_generation: allowance.fd_generation,
+            });
+        }
+    }
+    allowed_process_payload_lease(tgid, fd, direction)
+}
+
+fn allowed_process_payload_lease(tgid: u32, fd: i32, direction: u8) -> Option<SocketFdLease> {
+    let allowance = unsafe { TRAFFIC_PROBE_ALLOWED_PROCESS_TGIDS.get(&tgid).copied() }?;
+    if !allowance.allows(direction) {
         return None;
     }
     Some(SocketFdLease {
-        fd_table_epoch: allowance.fd_table_epoch,
-        fd_generation: allowance.fd_generation,
+        fd_table_epoch: current_fd_table_epoch(tgid)?,
+        fd_generation: current_active_socket_fd_generation(tgid, fd)?,
     })
+}
+
+fn revoke_current_process_payload_allowance() {
+    let tgid = current_tgid();
+    let _ = TRAFFIC_PROBE_ALLOWED_PROCESS_TGIDS.remove(&tgid);
 }
 
 fn untrack_socket_fd(fd: i32) {

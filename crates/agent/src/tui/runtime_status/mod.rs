@@ -8,20 +8,19 @@ mod capture;
 mod mitm;
 mod mitm_data_path;
 
+#[cfg(test)]
+use crate::status::AgentStatusSnapshot;
 use crate::{
     admin::{AdminClientError, AdminRequest, send_admin_json_request_with_timeout},
     artifacts::project_runtime_artifact_paths,
     runtime_composition::build_runtime_diagnostic_composition,
     status::{
-        AgentStatusSnapshot, CaptureStatusSnapshot, EnforcementStatusSnapshot,
-        build_status_snapshot, collect_spool_status,
+        CaptureStatusSnapshot, EnforcementStatusSnapshot, TrafficStatusProjection,
+        build_traffic_status_projection,
     },
-    tui::{
-        controls::ControlId,
-        copy::{
-            MITM_HTTP_PATH_LABEL, MITM_PLAINTEXT_COVERAGE, MITM_PROXY_FALLBACK_LABEL,
-            MITM_QUICK_SETUP_APPLY, MITM_TLS_PATH_LABEL, MITM_TLS_TRUST_ACTION,
-        },
+    tui::copy::{
+        MITM_HTTP_PATH_LABEL, MITM_PLAINTEXT_COVERAGE, MITM_PROXY_DATA_PATH_LABEL,
+        MITM_TLS_PATH_LABEL, MITM_TLS_TRUST_ACTION,
     },
 };
 
@@ -49,8 +48,8 @@ pub(crate) fn local_traffic_runtime_diagnostics(
     let composition = build_runtime_diagnostic_composition(config)
         .map_err(|error| LocalRuntimeStatusError::Runtime(error.into_parts().0))?;
     let plan = composition.into_plan();
-    let snapshot = build_status_snapshot(&plan, collect_spool_status(&plan));
-    TrafficRuntimeDiagnostics::from_status_snapshot(snapshot)
+    let projection = build_traffic_status_projection(&plan);
+    TrafficRuntimeDiagnostics::from_status_projection(projection)
         .map_err(LocalRuntimeStatusError::Status)
 }
 
@@ -69,6 +68,7 @@ impl TrafficRuntimeDiagnostics {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn from_status_snapshot(
         snapshot: AgentStatusSnapshot,
     ) -> Result<Self, RuntimeStatusClientError> {
@@ -78,6 +78,21 @@ impl TrafficRuntimeDiagnostics {
             tls,
             ..
         } = snapshot;
+        let tls_materials = MitmTlsMaterialDiagnostics::from_tls_status_snapshot(tls);
+        Ok(Self {
+            capture: CaptureDiagnostics::new(capture),
+            mitm: MitmDiagnostics::from_enforcement(enforcement, Some(&tls_materials)),
+        })
+    }
+
+    pub(crate) fn from_status_projection(
+        projection: TrafficStatusProjection,
+    ) -> Result<Self, RuntimeStatusClientError> {
+        let TrafficStatusProjection {
+            capture,
+            enforcement,
+            tls,
+        } = projection;
         let tls_materials = MitmTlsMaterialDiagnostics::from_tls_status_snapshot(tls);
         Ok(Self {
             capture: CaptureDiagnostics::new(capture),
@@ -148,7 +163,7 @@ impl TrafficRuntimeDiagnostics {
         self.mitm.as_ref().map_or_else(
             || {
                 format!(
-                    "not configured; {MITM_PROXY_FALLBACK_LABEL} can capture {MITM_PLAINTEXT_COVERAGE}"
+                    "not configured; {MITM_PROXY_DATA_PATH_LABEL} can capture {MITM_PLAINTEXT_COVERAGE}"
                 )
             },
             MitmDiagnostics::overview_line,
@@ -165,8 +180,7 @@ impl TrafficRuntimeDiagnostics {
                 ];
                 lines.extend(mitm_visibility_lines());
                 lines.extend([
-                    format!("quick setup: {}", missing_mitm_quick_setup_action()),
-                    format!("apply: {MITM_QUICK_SETUP_APPLY}"),
+                    format!("configuration: {}", missing_mitm_configuration_action()),
                     format!("next action: {}", missing_mitm_next_step()),
                 ]);
                 lines
@@ -211,22 +225,18 @@ fn combine_diagnostic_messages(
 
 fn missing_mitm_next_step() -> String {
     format!(
-        "configure {MITM_PROXY_FALLBACK_LABEL} for {MITM_PLAINTEXT_COVERAGE}: {}",
-        missing_mitm_quick_setup_action()
+        "configure {MITM_PROXY_DATA_PATH_LABEL} for {MITM_PLAINTEXT_COVERAGE}: {}",
+        missing_mitm_configuration_action()
     )
 }
 
-pub(crate) fn missing_mitm_quick_setup_action() -> String {
-    format!(
-        "select a process in Traffic, then use {} for outbound clients or {} for server listeners",
-        ControlId::ConfigureOutboundMitm.traffic_action_label(),
-        ControlId::ConfigureInboundMitm.traffic_action_label()
-    )
+pub(crate) fn missing_mitm_configuration_action() -> &'static str {
+    "configure transparent MITM interception in Enforcement"
 }
 
-pub(crate) fn mitm_fallback_coverage_line() -> String {
+pub(crate) fn mitm_data_path_coverage_line() -> String {
     format!(
-        "{MITM_PROXY_FALLBACK_LABEL} covers {MITM_PLAINTEXT_COVERAGE} when passive capture is unavailable"
+        "{MITM_PROXY_DATA_PATH_LABEL} covers {MITM_PLAINTEXT_COVERAGE} for scoped bidirectional MITM traffic"
     )
 }
 
@@ -408,12 +418,9 @@ mod tests {
             enforcement_status_with_transparent_proxy_for_test,
         },
         tcp_health::TcpHealthMode,
-        tui::{
-            controls::ControlId,
-            copy::{
-                MITM_HTTP_PATH_LABEL, MITM_PLAINTEXT_COVERAGE, MITM_QUICK_SETUP_APPLY,
-                MITM_TLS_PATH_LABEL, MITM_TLS_TRUST_ACTION,
-            },
+        tui::copy::{
+            MITM_HTTP_PATH_LABEL, MITM_PLAINTEXT_COVERAGE, MITM_TLS_PATH_LABEL,
+            MITM_TLS_TRUST_ACTION,
         },
     };
 
@@ -467,8 +474,8 @@ mod tests {
         assert_eq!(
             diagnostics.status_message(true),
             Some(CaptureDiagnosticMessage::Error(format!(
-                "Capture unavailable: ebpf: capture.ebpf.object_path is not configured; libpcap: libpcap is not available; configure reliable MITM proxy fallback for {MITM_PLAINTEXT_COVERAGE}: {}",
-                missing_mitm_quick_setup_action()
+                "Capture unavailable: ebpf: capture.ebpf.object_path is not configured; libpcap: libpcap is not available; configure reliable MITM proxy data path for {MITM_PLAINTEXT_COVERAGE}: {}",
+                missing_mitm_configuration_action()
             )))
         );
         let lines = diagnostics.detail_lines();
@@ -491,19 +498,9 @@ mod tests {
                 "TLS-decrypted HTTP: visible as {MITM_TLS_PATH_LABEL} after {MITM_TLS_TRUST_ACTION}"
             ),
         );
-        assert!(lines.iter().any(|line| {
-            line.contains(ControlId::ConfigureOutboundMitm.traffic_action_label())
-                && line.contains(ControlId::ConfigureInboundMitm.traffic_action_label())
-        }));
-        assert!(
-            lines
-                .iter()
-                .any(|line| line == &format!("quick setup: {}", missing_mitm_quick_setup_action()))
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|line| line == &format!("apply: {MITM_QUICK_SETUP_APPLY}"))
+        assert_detail_line(
+            &lines,
+            format!("configuration: {}", missing_mitm_configuration_action()),
         );
         Ok(())
     }
@@ -540,8 +537,8 @@ mod tests {
         assert!(
             !lines
                 .iter()
-                .any(|line| line.starts_with("fallback ladder:")),
-            "MITM disabled diagnostics must not claim an active fallback ladder: {lines:?}"
+                .any(|line| line.starts_with("data path priority:")),
+            "MITM disabled diagnostics must not claim an active data path priority: {lines:?}"
         );
         Ok(())
     }
@@ -577,12 +574,12 @@ mod tests {
         assert_eq!(
             diagnostics.status_message(true),
             Some(CaptureDiagnosticMessage::Error(format!(
-                "Capture unavailable: ebpf: capture.ebpf.object_path is not configured; libpcap: libpcap is not available; configure reliable MITM proxy fallback for {MITM_PLAINTEXT_COVERAGE}: {}",
-                missing_mitm_quick_setup_action()
+                "Capture unavailable: ebpf: capture.ebpf.object_path is not configured; libpcap: libpcap is not available; configure reliable MITM proxy data path for {MITM_PLAINTEXT_COVERAGE}: {}",
+                missing_mitm_configuration_action()
             )))
         );
         assert!(diagnostics.detail_lines().iter().any(|line| {
-            line == &format!("quick setup: {}", missing_mitm_quick_setup_action())
+            line == &format!("configuration: {}", missing_mitm_configuration_action())
         }));
         Ok(())
     }
@@ -593,15 +590,17 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Replay;
-        config.storage.path = temp.path().join("spool");
+        let spool_path = temp.path().join("spool");
+        config.storage.path = spool_path.clone();
 
         let diagnostics = local_traffic_runtime_diagnostics(config)?;
 
         let lines = diagnostics.detail_lines();
         assert!(lines.iter().any(|line| line == "selected: replay"));
         assert!(lines.iter().any(|line| {
-            line == &format!("quick setup: {}", missing_mitm_quick_setup_action())
+            line == &format!("configuration: {}", missing_mitm_configuration_action())
         }));
+        assert!(!spool_path.exists());
         Ok(())
     }
 
@@ -1198,14 +1197,14 @@ mod tests {
         assert_eq!(
             diagnostics.status_message(false),
             Some(CaptureDiagnosticMessage::Warning(format!(
-                "Passive capture failed (ebpf: object path is not configured; libpcap: libpcap is not installed); using reliable MITM proxy fallback for {MITM_PLAINTEXT_COVERAGE}; MITM proxy path ready for plain HTTP; TLS-decrypted HTTP status is unknown"
+                "Passive capture failed (ebpf: object path is not configured; libpcap: libpcap is not installed); using reliable MITM proxy data path for {MITM_PLAINTEXT_COVERAGE}; MITM proxy path ready for plain HTTP; TLS-decrypted HTTP status is unknown"
             )))
         );
         let lines = diagnostics.detail_lines();
         assert!(
             lines
                 .iter()
-                .any(|line| line == "selected: reliable MITM proxy fallback")
+                .any(|line| line == "selected: reliable MITM proxy data path")
         );
         assert!(
             lines
@@ -1214,7 +1213,7 @@ mod tests {
         );
         assert_detail_line(
             &lines,
-            "fallback ladder: passive capture (ebpf -> libpcap), then scoped reliable MITM proxy fallback",
+            "data path priority: passive capture (ebpf -> libpcap), scoped reliable MITM proxy data path",
         );
         assert!(
             lines
@@ -1222,7 +1221,7 @@ mod tests {
                 .any(|line| line == &format!("coverage: {MITM_PLAINTEXT_COVERAGE}"))
         );
         assert!(lines.iter().any(|line| {
-            line == "auto reliable MITM proxy fallback candidate: capture_event_feed: runtime=available, capability=available, evidence=nominal"
+            line == "auto reliable MITM proxy data path candidate: capture_event_feed: runtime=available, capability=available, evidence=nominal"
         }));
         Ok(())
     }
@@ -1269,7 +1268,7 @@ mod tests {
         assert_eq!(
             diagnostics.status_message(true),
             Some(CaptureDiagnosticMessage::Warning(format!(
-                "Passive capture failed (ebpf: object path is not configured; libpcap: libpcap is not installed); using reliable MITM proxy fallback for {MITM_PLAINTEXT_COVERAGE}; MITM proxy path ready for plain HTTP and TLS-decrypted HTTP after client trust; no matching events yet"
+                "Passive capture failed (ebpf: object path is not configured; libpcap: libpcap is not installed); using reliable MITM proxy data path for {MITM_PLAINTEXT_COVERAGE}; MITM proxy path ready for plain HTTP and TLS-decrypted HTTP after client trust; no matching events yet"
             )))
         );
         Ok(())
@@ -1296,7 +1295,7 @@ mod tests {
             "MITM proxy path ready for plain HTTP and TLS-decrypted HTTP after client trust"
         ));
         assert_eq!(message.matches("no matching events yet").count(), 1);
-        assert!(!message.contains("reliable MITM proxy fallback active"));
+        assert!(!message.contains("reliable MITM proxy data path active"));
         Ok(())
     }
 
@@ -1386,7 +1385,7 @@ mod tests {
 
         assert_detail_line(
             &lines,
-            "fallback ladder: passive capture (libpcap -> ebpf), then scoped reliable MITM proxy fallback",
+            "data path priority: passive capture (libpcap -> ebpf), scoped reliable MITM proxy data path",
         );
         Ok(())
     }
@@ -1479,7 +1478,7 @@ mod tests {
         assert_eq!(
             diagnostics.status_message(true),
             Some(CaptureDiagnosticMessage::Warning(format!(
-                "Passive capture unavailable (ebpf: capture.ebpf.object_path is not configured; libpcap: libpcap is not available); using reliable MITM proxy fallback for {MITM_PLAINTEXT_COVERAGE}; MITM proxy path ready for plain HTTP; TLS-decrypted HTTP status is unknown"
+                "Passive capture unavailable (ebpf: capture.ebpf.object_path is not configured; libpcap: libpcap is not available); using reliable MITM proxy data path for {MITM_PLAINTEXT_COVERAGE}; MITM proxy path ready for plain HTTP; TLS-decrypted HTTP status is unknown"
             )))
         );
         Ok(())

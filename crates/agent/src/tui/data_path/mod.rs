@@ -1,8 +1,9 @@
 use crate::tui::{
-    copy::{MITM_PLAINTEXT_COVERAGE, MITM_PROXY_FALLBACK_LABEL},
+    copy::{MITM_PLAINTEXT_COVERAGE, MITM_PROXY_DATA_PATH_LABEL},
     runtime_status::{
-        TrafficRuntimeDiagnostics, missing_mitm_quick_setup_action, mitm_visibility_lines,
+        TrafficRuntimeDiagnostics, missing_mitm_configuration_action, mitm_visibility_lines,
     },
+    text::terminal_safe_inline_text,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +45,7 @@ impl DataPathOverviewLine {
         Self {
             kind,
             label,
-            value: value.into(),
+            value: terminal_safe_inline_text(value),
         }
     }
 }
@@ -55,6 +56,22 @@ pub(crate) struct DataPathCompactSummary {
     pub(crate) capture: String,
     pub(crate) mitm: String,
     pub(crate) next: String,
+}
+
+impl DataPathCompactSummary {
+    fn new(
+        status: impl Into<String>,
+        capture: impl Into<String>,
+        mitm: impl Into<String>,
+        next: impl Into<String>,
+    ) -> Self {
+        Self {
+            status: terminal_safe_inline_text(status),
+            capture: terminal_safe_inline_text(capture),
+            mitm: terminal_safe_inline_text(mitm),
+            next: terminal_safe_inline_text(next),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,27 +152,29 @@ impl DataPathDiagnosticsView {
     pub(crate) fn compact_summary(&self, traffic_empty: bool) -> DataPathCompactSummary {
         match (&self.source, &self.diagnostics) {
             (DataPathDiagnosticsSource::RunningAgent, Some(diagnostics)) => {
-                DataPathCompactSummary {
-                    status: diagnostics.running_status_text(traffic_empty),
-                    capture: diagnostics.capture_overview_line(),
-                    mitm: diagnostics.mitm_overview_line(),
-                    next: diagnostics.mitm_next_step(),
-                }
+                DataPathCompactSummary::new(
+                    diagnostics.running_status_text(traffic_empty),
+                    diagnostics.capture_overview_line(),
+                    diagnostics.mitm_overview_line(),
+                    diagnostics.mitm_next_step(),
+                )
             }
-            (DataPathDiagnosticsSource::LocalConfig, Some(diagnostics)) => DataPathCompactSummary {
-                status: diagnostics.local_status_text(),
-                capture: diagnostics.capture_overview_line(),
-                mitm: diagnostics.mitm_overview_line(),
-                next: diagnostics.mitm_next_step(),
-            },
-            _ => DataPathCompactSummary {
-                status: "cannot evaluate capture or MITM readiness".to_string(),
-                capture: "not evaluated".to_string(),
-                mitm: format!(
-                    "not evaluated; {MITM_PROXY_FALLBACK_LABEL} can capture {MITM_PLAINTEXT_COVERAGE}"
+            (DataPathDiagnosticsSource::LocalConfig, Some(diagnostics)) => {
+                DataPathCompactSummary::new(
+                    diagnostics.local_status_text(),
+                    diagnostics.capture_overview_line(),
+                    diagnostics.mitm_overview_line(),
+                    diagnostics.mitm_next_step(),
+                )
+            }
+            _ => DataPathCompactSummary::new(
+                "cannot evaluate capture or MITM readiness",
+                "not evaluated",
+                format!(
+                    "not evaluated; {MITM_PROXY_DATA_PATH_LABEL} can capture {MITM_PLAINTEXT_COVERAGE}"
                 ),
-                next: "fix runtime config; use Data Path".to_string(),
-            },
+                "fix runtime config; use Data Path",
+            ),
         }
     }
 
@@ -177,16 +196,19 @@ impl DataPathDiagnosticsView {
                 lines.push("state: diagnostics unavailable".to_string());
                 lines.push("capture: not evaluated".to_string());
                 lines.push(format!(
-                    "MITM: not evaluated; {MITM_PROXY_FALLBACK_LABEL} can capture {MITM_PLAINTEXT_COVERAGE}"
+                    "MITM: not evaluated; {MITM_PROXY_DATA_PATH_LABEL} can capture {MITM_PLAINTEXT_COVERAGE}"
                 ));
                 lines.extend(mitm_visibility_lines());
-                lines.push(format!("MITM setup: {}", missing_mitm_quick_setup_action()));
+                lines.push(format!(
+                    "configuration: {}",
+                    missing_mitm_configuration_action()
+                ));
             }
         }
         if let Some(reason) = &self.reason {
             lines.push(format!("reason: {reason}"));
         }
-        lines
+        lines.into_iter().map(terminal_safe_inline_text).collect()
     }
 }
 
@@ -201,7 +223,7 @@ mod tests {
         assert_eq!(summary.status, "cannot evaluate capture or MITM readiness");
         assert_eq!(summary.capture, "not evaluated");
         assert!(summary.mitm.contains(
-            "reliable MITM proxy fallback can capture plain HTTP and TLS-decrypted HTTP"
+            "reliable MITM proxy data path can capture plain HTTP and TLS-decrypted HTTP"
         ));
         assert!(summary.next.contains("fix runtime config"));
     }
@@ -221,6 +243,26 @@ mod tests {
                 .iter()
                 .any(|line| line.kind == DataPathOverviewLineKind::NextAction
                     && line.value == "fix runtime config; use Data Path")
+        );
+    }
+
+    #[test]
+    fn diagnostic_reason_lines_are_terminal_safe() {
+        let view = DataPathDiagnosticsView::unavailable("startup\nfailed\x1b[31m");
+
+        let overview = view.overview_lines(true);
+        let detail = view.detail_lines();
+
+        assert!(
+            overview
+                .iter()
+                .filter(|line| line.kind == DataPathOverviewLineKind::Reason)
+                .all(|line| !line.value.chars().any(char::is_control))
+        );
+        assert!(
+            detail
+                .iter()
+                .all(|line| !line.chars().any(char::is_control))
         );
     }
 

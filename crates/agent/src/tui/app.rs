@@ -3,22 +3,19 @@ use std::path::{Path, PathBuf};
 use probe_config::AgentConfig;
 
 use super::controls::{ControlId, FocusTarget, focus_targets_for_tab};
-use super::copy::{MITM_PLAINTEXT_COVERAGE, MITM_PROXY_FALLBACK_LABEL, MITM_TLS_TRUST_ACTION};
 use super::data_path::{DataPathCompactSummary, DataPathDiagnosticsView, DataPathOverviewLine};
 use super::fields::{
     FieldApplyOutcome, FieldId, apply_field, apply_text_field, editable_text_value,
 };
 use super::hit::{HitTarget, ScrollTarget};
-use super::mitm_setup::{
-    DEFAULT_OUTBOUND_MITM_REMOTE_PORTS, MitmQuickSetupDirection, MitmQuickSetupOutcome,
-    MitmQuickSetupWarning, apply_mitm_quick_setup,
-};
+use super::observation_setup::{ProcessObservationMode, upsert_process_observation};
 use super::process_view::ProcessViewState;
 use super::processes::{ProcessCatalog, ProcessEntry, selector_for_exe_path};
 use super::runtime_attachment::RuntimeAttachment;
 use super::runtime_status::{
     local_traffic_runtime_diagnostics, request_traffic_runtime_diagnostics,
 };
+use super::text::terminal_safe_inline_text;
 use super::traffic::{TrafficDetailLoadRequest, TrafficDetailLoadResult, TrafficState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,8 +93,10 @@ pub(crate) enum TuiAction {
     StartProcessSearch,
     ToggleProcessMonitor,
     OpenTrafficDiagnostics,
-    ConfigureOutboundMitm,
-    ConfigureInboundMitm,
+    CycleTrafficEventFilter,
+    ObserveAuto,
+    ObserveEbpf,
+    ObserveLibpcap,
     Scroll {
         delta: isize,
         target: Option<ScrollTarget>,
@@ -151,39 +150,28 @@ impl StatusMessage {
     pub(crate) fn info(text: impl Into<String>) -> Self {
         Self {
             kind: StatusKind::Info,
-            text: text.into(),
+            text: terminal_safe_inline_text(text),
         }
     }
 
     pub(crate) fn saved(text: impl Into<String>) -> Self {
         Self {
             kind: StatusKind::Saved,
-            text: text.into(),
+            text: terminal_safe_inline_text(text),
         }
     }
 
     pub(crate) fn warning(text: impl Into<String>) -> Self {
         Self {
             kind: StatusKind::Warning,
-            text: text.into(),
+            text: terminal_safe_inline_text(text),
         }
     }
 
     pub(crate) fn error(text: impl Into<String>) -> Self {
         Self {
             kind: StatusKind::Error,
-            text: text.into(),
-        }
-    }
-}
-
-fn mitm_quick_setup_warning_message(warning: &MitmQuickSetupWarning) -> String {
-    match warning {
-        MitmQuickSetupWarning::MissingProxyExecutable { path } => {
-            format!("MITM proxy executable is missing at {}", path.display())
-        }
-        MitmQuickSetupWarning::UnsupportedOutboundProcessSelector { reason } => {
-            format!("Outbound MITM cannot use the selected process scope yet: {reason}")
+            text: terminal_safe_inline_text(text),
         }
     }
 }
@@ -427,6 +415,23 @@ impl TuiApp {
             .compact_summary(self.traffic.rows().is_empty())
     }
 
+    pub(crate) fn traffic_preview_title(&self) -> &'static str {
+        if self.traffic.rows().is_empty() {
+            "Traffic Readiness"
+        } else {
+            "Selected Traffic"
+        }
+    }
+
+    pub(crate) fn traffic_preview_lines(&self, max_lines: usize) -> Vec<String> {
+        if !self.traffic.rows().is_empty() {
+            return self.traffic.detail_preview_lines(max_lines);
+        }
+        let mut lines = self.data_path_diagnostics.detail_lines();
+        lines.push("Actions: select a process, then choose Auto, eBPF, or libpcap to observe inbound and outbound traffic".to_string());
+        fit_lines(lines, max_lines.max(1))
+    }
+
     pub(crate) fn active_admin_socket_path(&self) -> Option<&Path> {
         self.runtime_attachment.active_socket_path()
     }
@@ -444,10 +449,10 @@ impl TuiApp {
     }
 
     pub(crate) fn detach_agent(&mut self, message: impl Into<String>) {
-        let message = message.into();
-        self.runtime_attachment = RuntimeAttachment::lost(message.clone());
+        let status = StatusMessage::error(message);
+        self.runtime_attachment = RuntimeAttachment::lost(status.text.clone());
         self.invalidate_traffic_detail_requests();
-        self.status = StatusMessage::error(message);
+        self.status = status;
         self.refresh_local_runtime_diagnostics();
     }
 
@@ -473,11 +478,15 @@ impl TuiApp {
             TuiAction::StartProcessSearch => self.begin_process_search(),
             TuiAction::ToggleProcessMonitor => self.toggle_selected_process_monitor(),
             TuiAction::OpenTrafficDiagnostics => self.open_traffic_diagnostics(),
-            TuiAction::ConfigureOutboundMitm => {
-                return self.apply_mitm_quick_setup(MitmQuickSetupDirection::Outbound);
+            TuiAction::CycleTrafficEventFilter => self.cycle_traffic_event_filter(),
+            TuiAction::ObserveAuto => {
+                return self.apply_process_observation(ProcessObservationMode::Auto);
             }
-            TuiAction::ConfigureInboundMitm => {
-                return self.apply_mitm_quick_setup(MitmQuickSetupDirection::Inbound);
+            TuiAction::ObserveEbpf => {
+                return self.apply_process_observation(ProcessObservationMode::Ebpf);
+            }
+            TuiAction::ObserveLibpcap => {
+                return self.apply_process_observation(ProcessObservationMode::Libpcap);
             }
             TuiAction::Hover {
                 target,
@@ -849,11 +858,14 @@ impl TuiApp {
                 self.open_traffic_diagnostics();
                 None
             }
-            ControlId::ConfigureOutboundMitm => {
-                self.apply_mitm_quick_setup(MitmQuickSetupDirection::Outbound)
+            ControlId::TrafficEventFilter => {
+                self.cycle_traffic_event_filter();
+                None
             }
-            ControlId::ConfigureInboundMitm => {
-                self.apply_mitm_quick_setup(MitmQuickSetupDirection::Inbound)
+            ControlId::ObserveAuto => self.apply_process_observation(ProcessObservationMode::Auto),
+            ControlId::ObserveEbpf => self.apply_process_observation(ProcessObservationMode::Ebpf),
+            ControlId::ObserveLibpcap => {
+                self.apply_process_observation(ProcessObservationMode::Libpcap)
             }
             ControlId::SearchProcesses => {
                 self.begin_process_search();
@@ -866,29 +878,44 @@ impl TuiApp {
         }
     }
 
-    fn apply_mitm_quick_setup(&mut self, direction: MitmQuickSetupDirection) -> Option<TuiEffect> {
-        let selected_process_selector = self.selected_mitm_process_selector(direction);
-        match apply_mitm_quick_setup(&mut self.config, direction, selected_process_selector) {
-            MitmQuickSetupOutcome::Changed {
-                direction,
-                warnings,
-            } => {
-                self.dirty = true;
-                self.refresh_local_runtime_diagnostics();
-                let saved_status = self.mitm_quick_setup_saved_status(direction, &warnings);
-                self.status = saved_status.clone();
-                self.clamp_selection();
-                Some(TuiEffect::save_config_with_status(saved_status))
-            }
-            MitmQuickSetupOutcome::Rejected(warning) => {
-                self.status = StatusMessage::warning(mitm_quick_setup_warning_message(&warning));
-                None
-            }
-            MitmQuickSetupOutcome::MissingProcessSelector => {
-                self.status = self.mitm_selector_warning(direction);
-                None
-            }
-        }
+    fn apply_process_observation(&mut self, mode: ProcessObservationMode) -> Option<TuiEffect> {
+        let Some(index) = self.process_view.selected_index() else {
+            self.status = StatusMessage::warning("No selected process");
+            return None;
+        };
+        let Some(process) = self.processes.entries().get(index) else {
+            self.status = StatusMessage::warning("No selected process");
+            return None;
+        };
+        let Some(selector) = process.selector() else {
+            self.status = StatusMessage::warning(
+                "Selected process has no readable executable path; observation was not changed",
+            );
+            return None;
+        };
+        let process_name = process.name.clone();
+        let observation_id = process_observation_id(process);
+        upsert_process_observation(&mut self.config, observation_id, selector.clone(), mode);
+        self.project_current_process_observation(mode, selector);
+        self.process_view.set_single_monitor(index, &self.processes);
+        self.traffic = TrafficState::default();
+        self.clear_traffic_popup();
+        self.dirty = true;
+        self.refresh_local_runtime_diagnostics();
+        self.clamp_selection();
+
+        let saved_status = process_observation_status(mode, &process_name);
+        self.status = saved_status.clone();
+        Some(TuiEffect::save_config_with_status(saved_status))
+    }
+
+    fn project_current_process_observation(
+        &mut self,
+        mode: ProcessObservationMode,
+        selector: probe_core::Selector,
+    ) {
+        self.config.capture.selection = mode.capture_selection();
+        self.config.capture.deep_observe_selector = Some(selector);
     }
 
     fn begin_text_edit(&mut self, field: FieldId) {
@@ -1007,48 +1034,6 @@ impl TuiApp {
             .get(self.process_view.selected_index()?)
     }
 
-    fn selected_mitm_process_selector(
-        &self,
-        direction: MitmQuickSetupDirection,
-    ) -> Option<probe_core::Selector> {
-        let process = self.selected_process()?;
-        match direction {
-            MitmQuickSetupDirection::Inbound => process.selector(),
-            MitmQuickSetupDirection::Outbound => process.outbound_interception_process_selector(),
-        }
-    }
-
-    fn mitm_quick_setup_success_message(&self, direction: MitmQuickSetupDirection) -> String {
-        if direction == MitmQuickSetupDirection::Outbound
-            && let Some(process) = self.selected_process()
-            && let Some(scope) = process.outbound_interception_scope_label()
-        {
-            return format!(
-                "Outbound {MITM_PROXY_FALLBACK_LABEL} configured for {scope} on remote ports {}",
-                default_outbound_mitm_remote_ports_label()
-            );
-        }
-        direction.status_message().to_string()
-    }
-
-    fn mitm_quick_setup_saved_status(
-        &self,
-        direction: MitmQuickSetupDirection,
-        warnings: &[MitmQuickSetupWarning],
-    ) -> StatusMessage {
-        let summary = self.mitm_quick_setup_success_message(direction);
-        let data_path_action = ControlId::OpenTrafficDiagnostics.traffic_action_label();
-        if let Some(warning) = warnings.first() {
-            return StatusMessage::warning(format!(
-                "{summary}; {}; open {data_path_action} after fixing it",
-                mitm_quick_setup_warning_message(warning)
-            ));
-        }
-        StatusMessage::saved(format!(
-            "{summary}; captures {MITM_PLAINTEXT_COVERAGE}; {MITM_TLS_TRUST_ACTION}; open {data_path_action}"
-        ))
-    }
-
     fn traffic_filter_selector(&self) -> Option<probe_core::Selector> {
         let selectors = self
             .process_view
@@ -1075,6 +1060,11 @@ impl TuiApp {
 
     fn open_traffic_diagnostics(&mut self) {
         self.open_traffic_popup(TrafficPopup::Diagnostics);
+    }
+
+    fn cycle_traffic_event_filter(&mut self) {
+        self.traffic.cycle_event_filter();
+        self.status = StatusMessage::info(self.traffic.status().text.clone());
     }
 
     fn open_traffic_popup(&mut self, kind: TrafficPopup) {
@@ -1150,17 +1140,6 @@ impl TuiApp {
         StatusMessage::warning(message)
     }
 
-    fn mitm_selector_warning(&self, direction: MitmQuickSetupDirection) -> StatusMessage {
-        if direction == MitmQuickSetupDirection::Outbound {
-            let message = self
-                .selected_process()
-                .map(|process| process.outbound_interception_unavailable_reason())
-                .unwrap_or_else(|| "No selected process".to_string());
-            return StatusMessage::warning(message);
-        }
-        self.process_selector_warning()
-    }
-
     pub(crate) fn mark_dirty(&mut self, message: impl Into<String>) {
         self.dirty = true;
         self.refresh_local_runtime_diagnostics();
@@ -1212,12 +1191,29 @@ fn initial_status(processes: &ProcessCatalog) -> StatusMessage {
     }
 }
 
-fn default_outbound_mitm_remote_ports_label() -> String {
-    DEFAULT_OUTBOUND_MITM_REMOTE_PORTS
-        .iter()
-        .map(u16::to_string)
-        .collect::<Vec<_>>()
-        .join(",")
+fn process_observation_id(process: &ProcessEntry) -> String {
+    process
+        .selector_key()
+        .map(|key| format!("exe:{key}"))
+        .unwrap_or_else(|| format!("pid:{}", process.pid))
+}
+
+fn process_observation_status(mode: ProcessObservationMode, process_name: &str) -> StatusMessage {
+    StatusMessage::saved(format!(
+        "Observing {process_name} inbound and outbound with {} data path",
+        mode.label()
+    ))
+}
+
+fn fit_lines(mut lines: Vec<String>, max_lines: usize) -> Vec<String> {
+    if lines.len() <= max_lines {
+        return lines;
+    }
+    lines.truncate(max_lines);
+    if let Some(last) = lines.last_mut() {
+        *last = "... open Data Path for full diagnostics".to_string();
+    }
+    lines
 }
 
 fn offset_index(index: usize, len: usize, delta: isize) -> usize {
@@ -1260,11 +1256,30 @@ mod tests {
     use super::{
         super::{
             controls::{ControlId, FocusTarget},
+            copy::MITM_PLAINTEXT_COVERAGE,
             processes::{ProcessCatalog, ProcessEntry},
             runtime_attachment::RuntimeAttachment,
+            text::INLINE_TEXT_MAX_CHARS,
         },
         *,
     };
+
+    #[test]
+    fn detach_agent_stores_terminal_safe_runtime_status() {
+        let mut app = test_app();
+        let raw = format!(
+            "TUI managed agent exited\nstderr: {}\n{}",
+            "failed",
+            "x".repeat(INLINE_TEXT_MAX_CHARS * 2)
+        );
+
+        app.detach_agent(raw);
+
+        assert_eq!(app.status().kind, StatusKind::Error);
+        assert_eq!(app.runtime_agent_status(), app.status().text);
+        assert!(!app.runtime_agent_status().chars().any(char::is_control));
+        assert!(app.runtime_agent_status().chars().count() <= INLINE_TEXT_MAX_CHARS);
+    }
 
     #[test]
     fn keyboard_and_mouse_actions_share_the_same_field_path() {
@@ -1394,106 +1409,64 @@ mod tests {
     }
 
     #[test]
-    fn inbound_mitm_setup_control_uses_selected_process_selector() {
+    fn enforcement_observe_libpcap_control_uses_selected_process_profile() {
         let mut app = multi_process_app();
         app.select_tab(TuiTab::Processes);
         app.handle_action(TuiAction::Click(HitTarget::Process(1)));
 
         app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Enforcement)));
         let effect = app.handle_action(TuiAction::Click(HitTarget::Control(
-            ControlId::ConfigureInboundMitm,
+            ControlId::ObserveLibpcap,
         )));
 
         let saved_status = expect_save_status(effect);
         assert_eq!(saved_status.kind, StatusKind::Saved);
-        assert!(saved_status.text.contains(MITM_PLAINTEXT_COVERAGE));
-        assert!(saved_status.text.contains(MITM_TLS_TRUST_ACTION));
-        assert!(
-            saved_status
-                .text
-                .contains(ControlId::OpenTrafficDiagnostics.traffic_action_label())
-        );
         assert!(app.dirty());
-        assert!(app.config.enforcement.interception.selector.is_some());
+        assert_eq!(app.config.capture.selection, CaptureSelection::Libpcap);
+        assert_eq!(app.config.observations.len(), 1);
+        assert_eq!(app.config.observations[0].id, "exe:/usr/sbin/nginx");
         assert_eq!(
-            app.config.enforcement.interception.strategy,
-            probe_config::TransparentInterceptionStrategyConfig::InboundTproxyMitm
+            app.config.observations[0].data_path,
+            probe_config::ObservationDataPathMode::Libpcap
         );
-        assert!(
-            app.status().text.starts_with(
-                "Inbound reliable MITM proxy fallback configured for selected process"
-            )
+        assert_eq!(
+            app.config.observations[0].directions,
+            [
+                probe_core::Direction::Inbound,
+                probe_core::Direction::Outbound
+            ]
         );
     }
 
     #[test]
-    fn outbound_mitm_setup_uses_selected_process_cgroup_scope() {
+    fn traffic_observe_auto_writes_bidirectional_process_profile() {
         let mut app = multi_process_app();
-        app.select_tab(TuiTab::Processes);
-        app.handle_action(TuiAction::Click(HitTarget::Process(1)));
-
-        app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Enforcement)));
-        let effect = app.handle_action(TuiAction::Click(HitTarget::Control(
-            ControlId::ConfigureOutboundMitm,
-        )));
+        app.select_tab(TuiTab::Traffic);
+        app.handle_action(TuiAction::Click(HitTarget::TrafficProcess(1)));
+        let effect = app.handle_action(TuiAction::ObserveAuto);
 
         let saved_status = expect_save_status(effect);
         assert_eq!(saved_status.kind, StatusKind::Saved);
-        assert!(saved_status.text.contains(MITM_PLAINTEXT_COVERAGE));
         assert!(app.dirty());
+        assert_eq!(app.config.capture.selection, CaptureSelection::Auto);
+        assert!(app.config.capture.deep_observe_selector.is_some());
+        assert_eq!(app.traffic_filter_label(), "1 watched processes");
+        assert_eq!(app.config.observations.len(), 1);
         assert_eq!(
-            app.config.enforcement.interception.strategy,
-            probe_config::TransparentInterceptionStrategyConfig::OutboundTransparentMitm
+            app.config.observations[0].data_path,
+            probe_config::ObservationDataPathMode::Auto
         );
-        let Some(probe_core::Selector::Match { term }) =
-            app.config.enforcement.interception.selector.as_ref()
-        else {
-            panic!("outbound MITM selector should be a match selector");
-        };
-        assert_eq!(term.process.cgroup_paths, ["system.slice/nginx.service"]);
         assert_eq!(
-            term.traffic.remote_ports,
-            DEFAULT_OUTBOUND_MITM_REMOTE_PORTS
+            app.config.observations[0].directions,
+            [
+                probe_core::Direction::Inbound,
+                probe_core::Direction::Outbound
+            ]
         );
-        assert_eq!(term.traffic.directions, [probe_core::Direction::Outbound]);
     }
 
     #[test]
-    fn traffic_tab_mitm_actions_use_selected_process() {
-        let mut keyboard_app = multi_process_app();
-        keyboard_app.select_tab(TuiTab::Traffic);
-        keyboard_app.handle_action(TuiAction::Click(HitTarget::TrafficProcess(1)));
-        let keyboard_effect = keyboard_app.handle_action(TuiAction::ConfigureOutboundMitm);
-
-        let mut mouse_app = multi_process_app();
-        mouse_app.select_tab(TuiTab::Traffic);
-        mouse_app.handle_action(TuiAction::Click(HitTarget::TrafficProcess(1)));
-        let mouse_effect = mouse_app.handle_action(TuiAction::Click(HitTarget::Control(
-            ControlId::ConfigureOutboundMitm,
-        )));
-
-        let keyboard_saved_status = expect_save_status(keyboard_effect);
-        let mouse_saved_status = expect_save_status(mouse_effect);
-        assert_eq!(keyboard_saved_status.kind, StatusKind::Saved);
-        assert_eq!(mouse_saved_status.kind, StatusKind::Saved);
-        assert!(keyboard_saved_status.text.contains(MITM_PLAINTEXT_COVERAGE));
-        assert!(mouse_saved_status.text.contains(MITM_PLAINTEXT_COVERAGE));
-        assert_eq!(
-            keyboard_app.config.enforcement.interception.strategy,
-            probe_config::TransparentInterceptionStrategyConfig::OutboundTransparentMitm
-        );
-        assert_eq!(
-            keyboard_app.config.enforcement.interception.strategy,
-            mouse_app.config.enforcement.interception.strategy
-        );
-        assert_outbound_mitm_cgroup_selector(&keyboard_app, "system.slice/nginx.service");
-        assert_outbound_mitm_cgroup_selector(&mouse_app, "system.slice/nginx.service");
-        assert!(keyboard_app.dirty());
-        assert!(mouse_app.dirty());
-    }
-
-    #[test]
-    fn overview_data_path_summary_updates_after_mitm_quick_setup()
+    fn overview_data_path_summary_updates_after_process_observation()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
         let mut config = AgentConfig::default();
@@ -1507,15 +1480,12 @@ mod tests {
 
         app.select_tab(TuiTab::Traffic);
         app.handle_action(TuiAction::Click(HitTarget::TrafficProcess(1)));
-        let effect = app.handle_action(TuiAction::ConfigureOutboundMitm);
+        let effect = app.handle_action(TuiAction::ObserveAuto);
 
         let saved_status = expect_save_status(effect);
         assert_eq!(saved_status.kind, StatusKind::Saved);
-        let updated = overview_value(&app, "MITM");
-        assert!(
-            !updated.contains("not configured"),
-            "MITM summary should reflect quick setup immediately: {updated}"
-        );
+        let updated = overview_value(&app, "Capture");
+        assert!(updated.contains("mode=live") || updated.contains("unavailable"));
         assert!(
             !overview_value(&app, "Data path source").contains("running agent"),
             "overview must not report running agent diagnostics before admin refresh"
@@ -1556,29 +1526,27 @@ mod tests {
     }
 
     #[test]
-    fn outbound_mitm_setup_rejects_root_process_without_cgroup_scope() {
+    fn process_observation_fails_closed_without_executable_path() {
         let mut app = TuiApp::new(
             PathBuf::from("/tmp/agent.toml"),
             AgentConfig::default(),
             ProcessCatalog::from_entries([ProcessEntry {
                 pid: 42,
                 name: "root-daemon".to_string(),
-                exe_path: Some(PathBuf::from("/usr/bin/root-daemon")),
+                exe_path: None,
                 argv: vec!["root-daemon".to_string()],
                 uid: 0,
                 gid: 0,
                 cgroup_path: Some("/".to_string()),
             }]),
         );
-        app.select_tab(TuiTab::Enforcement);
-        let effect = app.handle_action(TuiAction::Click(HitTarget::Control(
-            ControlId::ConfigureOutboundMitm,
-        )));
+        app.select_tab(TuiTab::Traffic);
+        let effect = app.handle_action(TuiAction::ObserveAuto);
 
         assert_eq!(effect, None);
         assert!(!app.dirty());
         assert_eq!(app.status().kind, StatusKind::Warning);
-        assert!(app.status().text.contains("would be too broad"));
+        assert!(app.status().text.contains("no readable executable path"));
     }
 
     #[test]
@@ -1950,15 +1918,5 @@ mod tests {
             .into_iter()
             .find_map(|line| (line.label == label).then_some(line.value))
             .unwrap_or_else(|| panic!("overview should include {label}"))
-    }
-
-    fn assert_outbound_mitm_cgroup_selector(app: &TuiApp, expected_cgroup: &str) {
-        let Some(probe_core::Selector::Match { term }) =
-            app.config.enforcement.interception.selector.as_ref()
-        else {
-            panic!("outbound MITM selector should be a match selector");
-        };
-        assert_eq!(term.process.cgroup_paths, [expected_cgroup.to_string()]);
-        assert_eq!(term.traffic.directions, [probe_core::Direction::Outbound]);
     }
 }

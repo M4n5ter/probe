@@ -275,8 +275,10 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         spans.extend([
             Span::styled("d", Style::default().fg(Color::Gray)),
             Span::raw(" data path  "),
-            Span::styled("o/i", Style::default().fg(Color::Gray)),
-            Span::raw(" mitm  "),
+            Span::styled("a/e/l/m", Style::default().fg(Color::Gray)),
+            Span::raw(" observe  "),
+            Span::styled("x", Style::default().fg(Color::Gray)),
+            Span::raw(" mitm off  "),
         ]);
     }
     spans.extend([
@@ -702,11 +704,15 @@ mod tests {
         assert!(output.contains("[Data Path]"));
         assert!(output.contains("[Search]"));
         assert!(output.contains("[Watch]"));
-        assert!(output.contains("[MITM Out]"));
-        assert!(output.contains("[MITM In]"));
+        assert!(output.contains("[Auto]"));
+        assert!(output.contains("[eBPF]"));
+        assert!(output.contains("[libpcap]"));
+        assert!(!output.contains("[MITM]"));
+        assert!(output.contains("Traffic Readiness"));
+        assert!(output.contains("Data path source: local config"));
         assert!(output.contains("data path Capture unavailable"));
         assert!(output.contains("capture unavailable:"));
-        assert!(output.contains("next configure reliable MITM proxy fallback"));
+        assert!(output.contains("next configure reliable MITM proxy data path"));
         assert!(output.contains("MITM not configured;"));
         assert!(scroll_target_exists(
             &hit_map,
@@ -740,13 +746,19 @@ mod tests {
         ));
         assert!(hit_exists(
             &hit_map,
-            Some(HitTarget::Control(ControlId::ConfigureOutboundMitm)),
+            Some(HitTarget::Control(ControlId::ObserveAuto)),
             100,
             24
         ));
         assert!(hit_exists(
             &hit_map,
-            Some(HitTarget::Control(ControlId::ConfigureInboundMitm)),
+            Some(HitTarget::Control(ControlId::ObserveEbpf)),
+            100,
+            24
+        ));
+        assert!(hit_exists(
+            &hit_map,
+            Some(HitTarget::Control(ControlId::ObserveLibpcap)),
             100,
             24
         ));

@@ -45,6 +45,10 @@ pub trait EbpfSocketFlowResolver {
         lookup: EbpfSocketFlowLookup,
     ) -> Result<Option<EbpfResolvedSocketFlow>, CaptureError>;
 
+    fn resolve_process(&mut self, _tgid: u32) -> Result<Option<ProcessContext>, CaptureError> {
+        Ok(None)
+    }
+
     fn invalidate_cached_resolution(&mut self) {}
 }
 
@@ -84,6 +88,32 @@ pub(crate) fn accept_opened_event_from_observation(
     )
 }
 
+pub(crate) fn observed_connect_opened_event_from_observation(
+    connect: &EbpfConnectTracepointObservation,
+    timestamp: Timestamp,
+    resolved_process: Option<ProcessContext>,
+) -> Option<CaptureEvent> {
+    observed_opened_event(
+        &connect.process,
+        connect.endpoint.remote_endpoint()?,
+        timestamp,
+        resolved_process,
+    )
+}
+
+pub(crate) fn observed_accept_opened_event_from_observation(
+    accept: &EbpfAcceptTracepointObservation,
+    timestamp: Timestamp,
+    resolved_process: Option<ProcessContext>,
+) -> Option<CaptureEvent> {
+    observed_opened_event(
+        &accept.process,
+        accept.endpoint.remote_endpoint()?,
+        timestamp,
+        resolved_process,
+    )
+}
+
 fn opened_event_from_lookup(
     lookup: EbpfSocketFlowLookup,
     timestamp: Timestamp,
@@ -97,10 +127,26 @@ fn opened_event_from_lookup(
     }))
 }
 
+fn observed_opened_event(
+    observed_process: &EbpfObservedProcess,
+    remote: TcpEndpoint,
+    timestamp: Timestamp,
+    resolved_process: Option<ProcessContext>,
+) -> Option<CaptureEvent> {
+    let process =
+        resolved_process.unwrap_or_else(|| process_context_from_observed(observed_process));
+    Some(CaptureEvent::ConnectionOpened {
+        timestamp,
+        flow: flow_from_observed_socket(process, remote, timestamp.monotonic_ns),
+        origin: CaptureOrigin::from_source(CaptureSource::EbpfSyscall),
+    })
+}
+
 pub(crate) fn unresolved_connect_gap_from_observation(
     connect: &EbpfConnectTracepointObservation,
     timestamp: Timestamp,
     reason: String,
+    resolved_process: Option<ProcessContext>,
 ) -> CaptureEvent {
     unresolved_flow_gap(
         &connect.process,
@@ -108,6 +154,7 @@ pub(crate) fn unresolved_connect_gap_from_observation(
         Direction::Outbound,
         timestamp,
         reason,
+        resolved_process,
     )
 }
 
@@ -115,6 +162,7 @@ pub(crate) fn unresolved_accept_gap_from_observation(
     accept: &EbpfAcceptTracepointObservation,
     timestamp: Timestamp,
     reason: String,
+    resolved_process: Option<ProcessContext>,
 ) -> CaptureEvent {
     unresolved_flow_gap(
         &accept.process,
@@ -122,6 +170,7 @@ pub(crate) fn unresolved_accept_gap_from_observation(
         Direction::Inbound,
         timestamp,
         reason,
+        resolved_process,
     )
 }
 
@@ -138,8 +187,10 @@ fn unresolved_flow_gap(
     direction: Direction,
     timestamp: Timestamp,
     reason: String,
+    resolved_process: Option<ProcessContext>,
 ) -> CaptureEvent {
-    let process = process_context_from_observed(observed_process);
+    let process =
+        resolved_process.unwrap_or_else(|| process_context_from_observed(observed_process));
     let remote = remote_endpoint.unwrap_or_else(unknown_tcp_endpoint);
     let local = unknown_local_endpoint_for_remote(remote);
     let flow = flow_from_unresolved_socket(process, local, remote, timestamp.monotonic_ns);
@@ -184,6 +235,33 @@ fn flow_from_resolved_socket(
         start_monotonic_ns,
         socket_cookie: resolved.socket_cookie,
         attribution_confidence: resolved.confidence,
+    }
+}
+
+fn flow_from_observed_socket(
+    process: ProcessContext,
+    remote: TcpEndpoint,
+    start_monotonic_ns: u64,
+) -> FlowContext {
+    let local = unknown_local_endpoint_for_remote(remote);
+    let local = AddressPort::from(local);
+    let remote = AddressPort::from(remote);
+    FlowContext {
+        id: FlowIdentity::stable(
+            &process.identity,
+            &local,
+            &remote,
+            TransportProtocol::Tcp,
+            start_monotonic_ns,
+            None,
+        ),
+        process,
+        local,
+        remote,
+        protocol: TransportProtocol::Tcp,
+        start_monotonic_ns,
+        socket_cookie: None,
+        attribution_confidence: 0,
     }
 }
 

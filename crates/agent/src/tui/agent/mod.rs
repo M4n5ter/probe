@@ -324,14 +324,14 @@ async fn wait_for_managed_agent(
             return Err(TuiError::ManagedAgentExited {
                 status,
                 log_path: log_path.to_path_buf(),
-                log_tail: read_log_tail(log_path),
+                log_tail: managed_startup_log_tail(log_path),
             });
         }
         if Instant::now() >= deadline {
             return Err(TuiError::ManagedAgentStartupTimeout {
                 socket_path: socket_path.display().to_string(),
                 log_path: log_path.to_path_buf(),
-                log_tail: read_log_tail(log_path),
+                log_tail: managed_startup_log_tail(log_path),
             });
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -376,6 +376,10 @@ fn managed_agent_exit_message(status: std::process::ExitStatus, log_path: &Path)
             one_line_log_tail(&log_tail)
         )
     }
+}
+
+fn managed_startup_log_tail(log_path: &Path) -> String {
+    one_line_log_tail(&read_log_tail(log_path))
 }
 
 fn read_log_tail(path: &Path) -> String {
@@ -437,6 +441,19 @@ mod tests {
             one_line_log_tail("one\ntwo\nthree\nfour\nfive\n"),
             "two | three | four | five"
         );
+    }
+
+    #[test]
+    fn managed_startup_log_tail_is_single_line() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let log_path = temp.path().join("agent.log");
+        fs::write(&log_path, "one\ntwo\nthree\nfour\nfive\n")?;
+
+        assert_eq!(
+            managed_startup_log_tail(&log_path),
+            "two | three | four | five"
+        );
+        Ok(())
     }
 
     #[test]

@@ -46,6 +46,13 @@ pub struct AgentStatusSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TrafficStatusProjection {
+    pub capture: CaptureStatusSnapshot,
+    pub enforcement: EnforcementStatusSnapshot,
+    pub tls: TlsStatusSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HealthSnapshot {
     pub mode: RuntimeMode,
     pub reasons: Vec<String>,
@@ -84,6 +91,15 @@ pub fn build_status_snapshot_with_runtime(
     runtime: RuntimeStatusInput,
 ) -> AgentStatusSnapshot {
     build_status_snapshot_at_with_runtime(plan, spool, current_unix_time_ns(), runtime)
+}
+
+pub fn build_traffic_status_projection(plan: &RuntimePlan) -> TrafficStatusProjection {
+    let capabilities = capabilities_with_runtime(plan, None, None);
+    TrafficStatusProjection {
+        capture: capture_status(plan, None, None),
+        enforcement: enforcement_status_with_transparent_proxy(plan, None, None),
+        tls: tls_status(plan, &capabilities, None, None),
+    }
 }
 
 pub(in crate::status) fn build_status_snapshot_at(

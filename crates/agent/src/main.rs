@@ -29,6 +29,7 @@ mod shutdown;
 mod status;
 mod storage_retention;
 mod tcp_health;
+mod telemetry;
 mod tls_material;
 mod tls_plaintext;
 mod transparent_interception;
@@ -36,9 +37,7 @@ mod tui;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .init();
+    telemetry::init_for_current_invocation();
     if let Err(error) = cli::run_from_env().await {
         eprintln!("{error}");
         std::process::exit(1);

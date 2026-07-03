@@ -15,7 +15,7 @@ use crate::{
 };
 
 use super::super::{
-    EbpfCloseRangeTracepointObservation, EbpfCloseTracepointObservation,
+    EbpfCloseRangeTracepointObservation, EbpfCloseTracepointObservation, EbpfProcessLifecycleKind,
     EbpfProcessLifecycleObservation, EbpfProcessObservation, EbpfProcessObservationProbe,
     EbpfProcessObservationProbeConfig, EbpfProcessObservationProbeSnapshot, EbpfSocketFlowResolver,
     active_liveness::{
@@ -25,7 +25,7 @@ use super::super::{
     clock::EbpfObservationClock,
     flow_start::{PendingEbpfFlowResolution, PendingEbpfFlowStart},
     observation_source::{EbpfObservationSource, ProbeObservationSource},
-    payload_authorization::SocketPayloadSampleAuthorization,
+    payload_authorization::{ProcessPayloadSampleAuthorization, SocketPayloadSampleAuthorization},
     payload_bridge::{
         output_loss_gap_events, process_lifecycle_gap_events, read_events,
         tracked_flow_displacement_gap_events, write_events,
@@ -48,6 +48,7 @@ pub struct EbpfProcessObservationProvider {
     resolution_retry_sleep: Duration,
     stop_when_idle: bool,
     deep_observe_selector: Option<CompiledSelector>,
+    process_payload_selector: Option<CompiledSelector>,
     tracked_flows: TrackedEbpfFlows,
     pending_flows: VecDeque<PendingEbpfFlowResolution>,
     pending_events: VecDeque<CaptureEvent>,
@@ -61,18 +62,22 @@ impl EbpfProcessObservationProvider {
         config: EbpfProcessObservationProbeConfig,
         resolver: Box<dyn EbpfSocketFlowResolver>,
         deep_observe_selector: Option<CompiledSelector>,
+        process_payload_selector: Option<CompiledSelector>,
     ) -> Result<Self, CaptureError> {
         let probe = EbpfProcessObservationProbe::load(config)
             .map_err(|error| CaptureError::provider("ebpf", error.to_string()))?;
         let probe_snapshot = probe.probe_snapshot();
+        let observations: Box<dyn EbpfObservationSource> =
+            Box::new(ProbeObservationSource { probe });
         Ok(Self {
-            observations: Box::new(ProbeObservationSource { probe }),
+            observations,
             resolver,
             clock: EbpfObservationClock::default(),
             resolution_retries: DEFAULT_RESOLUTION_RETRIES,
             resolution_retry_sleep: DEFAULT_RESOLUTION_RETRY_SLEEP,
             stop_when_idle: false,
             deep_observe_selector,
+            process_payload_selector,
             tracked_flows: TrackedEbpfFlows::bounded(MAX_TRACKED_EBPF_FLOWS),
             pending_flows: VecDeque::new(),
             pending_events: VecDeque::new(),
@@ -84,6 +89,18 @@ impl EbpfProcessObservationProvider {
 
     pub fn probe_snapshot(&self) -> EbpfProcessObservationProbeSnapshot {
         self.probe_snapshot.clone()
+    }
+
+    pub fn allow_process_payload_sample(
+        &mut self,
+        authorization: ProcessPayloadSampleAuthorization,
+    ) -> Result<(), CaptureError> {
+        self.observations
+            .allow_process_payload_sample(authorization)
+    }
+
+    pub fn revoke_process_payload_sample(&mut self, tgid: u32) -> Result<(), CaptureError> {
+        self.observations.revoke_process_payload_sample(tgid)
     }
 
     fn poll_event(&mut self) -> Result<CapturePoll, CaptureError> {
@@ -132,6 +149,7 @@ impl EbpfProcessObservationProvider {
                 Ok(self.queue_events(events))
             }
             EbpfProcessObservation::ProcessLifecycle(lifecycle) => {
+                self.sync_process_payload_allowance_for_lifecycle(&lifecycle)?;
                 let events = self.process_lifecycle_events(&lifecycle);
                 Ok(self.queue_events(events))
             }
@@ -163,7 +181,7 @@ impl EbpfProcessObservationProvider {
         let timestamp = self.clock.next_timestamp();
         if flow_start.descriptor_lease().is_none() {
             return Ok(CapturePoll::event(
-                flow_start.invalid_descriptor_lease_gap(timestamp),
+                flow_start.invalid_descriptor_lease_gap(timestamp, self.resolver.as_mut()),
             ));
         }
         self.poll_pending_flow_resolution_attempt(PendingEbpfFlowResolution::new(
@@ -205,13 +223,22 @@ impl EbpfProcessObservationProvider {
             self.track_flow_start_event(&pending.flow_start, &event)?;
             return Ok(CapturePoll::event(event));
         }
+        if let Some(event) = pending
+            .flow_start
+            .observed_opened_event(pending.timestamp, self.resolver.as_mut())
+        {
+            self.track_flow_start_event(&pending.flow_start, &event)?;
+            return Ok(CapturePoll::event(event));
+        }
         if pending.attempts_completed >= self.resolution_retries {
             let reason = pending
                 .flow_start
                 .unresolved_reason(self.resolution_retries.saturating_add(1));
-            return Ok(CapturePoll::event(
-                pending.flow_start.unresolved_gap(pending.timestamp, reason),
-            ));
+            return Ok(CapturePoll::event(pending.flow_start.unresolved_gap(
+                pending.timestamp,
+                reason,
+                self.resolver.as_mut(),
+            )));
         }
         pending.attempts_completed = pending.attempts_completed.saturating_add(1);
         pending.retry_at = Some(Instant::now() + self.resolution_retry_sleep);
@@ -230,7 +257,11 @@ impl EbpfProcessObservationProvider {
                 .flow_start
                 .unresolved_reason(pending.attempts_completed)
         );
-        CapturePoll::event(pending.flow_start.unresolved_gap(pending.timestamp, reason))
+        CapturePoll::event(pending.flow_start.unresolved_gap(
+            pending.timestamp,
+            reason,
+            self.resolver.as_mut(),
+        ))
     }
 
     fn track_flow_start_event(
@@ -321,21 +352,49 @@ impl EbpfProcessObservationProvider {
             return Vec::new();
         }
         let timestamp = self.clock.next_timestamp();
-        let mut events = Self::cancel_pending_flow_resolutions_for_lifecycle(
-            &mut self.pending_flows,
-            lifecycle,
-            timestamp,
-        );
-        if active_payload_targets.is_empty() {
-            return events;
-        }
-        events.extend(process_lifecycle_gap_events(
+        let active_payload_events = process_lifecycle_gap_events(
             active_payload_targets,
             timestamp,
             lifecycle.process.tgid,
             lifecycle.kind,
-        ));
+        );
+        let mut events = self.cancel_pending_flow_resolutions_for_lifecycle(lifecycle, timestamp);
+        events.extend(active_payload_events);
         events
+    }
+
+    fn sync_process_payload_allowance_for_lifecycle(
+        &mut self,
+        lifecycle: &EbpfProcessLifecycleObservation,
+    ) -> Result<(), CaptureError> {
+        let Some(selector) = self.process_payload_selector.clone() else {
+            return Ok(());
+        };
+        match lifecycle.kind {
+            EbpfProcessLifecycleKind::Exit => self
+                .observations
+                .revoke_process_payload_sample(lifecycle.process.tgid),
+            EbpfProcessLifecycleKind::Exec => {
+                let authorization = match self.resolver.resolve_process(lifecycle.process.tgid) {
+                    Ok(Some(process)) => {
+                        ProcessPayloadSampleAuthorization::from_unattributed_selector(
+                            lifecycle.process.tgid,
+                            &process,
+                            &selector,
+                        )
+                    }
+                    Ok(None) | Err(_) => None,
+                };
+                match authorization {
+                    Some(authorization) => self
+                        .observations
+                        .allow_process_payload_sample(authorization),
+                    None => self
+                        .observations
+                        .revoke_process_payload_sample(lifecycle.process.tgid),
+                }
+            }
+        }
     }
 
     fn has_pending_flow_resolutions_for_tgid(&self, tgid: u32) -> bool {
@@ -345,24 +404,24 @@ impl EbpfProcessObservationProvider {
     }
 
     fn cancel_pending_flow_resolutions_for_lifecycle(
-        pending_flows: &mut VecDeque<PendingEbpfFlowResolution>,
+        &mut self,
         lifecycle: &EbpfProcessLifecycleObservation,
         timestamp: Timestamp,
     ) -> Vec<CaptureEvent> {
-        let mut retained = VecDeque::with_capacity(pending_flows.len());
+        let mut retained = VecDeque::with_capacity(self.pending_flows.len());
         let mut events = Vec::new();
-        while let Some(pending) = pending_flows.pop_front() {
+        while let Some(pending) = self.pending_flows.pop_front() {
             if pending.flow_start.tgid() == lifecycle.process.tgid {
-                events.push(
-                    pending
-                        .flow_start
-                        .lifecycle_boundary_gap(timestamp, lifecycle.kind),
-                );
+                events.push(pending.flow_start.lifecycle_boundary_gap(
+                    timestamp,
+                    lifecycle.kind,
+                    self.resolver.as_mut(),
+                ));
             } else {
                 retained.push_back(pending);
             }
         }
-        *pending_flows = retained;
+        self.pending_flows = retained;
         events
     }
 
@@ -513,7 +572,7 @@ impl CaptureProvider for EbpfProcessObservationProvider {
     fn capabilities(&self) -> Vec<CapabilityState> {
         vec![CapabilityState::degraded(
             CapabilityKind::Ebpf,
-            "eBPF provider emits result-gated connect and accept/accept4 flow-start observations with descriptor leases, selector-authorized always-degraded outbound single-buffer and bounded multi-iovec prefix syscall argument samples, outbound available sendfile family kernel-transfer byte-count gaps, inbound single-buffer and bounded multi-iovec prefix syscall result samples bound to descriptor generation, descriptor-generation close/plain close_range lifecycle events, TGID-level process exit/exec cancellation of pending flow resolution plus lifecycle boundary gaps for active payload-tracked flows, userspace tracked-flow displacement as event-local terminal provider-state boundary gaps, output ring-buffer failure conversion to degraded capture_loss events, conservative unknown-offset gap fan-out to active tracked payload flows, per-tracepoint kernel firing counters, and safe active pipe read/write tracepoint liveness diagnostics; payload beyond the bounded multi-iovec scan/sample or fixed verifier-friendly append slots, kernel-transfer payload bytes, partial-write retry semantics, precise flow-specific lost-event reconstruction, and kernel socket-object lifetime are not implemented",
+            "eBPF provider emits connect and accept/accept4 flow-start observations with descriptor leases, prefers procfs-resolved socket metadata when available, falls back to degraded observed flows when kernel tracepoints provide a remote endpoint before procfs resolution succeeds, selector-authorized always-degraded outbound single-buffer and bounded multi-iovec prefix syscall argument samples, outbound available sendfile family kernel-transfer byte-count gaps, inbound single-buffer and bounded multi-iovec prefix syscall result samples bound to descriptor generation, descriptor-generation close/plain close_range lifecycle events, TGID-level process exit/exec cancellation of pending flow resolution plus lifecycle boundary gaps for active payload-tracked flows, userspace tracked-flow displacement as event-local terminal provider-state boundary gaps, output ring-buffer failure conversion to degraded capture_loss events, conservative unknown-offset gap fan-out to active tracked payload flows, per-tracepoint kernel firing counters, and safe active pipe read/write tracepoint liveness diagnostics; payload beyond the bounded multi-iovec scan/sample or fixed verifier-friendly append slots, kernel-transfer payload bytes, partial-write retry semantics, precise flow-specific lost-event reconstruction, and kernel socket-object lifetime are not implemented",
         )]
     }
 
@@ -582,6 +641,7 @@ mod tests {
                 resolution_retries: 0,
                 resolution_retry_sleep: Duration::ZERO,
                 stop_when_idle: true,
+                process_payload_selector: deep_observe_selector.clone(),
                 deep_observe_selector,
                 tracked_flows: TrackedEbpfFlows::bounded(MAX_TRACKED_EBPF_FLOWS),
                 pending_flows: VecDeque::new(),
@@ -626,6 +686,17 @@ mod tests {
         ) -> Result<(), CaptureError> {
             Ok(())
         }
+
+        fn allow_process_payload_sample(
+            &mut self,
+            _authorization: ProcessPayloadSampleAuthorization,
+        ) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
+        fn revoke_process_payload_sample(&mut self, _tgid: u32) -> Result<(), CaptureError> {
+            Ok(())
+        }
     }
 
     struct RecordingObservationSource {
@@ -654,6 +725,17 @@ mod tests {
             Ok(())
         }
 
+        fn allow_process_payload_sample(
+            &mut self,
+            _authorization: ProcessPayloadSampleAuthorization,
+        ) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
+        fn revoke_process_payload_sample(&mut self, _tgid: u32) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
         fn revoke_socket_payload_sample(
             &mut self,
             key: DescriptorLeaseKey,
@@ -662,6 +744,51 @@ mod tests {
                 .lock()
                 .expect("revoked lock poisoned")
                 .push(key);
+            Ok(())
+        }
+    }
+
+    struct ProcessRecordingObservationSource {
+        observations: VecDeque<EbpfProcessObservation>,
+        allowed: Arc<Mutex<Vec<u32>>>,
+        revoked: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl EbpfObservationSource for ProcessRecordingObservationSource {
+        fn next_observation(&mut self) -> Result<Option<EbpfProcessObservation>, CaptureError> {
+            Ok(self.observations.pop_front())
+        }
+
+        fn allow_socket_payload_sample(
+            &mut self,
+            _authorization: SocketPayloadSampleAuthorization,
+        ) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
+        fn revoke_socket_payload_sample(
+            &mut self,
+            _key: DescriptorLeaseKey,
+        ) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
+        fn allow_process_payload_sample(
+            &mut self,
+            authorization: ProcessPayloadSampleAuthorization,
+        ) -> Result<(), CaptureError> {
+            self.allowed
+                .lock()
+                .expect("allowed process lock poisoned")
+                .push(authorization.tgid());
+            Ok(())
+        }
+
+        fn revoke_process_payload_sample(&mut self, tgid: u32) -> Result<(), CaptureError> {
+            self.revoked
+                .lock()
+                .expect("revoked process lock poisoned")
+                .push(tgid);
             Ok(())
         }
     }
@@ -936,6 +1063,142 @@ mod tests {
             )
         );
         assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn process_exec_authorizes_matching_process_payload() -> TestResult {
+        let process = observed_process(101, 100);
+        let allowed = Arc::new(Mutex::new(Vec::new()));
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let source = ProcessRecordingObservationSource {
+            observations: VecDeque::from([process_exec_observation(process)]),
+            allowed: Arc::clone(&allowed),
+            revoked: Arc::clone(&revoked),
+        };
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source,
+            Box::new(ProcessIdentityResolver {
+                process: Some(demo_process()),
+            }),
+            Some(process_selector([100])?),
+        );
+
+        assert!(matches!(provider.poll_next()?, CapturePoll::Progress));
+        assert_eq!(
+            allowed
+                .lock()
+                .expect("allowed process lock poisoned")
+                .as_slice(),
+            &[100]
+        );
+        assert!(
+            revoked
+                .lock()
+                .expect("revoked process lock poisoned")
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn process_exec_rejects_flow_dependent_process_payload_selector() -> TestResult {
+        let process = observed_process(101, 100);
+        let allowed = Arc::new(Mutex::new(Vec::new()));
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let source = ProcessRecordingObservationSource {
+            observations: VecDeque::from([process_exec_observation(process)]),
+            allowed: Arc::clone(&allowed),
+            revoked: Arc::clone(&revoked),
+        };
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source,
+            Box::new(ProcessIdentityResolver {
+                process: Some(demo_process()),
+            }),
+            Some(process_remote_port_selector([100], [443])?),
+        );
+
+        assert!(matches!(provider.poll_next()?, CapturePoll::Progress));
+        assert!(
+            allowed
+                .lock()
+                .expect("allowed process lock poisoned")
+                .is_empty()
+        );
+        assert_eq!(
+            revoked
+                .lock()
+                .expect("revoked process lock poisoned")
+                .as_slice(),
+            &[100]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn process_exec_revokes_payload_allowance_when_process_resolution_fails() -> TestResult {
+        let process = observed_process(101, 100);
+        let allowed = Arc::new(Mutex::new(Vec::new()));
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let source = ProcessRecordingObservationSource {
+            observations: VecDeque::from([process_exec_observation(process)]),
+            allowed: Arc::clone(&allowed),
+            revoked: Arc::clone(&revoked),
+        };
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source,
+            Box::new(FailingProcessIdentityResolver),
+            Some(process_selector([100])?),
+        );
+
+        assert!(matches!(provider.poll_next()?, CapturePoll::Progress));
+        assert!(
+            allowed
+                .lock()
+                .expect("allowed process lock poisoned")
+                .is_empty()
+        );
+        assert_eq!(
+            revoked
+                .lock()
+                .expect("revoked process lock poisoned")
+                .as_slice(),
+            &[100]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn process_exit_revokes_process_payload_allowance() -> TestResult {
+        let process = observed_process(101, 100);
+        let allowed = Arc::new(Mutex::new(Vec::new()));
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let source = ProcessRecordingObservationSource {
+            observations: VecDeque::from([process_exit_observation(process)]),
+            allowed: Arc::clone(&allowed),
+            revoked: Arc::clone(&revoked),
+        };
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source,
+            Box::new(ProcessIdentityResolver { process: None }),
+            Some(process_selector([100])?),
+        );
+
+        assert!(matches!(provider.poll_next()?, CapturePoll::Progress));
+        assert!(
+            allowed
+                .lock()
+                .expect("allowed process lock poisoned")
+                .is_empty()
+        );
+        assert_eq!(
+            revoked
+                .lock()
+                .expect("revoked process lock poisoned")
+                .as_slice(),
+            &[100]
+        );
         Ok(())
     }
 
@@ -1303,6 +1566,82 @@ mod tests {
     }
 
     #[test]
+    fn degraded_observed_flow_keeps_resolved_process_identity() -> TestResult {
+        let (_, remote) = inbound_loopback();
+        let observation = accept_observation(observed_process(101, 100), 9, 3, remote);
+        let resolver = Box::new(ProcessOnlyResolver {
+            process: demo_process(),
+        });
+        let mut provider =
+            EbpfProcessObservationProvider::from_observations_for_test([observation], resolver);
+
+        let (_, flow) = expect_connection_opened(&mut provider)?;
+
+        assert_eq!(flow.attribution_confidence, 0);
+        assert_eq!(flow.local.port, 0);
+        assert_eq!(flow.remote.port, 50_000);
+        assert_eq!(flow.process.identity.pid, 100);
+        assert_eq!(flow.process.identity.exe_path, "/usr/bin/curl");
+        let selector = Selector::term(
+            ProcessSelector {
+                exe_path_globs: vec!["/usr/bin/curl".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector {
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        )
+        .compile()?;
+        assert!(selector.matches_flow(&flow, Direction::Inbound));
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn degraded_observed_flow_tracks_authorized_payload() -> TestResult {
+        let (_, remote) = inbound_loopback();
+        let process = observed_process(101, 100);
+        let payload = b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n";
+        let observations = [
+            accept_observation(process.clone(), 9, 3, remote),
+            EbpfProcessObservation::Write(EbpfSocketWriteObservation {
+                process,
+                fd: 9,
+                fd_generation: 10,
+                original_len: payload.len() as u32,
+                buffer: payload.to_vec(),
+                truncated: false,
+                read_failed: false,
+                kernel_transfer: false,
+            }),
+        ];
+        let selector = Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        )
+        .compile()?;
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source_from_observations(observations),
+            Box::new(StaticResolver { resolved: None }),
+            Some(selector),
+        );
+
+        let (_, flow) = expect_connection_opened(&mut provider)?;
+        let bytes = expect_bytes(&mut provider)?;
+
+        assert_eq!(flow.attribution_confidence, 0);
+        assert_eq!(bytes.flow.id, flow.id);
+        assert_eq!(bytes.direction, Direction::Outbound);
+        assert_eq!(bytes.bytes.as_ref(), payload);
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn emits_gap_instead_of_unclosable_flow_for_invalid_descriptor_lease() -> TestResult {
         let (_, remote) = outbound_loopback();
         let observation =
@@ -1330,7 +1669,7 @@ mod tests {
     #[test]
     fn retries_fd_resolution() -> TestResult {
         let (local, remote) = outbound_loopback();
-        let observation = connect_observation(observed_process(101, 100), 7, remote);
+        let observation = missing_connect_observation(observed_process(101, 100), 7);
         let resolver = Box::new(RetryResolver {
             calls: 0,
             resolved: EbpfResolvedSocketFlow {
@@ -1354,7 +1693,7 @@ mod tests {
         let (local, remote) = outbound_loopback();
         let process = observed_process(101, 100);
         let observations = [
-            connect_observation(process.clone(), 7, remote),
+            missing_connect_observation(process.clone(), 7),
             process_exec_observation(process),
         ];
         let resolver = Box::new(RetryResolver {
@@ -1386,7 +1725,7 @@ mod tests {
         let (local, remote) = outbound_loopback();
         let process = observed_process(101, 100);
         let observations = [
-            connect_observation(process.clone(), 7, remote),
+            missing_connect_observation(process.clone(), 7),
             connect_observation(process, 8, remote),
         ];
         let resolver = Box::new(FdSelectiveResolver {
@@ -1418,7 +1757,7 @@ mod tests {
     fn full_pending_flow_resolution_queue_emits_gap() -> TestResult {
         let (_, remote) = outbound_loopback();
         let process = observed_process(101, 100);
-        let observation = connect_observation(process.clone(), 7, remote);
+        let observation = missing_connect_observation(process.clone(), 7);
         let mut provider = EbpfProcessObservationProvider::from_observations_for_test(
             [observation],
             Box::new(StaticResolver { resolved: None }),
@@ -1660,6 +1999,58 @@ mod tests {
         }
     }
 
+    struct ProcessIdentityResolver {
+        process: Option<ProcessContext>,
+    }
+
+    impl EbpfSocketFlowResolver for ProcessIdentityResolver {
+        fn resolve_socket_flow(
+            &mut self,
+            _lookup: EbpfSocketFlowLookup,
+        ) -> Result<Option<EbpfResolvedSocketFlow>, CaptureError> {
+            Ok(None)
+        }
+
+        fn resolve_process(&mut self, _tgid: u32) -> Result<Option<ProcessContext>, CaptureError> {
+            Ok(self.process.clone())
+        }
+    }
+
+    struct ProcessOnlyResolver {
+        process: ProcessContext,
+    }
+
+    impl EbpfSocketFlowResolver for ProcessOnlyResolver {
+        fn resolve_socket_flow(
+            &mut self,
+            _lookup: EbpfSocketFlowLookup,
+        ) -> Result<Option<EbpfResolvedSocketFlow>, CaptureError> {
+            Ok(None)
+        }
+
+        fn resolve_process(&mut self, _tgid: u32) -> Result<Option<ProcessContext>, CaptureError> {
+            Ok(Some(self.process.clone()))
+        }
+    }
+
+    struct FailingProcessIdentityResolver;
+
+    impl EbpfSocketFlowResolver for FailingProcessIdentityResolver {
+        fn resolve_socket_flow(
+            &mut self,
+            _lookup: EbpfSocketFlowLookup,
+        ) -> Result<Option<EbpfResolvedSocketFlow>, CaptureError> {
+            Ok(None)
+        }
+
+        fn resolve_process(&mut self, _tgid: u32) -> Result<Option<ProcessContext>, CaptureError> {
+            Err(CaptureError::provider(
+                "procfs",
+                "process table unavailable",
+            ))
+        }
+    }
+
     struct FdDistinctResolver {
         local: TcpEndpoint,
     }
@@ -1734,6 +2125,17 @@ mod tests {
         ) -> Result<(), CaptureError> {
             Err(CaptureError::provider("ebpf", "allow map unavailable"))
         }
+
+        fn allow_process_payload_sample(
+            &mut self,
+            _authorization: ProcessPayloadSampleAuthorization,
+        ) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
+        fn revoke_process_payload_sample(&mut self, _tgid: u32) -> Result<(), CaptureError> {
+            Ok(())
+        }
     }
 
     struct OutputLossObservationSource {
@@ -1750,6 +2152,17 @@ mod tests {
             &mut self,
             _authorization: SocketPayloadSampleAuthorization,
         ) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
+        fn allow_process_payload_sample(
+            &mut self,
+            _authorization: ProcessPayloadSampleAuthorization,
+        ) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
+        fn revoke_process_payload_sample(&mut self, _tgid: u32) -> Result<(), CaptureError> {
             Ok(())
         }
 
@@ -1774,6 +2187,17 @@ mod tests {
             Ok(())
         }
 
+        fn allow_process_payload_sample(
+            &mut self,
+            _authorization: ProcessPayloadSampleAuthorization,
+        ) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
+        fn revoke_process_payload_sample(&mut self, _tgid: u32) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
         fn process_tracepoint_firings(
             &mut self,
         ) -> Result<Option<Vec<EbpfProcessObservationTracepointFiring>>, CaptureError> {
@@ -1794,6 +2218,17 @@ mod tests {
             &mut self,
             _authorization: SocketPayloadSampleAuthorization,
         ) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
+        fn allow_process_payload_sample(
+            &mut self,
+            _authorization: ProcessPayloadSampleAuthorization,
+        ) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
+        fn revoke_process_payload_sample(&mut self, _tgid: u32) -> Result<(), CaptureError> {
             Ok(())
         }
 
@@ -1967,6 +2402,44 @@ mod tests {
                 ..TrafficSelector::default()
             },
         )
+        .compile()
+    }
+
+    fn process_selector(
+        pids: impl IntoIterator<Item = u32>,
+    ) -> Result<CompiledSelector, probe_core::SelectorError> {
+        Selector::term(
+            ProcessSelector {
+                pids: pids.into_iter().collect(),
+                ..ProcessSelector::default()
+            },
+            TrafficSelector::default(),
+        )
+        .compile()
+    }
+
+    fn process_remote_port_selector(
+        pids: impl IntoIterator<Item = u32>,
+        remote_ports: impl IntoIterator<Item = u16>,
+    ) -> Result<CompiledSelector, probe_core::SelectorError> {
+        Selector::All {
+            selectors: vec![
+                Selector::term(
+                    ProcessSelector {
+                        pids: pids.into_iter().collect(),
+                        ..ProcessSelector::default()
+                    },
+                    TrafficSelector::default(),
+                ),
+                Selector::term(
+                    ProcessSelector::default(),
+                    TrafficSelector {
+                        remote_ports: remote_ports.into_iter().collect(),
+                        ..TrafficSelector::default()
+                    },
+                ),
+            ],
+        }
         .compile()
     }
 

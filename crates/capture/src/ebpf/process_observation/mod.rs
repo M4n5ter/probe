@@ -15,8 +15,10 @@ mod types;
 pub use bridge::{EbpfResolvedSocketFlow, EbpfSocketFlowLookup, EbpfSocketFlowResolver};
 pub(crate) use bridge::{
     accept_opened_event_from_observation, connect_opened_event_from_observation,
+    observed_accept_opened_event_from_observation, observed_connect_opened_event_from_observation,
     unresolved_accept_gap_from_observation, unresolved_connect_gap_from_observation,
 };
+pub use payload_authorization::ProcessPayloadSampleAuthorization;
 pub use probe::{
     EbpfProcessObservationLinkOwnershipSnapshot,
     EbpfProcessObservationOptionalTracepointPairSnapshot,

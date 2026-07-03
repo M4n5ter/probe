@@ -113,6 +113,11 @@ pub const EBPF_ALLOWED_SOCKET_FDS_MAX_ENTRIES: u32 = 8192;
 pub const EBPF_ALLOWED_SOCKET_FD_KEY_BYTES: u32 = core::mem::size_of::<EbpfSocketFdKey>() as u32;
 pub const EBPF_ALLOWED_SOCKET_FD_VALUE_BYTES: u32 =
     core::mem::size_of::<EbpfSocketPayloadAllowance>() as u32;
+pub const EBPF_ALLOWED_PROCESS_TGIDS_MAP_NAME: &str = "TRAFFIC_PROBE_ALLOWED_PROCESS_TGIDS";
+pub const EBPF_ALLOWED_PROCESS_TGIDS_MAX_ENTRIES: u32 = 8192;
+pub const EBPF_ALLOWED_PROCESS_TGID_KEY_BYTES: u32 = core::mem::size_of::<u32>() as u32;
+pub const EBPF_ALLOWED_PROCESS_TGID_VALUE_BYTES: u32 =
+    core::mem::size_of::<EbpfProcessPayloadAllowance>() as u32;
 pub const EBPF_SOCKET_PAYLOAD_ALLOW_WRITE: u8 = 1 << 0;
 pub const EBPF_SOCKET_PAYLOAD_ALLOW_READ: u8 = 1 << 1;
 pub const EBPF_FD_TABLE_EPOCHS_MAP_NAME: &str = "TRAFFIC_PROBE_FD_TABLE_EPOCHS";
@@ -392,7 +397,7 @@ pub const EBPF_PROCESS_OPTIONAL_TRACEPOINT_PAIR_SPECS: [EbpfProcessOptionalTrace
     },
 ];
 
-pub const EBPF_PROCESS_MAP_SPECS: [EbpfMapSpec; 13] = [
+pub const EBPF_PROCESS_MAP_SPECS: [EbpfMapSpec; 14] = [
     EbpfMapSpec {
         name: EBPF_EVENTS_MAP_NAME,
         kind: EbpfMapKind::Ringbuf,
@@ -407,6 +412,14 @@ pub const EBPF_PROCESS_MAP_SPECS: [EbpfMapSpec; 13] = [
         key_size: EBPF_ALLOWED_SOCKET_FD_KEY_BYTES,
         value_size: EBPF_ALLOWED_SOCKET_FD_VALUE_BYTES,
         max_entries: EBPF_ALLOWED_SOCKET_FDS_MAX_ENTRIES,
+        map_flags: 0,
+    },
+    EbpfMapSpec {
+        name: EBPF_ALLOWED_PROCESS_TGIDS_MAP_NAME,
+        kind: EbpfMapKind::LruHash,
+        key_size: EBPF_ALLOWED_PROCESS_TGID_KEY_BYTES,
+        value_size: EBPF_ALLOWED_PROCESS_TGID_VALUE_BYTES,
+        max_entries: EBPF_ALLOWED_PROCESS_TGIDS_MAX_ENTRIES,
         map_flags: 0,
     },
     EbpfMapSpec {
@@ -705,6 +718,39 @@ impl EbpfSocketPayloadAllowance {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EbpfProcessPayloadAllowance {
+    pub direction_mask: u8,
+    pub _reserved: [u8; 7],
+}
+
+impl EbpfProcessPayloadAllowance {
+    pub const fn new(direction_mask: u8) -> Self {
+        Self {
+            direction_mask,
+            _reserved: [0; 7],
+        }
+    }
+
+    pub fn to_bpfel_bytes(self) -> [u8; core::mem::size_of::<Self>()] {
+        [
+            self.direction_mask,
+            self._reserved[0],
+            self._reserved[1],
+            self._reserved[2],
+            self._reserved[3],
+            self._reserved[4],
+            self._reserved[5],
+            self._reserved[6],
+        ]
+    }
+
+    pub fn allows(self, direction: u8) -> bool {
+        self.direction_mask & direction != 0
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EbpfPendingSocketConnectAttempt {
     pub observation: EbpfConnectObservation,
     pub flags: u16,
@@ -752,13 +798,24 @@ mod tests {
 
     #[test]
     fn process_map_specs_are_unique_and_layout_complete() {
-        assert_eq!(EBPF_PROCESS_MAP_SPECS.len(), 13);
+        assert_eq!(EBPF_PROCESS_MAP_SPECS.len(), 14);
         assert_unique(EBPF_PROCESS_MAP_SPECS.map(|spec| spec.name));
 
         let allow_map = process_map(EBPF_ALLOWED_SOCKET_FDS_MAP_NAME);
         assert_eq!(allow_map.kind, EbpfMapKind::LruHash);
         assert_eq!(allow_map.key_size, EBPF_ALLOWED_SOCKET_FD_KEY_BYTES);
         assert_eq!(allow_map.value_size, EBPF_ALLOWED_SOCKET_FD_VALUE_BYTES);
+
+        let process_allow_map = process_map(EBPF_ALLOWED_PROCESS_TGIDS_MAP_NAME);
+        assert_eq!(process_allow_map.kind, EbpfMapKind::LruHash);
+        assert_eq!(
+            process_allow_map.key_size,
+            EBPF_ALLOWED_PROCESS_TGID_KEY_BYTES
+        );
+        assert_eq!(
+            process_allow_map.value_size,
+            EBPF_ALLOWED_PROCESS_TGID_VALUE_BYTES
+        );
 
         let epoch_map = process_map(EBPF_FD_TABLE_EPOCHS_MAP_NAME);
         assert_eq!(epoch_map.kind, EbpfMapKind::Hash);
@@ -926,6 +983,20 @@ mod tests {
             ])
         );
         assert!(!EbpfProcessTracepointRole::WriteEnter.has_optional_attach());
+    }
+
+    #[test]
+    fn process_payload_allowance_layout_is_stable() {
+        assert_eq!(size_of::<EbpfProcessPayloadAllowance>(), 8);
+        assert_eq!(align_of::<EbpfProcessPayloadAllowance>(), 1);
+        assert_eq!(offset_of!(EbpfProcessPayloadAllowance, direction_mask), 0);
+        assert_eq!(offset_of!(EbpfProcessPayloadAllowance, _reserved), 1);
+        let allowance = EbpfProcessPayloadAllowance::new(
+            EBPF_SOCKET_PAYLOAD_ALLOW_READ | EBPF_SOCKET_PAYLOAD_ALLOW_WRITE,
+        );
+        assert!(allowance.allows(EBPF_SOCKET_PAYLOAD_ALLOW_READ));
+        assert!(allowance.allows(EBPF_SOCKET_PAYLOAD_ALLOW_WRITE));
+        assert!(!allowance.allows(1 << 7));
     }
 
     #[test]

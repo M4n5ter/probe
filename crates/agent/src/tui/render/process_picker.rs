@@ -221,8 +221,7 @@ impl ProcessPickerMode {
                     Cell::from(watched),
                     Cell::from(process.pid.to_string()),
                     Cell::from(process.name.clone()),
-                    Cell::from(process.capture_scope_label()),
-                    Cell::from(process.mitm_scope_label()),
+                    Cell::from(process.observation_scope_label()),
                     Cell::from(super::truncate(&exe, 48)),
                     Cell::from(process.argv_summary(PROCESS_VISIBLE_DETAIL_WIDTH)),
                 ])
@@ -263,7 +262,6 @@ impl ProcessPickerMode {
                 Constraint::Length(7),
                 Constraint::Length(20),
                 Constraint::Length(8),
-                Constraint::Length(7),
                 Constraint::Length(42),
                 Constraint::Min(24),
             ],
@@ -278,16 +276,9 @@ impl ProcessPickerMode {
 
     fn header(self) -> Row<'static> {
         let row = match self {
-            Self::Processes => Row::new([
-                "",
-                "Watch",
-                "PID",
-                "Name",
-                "Capture",
-                "MITM",
-                "Executable",
-                "Argv",
-            ]),
+            Self::Processes => {
+                Row::new(["", "Watch", "PID", "Name", "Observe", "Executable", "Argv"])
+            }
             Self::Traffic => Row::new(["", "Use", "PID", "Process"]),
         };
         row.style(

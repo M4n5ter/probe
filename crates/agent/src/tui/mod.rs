@@ -9,7 +9,7 @@ mod fields;
 mod generated_resources;
 mod hit;
 mod local_profile;
-mod mitm_setup;
+mod observation_setup;
 mod process_view;
 mod processes;
 mod render;
@@ -17,6 +17,7 @@ mod runtime_actions;
 mod runtime_attachment;
 mod runtime_status;
 mod terminal;
+mod text;
 mod traffic;
 mod wire;
 

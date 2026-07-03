@@ -420,12 +420,12 @@ fn key_to_action(key: KeyEvent, editing_text: bool, active_tab: TuiTab) -> Optio
         (KeyCode::Char('d'), _) if active_tab == TuiTab::Traffic => {
             Some(TuiAction::OpenTrafficDiagnostics)
         }
-        (KeyCode::Char('o'), _) if active_tab == TuiTab::Traffic => {
-            Some(TuiAction::ConfigureOutboundMitm)
+        (KeyCode::Char('h'), _) if active_tab == TuiTab::Traffic => {
+            Some(TuiAction::CycleTrafficEventFilter)
         }
-        (KeyCode::Char('i'), _) if active_tab == TuiTab::Traffic => {
-            Some(TuiAction::ConfigureInboundMitm)
-        }
+        (KeyCode::Char('a'), _) if active_tab == TuiTab::Traffic => Some(TuiAction::ObserveAuto),
+        (KeyCode::Char('e'), _) if active_tab == TuiTab::Traffic => Some(TuiAction::ObserveEbpf),
+        (KeyCode::Char('l'), _) if active_tab == TuiTab::Traffic => Some(TuiAction::ObserveLibpcap),
         (KeyCode::Tab, _) => Some(TuiAction::NextTab),
         (KeyCode::BackTab, _) => Some(TuiAction::PreviousTab),
         (KeyCode::Up, _) => Some(TuiAction::MoveUp),
@@ -526,19 +526,27 @@ mod tests {
         );
         assert_eq!(
             key_to_action(
-                KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
                 false,
                 TuiTab::Traffic
             ),
-            Some(TuiAction::ConfigureOutboundMitm)
+            Some(TuiAction::ObserveAuto)
         );
         assert_eq!(
             key_to_action(
-                KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
                 false,
                 TuiTab::Traffic
             ),
-            Some(TuiAction::ConfigureInboundMitm)
+            Some(TuiAction::ObserveEbpf)
+        );
+        assert_eq!(
+            key_to_action(
+                KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+                false,
+                TuiTab::Traffic
+            ),
+            Some(TuiAction::ObserveLibpcap)
         );
         assert_eq!(
             key_to_action(
@@ -550,6 +558,14 @@ mod tests {
         );
         assert_eq!(
             key_to_action(
+                KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+                false,
+                TuiTab::Traffic
+            ),
+            None
+        );
+        assert_eq!(
+            key_to_action(
                 KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
                 false,
                 TuiTab::Overview
@@ -558,7 +574,7 @@ mod tests {
         );
         assert_eq!(
             key_to_action(
-                KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
                 false,
                 TuiTab::Overview
             ),
@@ -765,7 +781,7 @@ mod tests {
             ProcessCatalog::default(),
         );
         let status = StatusMessage::warning(
-            "Outbound reliable MITM proxy fallback configured, but MITM proxy executable is missing",
+            "Outbound reliable MITM proxy data path configured, but MITM proxy executable is missing",
         );
 
         mark_saved_runtime_success(&mut app, &status, "restarted TUI managed agent");
@@ -787,7 +803,7 @@ mod tests {
             ProcessCatalog::default(),
         );
         let status = StatusMessage::saved(
-            "Outbound reliable MITM proxy fallback configured; captures plain HTTP and TLS-decrypted HTTP",
+            "Saved bidirectional MITM observation for curl; runtime bidirectional MITM expansion is pending",
         );
 
         mark_saved_runtime_error(
@@ -797,11 +813,8 @@ mod tests {
         );
 
         assert_eq!(app.status().kind, StatusKind::Error);
-        assert!(
-            app.status()
-                .text
-                .contains("captures plain HTTP and TLS-decrypted HTTP")
-        );
+        assert!(app.status().text.contains("bidirectional MITM observation"));
+        assert!(app.status().text.contains("MITM expansion is pending"));
         assert!(app.status().text.contains("startup failed"));
     }
 
@@ -813,7 +826,7 @@ mod tests {
             ProcessCatalog::default(),
         );
         let status = StatusMessage::saved(
-            "Outbound reliable MITM proxy fallback configured; captures plain HTTP and TLS-decrypted HTTP",
+            "Saved bidirectional MITM observation for curl; runtime bidirectional MITM expansion is pending",
         );
 
         detach_saved_runtime_error(
@@ -823,14 +836,15 @@ mod tests {
         );
 
         assert_eq!(app.status().kind, StatusKind::Error);
+        assert!(app.status().text.contains("bidirectional MITM observation"));
+        assert!(app.status().text.contains("MITM expansion is pending"));
         assert!(
-            app.status()
-                .text
-                .contains("captures plain HTTP and TLS-decrypted HTTP")
+            app.runtime_agent_status()
+                .contains("bidirectional MITM observation")
         );
         assert!(
             app.runtime_agent_status()
-                .contains("captures plain HTTP and TLS-decrypted HTTP")
+                .contains("MITM expansion is pending")
         );
         assert!(app.status().text.contains("restart failed"));
     }

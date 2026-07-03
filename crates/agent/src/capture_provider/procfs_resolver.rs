@@ -3,7 +3,7 @@ use capture::{
     CaptureError, EbpfResolvedSocketFlow, EbpfSocketFlowLookup, EbpfSocketFlowResolver,
     ProcessResolver, ResolvedProcess,
 };
-use probe_core::{CapabilityKind, RuntimeMode, TcpConnection};
+use probe_core::{CapabilityKind, ProcessContext, RuntimeMode, TcpConnection};
 use runtime::RuntimePlan;
 
 pub(super) fn procfs_tcp_process_resolver_for_plan(
@@ -76,6 +76,12 @@ impl EbpfSocketFlowResolver for ProcfsTcpProcessResolver {
                     socket_cookie: resolved.socket_cookie,
                 })
             })
+            .map_err(|error| CaptureError::provider("procfs_socket_attribution", error.to_string()))
+    }
+
+    fn resolve_process(&mut self, tgid: u32) -> Result<Option<ProcessContext>, CaptureError> {
+        self.resolver
+            .resolve_process(tgid)
             .map_err(|error| CaptureError::provider("procfs_socket_attribution", error.to_string()))
     }
 
