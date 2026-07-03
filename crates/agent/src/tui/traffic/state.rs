@@ -255,18 +255,18 @@ impl TrafficState {
     }
 
     pub(crate) fn active_row_count(&self) -> usize {
-        match self.effective_view_mode() {
+        match self.active_view().active {
             TrafficViewMode::Http => self.http_exchanges.len(),
             TrafficViewMode::Events => self.rows.len(),
         }
     }
 
     pub(crate) fn showing_http_exchanges(&self) -> bool {
-        self.effective_view_mode() == TrafficViewMode::Http
+        self.active_view().active == TrafficViewMode::Http
     }
 
     pub(crate) fn selected_detail_lines(&self) -> Option<Vec<String>> {
-        if self.effective_view_mode() == TrafficViewMode::Http {
+        if self.active_view().active == TrafficViewMode::Http {
             return self
                 .http_exchanges
                 .get(self.http_view.selected_index())
@@ -299,7 +299,7 @@ impl TrafficState {
     }
 
     pub(crate) fn selected_detail_fetch_sequence(&self) -> Option<u64> {
-        if self.effective_view_mode() == TrafficViewMode::Http {
+        if self.active_view().active == TrafficViewMode::Http {
             return None;
         }
         let row = self.selected_row()?;
@@ -328,8 +328,8 @@ impl TrafficState {
         if self.follow_tail { "Live" } else { "Paused" }
     }
 
-    pub(crate) fn view_mode_label(&self) -> &'static str {
-        self.view_mode.label()
+    pub(crate) fn view_mode_label(&self) -> String {
+        self.active_view().label()
     }
 
     pub(crate) fn set_viewport_rows(&mut self, rows: usize) {
@@ -376,7 +376,7 @@ impl TrafficState {
     }
 
     pub(crate) fn detail_preview_lines(&self, max_lines: usize) -> Vec<String> {
-        if self.effective_view_mode() == TrafficViewMode::Http {
+        if self.active_view().active == TrafficViewMode::Http {
             return self
                 .http_exchanges
                 .get(self.http_view.selected_index)
@@ -494,7 +494,7 @@ impl TrafficState {
         self.clamp_selection();
         self.status = TrafficStatus::idle(format!(
             "Traffic view changed to {}",
-            self.view_mode.label()
+            self.view_mode_label()
         ));
     }
 
@@ -529,7 +529,7 @@ impl TrafficState {
     }
 
     pub(crate) fn move_selection(&mut self, delta: isize, visible_rows: usize) {
-        let follow_tail = match self.effective_view_mode() {
+        let follow_tail = match self.active_view().active {
             TrafficViewMode::Http => {
                 self.http_view
                     .move_selection(self.http_exchanges.len(), delta, visible_rows)
@@ -545,7 +545,7 @@ impl TrafficState {
     }
 
     pub(crate) fn select_row(&mut self, index: usize, visible_rows: usize) {
-        let follow_tail = match self.effective_view_mode() {
+        let follow_tail = match self.active_view().active {
             TrafficViewMode::Http => {
                 self.http_view
                     .select_row(self.http_exchanges.len(), index, visible_rows)
@@ -561,7 +561,7 @@ impl TrafficState {
     }
 
     pub(crate) fn scroll_viewport(&mut self, delta: isize, visible_rows: usize) {
-        let follow_tail = match self.effective_view_mode() {
+        let follow_tail = match self.active_view().active {
             TrafficViewMode::Http => {
                 self.http_view
                     .scroll_viewport(self.http_exchanges.len(), delta, visible_rows)
@@ -580,7 +580,7 @@ impl TrafficState {
     }
 
     pub(crate) fn drag_scrollbar(&mut self, offset: usize, height: usize, visible_rows: usize) {
-        let follow_tail = match self.effective_view_mode() {
+        let follow_tail = match self.active_view().active {
             TrafficViewMode::Http => self.http_view.drag_scrollbar(
                 self.http_exchanges.len(),
                 offset,
@@ -691,7 +691,7 @@ impl TrafficState {
     }
 
     fn select_tail(&mut self, visible_rows: usize) {
-        match self.effective_view_mode() {
+        match self.active_view().active {
             TrafficViewMode::Http => self
                 .http_view
                 .select_tail(self.http_exchanges.len(), visible_rows),
@@ -705,12 +705,12 @@ impl TrafficState {
         self.http_view.clamp_to_len(self.http_exchanges.len());
     }
 
-    fn effective_view_mode(&self) -> TrafficViewMode {
-        if self.view_mode == TrafficViewMode::Http && self.http_exchanges.is_empty() {
-            TrafficViewMode::Events
-        } else {
-            self.view_mode
-        }
+    fn active_view(&self) -> TrafficActiveView {
+        TrafficActiveView::from_state(
+            self.view_mode,
+            !self.http_exchanges.is_empty(),
+            !self.rows.is_empty(),
+        )
     }
 }
 
@@ -734,6 +734,44 @@ impl TrafficViewMode {
             Self::Events => Self::Http,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrafficActiveView {
+    requested: TrafficViewMode,
+    active: TrafficViewMode,
+    fallback: Option<TrafficViewFallback>,
+}
+
+impl TrafficActiveView {
+    fn from_state(requested: TrafficViewMode, has_http_exchanges: bool, has_events: bool) -> Self {
+        match (requested, has_http_exchanges, has_events) {
+            (TrafficViewMode::Http, false, true) => Self {
+                requested,
+                active: TrafficViewMode::Events,
+                fallback: Some(TrafficViewFallback::NoHttpExchanges),
+            },
+            _ => Self {
+                requested,
+                active: requested,
+                fallback: None,
+            },
+        }
+    }
+
+    fn label(self) -> String {
+        match self.fallback {
+            Some(TrafficViewFallback::NoHttpExchanges) => {
+                format!("{} (no HTTP)", self.active.label())
+            }
+            None => self.requested.label().to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrafficViewFallback {
+    NoHttpExchanges,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1165,6 +1203,34 @@ mod tests {
                 .iter()
                 .any(|line| line == "  Body chunk offset=0 end_stream=true: hello")
         );
+    }
+
+    #[test]
+    fn http_view_label_reports_events_when_no_http_exchanges_are_visible() {
+        let mut traffic = TrafficState::default();
+
+        assert_eq!(traffic.view_mode_label(), "HTTP");
+        assert_eq!(
+            traffic.active_view(),
+            TrafficActiveView {
+                requested: TrafficViewMode::Http,
+                active: TrafficViewMode::Http,
+                fallback: None
+            }
+        );
+
+        traffic.apply_snapshot(tail_snapshot_with_gap_events(1..=3));
+
+        assert_eq!(traffic.view_mode_label(), "Events (no HTTP)");
+        assert_eq!(
+            traffic.active_view(),
+            TrafficActiveView {
+                requested: TrafficViewMode::Http,
+                active: TrafficViewMode::Events,
+                fallback: Some(TrafficViewFallback::NoHttpExchanges)
+            }
+        );
+        assert!(!traffic.showing_http_exchanges());
     }
 
     #[test]

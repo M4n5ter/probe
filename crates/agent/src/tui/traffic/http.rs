@@ -108,6 +108,8 @@ impl HttpMessage {
         if self.body.is_empty() {
             lines.push("  Body payload: -".to_string());
         } else {
+            lines.extend(self.body_payload_lines());
+            lines.push(format!("  Body chunks: {}", self.body.len()));
             for chunk in sorted_body_chunks(&self.body) {
                 lines.push(format!(
                     "  Body chunk offset={} end_stream={}: {}",
@@ -119,6 +121,35 @@ impl HttpMessage {
         }
         lines
     }
+
+    fn body_payload_lines(&self) -> Vec<String> {
+        let Some(payload) = BodyPayloadDetail::from_chunks(&self.body) else {
+            return vec!["  Body payload: -".to_string()];
+        };
+        match payload {
+            BodyPayloadDetail::Complete { bytes } => {
+                vec![format!("  Body payload: {}", bytes_detail(&bytes))]
+            }
+            BodyPayloadDetail::Incomplete {
+                start_offset,
+                observed_bytes,
+                reason,
+            } => {
+                let label = if start_offset == 0 {
+                    "  Body payload".to_string()
+                } else {
+                    format!("  Body payload from offset {start_offset}")
+                };
+                vec![
+                    format!("{label}: incomplete"),
+                    format!("  Observed body bytes: {}", bytes_detail(&observed_bytes)),
+                    format!("  Incomplete reason: {reason}"),
+                    "  Body payload is incomplete; chunk offsets below show the observed ranges"
+                        .to_string(),
+                ]
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +157,59 @@ struct BodyChunk {
     offset: u64,
     data: Vec<u8>,
     end_stream: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BodyPayloadDetail {
+    Complete {
+        bytes: Vec<u8>,
+    },
+    Incomplete {
+        start_offset: u64,
+        observed_bytes: Vec<u8>,
+        reason: &'static str,
+    },
+}
+
+impl BodyPayloadDetail {
+    fn from_chunks(chunks: &[BodyChunk]) -> Option<Self> {
+        let chunks = sorted_body_chunks(chunks);
+        let first = chunks.first()?;
+        let start_offset = first.offset;
+        let mut next_offset = start_offset;
+        let mut bytes = Vec::new();
+        let mut has_gap = false;
+        let mut has_end_stream = false;
+        for chunk in chunks {
+            has_end_stream |= chunk.end_stream;
+            if chunk.offset > next_offset {
+                has_gap = true;
+                next_offset = chunk.offset;
+            }
+            let overlap = next_offset.saturating_sub(chunk.offset) as usize;
+            if overlap >= chunk.data.len() {
+                continue;
+            }
+            let new_bytes = &chunk.data[overlap..];
+            bytes.extend_from_slice(new_bytes);
+            next_offset = next_offset.saturating_add(new_bytes.len() as u64);
+        }
+        if start_offset == 0 && !has_gap && has_end_stream {
+            return Some(Self::Complete { bytes });
+        }
+        let reason = if start_offset != 0 {
+            "body starts after offset 0"
+        } else if has_gap {
+            "missing bytes between observed chunks"
+        } else {
+            "end of stream was not observed"
+        };
+        Some(Self::Incomplete {
+            start_offset,
+            observed_bytes: bytes,
+            reason,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -423,6 +507,8 @@ mod tests {
             "POST /api/tasks -> 201 Created (req 5 B, resp 2 B)"
         );
         let details = exchange.detail_lines();
+        assert!(details.iter().any(|line| line == "  Body payload: hello"));
+        assert!(details.iter().any(|line| line == "  Body payload: ok"));
         assert!(
             details
                 .iter()
@@ -432,6 +518,263 @@ mod tests {
             details
                 .iter()
                 .any(|line| line == "  Body chunk offset=0 end_stream=true: ok")
+        );
+    }
+
+    #[test]
+    fn http_body_detail_reports_incomplete_payload_with_observed_chunks() {
+        let rows = vec![
+            TrafficRow::from_event(
+                1,
+                event(EventKind::HttpRequestHeaders(HttpHeaders {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    method: Some("POST".to_string()),
+                    target: Some("/upload".to_string()),
+                    status: None,
+                    reason: None,
+                    version: "HTTP/1.1".to_string(),
+                    headers: Vec::new(),
+                })),
+            ),
+            TrafficRow::from_event(
+                2,
+                event(EventKind::HttpBodyChunk(BodyChunk {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    offset: 0,
+                    data: b"hello".to_vec().into(),
+                    end_stream: false,
+                })),
+            ),
+            TrafficRow::from_event(
+                3,
+                event(EventKind::HttpBodyChunk(BodyChunk {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    offset: 8,
+                    data: b"world".to_vec().into(),
+                    end_stream: true,
+                })),
+            ),
+        ];
+
+        let exchanges = build_http_exchange_rows(&rows);
+        let [exchange] = exchanges.as_slice() else {
+            panic!("expected one exchange");
+        };
+        let details = exchange.detail_lines();
+
+        assert!(
+            details
+                .iter()
+                .any(|line| line == "  Body payload: incomplete")
+        );
+        assert!(
+            details
+                .iter()
+                .any(|line| line == "  Observed body bytes: helloworld")
+        );
+        assert!(
+            details
+                .iter()
+                .any(|line| line == "  Incomplete reason: missing bytes between observed chunks")
+        );
+        assert!(
+            details
+                .iter()
+                .any(|line| line.contains("payload is incomplete"))
+        );
+        assert!(
+            details
+                .iter()
+                .any(|line| line == "  Body chunk offset=8 end_stream=true: world")
+        );
+    }
+
+    #[test]
+    fn http_body_detail_reports_unfinished_contiguous_payload_as_incomplete() {
+        let rows = vec![
+            TrafficRow::from_event(
+                1,
+                event(EventKind::HttpRequestHeaders(HttpHeaders {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    method: Some("POST".to_string()),
+                    target: Some("/stream".to_string()),
+                    status: None,
+                    reason: None,
+                    version: "HTTP/1.1".to_string(),
+                    headers: Vec::new(),
+                })),
+            ),
+            TrafficRow::from_event(
+                2,
+                event(EventKind::HttpBodyChunk(BodyChunk {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    offset: 0,
+                    data: b"partial".to_vec().into(),
+                    end_stream: false,
+                })),
+            ),
+        ];
+
+        let exchanges = build_http_exchange_rows(&rows);
+        let [exchange] = exchanges.as_slice() else {
+            panic!("expected one exchange");
+        };
+        let details = exchange.detail_lines();
+
+        assert!(
+            details
+                .iter()
+                .any(|line| line == "  Body payload: incomplete")
+        );
+        assert!(
+            details
+                .iter()
+                .any(|line| line == "  Incomplete reason: end of stream was not observed")
+        );
+    }
+
+    #[test]
+    fn http_body_detail_reports_nonzero_start_offset_as_incomplete() {
+        let rows = vec![
+            TrafficRow::from_event(
+                1,
+                event(EventKind::HttpRequestHeaders(HttpHeaders {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    method: Some("POST".to_string()),
+                    target: Some("/partial".to_string()),
+                    status: None,
+                    reason: None,
+                    version: "HTTP/1.1".to_string(),
+                    headers: Vec::new(),
+                })),
+            ),
+            TrafficRow::from_event(
+                2,
+                event(EventKind::HttpBodyChunk(BodyChunk {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    offset: 5,
+                    data: b"tail".to_vec().into(),
+                    end_stream: true,
+                })),
+            ),
+        ];
+
+        let exchanges = build_http_exchange_rows(&rows);
+        let [exchange] = exchanges.as_slice() else {
+            panic!("expected one exchange");
+        };
+        let details = exchange.detail_lines();
+
+        assert!(
+            details
+                .iter()
+                .any(|line| line == "  Body payload from offset 5: incomplete")
+        );
+        assert!(
+            details
+                .iter()
+                .any(|line| line == "  Incomplete reason: body starts after offset 0")
+        );
+    }
+
+    #[test]
+    fn http_body_detail_accepts_empty_terminal_chunk_as_complete() {
+        let rows = vec![
+            TrafficRow::from_event(
+                1,
+                event(EventKind::HttpRequestHeaders(HttpHeaders {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    method: Some("POST".to_string()),
+                    target: Some("/chunked".to_string()),
+                    status: None,
+                    reason: None,
+                    version: "HTTP/1.1".to_string(),
+                    headers: Vec::new(),
+                })),
+            ),
+            TrafficRow::from_event(
+                2,
+                event(EventKind::HttpBodyChunk(BodyChunk {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    offset: 0,
+                    data: b"hello".to_vec().into(),
+                    end_stream: false,
+                })),
+            ),
+            TrafficRow::from_event(
+                3,
+                event(EventKind::HttpBodyChunk(BodyChunk {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    offset: 5,
+                    data: Vec::new().into(),
+                    end_stream: true,
+                })),
+            ),
+        ];
+
+        let exchanges = build_http_exchange_rows(&rows);
+        let [exchange] = exchanges.as_slice() else {
+            panic!("expected one exchange");
+        };
+        let details = exchange.detail_lines();
+
+        assert!(details.iter().any(|line| line == "  Body payload: hello"));
+        assert!(
+            !details
+                .iter()
+                .any(|line| line.contains("Body payload is incomplete"))
+        );
+    }
+
+    #[test]
+    fn http_body_detail_accepts_zero_length_complete_body() {
+        let rows = vec![
+            TrafficRow::from_event(
+                1,
+                event(EventKind::HttpRequestHeaders(HttpHeaders {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    method: Some("POST".to_string()),
+                    target: Some("/empty".to_string()),
+                    status: None,
+                    reason: None,
+                    version: "HTTP/1.1".to_string(),
+                    headers: Vec::new(),
+                })),
+            ),
+            TrafficRow::from_event(
+                2,
+                event(EventKind::HttpBodyChunk(BodyChunk {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    offset: 0,
+                    data: Vec::new().into(),
+                    end_stream: true,
+                })),
+            ),
+        ];
+
+        let exchanges = build_http_exchange_rows(&rows);
+        let [exchange] = exchanges.as_slice() else {
+            panic!("expected one exchange");
+        };
+        let details = exchange.detail_lines();
+
+        assert!(details.iter().any(|line| line == "  Body payload: -"));
+        assert!(
+            !details
+                .iter()
+                .any(|line| line.contains("Body payload is incomplete"))
         );
     }
 

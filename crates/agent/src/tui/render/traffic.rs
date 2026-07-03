@@ -206,11 +206,12 @@ fn render_traffic_action_bar(
         app.is_hovered(HitTarget::Control(ControlId::OpenTrafficDiagnostics)),
     )
     .unwrap_or(x);
+    let traffic_view_label = app.traffic().view_mode_label();
     x = render_action_button(
         frame,
         hits,
         action_area(area, x, y),
-        app.traffic().view_mode_label(),
+        &traffic_view_label,
         HitTarget::Control(ControlId::TrafficViewMode),
         app.is_hovered(HitTarget::Control(ControlId::TrafficViewMode)),
     )
