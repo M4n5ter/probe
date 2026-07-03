@@ -1,12 +1,17 @@
 use std::path::{Path, PathBuf};
 
 use pipeline::PipelinePolicySet;
-use probe_config::{AgentConfig, ConfigError};
-use runtime::{RuntimePlan, project_runtime_config, validate_static_runtime_config};
+use probe_config::{
+    AgentConfig, ConfigError, EnforcementConfig, EnforcementPolicyConfig,
+    EnforcementPolicyReloadConfig,
+};
+use runtime::{OnlineReloadConfigUpdate, RuntimePlan, validate_static_runtime_config};
 use serde::{Deserialize, Serialize};
 
 use crate::artifacts::normalize_embedded_artifact_paths_for_comparison;
+use crate::configured_enforcement::EnforcementRuntimeState;
 use crate::control_plane_http::policy_source_load_context_from_plan;
+use crate::enforcement_reload::{EnforcementReloadGate, reload_enforcement_policy};
 use crate::policy_reload::{PolicyReloadGate, reload_policies_from_config};
 use crate::runtime_generation::RuntimeGenerationReloadRequestInput;
 
@@ -193,10 +198,7 @@ pub(crate) fn plan_config_reload_for_candidate(
     let changed_sections = changed_sections(&comparable_current, &comparable_candidate);
     let decision = if changed_sections.is_empty() {
         ConfigReloadDecision::NoChange
-    } else if changed_sections
-        .iter()
-        .all(|change| !change.restart_required)
-    {
+    } else if changed_sections_can_apply_online(&changed_sections) {
         ConfigReloadDecision::ApplyOnline {
             reason: "changed sections are owned by runtime reload gates".to_string(),
         }
@@ -226,6 +228,8 @@ pub(crate) async fn apply_config_reload(
     current_plan: &RuntimePlan,
     policy_set: &PipelinePolicySet,
     policy_reload_gate: &PolicyReloadGate,
+    enforcement_runtime_state: Option<&EnforcementRuntimeState>,
+    enforcement_reload_gate: &EnforcementReloadGate,
     candidate_path: &Path,
 ) -> ConfigReloadApplyOutcome {
     let loaded = match load_config_reload_plan(&current_plan.config, candidate_path) {
@@ -275,6 +279,22 @@ pub(crate) async fn apply_config_reload(
         }
     }
 
+    let online_update = match online_reload_config_update(&plan, &candidate) {
+        Some(update) => update,
+        None => {
+            return ConfigReloadApplyOutcome {
+                snapshot: ConfigReloadApplySnapshot {
+                    plan,
+                    actions: Vec::new(),
+                    active_plan_updated: false,
+                },
+                applied_plan: None,
+                runtime_generation_request: None,
+            };
+        }
+    };
+    let applied_plan = online_applied_plan(current_plan, online_update.clone());
+
     let mut actions = Vec::new();
     if plan
         .changed_sections
@@ -306,6 +326,36 @@ pub(crate) async fn apply_config_reload(
             },
         );
     }
+    if plan
+        .changed_sections
+        .iter()
+        .any(|change| change.section == ConfigReloadSection::Enforcement)
+    {
+        actions.push(
+            match reload_enforcement_policy(
+                &applied_plan,
+                enforcement_runtime_state,
+                enforcement_reload_gate,
+            )
+            .await
+            {
+                Ok(summary) => ConfigReloadApplyAction::ReloadEnforcementPolicy(
+                    ConfigReloadApplyActionOutcome::Succeeded {
+                        detail: format!(
+                            "active enforcement policy reloaded, effective selector configured: {}, protective actions: {:?}",
+                            summary.active_policy.effective_selector_configured(),
+                            summary.active_policy.protective_actions()
+                        ),
+                    },
+                ),
+                Err(error) => ConfigReloadApplyAction::ReloadEnforcementPolicy(
+                    ConfigReloadApplyActionOutcome::Failed {
+                        message: error.to_string(),
+                    },
+                ),
+            },
+        );
+    }
 
     if actions.iter().any(|action| {
         matches!(
@@ -330,7 +380,6 @@ pub(crate) async fn apply_config_reload(
         };
     }
 
-    let applied_plan = online_applied_plan(current_plan, candidate);
     ConfigReloadApplyOutcome {
         snapshot: ConfigReloadApplySnapshot {
             plan,
@@ -342,11 +391,34 @@ pub(crate) async fn apply_config_reload(
     }
 }
 
-fn online_applied_plan(current_plan: &RuntimePlan, candidate: AgentConfig) -> RuntimePlan {
-    let mut applied = current_plan.clone();
-    applied.config = candidate;
-    applied.effective_config = project_runtime_config(applied.config.clone());
-    applied
+fn online_reload_config_update(
+    plan: &ConfigReloadPlanSnapshot,
+    candidate: &AgentConfig,
+) -> Option<OnlineReloadConfigUpdate> {
+    let [change] = plan.changed_sections.as_slice() else {
+        return None;
+    };
+    match change.section {
+        ConfigReloadSection::Policies if !change.restart_required => {
+            Some(OnlineReloadConfigUpdate::PipelinePolicies {
+                policies: candidate.policies.clone(),
+            })
+        }
+        ConfigReloadSection::Enforcement if !change.restart_required => {
+            Some(OnlineReloadConfigUpdate::EnforcementPolicy {
+                selector: candidate.enforcement.selector.clone(),
+                source: candidate.enforcement.policy.source.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn online_applied_plan(
+    current_plan: &RuntimePlan,
+    update: OnlineReloadConfigUpdate,
+) -> RuntimePlan {
+    current_plan.with_online_reload_update(update)
 }
 
 fn load_candidate_config(
@@ -453,6 +525,7 @@ fn section_restart_required(
 ) -> bool {
     match section {
         ConfigReloadSection::Policies => !policies_can_apply_online(current, candidate),
+        ConfigReloadSection::Enforcement => !enforcement_can_apply_online(current, candidate),
         _ => true,
     }
 }
@@ -470,14 +543,88 @@ fn section_change_reason(
         ConfigReloadSection::Policies => {
             "policy watcher or poller topology is still owned by startup background services"
         }
+        ConfigReloadSection::Enforcement if enforcement_can_apply_online(current, candidate) => {
+            "enforcement policy source and enforcement.selector are owned by an online reload gate"
+        }
+        ConfigReloadSection::Enforcement => {
+            "enforcement mode, backend, interception, or reload topology is still owned by setup-time services"
+        }
         _ => default_reason,
     }
+}
+
+fn changed_sections_can_apply_online(changed_sections: &[ConfigReloadSectionChange]) -> bool {
+    matches!(
+        changed_sections,
+        [change]
+            if !change.restart_required
+                && matches!(
+                    change.section,
+                    ConfigReloadSection::Policies | ConfigReloadSection::Enforcement
+                )
+    )
 }
 
 fn policies_can_apply_online(current: &AgentConfig, candidate: &AgentConfig) -> bool {
     current.policy_reload == candidate.policy_reload
         && !current.policy_reload.watch_local_bundles
         && !current.policy_reload.poll_remote_bundles
+}
+
+fn enforcement_can_apply_online(current: &AgentConfig, candidate: &AgentConfig) -> bool {
+    let EnforcementConfig {
+        mode: current_mode,
+        backend: current_backend,
+        selector: _,
+        interception: current_interception,
+        policy: current_policy,
+    } = &current.enforcement;
+    let EnforcementConfig {
+        mode: candidate_mode,
+        backend: candidate_backend,
+        selector: _,
+        interception: candidate_interception,
+        policy: candidate_policy,
+    } = &candidate.enforcement;
+    let EnforcementPolicyConfig {
+        source: _,
+        reload: current_reload,
+    } = current_policy;
+    let EnforcementPolicyConfig {
+        source: _,
+        reload: candidate_reload,
+    } = candidate_policy;
+
+    current_mode == candidate_mode
+        && current_backend == candidate_backend
+        && current_interception == candidate_interception
+        && !current_interception.strategy.is_enabled()
+        && enforcement_reload_topology_can_apply_online(current_reload, candidate_reload)
+}
+
+fn enforcement_reload_topology_can_apply_online(
+    current: &EnforcementPolicyReloadConfig,
+    candidate: &EnforcementPolicyReloadConfig,
+) -> bool {
+    let EnforcementPolicyReloadConfig {
+        watch_local_manifest: current_watch_local_manifest,
+        debounce_ms: current_debounce_ms,
+        poll_remote_manifest: current_poll_remote_manifest,
+        remote_poll_interval_ms: current_remote_poll_interval_ms,
+    } = current;
+    let EnforcementPolicyReloadConfig {
+        watch_local_manifest: candidate_watch_local_manifest,
+        debounce_ms: candidate_debounce_ms,
+        poll_remote_manifest: candidate_poll_remote_manifest,
+        remote_poll_interval_ms: candidate_remote_poll_interval_ms,
+    } = candidate;
+
+    current_watch_local_manifest == candidate_watch_local_manifest
+        && current_debounce_ms == candidate_debounce_ms
+        && current_poll_remote_manifest == candidate_poll_remote_manifest
+        && current_remote_poll_interval_ms == candidate_remote_poll_interval_ms
+        && !*current_watch_local_manifest
+        && !*current_poll_remote_manifest
 }
 
 fn section_changed(
@@ -858,6 +1005,114 @@ mod tests {
                 .map(|change| (change.section, change.restart_required))
                 .collect::<Vec<_>>(),
             vec![(ConfigReloadSection::Policies, false)]
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_can_apply_enforcement_policy_config_changes_online()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-enforcement-online")?;
+        let current = runtime_plan(base_config(temp.join("spool")))?;
+        let mut candidate = current.config.clone();
+        candidate.enforcement.selector = Some(Selector::term(
+            ProcessSelector {
+                names: vec!["backend".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector::default(),
+        ));
+        candidate.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: temp.join("enforcement.toml"),
+        };
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current.config, &candidate_path);
+
+        assert!(
+            matches!(plan.decision, ConfigReloadDecision::ApplyOnline { .. }),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.restart_required))
+                .collect::<Vec<_>>(),
+            vec![(ConfigReloadSection::Enforcement, false)]
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_keeps_enforcement_reload_topology_changes_restart_required()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-enforcement-reload-topology")?;
+        let current = runtime_plan(base_config(temp.join("spool")))?;
+        let mut candidate = current.config.clone();
+        candidate.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: temp.join("enforcement.toml"),
+        };
+        candidate.enforcement.policy.reload.watch_local_manifest = true;
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current.config, &candidate_path);
+
+        assert!(
+            matches!(plan.decision, ConfigReloadDecision::RestartRequired { .. }),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.restart_required))
+                .collect::<Vec<_>>(),
+            vec![(ConfigReloadSection::Enforcement, true)]
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_keeps_mixed_online_owner_changes_restart_required()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-mixed-online-owners")?;
+        let current = runtime_plan(base_config(temp.join("spool")))?;
+        let mut candidate = current.config.clone();
+        candidate.policies.push(PolicyConfig {
+            id: "guard".to_string(),
+            source: PolicySourceConfig::LocalDirectory {
+                path: temp.join("guard.bundle"),
+            },
+            ..PolicyConfig::default()
+        });
+        candidate.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: temp.join("enforcement.toml"),
+        };
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current.config, &candidate_path);
+
+        assert!(
+            matches!(plan.decision, ConfigReloadDecision::RestartRequired { .. }),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| change.section)
+                .collect::<Vec<_>>(),
+            vec![
+                ConfigReloadSection::Policies,
+                ConfigReloadSection::Enforcement
+            ]
         );
         fs::remove_dir_all(temp)?;
         Ok(())

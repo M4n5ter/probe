@@ -294,9 +294,11 @@ async fn handle_admin_request(
             .await
         }
         AdminRequest::ReloadEnforcementPolicy => {
+            let _config_apply_guard = runtime_state.config_apply_gate.lock().await;
+            let plan = plan_handle.snapshot();
             reload_action_response(
                 RuntimeReloadAction::ReloadEnforcementPolicy,
-                plan,
+                plan.as_ref(),
                 runtime_state,
             )
             .await
@@ -406,6 +408,8 @@ async fn apply_config_reload_response(
         plan,
         &runtime_state.policy_set,
         &runtime_state.policy_reload_gate,
+        runtime_state.enforcement.as_ref(),
+        &runtime_state.enforcement_reload_gate,
         &path,
     )
     .await;
@@ -520,13 +524,16 @@ mod tests {
     };
 
     use capture::ReplayProvider;
-    use enforcement::{EnforcementPlanRequest, EnforcementPlanner, ScopedEnforcementPlanner};
+    use enforcement::{
+        EnforcementBackend, EnforcementBackendDecision, EnforcementBackendRequest,
+        EnforcementPlanRequest, EnforcementPlanner, ScopedEnforcementPlanner,
+    };
     use parsers::Http1ParserFactory;
     use pipeline::{CapturePipeline, ExportEventWriter, PipelineRuntimeMetrics};
     use probe_config::{
-        AgentConfig, CaptureBackend, CaptureSelection, EnforcementPolicyManifest,
-        EnforcementPolicySourceConfig, ExporterConfig, LiveCaptureBackend, PolicyConfig,
-        PolicySourceConfig,
+        AgentConfig, CaptureBackend, CaptureSelection, ConnectionEnforcementBackendConfig,
+        EnforcementPolicyManifest, EnforcementPolicySourceConfig, ExporterConfig,
+        LiveCaptureBackend, PolicyConfig, PolicySourceConfig,
     };
     use probe_core::{
         Action, AddressPort, CapabilityKind, CapabilityState, CaptureOrigin, CaptureSource,
@@ -1420,6 +1427,253 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_apply_config_reload_applies_enforcement_config_online_and_updates_plan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-config-reload-enforcement-online")?;
+        let socket_path = temp.join("admin.sock");
+        let spool_path = temp.join("spool");
+        let initial_manifest_path = temp.join("initial-enforcement.toml");
+        let reloaded_manifest_path = temp.join("reloaded-enforcement.toml");
+        let candidate_path = temp.join("agent.toml");
+        write_enforcement_manifest(&initial_manifest_path, "initial", 80, Action::Deny)?;
+        write_enforcement_manifest(&reloaded_manifest_path, "reloaded", 443, Action::Reset)?;
+        let mut config = config_with_storage_path(spool_path.clone());
+        config.enforcement.mode = EnforcementMode::DryRun;
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: initial_manifest_path.clone(),
+        };
+        let spool = Arc::new(FjallSpool::open(&spool_path)?);
+        let plan = Arc::new(runtime_plan_from_config(config.clone())?);
+        let configured = crate::configured_enforcement::build_configured_enforcement_with_backend(
+            &plan,
+            None,
+            crate::configured_enforcement::EnforcementPolicySourceLoadContext::default(),
+        )
+        .await?;
+        let (mut planner_view, runtime_state) =
+            EnforcementRuntimeState::from_planner(configured.planner, configured.active_policy);
+        let server = spawn_admin_server(
+            RuntimePlanHandle::new(Arc::clone(&plan)),
+            Arc::clone(&spool),
+            AdminServerConfig::unix_socket(socket_path.clone()),
+            AdminRuntimeState {
+                enforcement: Some(runtime_state),
+                ..AdminRuntimeState::default()
+            },
+        )?;
+        let mut candidate = config;
+        candidate.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: reloaded_manifest_path.clone(),
+        };
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let response = send_admin_request(
+            &socket_path,
+            json!({
+                "command": "apply_config_reload",
+                "path": candidate_path
+            }),
+        )
+        .await?;
+
+        assert_eq!(response["kind"], json!("config_reload_apply"));
+        assert_eq!(
+            response["apply"]["plan"]["decision"]["kind"],
+            json!("apply_online")
+        );
+        assert_eq!(response["apply"]["active_plan_updated"], json!(true));
+        assert_eq!(
+            response["apply"]["actions"][0]["action"],
+            json!("reload_enforcement_policy")
+        );
+        assert_eq!(
+            response["apply"]["actions"][0]["outcome"]["result"],
+            json!("succeeded")
+        );
+
+        let old_scope_decision = enforcement_decision(&mut planner_view, Action::Deny, 80)?;
+        assert_eq!(old_scope_decision.outcome, EnforcementOutcome::SelectorMiss);
+        assert!(!old_scope_decision.selector_matched);
+
+        let new_scope_decision = enforcement_decision(&mut planner_view, Action::Reset, 443)?;
+        assert_eq!(new_scope_decision.outcome, EnforcementOutcome::DryRun);
+        assert!(new_scope_decision.selector_matched);
+
+        let status = send_admin_request(&socket_path, json!({ "command": "status" })).await?;
+        assert_eq!(
+            status["snapshot"]["enforcement"]["policy"]["source"]["manifest"]["version"],
+            json!("reloaded")
+        );
+        assert_eq!(
+            status["snapshot"]["enforcement"]["policy"]["source"]["source"]["path"],
+            json!(reloaded_manifest_path)
+        );
+
+        server.stop().await;
+        drop(spool);
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_apply_config_reload_applies_enforcement_selector_online()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-config-reload-enforcement-selector-online")?;
+        let socket_path = temp.join("admin.sock");
+        let spool_path = temp.join("spool");
+        let manifest_path = temp.join("enforcement.toml");
+        let candidate_path = temp.join("agent.toml");
+        write_enforcement_manifest(&manifest_path, "selector-reload", 443, Action::Reset)?;
+        let mut config = config_with_storage_path(spool_path.clone());
+        config.enforcement.mode = EnforcementMode::DryRun;
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: manifest_path.clone(),
+        };
+        let spool = Arc::new(FjallSpool::open(&spool_path)?);
+        let plan = Arc::new(runtime_plan_from_config(config.clone())?);
+        let configured = crate::configured_enforcement::build_configured_enforcement_with_backend(
+            &plan,
+            None,
+            crate::configured_enforcement::EnforcementPolicySourceLoadContext::default(),
+        )
+        .await?;
+        let (mut planner_view, runtime_state) =
+            EnforcementRuntimeState::from_planner(configured.planner, configured.active_policy);
+        let server = spawn_admin_server(
+            RuntimePlanHandle::new(Arc::clone(&plan)),
+            Arc::clone(&spool),
+            AdminServerConfig::unix_socket(socket_path.clone()),
+            AdminRuntimeState {
+                enforcement: Some(runtime_state),
+                ..AdminRuntimeState::default()
+            },
+        )?;
+        let mut candidate = config;
+        candidate.enforcement.selector = Some(process_name_selector("backend"));
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let response = send_admin_request(
+            &socket_path,
+            json!({
+                "command": "apply_config_reload",
+                "path": candidate_path
+            }),
+        )
+        .await?;
+
+        assert_eq!(response["kind"], json!("config_reload_apply"));
+        assert_eq!(
+            response["apply"]["plan"]["decision"]["kind"],
+            json!("apply_online")
+        );
+        assert_eq!(response["apply"]["active_plan_updated"], json!(true));
+
+        let old_process_decision =
+            enforcement_decision_for_process(&mut planner_view, Action::Reset, 443, "replay")?;
+        assert_eq!(
+            old_process_decision.outcome,
+            EnforcementOutcome::SelectorMiss
+        );
+        assert!(!old_process_decision.selector_matched);
+
+        let new_process_decision =
+            enforcement_decision_for_process(&mut planner_view, Action::Reset, 443, "backend")?;
+        assert_eq!(new_process_decision.outcome, EnforcementOutcome::DryRun);
+        assert!(new_process_decision.selector_matched);
+
+        let status = send_admin_request(&socket_path, json!({ "command": "status" })).await?;
+        assert_eq!(
+            status["snapshot"]["enforcement"]["config_selector_configured"],
+            json!(true)
+        );
+        assert_eq!(
+            status["snapshot"]["enforcement"]["effective_selector_configured"],
+            json!(true)
+        );
+
+        server.stop().await;
+        drop(spool);
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_apply_config_reload_rejects_enforce_without_policy_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-config-reload-enforce-source-required")?;
+        let socket_path = temp.join("admin.sock");
+        let spool_path = temp.join("spool");
+        let manifest_path = temp.join("enforcement.toml");
+        let candidate_path = temp.join("agent.toml");
+        write_enforcement_manifest(&manifest_path, "initial", 443, Action::Reset)?;
+        let mut config = config_with_storage_path(spool_path.clone());
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.backend = ConnectionEnforcementBackendConfig::LinuxSocketDestroy;
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: manifest_path.clone(),
+        };
+        let spool = Arc::new(FjallSpool::open(&spool_path)?);
+        let plan = Arc::new(enforcing_runtime_plan_from_config(config.clone())?);
+        let configured = crate::configured_enforcement::build_configured_enforcement_with_backend(
+            &plan,
+            Some(Box::new(ApplyingBackend)),
+            crate::configured_enforcement::EnforcementPolicySourceLoadContext::default(),
+        )
+        .await?;
+        let (_, runtime_state) =
+            EnforcementRuntimeState::from_planner(configured.planner, configured.active_policy);
+        let server = spawn_admin_server(
+            RuntimePlanHandle::new(Arc::clone(&plan)),
+            Arc::clone(&spool),
+            AdminServerConfig::unix_socket(socket_path.clone()),
+            AdminRuntimeState {
+                enforcement: Some(runtime_state),
+                ..AdminRuntimeState::default()
+            },
+        )?;
+        let mut candidate = config;
+        candidate.enforcement.policy.source = EnforcementPolicySourceConfig::None;
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let response = send_admin_request(
+            &socket_path,
+            json!({
+                "command": "apply_config_reload",
+                "path": candidate_path
+            }),
+        )
+        .await?;
+
+        assert_eq!(response["kind"], json!("config_reload_apply"));
+        assert_eq!(
+            response["apply"]["plan"]["decision"]["kind"],
+            json!("invalid_candidate")
+        );
+        assert_eq!(
+            response["apply"]["plan"]["decision"]["stage"],
+            json!("validate")
+        );
+        assert_eq!(response["apply"]["active_plan_updated"], json!(false));
+        assert_eq!(response["apply"]["actions"], json!([]));
+
+        let status = send_admin_request(&socket_path, json!({ "command": "status" })).await?;
+        assert_eq!(
+            status["snapshot"]["enforcement"]["policy"]["source"]["manifest"]["version"],
+            json!("initial")
+        );
+        assert_eq!(
+            status["snapshot"]["enforcement"]["policy"]["source"]["source"]["path"],
+            json!(manifest_path)
+        );
+
+        server.stop().await;
+        drop(spool);
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn admin_reload_runtime_actions_reports_each_action_independently()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("admin-runtime-actions-reload")?;
@@ -1541,6 +1795,19 @@ mod tests {
         RuntimePlan::build(config, &registry)
     }
 
+    fn enforcing_runtime_plan_from_config(
+        config: AgentConfig,
+    ) -> Result<RuntimePlan, runtime::RuntimeError> {
+        let registry = ProviderRegistry::new(
+            vec![CaptureProviderDescriptor::available(
+                CaptureBackend::Libpcap,
+                CaptureProviderBuilder::Libpcap,
+            )],
+            test_platform_capabilities_with_connection_enforcement(),
+        );
+        RuntimePlan::build(config, &registry)
+    }
+
     fn config_with_storage_path(storage_path: PathBuf) -> AgentConfig {
         AgentConfig {
             capture: probe_config::CaptureConfig {
@@ -1576,6 +1843,19 @@ mod tests {
             CapabilityState::unavailable(CapabilityKind::ConnectionEnforcement, "not built"),
             CapabilityState::unavailable(CapabilityKind::TransparentInterception, "not built"),
         ]
+    }
+
+    fn test_platform_capabilities_with_connection_enforcement() -> Vec<CapabilityState> {
+        test_platform_capabilities()
+            .into_iter()
+            .map(|state| {
+                if state.kind == CapabilityKind::ConnectionEnforcement {
+                    CapabilityState::available(CapabilityKind::ConnectionEnforcement)
+                } else {
+                    state
+                }
+            })
+            .collect()
     }
 
     fn enforcement_runtime(
@@ -1650,7 +1930,16 @@ end
         action: Action,
         remote_port: u16,
     ) -> Result<EnforcementDecision, Box<dyn std::error::Error>> {
-        let trigger = request_event(remote_port);
+        enforcement_decision_for_process(planner, action, remote_port, "replay")
+    }
+
+    fn enforcement_decision_for_process(
+        planner: &mut impl EnforcementPlanner,
+        action: Action,
+        remote_port: u16,
+        process_name: &str,
+    ) -> Result<EnforcementDecision, Box<dyn std::error::Error>> {
+        let trigger = request_event_for_process(remote_port, process_name);
         let verdict = Verdict {
             action,
             scope: VerdictScope::Flow,
@@ -1667,12 +1956,16 @@ end
     }
 
     fn request_event(remote_port: u16) -> EventEnvelope {
+        request_event_for_process(remote_port, "replay")
+    }
+
+    fn request_event_for_process(remote_port: u16, process_name: &str) -> EventEnvelope {
         EventEnvelope::from_flow(
             Timestamp {
                 monotonic_ns: 1,
                 wall_time_unix_ns: 1,
             },
-            demo_flow_with_remote_port(remote_port),
+            demo_flow_with_remote_port_and_process(remote_port, process_name),
             CaptureOrigin::from_source(CaptureSource::Replay),
             "test",
             EventKind::HttpRequestHeaders(HttpHeaders {
@@ -1693,12 +1986,16 @@ end
     }
 
     fn demo_flow_with_remote_port(remote_port: u16) -> FlowContext {
+        demo_flow_with_remote_port_and_process(remote_port, "replay")
+    }
+
+    fn demo_flow_with_remote_port_and_process(remote_port: u16, process_name: &str) -> FlowContext {
         let process = ProcessIdentity {
             pid: 1,
             tgid: 1,
             start_time_ticks: 1,
             boot_id: "boot".to_string(),
-            exe_path: "replay".to_string(),
+            exe_path: process_name.to_string(),
             cmdline_hash: "hash".to_string(),
             uid: 0,
             gid: 0,
@@ -1719,8 +2016,8 @@ end
             id: FlowIdentity::stable(&process, &local, &remote, TransportProtocol::Tcp, 1, None),
             process: ProcessContext {
                 identity: process,
-                name: "replay".to_string(),
-                cmdline: vec!["replay".to_string()],
+                name: process_name.to_string(),
+                cmdline: vec![process_name.to_string()],
             },
             local,
             remote,
@@ -1728,6 +2025,30 @@ end
             start_monotonic_ns: 1,
             socket_cookie: None,
             attribution_confidence: 0,
+        }
+    }
+
+    fn process_name_selector(name: &str) -> Selector {
+        Selector::term(
+            ProcessSelector {
+                names: vec![name.to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector::default(),
+        )
+    }
+
+    struct ApplyingBackend;
+
+    impl EnforcementBackend for ApplyingBackend {
+        fn apply(
+            &mut self,
+            request: EnforcementBackendRequest<'_>,
+        ) -> Result<EnforcementBackendDecision, enforcement::EnforcementError> {
+            Ok(EnforcementBackendDecision::applied(format!(
+                "backend applied {:?}",
+                request.verdict.action
+            )))
         }
     }
 

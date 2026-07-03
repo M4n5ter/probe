@@ -561,6 +561,46 @@ mod tests {
     }
 
     #[test]
+    fn config_reload_apply_summary_reports_enforcement_success() {
+        let response = json!({
+            "kind": "config_reload_apply",
+            "apply": {
+                "plan": config_reload_plan(
+                    json!({
+                        "kind": "apply_online",
+                        "reason": "changed sections are owned by runtime reload gates"
+                    }),
+                    json!([
+                        { "section": "enforcement", "restart_required": false, "reason": "enforcement policy source and enforcement.selector are owned by an online reload gate" }
+                    ])
+                ),
+                "active_plan_updated": true,
+                "actions": [
+                    {
+                        "action": "reload_enforcement_policy",
+                        "outcome": {
+                            "result": "succeeded",
+                            "detail": "active enforcement policy reloaded"
+                        }
+                    }
+                ]
+            }
+        });
+
+        let summary =
+            parse_config_reload_apply_response(&response).expect("apply response should parse");
+
+        assert_eq!(
+            summary.disposition(),
+            ConfigReloadApplyDisposition::AppliedOnline
+        );
+        assert_eq!(
+            summary.status_text(),
+            "runtime applied saved config online: reload_enforcement_policy: active enforcement policy reloaded"
+        );
+    }
+
+    #[test]
     fn config_reload_apply_summary_reports_online_failure() {
         let response = json!({
             "kind": "config_reload_apply",

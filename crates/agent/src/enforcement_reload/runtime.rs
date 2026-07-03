@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use runtime::{RuntimePlan, TransparentInterceptionExecutionPlan};
+use probe_core::EnforcementMode;
+use runtime::{EnforcementPolicySourcePlan, RuntimePlan, TransparentInterceptionExecutionPlan};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -27,6 +28,8 @@ pub(crate) enum EnforcementReloadError {
         "online enforcement policy reload is not supported while transparent interception owns setup-time host rules"
     )]
     SetupTimeInterception,
+    #[error("enforce mode requires an explicit enforcement policy source")]
+    PolicySourceRequiredForEnforce,
     #[error(transparent)]
     Configured(#[from] Box<ConfiguredEnforcementError>),
     #[error("failed to reconfigure active enforcement planner: {0}")]
@@ -42,7 +45,8 @@ impl From<ConfiguredEnforcementError> for EnforcementReloadError {
 pub(crate) fn validate_enforcement_policy_reload_plan(
     plan: &RuntimePlan,
 ) -> Result<(), EnforcementReloadError> {
-    reject_setup_time_interception_reload(plan)
+    reject_setup_time_interception_reload(plan)?;
+    reject_enforce_without_policy_source(plan)
 }
 
 pub(crate) async fn reload_enforcement_policy(
@@ -72,6 +76,18 @@ fn reject_setup_time_interception_reload(plan: &RuntimePlan) -> Result<(), Enfor
         TransparentInterceptionExecutionPlan::Disabled
     ) {
         return Err(EnforcementReloadError::SetupTimeInterception);
+    }
+    Ok(())
+}
+
+fn reject_enforce_without_policy_source(plan: &RuntimePlan) -> Result<(), EnforcementReloadError> {
+    if plan.enforcement.mode == EnforcementMode::Enforce
+        && matches!(
+            plan.enforcement.policy_source,
+            EnforcementPolicySourcePlan::None
+        )
+    {
+        return Err(EnforcementReloadError::PolicySourceRequiredForEnforce);
     }
     Ok(())
 }

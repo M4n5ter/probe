@@ -290,14 +290,19 @@ plaintext bridge and traffic view.
 
 The Runtime tab can call the online admin `reload_runtime_actions` command. It
 reloads the runtime owners that are explicitly safe to update online, currently
-policy bundles and the external enforcement manifest, and reports partial
+policy bundles and the enforcement policy source, and reports partial
 failures per action. Saving from the TUI uses `apply_config_reload` when an
 active admin socket is available: policy-only main config changes are applied
-online when policy watcher and poller topology does not change; capture and
-observation data-path rebuild verdicts are queued as runtime generation
-requests and swapped by the live agent at capture safe points. The queued
-response includes a generation request id; the TUI follows status until that
-request is applied, fails, or remains pending beyond the background wait window.
+online when policy watcher and poller topology does not change; enforcement
+policy source and `enforcement.selector` changes are applied online when
+enforcement reload watcher and poller topology is disabled and transparent
+interception is not owning setup-time host rules. Top-level `[selectors]`
+registry changes, including entries referenced by `enforcement.selector`, still
+require restart until selector ownership has a lifecycle owner. Capture and
+observation data-path rebuild verdicts are queued as runtime generation requests
+and swapped by the live agent at capture safe points. The queued response
+includes a generation request id; the TUI follows status until that request is
+applied, fails, or remains pending beyond the background wait window.
 Online apply failures keep the old running agent alive and are reported in the
 status line instead of forcing a managed-agent restart. Setup topology such as
 export, storage, admin socket, and watcher topology still requires a process
@@ -933,7 +938,7 @@ name = "managed_https"
 
 Enforcement manifests may also declare their own `[selectors.<name>]` registry.
 Manifest refs are resolved inside the manifest namespace before the agent
-combines them with the main config selector.
+combines them with the main config `enforcement.selector`.
 
 Selector list fields default to empty lists when omitted. Empty process or
 traffic dimensions mean "do not constrain this dimension"; they are not parse
@@ -1090,18 +1095,24 @@ response. Candidate main configs can be parsed and statically validated with
 `restart_required`, or `invalid_candidate`. `apply-config-reload` executes the
 online subset and updates the active plan when every online action succeeds.
 Policy-only config changes are online-applicable when local watcher and remote
-poller topology is disabled. Data-path rebuild verdicts can queue a
-`request_runtime_generation` action with a request id and appear as a pending
-runtime generation in status; the live agent consumes queued requests at capture
-safe points and records a runtime generation outcome. Capture and observation
-changes rebuild a candidate capture provider, swap it into the live loop, update
-capture runtime status, and replace the shared active plan only after the
-candidate opens. If a generation request cannot be queued, the old runtime stays
-active; a TUI-managed agent can restart to converge on the saved config, while an
-attached external agent reports that an explicit restart or retry is required.
-Selectors, TLS, enforcement, export, storage, admin, agent identity, and watcher
-topology changes are not silently applied by this path and remain
-`restart_required` until their lifecycle owners exist.
+poller topology is disabled. Enforcement policy source and
+`enforcement.selector` changes are online-applicable when enforcement reload
+watcher and poller topology is disabled and transparent interception is not
+owning setup-time host rules. Top-level `[selectors]` registry changes remain
+restart-required, even when an updated entry is referenced by
+`enforcement.selector`.
+Data-path rebuild verdicts can queue a `request_runtime_generation` action with
+a request id and appear as a pending runtime generation in status; the live agent
+consumes queued requests at capture safe points and records a runtime generation
+outcome. Capture and observation changes rebuild a candidate capture provider,
+swap it into the live loop, update capture runtime status, and replace the
+shared active plan only after the candidate opens. If a generation request cannot
+be queued, the old runtime stays active; a TUI-managed agent can restart to
+converge on the saved config, while an attached external agent reports that an
+explicit restart or retry is required. Selectors, TLS, enforcement execution
+surface changes, export, storage, admin, agent identity, and watcher topology
+changes are not silently applied by this path and remain `restart_required`
+until their lifecycle owners exist.
 Candidate config reads require a regular file, reject symlinks and oversized
 files, and do not echo raw config lines in parse errors.
 

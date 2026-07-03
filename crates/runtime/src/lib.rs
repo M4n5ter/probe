@@ -7,7 +7,7 @@ pub use plan::{
     EnforcementPlan, EnforcementPolicySourceKind, EnforcementPolicySourcePlan,
     ExportFailureBackoffPlan, ExportPlan, ExportRetentionPlan, ExportSinkPlan, ExportSinkTlsPlan,
     ExportSinkWorkerPlan, ExportTlsMaterialPlan, ExportWorkerPlan, FileExportSinkPlan,
-    IngressRetentionPlan, PlatformProbeResults, ProviderRegistry,
+    IngressRetentionPlan, OnlineReloadConfigUpdate, PlatformProbeResults, ProviderRegistry,
     RemoteEnforcementPolicyBodyLimitBytes, RequiredCapabilityPlan, RuntimeError, RuntimePlan,
     StoragePlan, StorageRetentionPlan, TlsDecryptHintPlan, TlsMaterialPlan, TlsMaterialStorePlan,
     TlsPlaintextCapabilityPlan, TlsPlaintextInstrumentationPlan, TlsPlaintextMaterialPlan,

@@ -1,5 +1,5 @@
-use probe_config::AgentConfig;
-use probe_core::CapabilityMatrix;
+use probe_config::{AgentConfig, EnforcementPolicySourceConfig, PolicyConfig};
+use probe_core::{CapabilityMatrix, Selector};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -27,6 +27,17 @@ pub struct RuntimePlan {
     pub storage: StoragePlan,
     pub export: ExportPlan,
     pub enforcement: EnforcementPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnlineReloadConfigUpdate {
+    PipelinePolicies {
+        policies: Vec<PolicyConfig>,
+    },
+    EnforcementPolicy {
+        selector: Option<Selector>,
+        source: EnforcementPolicySourceConfig,
+    },
 }
 
 impl RuntimePlan {
@@ -68,6 +79,33 @@ impl RuntimePlan {
             })
         }
     }
+
+    pub fn with_online_reload_update(&self, update: OnlineReloadConfigUpdate) -> Self {
+        let mut config = self.config.clone();
+        let update_enforcement =
+            matches!(update, OnlineReloadConfigUpdate::EnforcementPolicy { .. });
+        match update {
+            OnlineReloadConfigUpdate::PipelinePolicies { policies } => {
+                config.policies = policies;
+            }
+            OnlineReloadConfigUpdate::EnforcementPolicy { selector, source } => {
+                config.enforcement.selector = selector;
+                config.enforcement.policy.source = source;
+            }
+        }
+        let effective_config = project_runtime_config(config.clone());
+        let mut plan = self.clone();
+        plan.config = config;
+        plan.effective_config = effective_config;
+        if update_enforcement {
+            plan.enforcement = EnforcementPlan::resolve(
+                &plan.effective_config,
+                &plan.capabilities,
+                &plan.tls_material_store,
+            );
+        }
+        plan
+    }
 }
 
 pub fn project_runtime_config(config: AgentConfig) -> AgentConfig {
@@ -84,8 +122,8 @@ pub fn validate_static_runtime_config(config: &AgentConfig) -> Result<(), Runtim
 #[cfg(test)]
 mod tests {
     use probe_config::{
-        AgentConfig, CaptureBackend, CaptureSelection, ObservationDataPathMode,
-        ProcessObservationConfig,
+        AgentConfig, CaptureBackend, CaptureSelection, EnforcementPolicySourceConfig,
+        ObservationDataPathMode, PolicyConfig, ProcessObservationConfig,
     };
     use probe_core::{
         CapabilityKind, CapabilityState, Direction, ProcessSelector, RuntimeMode, Selector,
@@ -180,6 +218,63 @@ mod tests {
         let plan = RuntimePlan::build(config, &registry)?;
 
         assert_eq!(plan.capture.selection, CaptureSelection::Libpcap);
+        Ok(())
+    }
+
+    #[test]
+    fn online_reload_update_preserves_unowned_runtime_config_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ProviderRegistry::new(
+            vec![capture_provider(
+                CaptureBackend::Replay,
+                CaptureProviderBuilder::Replay,
+                RuntimeMode::Available,
+            )],
+            test_platform_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.capture.ebpf.object_path = Some("/runtime/generated-ebpf.o".into());
+        let plan = RuntimePlan::build(config, &registry)?;
+
+        let updated = plan.with_online_reload_update(OnlineReloadConfigUpdate::PipelinePolicies {
+            policies: vec![PolicyConfig {
+                id: "guard".to_string(),
+                ..PolicyConfig::default()
+            }],
+        });
+
+        assert_eq!(updated.config.policies.len(), 1);
+        assert_eq!(
+            updated.config.capture.ebpf.object_path,
+            Some("/runtime/generated-ebpf.o".into())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn online_enforcement_policy_update_recomputes_enforcement_plan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ProviderRegistry::new(
+            vec![capture_provider(
+                CaptureBackend::Replay,
+                CaptureProviderBuilder::Replay,
+                RuntimeMode::Available,
+            )],
+            test_platform_capabilities(),
+        );
+        let plan = RuntimePlan::build(AgentConfig::default(), &registry)?;
+
+        let updated = plan.with_online_reload_update(OnlineReloadConfigUpdate::EnforcementPolicy {
+            selector: None,
+            source: EnforcementPolicySourceConfig::File {
+                path: "/tmp/enforcement.toml".into(),
+            },
+        });
+
+        assert!(matches!(
+            updated.enforcement.policy_source,
+            crate::plan::EnforcementPolicySourcePlan::LocalManifest { .. }
+        ));
         Ok(())
     }
 
