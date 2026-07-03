@@ -203,7 +203,7 @@ fn render_traffic_action_bar(
         frame,
         hits,
         action_area(area, x, y),
-        ControlId::TrafficEventFilter.traffic_action_label(),
+        app.traffic().event_filter_label(),
         HitTarget::Control(ControlId::TrafficEventFilter),
         app.is_hovered(HitTarget::Control(ControlId::TrafficEventFilter)),
     )

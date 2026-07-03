@@ -1,6 +1,4 @@
-use probe_config::{
-    AgentConfig, CaptureSelection, ObservationDataPathMode, ProcessObservationConfig,
-};
+use probe_config::{AgentConfig, ObservationDataPathMode, ProcessObservationConfig};
 use probe_core::{Direction, Selector};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,14 +14,6 @@ impl ProcessObservationMode {
             Self::Auto => ObservationDataPathMode::Auto,
             Self::Ebpf => ObservationDataPathMode::Ebpf,
             Self::Libpcap => ObservationDataPathMode::Libpcap,
-        }
-    }
-
-    pub(crate) fn capture_selection(self) -> CaptureSelection {
-        match self {
-            Self::Auto => CaptureSelection::Auto,
-            Self::Ebpf => CaptureSelection::Ebpf,
-            Self::Libpcap => CaptureSelection::Libpcap,
         }
     }
 

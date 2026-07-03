@@ -6,9 +6,10 @@ use std::{
 };
 
 use ebpf_object::EbpfObjectArtifact;
-#[cfg(test)]
-use probe_config::CaptureSelection;
 use probe_config::{AgentConfig, CaptureBackend, probe_home_path};
+#[cfg(test)]
+use probe_config::{CaptureSelection, ObservationDataPathMode, ProcessObservationConfig};
+use runtime::project_runtime_config;
 use rustix::fs::OFlags;
 use thiserror::Error;
 
@@ -81,7 +82,7 @@ fn hydrate_process_observation_object_path_in(
     config: &mut AgentConfig,
     directory: PathBuf,
 ) -> Result<ArtifactHydration, ArtifactError> {
-    if !config.capture.may_use_backend(CaptureBackend::Ebpf) {
+    if !effective_capture_may_use_backend(config, CaptureBackend::Ebpf) {
         return Ok(ArtifactHydration::NotNeeded);
     }
     if config
@@ -139,7 +140,7 @@ fn project_process_observation_object_path(config: &mut AgentConfig) {
 }
 
 fn project_process_observation_object_path_in(config: &mut AgentConfig, directory: PathBuf) {
-    if !config.capture.may_use_backend(CaptureBackend::Ebpf) {
+    if !effective_capture_may_use_backend(config, CaptureBackend::Ebpf) {
         return;
     }
     if config
@@ -153,6 +154,12 @@ fn project_process_observation_object_path_in(config: &mut AgentConfig, director
     }
     config.capture.ebpf.object_path =
         Some(directory.join(EbpfObjectArtifact::ProcessObservation.file_name()));
+}
+
+fn effective_capture_may_use_backend(config: &AgentConfig, backend: CaptureBackend) -> bool {
+    project_runtime_config(config.clone())
+        .capture
+        .may_use_backend(backend)
 }
 
 fn project_tls_uprobe_object_path(config: &mut AgentConfig) {
@@ -404,6 +411,25 @@ fn process_observation_hydration_ignores_non_ebpf_capture_selection() -> Result<
 
 #[cfg(test)]
 #[test]
+fn process_observation_hydration_uses_projected_ebpf_selection() -> Result<(), ArtifactError> {
+    let (_temp, directory) = temp_artifact_directory();
+    let mut config = AgentConfig::default();
+    config.capture.selection = CaptureSelection::Libpcap;
+    config.observations.push(process_observation(
+        "nginx",
+        "/usr/sbin/nginx",
+        ObservationDataPathMode::Ebpf,
+    ));
+
+    let outcome = hydrate_process_observation_object_path_in(&mut config, directory)?;
+
+    assert_eq!(outcome, ArtifactHydration::Materialized);
+    assert!(config.capture.ebpf.object_path.is_some());
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
 fn process_observation_hydration_keeps_explicit_object_path() -> Result<(), ArtifactError> {
     let (_temp, directory) = temp_artifact_directory();
     let mut config = AgentConfig::default();
@@ -547,6 +573,29 @@ fn temp_artifact_directory() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().expect("tempdir should be created");
     let directory = temp.path().join("artifacts/ebpf");
     (temp, directory)
+}
+
+#[cfg(test)]
+fn process_observation(
+    id: &str,
+    exe_path: &str,
+    data_path: ObservationDataPathMode,
+) -> ProcessObservationConfig {
+    ProcessObservationConfig {
+        id: id.to_string(),
+        selector: probe_core::Selector::term(
+            probe_core::ProcessSelector {
+                exe_path_globs: vec![exe_path.to_string()],
+                ..probe_core::ProcessSelector::default()
+            },
+            probe_core::TrafficSelector::default(),
+        ),
+        data_path,
+        directions: vec![
+            probe_core::Direction::Inbound,
+            probe_core::Direction::Outbound,
+        ],
+    }
 }
 
 #[cfg(test)]

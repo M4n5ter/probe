@@ -214,7 +214,7 @@ fn try_open_live_backend_with_fallback<T>(
                     open_failures: failures,
                 }));
             }
-            Err(error) if plan.config.capture.selection == CaptureSelection::Auto => {
+            Err(error) if plan.effective_config.capture.selection == CaptureSelection::Auto => {
                 failures.push(CaptureProviderOpenFailureSnapshot {
                     backend,
                     reason: error.to_string(),
@@ -243,7 +243,7 @@ fn build_live_capture_backend(
         CaptureBackend::Ebpf => build_ebpf_capture_provider(plan),
         CaptureBackend::Libpcap => Ok(OpenedLiveCaptureBackend {
             provider: Box::new(LibpcapProvider::open_with_process_resolver(
-                libpcap_config_from_agent(&plan.config),
+                libpcap_config_from_agent(&plan.effective_config),
                 procfs_tcp_process_resolver_for_plan(plan),
             )?) as Box<dyn CaptureProvider>,
             provider_details: None,
@@ -351,7 +351,7 @@ fn build_plaintext_feed_provider(
 fn build_capture_event_feed_provider(
     plan: &RuntimePlan,
 ) -> Result<Box<dyn CaptureProvider>, AgentError> {
-    let config = &plan.config.capture.capture_event_feed;
+    let config = &plan.effective_config.capture.capture_event_feed;
     let path = config.path.as_ref().ok_or_else(|| {
         AgentError::UnsupportedRunConfig(
             "capture_event_feed capture requires capture.capture_event_feed.path".to_string(),

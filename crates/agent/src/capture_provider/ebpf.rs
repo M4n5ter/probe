@@ -18,7 +18,7 @@ pub(super) fn build_ebpf_capture_provider(
     plan: &RuntimePlan,
 ) -> Result<OpenedLiveCaptureBackend, AgentError> {
     let object_path = plan
-        .config
+        .effective_config
         .capture
         .ebpf
         .object_path
@@ -48,11 +48,11 @@ pub(super) fn build_ebpf_capture_provider(
 fn deep_observe_selector_plan(
     plan: &RuntimePlan,
 ) -> Result<(Option<CompiledSelector>, Option<CompiledSelector>), AgentError> {
-    let Some(selector) = plan.config.capture.deep_observe_selector.as_ref() else {
+    let Some(selector) = plan.effective_config.capture.deep_observe_selector.as_ref() else {
         return Ok((None, None));
     };
     let resolved = selector
-        .resolve_refs_with_registry(&plan.config.selectors)
+        .resolve_refs_with_registry(&plan.effective_config.selectors)
         .map_err(|source| {
             AgentError::UnsupportedRunConfig(format!(
                 "invalid capture.deep_observe_selector: {source}"

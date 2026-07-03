@@ -257,15 +257,16 @@ mod tests {
     use probe_config::{
         AgentConfig, CaptureBackend, CaptureSelection, EnforcementConfig,
         EnforcementInterceptionConfig, EnforcementPolicyConfig, EnforcementPolicySourceConfig,
-        ExporterConfig, ExporterTransportConfig, LiveCaptureBackend, StorageConfig, TlsConfig,
-        TlsMaterialConfig, TlsMaterialKind, TransparentInterceptionMitmBackendConfig,
+        ExporterConfig, ExporterTransportConfig, LiveCaptureBackend, ObservationDataPathMode,
+        ProcessObservationConfig, StorageConfig, TlsConfig, TlsMaterialConfig, TlsMaterialKind,
+        TransparentInterceptionMitmBackendConfig,
         TransparentInterceptionMitmBackendReadinessProbeConfig,
         TransparentInterceptionMitmClientTrustConfig,
         TransparentInterceptionMitmClientTrustModeConfig, TransparentInterceptionMitmConfig,
         TransparentInterceptionProxyConfig, TransparentInterceptionStrategyConfig,
     };
     use probe_core::{
-        CapabilityKind, CapabilityState, EnforcementMode, ProcessSelector, Selector,
+        CapabilityKind, CapabilityState, Direction, EnforcementMode, ProcessSelector, Selector,
         TrafficSelector,
     };
     use runtime::{
@@ -294,6 +295,28 @@ mod tests {
                 ConfigReloadRuntimeAction::ReloadEnforcementPolicy,
             ]
         );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_compares_raw_config_when_observations_project_capture()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-observation-projection")?;
+        let mut config = base_config(temp.join("spool"));
+        config.observations.push(process_observation(
+            "nginx",
+            "/usr/sbin/nginx",
+            ObservationDataPathMode::Libpcap,
+        ));
+        let current = runtime_plan(config.clone())?;
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&config)?)?;
+
+        let plan = plan_config_reload(&current.config, &candidate_path);
+
+        assert!(matches!(plan.decision, ConfigReloadDecision::NoChange));
+        assert!(plan.changed_sections.is_empty());
         fs::remove_dir_all(temp)?;
         Ok(())
     }
@@ -493,6 +516,25 @@ mod tests {
                 ..StorageConfig::default()
             },
             ..AgentConfig::default()
+        }
+    }
+
+    fn process_observation(
+        id: &str,
+        exe_path: &str,
+        data_path: ObservationDataPathMode,
+    ) -> ProcessObservationConfig {
+        ProcessObservationConfig {
+            id: id.to_string(),
+            selector: Selector::term(
+                ProcessSelector {
+                    exe_path_globs: vec![exe_path.to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            ),
+            data_path,
+            directions: vec![Direction::Inbound, Direction::Outbound],
         }
     }
 

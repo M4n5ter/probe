@@ -4,6 +4,7 @@ mod enforcement_policy_source;
 mod error;
 mod export;
 mod interception_scope;
+mod observation;
 mod registry;
 mod runtime_plan;
 mod storage;
@@ -45,7 +46,7 @@ pub use interception_scope::{
 };
 pub use probe_config::RemoteEnforcementPolicyBodyLimitBytes;
 pub use registry::{PlatformProbeResults, ProviderRegistry, default_l7_mitm_unavailable_reason};
-pub use runtime_plan::{RuntimePlan, validate_static_runtime_config};
+pub use runtime_plan::{RuntimePlan, project_runtime_config, validate_static_runtime_config};
 pub use storage::{ExportRetentionPlan, IngressRetentionPlan, StoragePlan, StorageRetentionPlan};
 pub use tls::{
     ExportTlsMaterialPlan, TlsDecryptHintPlan, TlsMaterialPlan, TlsMaterialStorePlan,

@@ -895,8 +895,7 @@ impl TuiApp {
         };
         let process_name = process.name.clone();
         let observation_id = process_observation_id(process);
-        upsert_process_observation(&mut self.config, observation_id, selector.clone(), mode);
-        self.project_current_process_observation(mode, selector);
+        upsert_process_observation(&mut self.config, observation_id, selector, mode);
         self.process_view.set_single_monitor(index, &self.processes);
         self.traffic = TrafficState::default();
         self.clear_traffic_popup();
@@ -907,15 +906,6 @@ impl TuiApp {
         let saved_status = process_observation_status(mode, &process_name);
         self.status = saved_status.clone();
         Some(TuiEffect::save_config_with_status(saved_status))
-    }
-
-    fn project_current_process_observation(
-        &mut self,
-        mode: ProcessObservationMode,
-        selector: probe_core::Selector,
-    ) {
-        self.config.capture.selection = mode.capture_selection();
-        self.config.capture.deep_observe_selector = Some(selector);
     }
 
     fn begin_text_edit(&mut self, field: FieldId) {
@@ -1409,7 +1399,7 @@ mod tests {
     }
 
     #[test]
-    fn enforcement_observe_libpcap_control_uses_selected_process_profile() {
+    fn enforcement_observe_libpcap_control_writes_selected_process_observation() {
         let mut app = multi_process_app();
         app.select_tab(TuiTab::Processes);
         app.handle_action(TuiAction::Click(HitTarget::Process(1)));
@@ -1422,7 +1412,8 @@ mod tests {
         let saved_status = expect_save_status(effect);
         assert_eq!(saved_status.kind, StatusKind::Saved);
         assert!(app.dirty());
-        assert_eq!(app.config.capture.selection, CaptureSelection::Libpcap);
+        assert_eq!(app.config.capture.selection, CaptureSelection::Auto);
+        assert!(app.config.capture.deep_observe_selector.is_none());
         assert_eq!(app.config.observations.len(), 1);
         assert_eq!(app.config.observations[0].id, "exe:/usr/sbin/nginx");
         assert_eq!(
@@ -1449,7 +1440,7 @@ mod tests {
         assert_eq!(saved_status.kind, StatusKind::Saved);
         assert!(app.dirty());
         assert_eq!(app.config.capture.selection, CaptureSelection::Auto);
-        assert!(app.config.capture.deep_observe_selector.is_some());
+        assert!(app.config.capture.deep_observe_selector.is_none());
         assert_eq!(app.traffic_filter_label(), "1 watched processes");
         assert_eq!(app.config.observations.len(), 1);
         assert_eq!(
