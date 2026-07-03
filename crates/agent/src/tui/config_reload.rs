@@ -705,7 +705,7 @@ mod tests {
                         "action": "request_runtime_generation",
                         "outcome": {
                             "result": "busy",
-                            "message": "runtime generation reload is busy: pending request 1"
+                            "message": "runtime generation reload is busy: applying request 1"
                         }
                     }
                 ]
@@ -721,7 +721,7 @@ mod tests {
         );
         assert_eq!(
             summary.status_text(),
-            "runtime generation reload request failed: request_runtime_generation: runtime generation reload is busy: pending request 1"
+            "runtime generation reload request failed: request_runtime_generation: runtime generation reload is busy: applying request 1"
         );
     }
 

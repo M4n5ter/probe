@@ -296,7 +296,7 @@ mod tests {
                         "action": "request_runtime_generation",
                         "outcome": {
                             "result": "busy",
-                            "message": "runtime generation reload is busy: pending request 1"
+                            "message": "runtime generation reload is busy: applying request 1"
                         }
                     }
                 ]
@@ -306,7 +306,7 @@ mod tests {
         assert_eq!(
             admin_action_error_message(&response).as_deref(),
             Some(
-                "config reload action failed: request_runtime_generation: runtime generation reload is busy: pending request 1"
+                "config reload action failed: request_runtime_generation: runtime generation reload is busy: applying request 1"
             )
         );
     }

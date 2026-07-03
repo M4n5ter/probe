@@ -1588,7 +1588,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_config_reload_apply_reports_busy_generation_without_replacing_plan()
+    async fn complete_config_reload_apply_reports_busy_generation_while_applying_without_replacing_plan()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("config-reload-busy-generation")?;
         let current = runtime_plan(base_config(temp.join("spool")))?;
@@ -1606,6 +1606,7 @@ mod tests {
             candidate_config_version: Some(candidate.config_version.clone()),
             changed_sections: vec!["capture".to_string()],
         })?;
+        runtime_generation.begin_pending_reload();
 
         let outcome = apply_config_reload(
             &current,
@@ -1629,6 +1630,63 @@ mod tests {
         assert_eq!(
             plan_handle.snapshot().config.capture.fallback_backends,
             current.config.capture.fallback_backends
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn complete_config_reload_apply_replaces_pending_generation_with_latest_candidate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-replace-pending-generation")?;
+        let current = runtime_plan(base_config(temp.join("spool")))?;
+        let mut first_candidate = current.config.clone();
+        first_candidate.config_version = "first".to_string();
+        first_candidate.capture.fallback_backends = vec![LiveCaptureBackend::Libpcap];
+        let mut latest_candidate = first_candidate.clone();
+        latest_candidate.config_version = "latest".to_string();
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&latest_candidate)?)?;
+        let plan_handle = RuntimePlanHandle::new(Arc::new(current.clone()));
+        let runtime_generation =
+            RuntimeGenerationState::for_config_version(current.config.config_version.clone());
+        let first = runtime_generation.request_reload(RuntimeGenerationReloadRequestInput {
+            candidate_path: candidate_path.clone(),
+            candidate_config: first_candidate,
+            current_config_version: current.config.config_version.clone(),
+            candidate_config_version: Some("first".to_string()),
+            changed_sections: vec!["agent_identity".to_string(), "capture".to_string()],
+        })?;
+
+        let outcome = apply_config_reload(
+            &current,
+            &PipelinePolicySet::default(),
+            &PolicyReloadGate::default(),
+            None,
+            &EnforcementReloadGate::default(),
+            &candidate_path,
+        )
+        .await;
+        let snapshot =
+            complete_config_reload_apply(outcome, &plan_handle, Some(&runtime_generation));
+
+        assert!(!snapshot.active_plan_updated);
+        assert!(matches!(
+            snapshot.actions.as_slice(),
+            [ConfigReloadApplyAction::RequestRuntimeGeneration(
+                ConfigReloadRuntimeGenerationActionOutcome::Queued { request_id: 2, .. },
+            )]
+        ));
+        let pending = runtime_generation
+            .snapshot()
+            .pending
+            .expect("latest candidate should remain pending");
+        assert_eq!(first.request_id, 1);
+        assert_eq!(pending.request_id, 2);
+        assert_eq!(pending.candidate_config_version.as_deref(), Some("latest"));
+        assert_eq!(
+            plan_handle.snapshot().config.config_version,
+            current.config.config_version
         );
         fs::remove_dir_all(temp)?;
         Ok(())
