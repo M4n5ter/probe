@@ -3,5 +3,6 @@ mod state;
 
 pub(crate) use executor::RuntimeGenerationExecutor;
 pub(crate) use state::{
-    RuntimeGenerationReloadRequestInput, RuntimeGenerationSnapshot, RuntimeGenerationState,
+    RuntimeGenerationReloadRequestInput, RuntimeGenerationReloadResultSnapshot,
+    RuntimeGenerationSnapshot, RuntimeGenerationState,
 };

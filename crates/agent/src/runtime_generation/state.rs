@@ -6,7 +6,7 @@ use std::{
 };
 
 use probe_config::AgentConfig;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
 pub(crate) struct RuntimeGenerationState {
@@ -34,7 +34,7 @@ pub(crate) struct RuntimeGenerationReloadQueueError {
     applying_request_id: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) struct RuntimeGenerationReloadRequestSnapshot {
     pub request_id: u64,
     pub candidate_path: PathBuf,
@@ -44,7 +44,7 @@ pub(crate) struct RuntimeGenerationReloadRequestSnapshot {
     pub requested_unix_ns: u64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) struct RuntimeGenerationSnapshot {
     pub active: ActiveRuntimeGenerationSnapshot,
     pub pending: Option<RuntimeGenerationReloadRequestSnapshot>,
@@ -53,32 +53,32 @@ pub(crate) struct RuntimeGenerationSnapshot {
     pub capture_control: CaptureControlSafePointSnapshot,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) struct ActiveRuntimeGenerationSnapshot {
     pub generation: u64,
     pub config_version: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) struct CaptureControlSafePointSnapshot {
     pub safe_points: u64,
     pub last_safe_point_unix_ns: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) struct RuntimeGenerationReloadApplyingSnapshot {
     pub request: RuntimeGenerationReloadRequestSnapshot,
     pub started_unix_ns: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) struct RuntimeGenerationReloadOutcomeSnapshot {
     pub request_id: u64,
     pub completed_unix_ns: u64,
     pub result: RuntimeGenerationReloadResultSnapshot,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case", tag = "result")]
 pub(crate) enum RuntimeGenerationReloadResultSnapshot {
     Applied {

@@ -37,8 +37,8 @@ use crate::runtime_plan::RuntimePlanHandle;
 use crate::runtime_reload::{
     RuntimeReloadGate,
     config_reload::{
-        ConfigReloadApplyAction, ConfigReloadApplyActionOutcome, ConfigReloadRuntimeAction,
-        apply_config_reload, plan_config_reload,
+        ConfigReloadApplyAction, ConfigReloadRuntimeGenerationActionOutcome, apply_config_reload,
+        plan_config_reload,
     },
 };
 use crate::status::{
@@ -411,16 +411,16 @@ async fn apply_config_reload_response(
     .await;
     if let Some(applied_plan) = outcome.applied_plan {
         plan_handle.replace(applied_plan);
-    } else if let Some(runtime_generation) = &runtime_state.runtime_generation
-        && let Some(request) = outcome.runtime_generation_request.take()
-    {
-        outcome
-            .snapshot
-            .actions
-            .push(match runtime_generation.request_reload(request) {
-                Ok(request) => ConfigReloadApplyAction {
-                    action: ConfigReloadRuntimeAction::RequestRuntimeGeneration,
-                    outcome: ConfigReloadApplyActionOutcome::Queued {
+    } else if let Some(request) = outcome.runtime_generation_request.take() {
+        outcome.snapshot.actions.push(
+            match runtime_state
+                .runtime_generation
+                .as_ref()
+                .map(|runtime_generation| runtime_generation.request_reload(request))
+            {
+                Some(Ok(request)) => ConfigReloadApplyAction::RequestRuntimeGeneration(
+                    ConfigReloadRuntimeGenerationActionOutcome::Queued {
+                        request_id: request.request_id,
                         detail: format!(
                             "runtime generation reload request {} queued for {}",
                             request.request_id,
@@ -430,14 +430,19 @@ async fn apply_config_reload_response(
                                 .unwrap_or("<unknown config_version>")
                         ),
                     },
-                },
-                Err(error) => ConfigReloadApplyAction {
-                    action: ConfigReloadRuntimeAction::RequestRuntimeGeneration,
-                    outcome: ConfigReloadApplyActionOutcome::Failed {
+                ),
+                Some(Err(error)) => ConfigReloadApplyAction::RequestRuntimeGeneration(
+                    ConfigReloadRuntimeGenerationActionOutcome::Failed {
                         message: error.to_string(),
                     },
-                },
-            });
+                ),
+                None => ConfigReloadApplyAction::RequestRuntimeGeneration(
+                    ConfigReloadRuntimeGenerationActionOutcome::Failed {
+                        message: "runtime generation owner is unavailable".to_string(),
+                    },
+                ),
+            },
+        );
     }
     AdminResponse::ConfigReloadApply {
         apply: Box::new(outcome.snapshot),
@@ -991,7 +996,16 @@ mod tests {
             json!("queue_runtime_generation")
         );
         assert_eq!(response["apply"]["active_plan_updated"], json!(false));
-        assert_eq!(response["apply"]["actions"], json!([]));
+        assert_eq!(
+            response["apply"]["actions"][0],
+            json!({
+                "action": "request_runtime_generation",
+                "outcome": {
+                    "result": "failed",
+                    "message": "runtime generation owner is unavailable"
+                }
+            })
+        );
 
         let status = send_admin_request(&socket_path, json!({ "command": "status" })).await?;
         assert_eq!(status["snapshot"]["policy"]["configured_count"], json!(0));
@@ -1049,6 +1063,10 @@ mod tests {
         assert_eq!(
             response["apply"]["actions"][0]["outcome"]["result"],
             json!("queued")
+        );
+        assert_eq!(
+            response["apply"]["actions"][0]["outcome"]["request_id"],
+            json!(1)
         );
 
         let status = send_admin_request(&socket_path, json!({ "command": "status" })).await?;

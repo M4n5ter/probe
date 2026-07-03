@@ -5,9 +5,13 @@ use probe_config::AgentConfig;
 use super::{
     agent::TuiAgentSupervisor,
     app::{StatusKind, StatusMessage, TuiApp},
-    config_reload::request_config_reload_apply,
+    config_reload::{ConfigReloadApplyDisposition, request_config_reload_apply},
     runtime_actions::request_runtime_actions_reload,
     runtime_attachment::RuntimeAttachment,
+    runtime_generation_status::{
+        RuntimeGenerationStatusError, RuntimeGenerationWaitOutcome,
+        wait_for_runtime_generation_outcome,
+    },
 };
 
 pub(super) struct QueuedRuntimeReconcile {
@@ -45,7 +49,7 @@ enum RuntimeReconcileCompletion {
         saved_status: StatusMessage,
         plan_note: Option<RuntimeApplyPlanNote>,
     },
-    SavedNoRuntimeChange {
+    SavedRuntimeKept {
         saved_status: StatusMessage,
         plan_note: RuntimeApplyPlanNote,
     },
@@ -71,7 +75,14 @@ enum RuntimeReconcileCompletion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeApplyPlanNote {
     text: String,
-    no_runtime_rebuild_required: bool,
+    follow_up: RuntimeApplyFollowUp,
+    status_kind: StatusKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeApplyFollowUp {
+    KeepRunning,
+    RestartToApply,
 }
 
 pub(super) fn spawn_startup_runtime_reconcile(config: AgentConfig) -> PendingRuntimeReconcile {
@@ -123,12 +134,12 @@ async fn saved_runtime_reconcile(
     } = queued;
     let plan_note = runtime_apply_plan_note(active_socket_path.as_deref(), &config_path).await;
     if let (Some(_running), Some(note)) = (&supervisor, &plan_note)
-        && note.no_runtime_rebuild_required
+        && note.follow_up == RuntimeApplyFollowUp::KeepRunning
     {
         let running = supervisor.expect("supervisor was checked");
         return RuntimeReconcileResult {
             supervisor: Some(running),
-            completion: RuntimeReconcileCompletion::SavedNoRuntimeChange {
+            completion: RuntimeReconcileCompletion::SavedRuntimeKept {
                 saved_status,
                 plan_note: note.clone(),
             },
@@ -192,12 +203,24 @@ async fn runtime_apply_plan_note(
     let socket_path = active_socket_path?;
     Some(
         match request_config_reload_apply(socket_path, config_path).await {
-            Ok(summary) => RuntimeApplyPlanNote {
-                no_runtime_rebuild_required: summary.no_runtime_rebuild_required(),
-                text: summary.status_text(),
-            },
+            Ok(summary) => {
+                let disposition = summary.disposition();
+                let mut note = RuntimeApplyPlanNote {
+                    follow_up: runtime_apply_follow_up(&disposition),
+                    status_kind: runtime_apply_status_kind(&disposition),
+                    text: summary.status_text(),
+                };
+                if let ConfigReloadApplyDisposition::QueuedGeneration { request_id } = disposition {
+                    note = note.with_runtime_generation_outcome(
+                        request_id,
+                        wait_for_runtime_generation_outcome(socket_path, request_id).await,
+                    );
+                }
+                note
+            }
             Err(error) => RuntimeApplyPlanNote {
-                no_runtime_rebuild_required: false,
+                follow_up: RuntimeApplyFollowUp::RestartToApply,
+                status_kind: StatusKind::Warning,
                 text: format!("runtime config apply unavailable: {error}"),
             },
         },
@@ -272,11 +295,11 @@ pub(super) fn apply_runtime_reconcile_result(
                 ),
             );
         }
-        RuntimeReconcileCompletion::SavedNoRuntimeChange {
+        RuntimeReconcileCompletion::SavedRuntimeKept {
             saved_status,
             plan_note,
         } => {
-            mark_saved_runtime_success(app, &saved_status, plan_note.text);
+            mark_saved_runtime_with_kind(app, &saved_status, plan_note.text, plan_note.status_kind);
         }
         RuntimeReconcileCompletion::SavedRestarted {
             attachment,
@@ -329,6 +352,93 @@ pub(super) fn apply_runtime_reconcile_result(
                 format!("failed to restart TUI managed agent: {message}"),
             );
         }
+    }
+}
+
+fn runtime_apply_status_kind(disposition: &ConfigReloadApplyDisposition) -> StatusKind {
+    match disposition {
+        ConfigReloadApplyDisposition::Rejected
+        | ConfigReloadApplyDisposition::OnlineApplyFailed
+        | ConfigReloadApplyDisposition::RuntimeGenerationQueueFailed
+        | ConfigReloadApplyDisposition::Failed => StatusKind::Error,
+        ConfigReloadApplyDisposition::NeedsRestart => StatusKind::Warning,
+        ConfigReloadApplyDisposition::NoChange
+        | ConfigReloadApplyDisposition::AppliedOnline
+        | ConfigReloadApplyDisposition::QueuedGeneration { .. } => StatusKind::Info,
+    }
+}
+
+fn runtime_apply_follow_up(disposition: &ConfigReloadApplyDisposition) -> RuntimeApplyFollowUp {
+    match disposition {
+        ConfigReloadApplyDisposition::NeedsRestart
+        | ConfigReloadApplyDisposition::RuntimeGenerationQueueFailed
+        | ConfigReloadApplyDisposition::Failed => RuntimeApplyFollowUp::RestartToApply,
+        ConfigReloadApplyDisposition::NoChange
+        | ConfigReloadApplyDisposition::AppliedOnline
+        | ConfigReloadApplyDisposition::QueuedGeneration { .. }
+        | ConfigReloadApplyDisposition::Rejected
+        | ConfigReloadApplyDisposition::OnlineApplyFailed => RuntimeApplyFollowUp::KeepRunning,
+    }
+}
+
+impl RuntimeApplyPlanNote {
+    fn with_runtime_generation_outcome(
+        mut self,
+        request_id: u64,
+        outcome: Result<RuntimeGenerationWaitOutcome, RuntimeGenerationStatusError>,
+    ) -> Self {
+        let suffix = match outcome {
+            Ok(RuntimeGenerationWaitOutcome::Applied {
+                generation,
+                config_version,
+            }) => {
+                self.status_kind = StatusKind::Info;
+                format!(
+                    "runtime generation request {request_id} applied as generation {generation} ({config_version})"
+                )
+            }
+            Ok(RuntimeGenerationWaitOutcome::Failed { message }) => {
+                self.status_kind = StatusKind::Error;
+                format!("runtime generation request {request_id} failed: {message}")
+            }
+            Ok(RuntimeGenerationWaitOutcome::StillPending) => {
+                self.status_kind = StatusKind::Warning;
+                format!(
+                    "runtime generation request {request_id} is still pending; old generation remains active"
+                )
+            }
+            Err(error) => {
+                self.status_kind = StatusKind::Warning;
+                format!("runtime generation request {request_id} status unavailable: {error}")
+            }
+        };
+        self.follow_up = RuntimeApplyFollowUp::KeepRunning;
+        self.text = format!("{}; {suffix}", self.text);
+        self
+    }
+}
+
+fn mark_saved_runtime_with_kind(
+    app: &mut TuiApp,
+    saved_status: &StatusMessage,
+    suffix: impl AsRef<str>,
+    status_kind: StatusKind,
+) {
+    let text = saved_runtime_status_text(saved_status, suffix);
+    match strongest_status_kind(saved_status.kind, status_kind) {
+        StatusKind::Error => app.mark_error(text),
+        StatusKind::Warning => app.mark_warning(text),
+        StatusKind::Info | StatusKind::Saved => app.mark_info(text),
+    }
+}
+
+fn strongest_status_kind(left: StatusKind, right: StatusKind) -> StatusKind {
+    if left == StatusKind::Error || right == StatusKind::Error {
+        StatusKind::Error
+    } else if left == StatusKind::Warning || right == StatusKind::Warning {
+        StatusKind::Warning
+    } else {
+        StatusKind::Info
     }
 }
 
@@ -504,7 +614,8 @@ mod tests {
                 saved_status,
                 plan_note: Some(RuntimeApplyPlanNote {
                     text: "runtime rebuild required for observations".to_string(),
-                    no_runtime_rebuild_required: false,
+                    follow_up: RuntimeApplyFollowUp::RestartToApply,
+                    status_kind: StatusKind::Warning,
                 }),
             },
         };
@@ -523,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn saved_runtime_reconcile_no_change_does_not_ask_for_restart() {
+    fn saved_runtime_reconcile_keeps_running_agent_without_restart() {
         let mut app = TuiApp::new(
             PathBuf::from("/tmp/agent.toml"),
             AgentConfig::default(),
@@ -531,11 +642,12 @@ mod tests {
         );
         let result = RuntimeReconcileResult {
             supervisor: None,
-            completion: RuntimeReconcileCompletion::SavedNoRuntimeChange {
+            completion: RuntimeReconcileCompletion::SavedRuntimeKept {
                 saved_status: StatusMessage::saved("Saved config"),
                 plan_note: RuntimeApplyPlanNote {
                     text: "running agent already matches saved config".to_string(),
-                    no_runtime_rebuild_required: true,
+                    follow_up: RuntimeApplyFollowUp::KeepRunning,
+                    status_kind: StatusKind::Info,
                 },
             },
         };
@@ -549,6 +661,38 @@ mod tests {
             app.status()
                 .text
                 .contains("running agent already matches saved config")
+        );
+        assert!(!app.status().text.contains("restart"));
+    }
+
+    #[test]
+    fn saved_runtime_reconcile_reports_generation_failure_without_restart() {
+        let mut app = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::default(),
+        );
+        let result = RuntimeReconcileResult {
+            supervisor: None,
+            completion: RuntimeReconcileCompletion::SavedRuntimeKept {
+                saved_status: StatusMessage::saved("Saved capture config"),
+                plan_note: RuntimeApplyPlanNote {
+                    text: "runtime generation request 7 failed: provider open failed".to_string(),
+                    follow_up: RuntimeApplyFollowUp::KeepRunning,
+                    status_kind: StatusKind::Error,
+                },
+            },
+        };
+        let mut supervisor = None;
+
+        apply_runtime_reconcile_result(&mut supervisor, &mut app, result);
+
+        assert_eq!(app.status().kind, StatusKind::Error);
+        assert!(app.status().text.contains("Saved capture config"));
+        assert!(
+            app.status()
+                .text
+                .contains("runtime generation request 7 failed")
         );
         assert!(!app.status().text.contains("restart"));
     }

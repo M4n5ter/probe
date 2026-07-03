@@ -332,8 +332,12 @@ Operator TUI 能力事实：
   为 omission 时通过后台任务使用该命令补齐详情，并在等待、too-large 或失败时保留 tail budget 诊断。
 - Runtime tab 保存配置后通过 admin Unix socket 调用 `apply_config_reload`。该动作先复用主配置 reload planning，
   再应用可在线切换的候选配置段；policy-only 变更在 policy watcher/poller topology 不变且未启用时可在线生效。
-  对 capture、export、TLS、admin、interception、process observation 或 watcher topology 变更，TUI 显示
-  runtime rebuild verdict。
+  对 capture/process observation 变更，admin response 会返回带 `request_id` 的 `request_runtime_generation`
+  queued action；TUI 使用该 id 轮询 `status.runtime_generation`，直到显示 applied、failed 或 still-pending
+  outcome。在线 apply 失败、已排队 generation 失败或仍 pending 时，旧 running agent 继续保留；generation
+  request 无法入队表示保存的候选配置尚未进入 live data path，TUI-managed agent 可以重启以收敛到保存配置，
+  attached external agent 会提示显式重启或重试。planning 明确要求 setup-time rebuild 的 export、storage、
+  TLS、admin、interception 或 watcher topology 变更仍进入重启提示。
 - Runtime tab 也可以调用 `reload_runtime_actions`。该动作只执行 active `RuntimePlan`
   中可安全在线切换的 runtime owners：policy bundle reload 和 external enforcement manifest reload。
   响应按 action 独立展示成功或失败；它不替换运行中的主 agent config，也不改变 exporter sink cursor。
@@ -4856,8 +4860,8 @@ Config reload planning：
 - `apply_config_reload` 返回 `config_reload_apply`，其中包含原始 plan、每个 apply action 的 outcome，
   以及 `active_plan_updated`。
 - 对只涉及 data path generation 的 rebuild verdict，`apply_config_reload` 会向 runtime generation owner 提交
-  `request_runtime_generation` action；action outcome 为 `queued`，表示候选配置已进入运行时请求队列但 active plan
-  尚未替换。
+  `request_runtime_generation` action；action outcome 为 `queued` 并携带 `request_id`，表示候选配置已进入运行时
+  请求队列但 active plan 尚未替换。
 - live agent 在 capture control safe point 消费 pending generation request。请求进入 `applying` 后会记录
   `last_outcome`，避免永久 pending。
 - `reload_runtime_actions` 可执行 active `RuntimePlan` 下可安全在线切换的 runtime actions。
@@ -4878,7 +4882,7 @@ Admin reload：
 | --- | --- | --- | --- |
 | `plan_config_reload` | 无 mutation；候选配置 validator | `config_reload_plan` | `invalid_candidate` 描述 read/parse/validate 阶段 |
 | `apply_config_reload` | 候选配置中可在线应用的 runtime owner | `config_reload_apply`，包含 plan、actions、`active_plan_updated` | action 失败时保留旧 active plan；非 online section 返回 restart verdict |
-| `request_runtime_generation` | live agent runtime generation owner | `queued` action outcome，status 中出现 pending generation request | active plan 不提前替换；不覆盖 setup-time service topology |
+| `request_runtime_generation` | live agent runtime generation owner | 带 `request_id` 的 `queued` action outcome，status 中出现 pending generation request | active plan 不提前替换；TUI 可跟踪 applied/failed/pending outcome；queue submission 失败返回 failed action；不覆盖 setup-time service topology |
 | `reload_runtime_actions` | 当前可在线切换的 runtime owner 集合 | 每个 action 的独立 outcome | 返回 `runtime_actions_reload`，失败 action 进入 `failed` outcome |
 | `reload_policies` | active pipeline policy set | `loaded_count`、policy sources、`active_set_updated` | 返回 error，保留旧 active policy set |
 | `reload_enforcement_policy` | active enforcement planner/policy state | source、selector 状态、protective action profile | 返回 error，保留旧 active enforcement policy |
@@ -4948,10 +4952,18 @@ Full config hot reload：
 | selectors/TLS/enforcement generation | 当前缺少对应 lifecycle owner；config reload planning 保持 `restart_required`，不提交 runtime generation request。 |
 | setup-time service topology | 需要对应 lifecycle owner；admin socket、exporter topology 和 storage path 不随 data path generation 隐式切换。 |
 
-运行时约束：
+当前实现边界：
+
+- 当前 runtime generation queue 只接收 capture 和 observations section 变更。
+- selectors、TLS、enforcement、MITM bridge、transparent interception、storage、export 和 admin topology
+  仍由 startup/setup-time owner 持有；planning 必须保持 `restart_required`，不能因为目标模型存在
+  data path generation 概念而提前排队。
+
+目标运行时约束：
 
 - capture data path、TLS plaintext、MITM bridge 和 transparent interception host rules 属于同一 generation 生命周期。
-- data path generation 包含 capture backend、process observations、selectors、TLS plaintext、MITM bridge 和 transparent interception。
+- 完整 data path generation 应包含 capture backend、process observations、selectors、TLS plaintext、MITM bridge
+  和 transparent interception；这些 owner 存在前，当前实现不得把它们放入 runtime generation queue。
 - setup-time host rules 不能被 planner-only enforcement reload 隐式改变。
 - exporter cursor 和 durable spool path 不能被 capture generation swap 偷换；涉及存储路径或 exporter topology 的配置需要独立 owner。
 - 主配置 watcher 与手动 `apply_config_reload` 应共享同一个 planning/apply contract，不能各自解释 TOML。

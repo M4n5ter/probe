@@ -245,6 +245,18 @@ passive traffic scope 或 product-proxy MITM，不需要切换到单独的配置
 quick action 默认使用 80 和 443 端口，让普通明文 HTTP 和 TLS 解密后 HTTP 进入同一条
 plaintext bridge 与 traffic view。
 
+Runtime tab 可以调用在线 admin `reload_runtime_actions` 命令，重载 active `RuntimePlan`
+中明确可在线切换的 runtime owner，目前包括 policy bundles 和 external enforcement manifest，
+并逐个 action 报告成功或失败。TUI 保存配置时，如果有 active admin socket，会先调用
+`apply_config_reload`：policy-only 主配置变更在 policy watcher/poller topology 不变且未启用时
+在线应用；capture 和 observation data-path rebuild verdict 会排入 runtime generation request，
+并由 live agent 在 capture safe point 交换。queued response 会携带 generation request id；
+TUI 会跟踪 status，直到该 request applied、failed，或超过后台等待窗口后仍 pending。在线 apply
+失败、已入队 generation failed 或仍 pending 时，旧 running agent 继续保留，TUI 在状态行报告结果。
+generation request 无法入队时，TUI-managed agent 可以重启以收敛到保存配置；attached external
+agent 会提示显式重启或重试。export、storage、admin socket、watcher topology 等 setup-time topology
+仍需要进程 rebuild。
+
 ### 最小 Policy 与 Webhook 接线
 
 第一次接入真实系统时先看这一节。可部署配置需要显式描述四份契约：event 从哪里来、durable
@@ -947,10 +959,14 @@ listen_addr = "127.0.0.1:9464"
 admin reload 会先校验新 policy 或 enforcement state，再替换 runtime state。
 `reload-runtime-actions` 会执行 active `RuntimePlan` 下安全的 runtime action，并独立报告每个
 action 的结果，因此 enforcement reload 失败不会掩盖 policy reload 成功。CLI 会先打印完整 JSON response，
-再在任一 action outcome 为 `failed` 时以非零状态退出。候选主配置也可以解析并做静态校验，然后报告
-`no_change`、`restart_required` 或 `invalid_candidate`；这是规划入口，不会在线替换
-capture、export、TLS、admin 或 interception owner，也不会执行 setup-time active probes。候选配置读取要求
-regular file，会拒绝 symlink 和超限文件，parse error 不回显 raw config line。
+再在任一 action outcome 为 `failed` 时以非零状态退出。候选主配置可以通过
+`plan-config-reload` 解析并做静态校验，报告 `no_change`、`apply_online`、`restart_required`
+或 `invalid_candidate`。`apply-config-reload` 执行在线子集，所有在线 action 成功后更新 active plan。
+Data-path rebuild verdict 会提交带 request id 的 `request_runtime_generation` action，并在 status 中表现为
+pending runtime generation；live agent 在 capture safe point 消费该 request 并记录 runtime generation outcome。
+capture 和 observation 变更会构建候选 capture provider，只有候选 provider 打开成功后才交换到 live loop、
+更新 capture runtime status 并替换共享 active plan。generation request 无法入队时，旧 runtime 保持活跃；
+TUI-managed agent 可以通过重启收敛到保存配置，attached external agent 会提示显式重启或重试。
 
 Prometheus listener 是只读、loopback-only 的 `GET /metrics` surface；控制命令仍留在私有 Unix
 socket。runtime status 和 metrics 会暴露 capture input activity、pipeline progress、

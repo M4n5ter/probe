@@ -295,10 +295,14 @@ failures per action. Saving from the TUI uses `apply_config_reload` when an
 active admin socket is available: policy-only main config changes are applied
 online when policy watcher and poller topology does not change; capture and
 observation data-path rebuild verdicts are queued as runtime generation
-requests and swapped by the live agent at capture safe points. Setup topology
-such as export, storage, admin socket, and watcher topology still requires a
-process rebuild. The same tab edits admin socket settings for future runs; the
-current TUI session keeps using the active socket it attached to at startup.
+requests and swapped by the live agent at capture safe points. The queued
+response includes a generation request id; the TUI follows status until that
+request is applied, fails, or remains pending beyond the background wait window.
+Online apply failures keep the old running agent alive and are reported in the
+status line instead of forcing a managed-agent restart. Setup topology such as
+export, storage, admin socket, and watcher topology still requires a process
+rebuild. The same tab edits admin socket settings for future runs; the current
+TUI session keeps using the active socket it attached to at startup.
 
 ### Minimal Policy And Webhook Wiring
 
@@ -1087,11 +1091,14 @@ response. Candidate main configs can be parsed and statically validated with
 online subset and updates the active plan when every online action succeeds.
 Policy-only config changes are online-applicable when local watcher and remote
 poller topology is disabled. Data-path rebuild verdicts can queue a
-`request_runtime_generation` action and appear as a pending runtime generation in
-status; the live agent consumes queued requests at capture safe points and
-records a runtime generation outcome. Capture and observation changes rebuild a
-candidate capture provider, swap it into the live loop, update capture runtime
-status, and replace the shared active plan only after the candidate opens.
+`request_runtime_generation` action with a request id and appear as a pending
+runtime generation in status; the live agent consumes queued requests at capture
+safe points and records a runtime generation outcome. Capture and observation
+changes rebuild a candidate capture provider, swap it into the live loop, update
+capture runtime status, and replace the shared active plan only after the
+candidate opens. If a generation request cannot be queued, the old runtime stays
+active; a TUI-managed agent can restart to converge on the saved config, while an
+attached external agent reports that an explicit restart or retry is required.
 Selectors, TLS, enforcement, export, storage, admin, agent identity, and watcher
 topology changes are not silently applied by this path and remain
 `restart_required` until their lifecycle owners exist.

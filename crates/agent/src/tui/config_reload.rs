@@ -8,7 +8,7 @@ use crate::{
     runtime_reload::config_reload::{
         ConfigReloadApplyAction, ConfigReloadApplyActionOutcome, ConfigReloadApplySnapshot,
         ConfigReloadDecision, ConfigReloadPlanSnapshot, ConfigReloadRuntimeAction,
-        ConfigReloadSection,
+        ConfigReloadRuntimeGenerationActionOutcome, ConfigReloadSection,
     },
 };
 
@@ -42,10 +42,17 @@ impl ConfigReloadPlanSummary {
         matches!(self.decision, ConfigReloadPlanDecision::ApplyOnline { .. })
     }
 
-    fn can_queue_runtime_generation(&self) -> bool {
+    fn requires_runtime_rebuild(&self) -> bool {
         matches!(
             self.decision,
-            ConfigReloadPlanDecision::QueueRuntimeGeneration { .. }
+            ConfigReloadPlanDecision::RestartRequired { .. }
+        )
+    }
+
+    fn invalid_candidate(&self) -> bool {
+        matches!(
+            self.decision,
+            ConfigReloadPlanDecision::InvalidCandidate { .. }
         )
     }
 
@@ -126,25 +133,49 @@ pub(crate) struct ConfigReloadApplySummary {
     active_plan_updated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConfigReloadApplyDisposition {
+    NoChange,
+    AppliedOnline,
+    QueuedGeneration { request_id: u64 },
+    NeedsRestart,
+    Rejected,
+    OnlineApplyFailed,
+    RuntimeGenerationQueueFailed,
+    Failed,
+}
+
 impl ConfigReloadApplySummary {
-    pub(crate) fn no_runtime_rebuild_required(&self) -> bool {
-        self.plan.no_runtime_change()
-            || (self.plan.can_apply_online()
-                && self.active_plan_updated
-                && self
-                    .actions
-                    .iter()
-                    .all(ConfigReloadApplyActionSummary::succeeded))
-            || (self.plan.can_queue_runtime_generation()
-                && !self.actions.is_empty()
-                && self
-                    .actions
-                    .iter()
-                    .all(ConfigReloadApplyActionSummary::accepted_without_restart)
-                && self
-                    .actions
-                    .iter()
-                    .any(ConfigReloadApplyActionSummary::queued))
+    pub(crate) fn disposition(&self) -> ConfigReloadApplyDisposition {
+        if self.plan.requires_runtime_rebuild() {
+            return ConfigReloadApplyDisposition::NeedsRestart;
+        }
+        if self.plan.invalid_candidate() {
+            return ConfigReloadApplyDisposition::Rejected;
+        }
+        if self
+            .actions
+            .iter()
+            .any(ConfigReloadApplyActionSummary::failed)
+        {
+            if self.has_failed_runtime_generation_request() {
+                return ConfigReloadApplyDisposition::RuntimeGenerationQueueFailed;
+            }
+            if self.plan.can_apply_online() {
+                return ConfigReloadApplyDisposition::OnlineApplyFailed;
+            }
+            return ConfigReloadApplyDisposition::Failed;
+        }
+        if let Some(request_id) = self.queued_runtime_generation_request_id() {
+            return ConfigReloadApplyDisposition::QueuedGeneration { request_id };
+        }
+        if self.plan.no_runtime_change() {
+            return ConfigReloadApplyDisposition::NoChange;
+        }
+        if self.plan.can_apply_online() && self.active_plan_updated {
+            return ConfigReloadApplyDisposition::AppliedOnline;
+        }
+        ConfigReloadApplyDisposition::Failed
     }
 
     pub(crate) fn status_text(&self) -> String {
@@ -162,10 +193,12 @@ impl ConfigReloadApplySummary {
             .filter_map(ConfigReloadApplyActionSummary::failure_text)
             .collect::<Vec<_>>();
         if !failed.is_empty() {
-            let prefix = if self.plan.can_apply_online() {
-                "runtime online apply failed"
-            } else {
-                "runtime config reload failed"
+            let prefix = match self.disposition() {
+                ConfigReloadApplyDisposition::OnlineApplyFailed => "runtime online apply failed",
+                ConfigReloadApplyDisposition::RuntimeGenerationQueueFailed => {
+                    "runtime generation reload request failed"
+                }
+                _ => "runtime config reload failed",
             };
             return format!("{prefix}: {}", failed.join("; "));
         }
@@ -188,57 +221,70 @@ impl ConfigReloadApplySummary {
             applied.join("; ")
         )
     }
+
+    fn queued_runtime_generation_request_id(&self) -> Option<u64> {
+        self.actions.iter().find_map(|action| {
+            (action.action == ConfigReloadRuntimeAction::RequestRuntimeGeneration)
+                .then(|| action.queued_request_id())
+                .flatten()
+        })
+    }
+
+    fn has_failed_runtime_generation_request(&self) -> bool {
+        self.actions.iter().any(|action| {
+            action.action == ConfigReloadRuntimeAction::RequestRuntimeGeneration && action.failed()
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ConfigReloadApplyActionSummary {
-    action: String,
+    action: ConfigReloadRuntimeAction,
     outcome: ConfigReloadApplyActionOutcomeSummary,
 }
 
 impl ConfigReloadApplyActionSummary {
-    fn succeeded(&self) -> bool {
+    fn failed(&self) -> bool {
         matches!(
             self.outcome,
+            ConfigReloadApplyActionOutcomeSummary::Failed { .. }
+        )
+    }
+
+    fn queued_request_id(&self) -> Option<u64> {
+        match self.outcome {
+            ConfigReloadApplyActionOutcomeSummary::QueuedGeneration { request_id, .. } => {
+                Some(request_id)
+            }
             ConfigReloadApplyActionOutcomeSummary::Succeeded { .. }
-        )
-    }
-
-    fn queued(&self) -> bool {
-        matches!(
-            self.outcome,
-            ConfigReloadApplyActionOutcomeSummary::Queued { .. }
-        )
-    }
-
-    fn accepted_without_restart(&self) -> bool {
-        self.succeeded() || self.queued()
+            | ConfigReloadApplyActionOutcomeSummary::Failed { .. } => None,
+        }
     }
 
     fn success_text(&self) -> Option<String> {
         match &self.outcome {
             ConfigReloadApplyActionOutcomeSummary::Succeeded { detail } => {
-                Some(format!("{}: {detail}", self.action))
+                Some(format!("{}: {detail}", runtime_action_label(self.action)))
             }
             ConfigReloadApplyActionOutcomeSummary::Failed { .. }
-            | ConfigReloadApplyActionOutcomeSummary::Queued { .. } => None,
+            | ConfigReloadApplyActionOutcomeSummary::QueuedGeneration { .. } => None,
         }
     }
 
     fn failure_text(&self) -> Option<String> {
         match &self.outcome {
             ConfigReloadApplyActionOutcomeSummary::Failed { message } => {
-                Some(format!("{}: {message}", self.action))
+                Some(format!("{}: {message}", runtime_action_label(self.action)))
             }
-            ConfigReloadApplyActionOutcomeSummary::Queued { .. } => None,
+            ConfigReloadApplyActionOutcomeSummary::QueuedGeneration { .. } => None,
             ConfigReloadApplyActionOutcomeSummary::Succeeded { .. } => None,
         }
     }
 
     fn queued_text(&self) -> Option<String> {
         match &self.outcome {
-            ConfigReloadApplyActionOutcomeSummary::Queued { detail } => {
-                Some(format!("{}: {detail}", self.action))
+            ConfigReloadApplyActionOutcomeSummary::QueuedGeneration { detail, .. } => {
+                Some(format!("{}: {detail}", runtime_action_label(self.action)))
             }
             ConfigReloadApplyActionOutcomeSummary::Succeeded { .. }
             | ConfigReloadApplyActionOutcomeSummary::Failed { .. } => None,
@@ -249,25 +295,49 @@ impl ConfigReloadApplyActionSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ConfigReloadApplyActionOutcomeSummary {
     Succeeded { detail: String },
-    Queued { detail: String },
+    QueuedGeneration { detail: String, request_id: u64 },
     Failed { message: String },
 }
 
 impl ConfigReloadApplyActionSummary {
     fn from_snapshot(snapshot: ConfigReloadApplyAction) -> Self {
-        Self {
-            action: runtime_action_label(snapshot.action).to_string(),
-            outcome: ConfigReloadApplyActionOutcomeSummary::from_snapshot(snapshot.outcome),
+        match snapshot {
+            ConfigReloadApplyAction::ReloadPolicies(outcome) => Self {
+                action: ConfigReloadRuntimeAction::ReloadPolicies,
+                outcome: ConfigReloadApplyActionOutcomeSummary::from_action_outcome(outcome),
+            },
+            ConfigReloadApplyAction::ReloadEnforcementPolicy(outcome) => Self {
+                action: ConfigReloadRuntimeAction::ReloadEnforcementPolicy,
+                outcome: ConfigReloadApplyActionOutcomeSummary::from_action_outcome(outcome),
+            },
+            ConfigReloadApplyAction::RequestRuntimeGeneration(outcome) => Self {
+                action: ConfigReloadRuntimeAction::RequestRuntimeGeneration,
+                outcome: ConfigReloadApplyActionOutcomeSummary::from_runtime_generation_outcome(
+                    outcome,
+                ),
+            },
         }
     }
 }
 
 impl ConfigReloadApplyActionOutcomeSummary {
-    fn from_snapshot(snapshot: ConfigReloadApplyActionOutcome) -> Self {
+    fn from_action_outcome(snapshot: ConfigReloadApplyActionOutcome) -> Self {
         match snapshot {
             ConfigReloadApplyActionOutcome::Succeeded { detail } => Self::Succeeded { detail },
-            ConfigReloadApplyActionOutcome::Queued { detail } => Self::Queued { detail },
             ConfigReloadApplyActionOutcome::Failed { message } => Self::Failed { message },
+        }
+    }
+
+    fn from_runtime_generation_outcome(
+        snapshot: ConfigReloadRuntimeGenerationActionOutcome,
+    ) -> Self {
+        match snapshot {
+            ConfigReloadRuntimeGenerationActionOutcome::Queued { detail, request_id } => {
+                Self::QueuedGeneration { detail, request_id }
+            }
+            ConfigReloadRuntimeGenerationActionOutcome::Failed { message } => {
+                Self::Failed { message }
+            }
         }
     }
 }
@@ -480,7 +550,10 @@ mod tests {
         let summary =
             parse_config_reload_apply_response(&response).expect("apply response should parse");
 
-        assert!(summary.no_runtime_rebuild_required());
+        assert_eq!(
+            summary.disposition(),
+            ConfigReloadApplyDisposition::AppliedOnline
+        );
         assert_eq!(
             summary.status_text(),
             "runtime applied saved config online: reload_policies: loaded 1 policy bundle(s), active set updated: true"
@@ -517,7 +590,10 @@ mod tests {
         let summary =
             parse_config_reload_apply_response(&response).expect("apply response should parse");
 
-        assert!(!summary.no_runtime_rebuild_required());
+        assert_eq!(
+            summary.disposition(),
+            ConfigReloadApplyDisposition::OnlineApplyFailed
+        );
         assert_eq!(
             summary.status_text(),
             "runtime online apply failed: reload_policies: failed to compile policy"
@@ -544,6 +620,7 @@ mod tests {
                         "action": "request_runtime_generation",
                         "outcome": {
                             "result": "queued",
+                            "request_id": 1,
                             "detail": "runtime generation reload request 1 queued for live"
                         }
                     }
@@ -554,7 +631,10 @@ mod tests {
         let summary =
             parse_config_reload_apply_response(&response).expect("queued response should parse");
 
-        assert!(summary.no_runtime_rebuild_required());
+        assert_eq!(
+            summary.disposition(),
+            ConfigReloadApplyDisposition::QueuedGeneration { request_id: 1 }
+        );
         assert_eq!(
             summary.status_text(),
             "runtime generation reload queued: request_runtime_generation: runtime generation reload request 1 queued for live"
@@ -591,10 +671,13 @@ mod tests {
         let summary = parse_config_reload_apply_response(&response)
             .expect("queue failure response should parse");
 
-        assert!(!summary.no_runtime_rebuild_required());
+        assert_eq!(
+            summary.disposition(),
+            ConfigReloadApplyDisposition::RuntimeGenerationQueueFailed
+        );
         assert_eq!(
             summary.status_text(),
-            "runtime config reload failed: request_runtime_generation: runtime generation reload is busy: pending request 1"
+            "runtime generation reload request failed: request_runtime_generation: runtime generation reload is busy: pending request 1"
         );
     }
 

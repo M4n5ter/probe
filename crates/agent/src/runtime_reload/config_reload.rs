@@ -125,16 +125,24 @@ pub(crate) struct ConfigReloadApplySnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub(crate) struct ConfigReloadApplyAction {
-    pub action: ConfigReloadRuntimeAction,
-    pub outcome: ConfigReloadApplyActionOutcome,
+#[serde(rename_all = "snake_case", tag = "action", content = "outcome")]
+pub(crate) enum ConfigReloadApplyAction {
+    ReloadPolicies(ConfigReloadApplyActionOutcome),
+    ReloadEnforcementPolicy(ConfigReloadApplyActionOutcome),
+    RequestRuntimeGeneration(ConfigReloadRuntimeGenerationActionOutcome),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case", tag = "result")]
 pub(crate) enum ConfigReloadApplyActionOutcome {
     Succeeded { detail: String },
-    Queued { detail: String },
+    Failed { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", tag = "result")]
+pub(crate) enum ConfigReloadRuntimeGenerationActionOutcome {
+    Queued { detail: String, request_id: u64 },
     Failed { message: String },
 }
 
@@ -282,29 +290,33 @@ pub(crate) async fn apply_config_reload(
             )
             .await
             {
-                Ok(summary) => ConfigReloadApplyAction {
-                    action: ConfigReloadRuntimeAction::ReloadPolicies,
-                    outcome: ConfigReloadApplyActionOutcome::Succeeded {
+                Ok(summary) => ConfigReloadApplyAction::ReloadPolicies(
+                    ConfigReloadApplyActionOutcome::Succeeded {
                         detail: format!(
                             "loaded {} policy bundle(s), active set updated: {}",
                             summary.loaded_count, summary.active_set_updated
                         ),
                     },
-                },
-                Err(error) => ConfigReloadApplyAction {
-                    action: ConfigReloadRuntimeAction::ReloadPolicies,
-                    outcome: ConfigReloadApplyActionOutcome::Failed {
+                ),
+                Err(error) => ConfigReloadApplyAction::ReloadPolicies(
+                    ConfigReloadApplyActionOutcome::Failed {
                         message: error.to_string(),
                     },
-                },
+                ),
             },
         );
     }
 
     if actions.iter().any(|action| {
         matches!(
-            action.outcome,
-            ConfigReloadApplyActionOutcome::Failed { .. }
+            action,
+            ConfigReloadApplyAction::ReloadPolicies(ConfigReloadApplyActionOutcome::Failed { .. })
+                | ConfigReloadApplyAction::ReloadEnforcementPolicy(
+                    ConfigReloadApplyActionOutcome::Failed { .. }
+                )
+                | ConfigReloadApplyAction::RequestRuntimeGeneration(
+                    ConfigReloadRuntimeGenerationActionOutcome::Failed { .. }
+                )
         )
     }) {
         return ConfigReloadApplyOutcome {
