@@ -120,6 +120,7 @@ impl CaptureDiagnostics {
                     capture_backend_name(backend)
                 ));
             }
+            lines.push(self.mitm_fallback_ladder_line());
             lines.push(format!("coverage: {MITM_PLAINTEXT_COVERAGE}"));
         }
         if let Some(reason) = &self.snapshot.reason {
@@ -240,6 +241,49 @@ impl CaptureDiagnostics {
             .collect::<Vec<_>>();
         (!reasons.is_empty()).then(|| reasons.join("; "))
     }
+
+    fn mitm_fallback_ladder_line(&self) -> String {
+        let live_backends = self.live_fallback_backend_names();
+        if live_backends.is_empty() {
+            return format!(
+                "fallback ladder: passive capture, then scoped {MITM_PROXY_FALLBACK_LABEL}"
+            );
+        }
+        format!(
+            "fallback ladder: passive capture ({}), then scoped {MITM_PROXY_FALLBACK_LABEL}",
+            live_backends.join(" -> ")
+        )
+    }
+
+    fn live_fallback_backend_names(&self) -> Vec<&'static str> {
+        let mut backends = self
+            .snapshot
+            .candidates
+            .iter()
+            .map(|candidate| candidate.backend)
+            .filter(|backend| live_backend(*backend))
+            .collect::<Vec<_>>();
+        if backends.is_empty() {
+            backends.extend(
+                self.snapshot
+                    .open_failures
+                    .iter()
+                    .map(|failure| failure.backend)
+                    .filter(|backend| live_backend(*backend)),
+            );
+        }
+        unique_backend_names(backends)
+    }
+}
+
+fn unique_backend_names(backends: Vec<CaptureBackend>) -> Vec<&'static str> {
+    backends.into_iter().fold(Vec::new(), |mut names, backend| {
+        let name = capture_backend_name(backend);
+        if !names.contains(&name) {
+            names.push(name);
+        }
+        names
+    })
 }
 
 fn candidate_failure_detail(candidate: &CaptureCandidateStatusSnapshot) -> Option<String> {

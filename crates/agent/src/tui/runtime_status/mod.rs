@@ -439,6 +439,44 @@ mod tests {
     }
 
     #[test]
+    fn traffic_diagnostics_do_not_report_ladder_when_mitm_is_disabled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "kind": "status",
+            "snapshot": {
+                "capture": {
+                    "selection": "ebpf",
+                    "selected_backend": null,
+                    "mode": "unavailable",
+                    "reason": "eBPF capture provider is not available",
+                    "candidates": [
+                        {
+                            "backend": "ebpf",
+                            "runtime_mode": "unavailable",
+                            "capability_mode": "unavailable",
+                            "evidence_mode": "nominal",
+                            "reason": "eBPF object is missing"
+                        }
+                    ],
+                    "open_failures": []
+                }
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+        let lines = diagnostics.detail_lines();
+
+        assert_detail_line(&lines, "strategy: disabled");
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.starts_with("fallback ladder:")),
+            "MITM disabled diagnostics must not claim an active fallback ladder: {lines:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn local_status_snapshot_diagnostics_keep_passive_failures_and_mitm_action()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
@@ -1093,27 +1131,89 @@ mod tests {
                 "Passive capture failed (ebpf: object path is not configured; libpcap: libpcap is not installed); using reliable MITM proxy fallback for {MITM_PLAINTEXT_COVERAGE}"
             )))
         );
+        let lines = diagnostics.detail_lines();
         assert!(
-            diagnostics
-                .detail_lines()
+            lines
                 .iter()
                 .any(|line| line == "selected: reliable MITM proxy fallback")
         );
         assert!(
-            diagnostics
-                .detail_lines()
+            lines
                 .iter()
                 .any(|line| line == "provider backend: capture_event_feed")
         );
+        assert_detail_line(
+            &lines,
+            "fallback ladder: passive capture (ebpf -> libpcap), then scoped reliable MITM proxy fallback",
+        );
         assert!(
-            diagnostics
-                .detail_lines()
+            lines
                 .iter()
                 .any(|line| line == &format!("coverage: {MITM_PLAINTEXT_COVERAGE}"))
         );
-        assert!(diagnostics.detail_lines().iter().any(|line| {
+        assert!(lines.iter().any(|line| {
             line == "auto reliable MITM proxy fallback candidate: capture_event_feed: runtime=available, capability=available, evidence=nominal"
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_report_configured_passive_fallback_order_for_mitm_bridge()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "kind": "status",
+            "snapshot": {
+                "capture": {
+                    "selection": "auto",
+                    "selected_backend": "capture_event_feed",
+                    "selected_input_source": "mitm_plaintext_bridge",
+                    "mode": "capture_event_feed",
+                    "reason": null,
+                    "candidates": [
+                        {
+                            "backend": "libpcap",
+                            "runtime_mode": "unavailable",
+                            "capability_mode": "unavailable",
+                            "evidence_mode": "nominal",
+                            "reason": "libpcap is not available"
+                        },
+                        {
+                            "backend": "ebpf",
+                            "runtime_mode": "unavailable",
+                            "capability_mode": "unavailable",
+                            "evidence_mode": "nominal",
+                            "reason": "eBPF unavailable"
+                        },
+                        {
+                            "backend": "capture_event_feed",
+                            "runtime_mode": "available",
+                            "capability_mode": "available",
+                            "evidence_mode": "nominal",
+                            "reason": null,
+                            "evidence_reason": null
+                        }
+                    ],
+                    "open_failures": [],
+                    "auto_mitm_plaintext_bridge_candidate": {
+                        "backend": "capture_event_feed",
+                        "runtime_mode": "available",
+                        "capability_mode": "available",
+                        "evidence_mode": "nominal",
+                        "reason": null,
+                        "evidence_reason": null
+                    }
+                },
+                "enforcement": configured_mitm_enforcement_status_json()?
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+        let lines = diagnostics.detail_lines();
+
+        assert_detail_line(
+            &lines,
+            "fallback ladder: passive capture (libpcap -> ebpf), then scoped reliable MITM proxy fallback",
+        );
         Ok(())
     }
 

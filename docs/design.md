@@ -3648,11 +3648,16 @@ flowchart LR
 - `capture.selection = "ebpf"`、`"libpcap"`、`"plaintext_feed"`、`"capture_event_feed"` 或 `"replay"` 表示 required backend；显式
   backend 不自动使用 `fallback_backends`。这是为了让 operator 能表达“缺少该能力就 fail fast”，避免把强能力需求静默降级。provider 是否可选只看
   runtime/openability；capability state 和 evidence quality 只负责报告面。
-- 当 `auto` 同时配置了 MITM plaintext bridge 时，RuntimePlan 会保留可用的
-  `auto_mitm_plaintext_bridge_candidate`。admin status 将该候选暴露为
-  `capture.auto_mitm_plaintext_bridge_candidate`，用于解释 MITM bridge fallback 的可用性。实际输入流由
-  `capture.selected_input_source` 判定；值为 `"mitm_plaintext_bridge"` 时，TUI 将它显示为 passive capture 不可用后的
-  MITM plaintext bridge，而不是普通 configured capture-event feed。
+- MITM plaintext bridge 是按 selector 生效的可靠 fallback data path，不是被动全机抓包。
+  当 `auto` 同时配置了 MITM plaintext bridge 时，RuntimePlan 会保留可用的
+  `auto_mitm_plaintext_bridge_candidate`，admin status 将该候选暴露为
+  `capture.auto_mitm_plaintext_bridge_candidate`。passive eBPF/libpcap provider 在
+  plan-time 均不可用或 runtime 全部 open 失败后，agent 可切到
+  `capture.selected_input_source = "mitm_plaintext_bridge"`，用同一 capture-event feed
+  承载普通明文 HTTP 与 TLS 解密后 HTTP。TUI 用该输入源区分 MITM bridge fallback
+  和普通 configured capture-event feed；普通明文 HTTP 标为 `mitm-http`，TLS 解密后
+  HTTP 标为 `mitm-tls`。明文 HTTP 不依赖 TLS client trust；TLS 解密路径需要 operator
+  将 MITM CA 或配置的 leaf issuing chain 放入目标客户端信任。
 - `capture.fallback_backends` 只允许 live backend，不包含 replay。replay 是可重复验证入口，不是 live agent 的自动 fallback。
 - process observation eBPF object 默认随 agent binary 内嵌，并在需要 eBPF capture 且未配置 override 时物化到
   `PROBE_HOME/artifacts/ebpf/` 下的 content-addressed 文件。`[capture.ebpf] object_path` 是自定义或外部管理 process
@@ -5179,9 +5184,13 @@ benchmark 参数：
     eBPF process observation provider。eBPF preflight unavailable 时 plan-time 进入 libpcap fallback；eBPF 已规划但运行期 open/attach
     失败时，`auto` 继续尝试后续 live provider，status 报告实际运行 backend 并在 `capture.open_failures` 保留失败尝试。显式 `capture.selection =
     "ebpf"` 仍是 required backend，不自动回退。
-    若 MITM plaintext bridge 已配置，`auto` 会额外暴露 `capture.auto_mitm_plaintext_bridge_candidate`；当 passive live provider
-    在 plan-time 均不可用或运行期全部 open 失败后，agent 可切到 `capture.selected_input_source = "mitm_plaintext_bridge"` 的
-    capture-event feed 输入源，用同一条事件路径承载普通明文流量与 TLS 解密后的 plaintext。
+    若 MITM plaintext bridge 已配置，`auto` 会额外暴露
+    `capture.auto_mitm_plaintext_bridge_candidate`。当 passive live provider 在
+    plan-time 均不可用或运行期全部 open 失败后，agent 可切到
+    `capture.selected_input_source = "mitm_plaintext_bridge"` 的 capture-event feed
+    输入源。该路径是按 selector 生效的可靠 fallback data path：普通明文 HTTP 以
+    `mitm-http` 标记进入 traffic 视图；TLS 终止后的 HTTP 以 `mitm-tls` 标记进入同一视图，
+    但 TLS 侧需要 operator 配置 client trust。
   - eBPF observation：已有 `aya-obj` strict process artifact preflight、shared ABI、最小内核 object scaffold、高层用户态 `aya` loader、
     ringbuf decoder、procfs socket attribution 依赖检查、result-gated connect/accept observation 到 `ConnectionOpened` 的 bridge、
     selector-authorized outbound single-buffer/bounded multi-iovec prefix syscall argument sample 与 inbound
