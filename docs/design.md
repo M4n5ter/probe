@@ -195,10 +195,10 @@ flowchart LR
   并省略 message event；不解压 WebSocket extension payload。
 - 不支持 HTTP/2、HTTP/3/QUIC 的完整解析。
 - 不实现动态远程控制面或长连接下发；主配置热重载限定为已有明确 lifecycle owner 的资源。
-  policy-only 主配置变更和 enforcement policy source 与 `enforcement.selector` 变更可在线应用；
+  policy-only 主配置变更、export 主配置变更、enforcement policy source 与 `enforcement.selector` 变更可在线应用；
   capture、observations、agent `config_version`、TLS plaintext instrumentation 和 TLS decrypt-hint
-  material 通过 runtime generation safe point 替换；MITM/export TLS material、export、storage、
-  admin、transparent interception 和完整 MITM lifecycle 不通过该路径隐式切换。
+  material 通过 runtime generation safe point 替换；TLS material registry/source changes、storage、admin、
+  transparent interception 和完整 MITM lifecycle 不通过该路径隐式切换。
 - 不长期保存全量原始流量。
 
 当前实现状态不在本节展开；第 6 节维护 capability 事实目录，各领域章节维护实现细节与验证路径。
@@ -341,8 +341,9 @@ Operator TUI 能力事实：
   为 omission 时通过后台任务使用该命令补齐详情，并在等待、too-large 或失败时保留 tail budget 诊断。
 - Runtime tab 保存配置后通过 admin Unix socket 调用 `apply_config_reload`。该动作先复用主配置 reload planning，
   再应用可在线切换的候选配置段；policy-only 变更在 policy watcher/poller topology 不变且未启用时可在线生效。
-  export sink detail 与 export worker schedule 变更在运行中已经存在 export worker、候选配置仍保留 export
-  worker，且 exporter id 集合不变时可在线生效；endpoint、codec、path、header 和 batch quota 变更会影响后续批次。
+  export 变更由常驻 export lifecycle owner 在线调和；worker enablement、worker schedule、exporter id 集合、
+  endpoint、codec、path、header 和 batch quota 变更会影响后续批次，export retention cursor owners 从 active plan
+  派生。
   enforcement policy source 和 `enforcement.selector` 变更在 enforcement reload watcher/poller topology
   未启用且 transparent interception 未持有 setup-time host rules 时可在线生效。顶层 `[selectors]`
   registry 变更，包括被 `enforcement.selector` 引用的条目变更，仍需要重启，直到 selector ownership
@@ -352,9 +353,8 @@ Operator TUI 能力事实：
   轮询 `status.runtime_generation`，直到显示 applied、failed 或 still-pending outcome。
   在线 apply 失败、已排队 generation 失败或仍 pending 时，旧 running agent 继续保留；generation
   request 无法入队表示保存的候选配置尚未进入 live data path，TUI-managed agent 可以重启以收敛到保存配置，
-  attached external agent 会提示显式重启或重试。planning 明确要求 setup-time rebuild 的 export worker
-  首次启动、exporter id 集合变更、storage、MITM/export TLS material、admin、interception 或 watcher
-  topology 变更仍进入重启提示。
+  attached external agent 会提示显式重启或重试。planning 明确要求 setup-time rebuild 的 storage、
+  TLS material registry/source changes、admin、interception 或 watcher topology 变更仍进入重启提示。
 - Runtime tab 也可以调用 `reload_runtime_actions`。该动作只执行 active `RuntimePlan`
   中可安全在线切换的 runtime owners：policy bundle reload 和 enforcement policy source reload。
   响应按 action 独立展示成功或失败；它不替换运行中的主 agent config，也不改变 exporter sink cursor。
@@ -3757,7 +3757,9 @@ TLS plaintext uprobe 配置与运行语义：
 worker enablement：
 
 - `[export.worker] enabled = true` 是默认行为。
-- 只有 RuntimePlan 中存在 planned exporter sinks 时，`run` 才会启动后台 exporter worker。
+- `run` 启动常驻 exporter lifecycle owner。
+- 没有 planned exporter sinks 或显式禁用 worker 时，owner 保持空转并清空 sink runtime state。
+- active plan 在线替换后，同一个 owner 会按新的 worker plan 启动、停止或调和 sinks。
 - `[export.worker.schedule] mode = "fixed_interval_bounded"` 是当前唯一实现的 worker schedule。
 
 worker schedule 字段：
@@ -3826,11 +3828,14 @@ export retention：
 
 - `[storage.retention.export]` 定义 export queue 的本地生命周期策略。
 - 它不是 exporter retry 行为。
-- capacity 清理会把被删除前缀上的 planned sink cursor 退休到前缀末端。
+- 每次 retention sweep 都从 active plan 派生当前 export sink cursor owners。
+- 清理会把被删除前缀上的 active sink cursor 退休到前缀末端。
+- 新增 exporter 后，retention owner 会在下一次 sweep 使用新的 cursor owner 集合，避免按旧拓扑误删新 sink 未消费的 records。
 - `max_age_ms` 与 `max_records` 同时配置时，worker 先执行 max-age 清理。
 - worker 随后用本次 sweep 剩余 `prune_batch_limit` 执行 max-records 清理。
 - 因此 `max_records` 不是年龄清理的全局保底。
 - `[storage.retention.ingress]` 使用同一组 `sweep_interval_ms` 与 `prune_batch_limit` 字段和默认值。
+- storage retention worker 的启停和 sweep interval 仍属于 storage lifecycle；修改这些 storage 字段需要进程重建，直到 storage lifecycle owner 支持在线调和。
 
 RuntimePlan ownership：
 
@@ -3840,10 +3845,10 @@ RuntimePlan ownership：
 - `disabled` worker plan 携带原因。
 - `fixed_interval_bounded` worker plan 携带 interval、全局 batch budget、timeout 和 typed failure backoff。
 - `RuntimePlan.export.sinks[]` 是 typed `ExportSinkPlan`。
-- 当前实现 `Webhook` 和 `File` 两个 transport 变体。
+- 当前实现 `Webhook`、`File` 和 `UnixHttp` transport 变体。
 - 每个 sink 保留 per-sink batch quota override 和 resolved effective quota。
-- `run` 的后台 exporter worker 从该 plan 构造。
-- storage retention worker 从该 plan 构造。
+- `run` 的后台 exporter lifecycle owner 从 active plan 调和 worker 和 sinks。
+- storage retention worker 从 active plan 派生 export cursor owners。
 - `check` 的 plan 输出从该 plan 构造。
 - `status`/admin 的 aggregate export status、spool status 和 per-sink exporter snapshot 都从该 plan 构造。
 - 这些路径不重新解释 raw exporter config。
@@ -4933,14 +4938,14 @@ Admin reload：
 | `reload_policies` | active pipeline policy set | `loaded_count`、policy sources、`active_set_updated` | 返回 error，保留旧 active policy set |
 | `reload_enforcement_policy` | active enforcement planner/policy state | source、selector 状态、protective action profile | 返回 error，保留旧 active enforcement policy |
 
-- `apply_config_reload` 在线应用 policy-only 变更，以及 enforcement policy source 和主配置
-  `enforcement.selector` 变更。顶层 `[selectors]` registry 变更，包括被 `enforcement.selector`
+- `apply_config_reload` 在线应用 policy-only 变更、export 主配置变更，以及 enforcement policy source
+  和主配置 `enforcement.selector` 变更。顶层 `[selectors]` registry 变更，包括被 `enforcement.selector`
   引用的条目变更，仍属于 selectors section。policy watch/poll topology、enforcement reload watch/poll
   topology、enforcement mode/backend、transparent interception 和 MITM hook 变更需要对应 lifecycle owner。
 - data path generation request 由 capture、observations、config version、TLS plaintext instrumentation
   和 TLS decrypt-hint material 变更触发；当前 executor 在线替换对应 capture provider generation，
   并在 candidate provider 构建失败时回滚 TLS runtime snapshot。
-- selectors、MITM/export TLS material、enforcement execution surface、storage、export、admin socket、
+- selectors、TLS material registry/source changes、enforcement execution surface、storage、admin socket、
   policy reload topology 或 agent id 变更保持 `restart_required`，直到对应 lifecycle owner 存在。
 - `reload_policies` 只重载当前配置中的 enabled policy bundles。
 - `reload_enforcement_policy` 只重载当前 `RuntimePlan` 中的 enforcement policy source。
@@ -4992,7 +4997,7 @@ Full config hot reload：
   `RuntimePlan` handle，并推进 active runtime generation。
 - generation executor 的二次校验只接受纯 `runtime_generation` diff。混合 online/data-path 候选配置保持
   `restart_required`，不能在 admin apply 阶段拆成两个非事务提交。
-- selectors、MITM/export TLS material 和 enforcement execution surface 仍缺完整 lifecycle owner；这些 section
+- selectors、TLS material registry/source changes 和 enforcement execution surface 仍缺完整 lifecycle owner；这些 section
   保持 `restart_required`，不进入 runtime generation queue。enforcement policy source 和主配置
   `enforcement.selector` 已由 enforcement reload owner 在线 validate-then-swap。
 
@@ -5008,16 +5013,16 @@ Full config hot reload：
 | capture/observations/TLS plaintext generation | `apply_config_reload` 提交 `request_runtime_generation`；live agent 在 capture safe point validate-then-swap capture provider、TLS plaintext/decrypt-hint runtime state 和 active plan。 |
 | mixed online/data-path config | 当前保持 `restart_required`；需要完整事务型 generation owner 后才能整体 validate-then-swap。 |
 | selectors/MITM TLS/enforcement execution generation | 当前缺少对应 lifecycle owner；config reload planning 保持 `restart_required`，不提交 runtime generation request。 |
-| setup-time service topology | 需要对应 lifecycle owner；runtime reload watcher、admin socket、exporter topology 和 storage path 不随 data path generation 隐式切换。 |
+| setup-time service topology | 需要对应 lifecycle owner；runtime reload watcher、admin socket 和 storage path 不随 data path generation 隐式切换。 |
 
 当前实现边界：
 
 - 当前 runtime generation queue 接收 capture、observations、agent `config_version`、TLS plaintext instrumentation
   和 TLS decrypt-hint material 变更。
-- 当前主配置 watcher 可触发 policy-only 在线应用、enforcement policy source / `enforcement.selector`
-  在线应用和纯 data-path runtime generation queue。
-- selectors、MITM/export TLS material、enforcement execution surface、MITM bridge、transparent interception、storage、export
-  和 runtime/admin topology 仍由 startup/setup-time owner 持有；planning 必须保持 `restart_required`，
+- 当前主配置 watcher 可触发 policy-only 在线应用、export 主配置在线应用、enforcement policy source /
+  `enforcement.selector` 在线应用和纯 data-path runtime generation queue。
+- selectors、TLS material registry/source changes、enforcement execution surface、MITM bridge、transparent interception、
+  storage 和 runtime/admin topology 仍由 startup/setup-time owner 持有；planning 必须保持 `restart_required`，
   不能因为目标模型存在 data path generation 概念而提前排队。
 
 目标运行时约束：

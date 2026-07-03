@@ -117,7 +117,7 @@ pub(crate) async fn run_live_agent(
         capture: capture_runtime.clone(),
         config_apply_gate: config_apply_gate.clone(),
         enforcement: Some(enforcement_runtime.clone()),
-        export_worker: export_worker.as_ref().map(ExportWorker::runtime_state),
+        export_worker: export_worker.runtime_state(),
         pipeline: Some(pipeline_metrics.clone()),
         policy_reload_gate: reloadable_policies.reload_gate(),
         policy_set: policy_set.clone(),
@@ -208,8 +208,8 @@ pub(crate) async fn run_live_agent(
             return Err(error.into());
         }
     };
-    let export_worker = export_worker.map(|worker| worker.spawn(Arc::clone(&spool)));
-    let storage_retention_config = storage_retention_worker_config_from_plan(&plan);
+    let export_worker = export_worker.spawn(Arc::clone(&spool));
+    let storage_retention_config = storage_retention_worker_config_from_plan(plan_handle.clone());
     println!(
         "agent {} running config {} capture {:?} selected {:?}",
         plan.config.agent_id,
@@ -243,9 +243,7 @@ pub(crate) async fn run_live_agent(
     let blocking_run = tokio::task::spawn_blocking(|| blocking_run.run()).await;
     shutdown_signal_task.abort();
     background_services.stop().await;
-    if let Some(worker) = export_worker {
-        worker.stop().await;
-    }
+    export_worker.stop().await;
     let (
         summary_result,
         interception_cleanup_result,
@@ -687,9 +685,9 @@ fn merge_run_results(
 }
 
 fn storage_retention_worker_config_from_plan(
-    plan: &RuntimePlan,
+    plan_handle: RuntimePlanHandle,
 ) -> Option<StorageRetentionWorkerConfig> {
-    StorageRetentionWorkerConfig::from_plans(&plan.export, &plan.storage)
+    StorageRetentionWorkerConfig::from_plan_handle(plan_handle)
 }
 
 fn admin_server_config_from_plan(plan: &RuntimePlan) -> Option<AdminServerConfig> {

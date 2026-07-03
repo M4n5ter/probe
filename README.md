@@ -306,11 +306,11 @@ The main-config reload contract is owner-scoped:
 
 - Policy-only changes apply online when policy watcher and poller topology is
   disabled.
-- Export sink detail and export worker schedule changes apply online when the
-  running plan already owns an export worker, the candidate plan keeps one, and
-  the exporter id set is unchanged. This covers webhook endpoint, headers,
-  codec, file path, Unix HTTP socket path, and per-sink batch quota changes for
-  existing sinks.
+- Export changes apply online through the running export lifecycle. This covers
+  worker enablement, worker schedule, exporter id set changes, webhook endpoint,
+  headers, codec, file path, Unix HTTP socket path, and per-sink batch quota
+  changes. Export retention cursor owners are derived from the active plan on
+  each retention sweep.
 - Enforcement policy source and `enforcement.selector` changes apply online
   when enforcement reload watcher and poller topology is disabled and
   transparent interception is not owning setup-time host rules.
@@ -320,13 +320,12 @@ The main-config reload contract is owner-scoped:
 
 Top-level `[selectors]` registry changes, including entries referenced by
 `enforcement.selector`, still require restart until selector ownership has a
-lifecycle owner. Export worker enablement and exporter id set changes, storage,
-admin socket, watcher topology, interception topology, and MITM/export TLS
-material changes still require a process rebuild. Online apply failures keep
-the old running agent alive and are reported in the status line instead of
-forcing a managed-agent restart. The same tab edits admin socket settings for
-future runs; the current TUI session keeps using the active socket it attached
-to at startup.
+lifecycle owner. Storage, admin socket, watcher topology, interception topology,
+and TLS material registry/source changes still require a process rebuild.
+Online apply failures keep the old running agent alive and are reported in the
+status line instead of forcing a managed-agent restart. The same tab edits admin
+socket settings for future runs; the current TUI session keeps using the active
+socket it attached to at startup.
 
 ### Minimal Policy And Webhook Wiring
 
@@ -1135,13 +1134,11 @@ poller topology is disabled. Enforcement policy source and
 watcher and poller topology is disabled and transparent interception is not
 owning setup-time host rules. Top-level `[selectors]` registry changes remain
 restart-required, even when an updated entry is referenced by
-`enforcement.selector`. Export sink detail and export worker schedule changes
-are online-applicable when the running plan already owns an export worker, the
-candidate plan keeps one, and the exporter id set is unchanged; endpoint,
+`enforcement.selector`. Export changes are online-applicable through the running
+export lifecycle; worker enablement, worker schedule, exporter id set, endpoint,
 headers, codec, file path, Unix HTTP socket path, and batch quota changes affect
-subsequent batches. Export worker enablement and exporter id set changes require
-a process rebuild until background service and retention owners can reconcile
-worker start, stop, and cursor-owner topology.
+subsequent batches. Export retention cursor owners are reconciled from the
+active plan on each retention sweep.
 Data-path rebuild verdicts can queue a `request_runtime_generation` action with
 a request id and appear as a pending runtime generation in status; the live agent
 consumes queued requests at capture safe points and records a runtime generation
@@ -1153,10 +1150,10 @@ plan only after the candidate opens. Mixed online/data-path changes remain
 candidate without partial commits. If a generation request cannot be queued, the
 old runtime stays active; a TUI-managed agent can restart to converge on the
 saved config, while an attached external agent reports that an explicit restart
-or retry is required. Selectors, MITM/export TLS materials, enforcement
-execution surface changes, storage, admin, agent id, and watcher topology changes
-are not silently applied by this path and remain `restart_required` until their
-lifecycle owners exist.
+or retry is required. Selectors, TLS material registry/source changes,
+enforcement execution surface changes, storage, admin, agent id, and watcher
+topology changes are not silently applied by this path and remain
+`restart_required` until their lifecycle owners exist.
 The `[runtime_reload]` section controls the watcher topology itself, so changing
 it is also `restart_required`; the running watcher does not rebuild its own
 lifecycle.

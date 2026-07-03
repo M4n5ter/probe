@@ -5,9 +5,7 @@ use probe_config::{
     AgentConfig, ConfigError, EnforcementConfig, EnforcementPolicyConfig,
     EnforcementPolicyReloadConfig, TlsConfig, TlsMaterialConfig, TlsMaterialKind,
 };
-use runtime::{
-    OnlineReloadConfigUpdate, RuntimePlan, export_reload_ownership, validate_static_runtime_config,
-};
+use runtime::{OnlineReloadConfigUpdate, RuntimePlan, validate_static_runtime_config};
 use serde::{Deserialize, Serialize};
 
 use crate::artifacts::normalize_embedded_artifact_paths_for_comparison;
@@ -622,9 +620,7 @@ fn section_reload_mode(
         ConfigReloadSection::Policies if policies_can_apply_online(current, candidate) => {
             ConfigReloadSectionReloadMode::ApplyOnline
         }
-        ConfigReloadSection::Export if export_can_apply_online(current, candidate) => {
-            ConfigReloadSectionReloadMode::ApplyOnline
-        }
+        ConfigReloadSection::Export => ConfigReloadSectionReloadMode::ApplyOnline,
         ConfigReloadSection::Tls if tls_can_use_runtime_generation(current, candidate) => {
             ConfigReloadSectionReloadMode::RuntimeGeneration
         }
@@ -653,11 +649,8 @@ fn section_change_reason(
         ConfigReloadSection::Policies => {
             "policy watcher or poller topology is still owned by startup background services"
         }
-        ConfigReloadSection::Export if export_can_apply_online(current, candidate) => {
-            "export sink details and worker schedule are owned by the running export worker lifecycle for subsequent batches"
-        }
         ConfigReloadSection::Export => {
-            "export worker enablement and sink id ownership cannot change online until background service and retention owners can reconcile them"
+            "export worker lifecycle and export retention cursor owners reconcile the active export plan online"
         }
         ConfigReloadSection::Tls if tls_can_use_runtime_generation(current, candidate) => {
             "TLS plaintext instrumentation and decrypt hint materials are rebuilt by runtime generation swaps"
@@ -717,10 +710,6 @@ fn policies_can_apply_online(current: &AgentConfig, candidate: &AgentConfig) -> 
     current.policy_reload == candidate.policy_reload
         && !current.policy_reload.watch_local_bundles
         && !current.policy_reload.poll_remote_bundles
-}
-
-fn export_can_apply_online(current: &AgentConfig, candidate: &AgentConfig) -> bool {
-    export_reload_ownership(current).can_apply_online_to(&export_reload_ownership(candidate))
 }
 
 fn enforcement_can_apply_online(current: &AgentConfig, candidate: &AgentConfig) -> bool {
@@ -1041,7 +1030,7 @@ mod tests {
                 ),
                 (
                     ConfigReloadSection::Export,
-                    ConfigReloadSectionReloadMode::ProcessRestart,
+                    ConfigReloadSectionReloadMode::ApplyOnline,
                 ),
             ]
         );
@@ -1170,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn config_reload_plan_keeps_export_sink_id_changes_restart_required()
+    fn config_reload_plan_can_apply_export_sink_id_changes_online()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("config-reload-export-sink-ids")?;
         let mut current_config = base_config(temp.join("spool"));
@@ -1190,7 +1179,7 @@ mod tests {
         let plan = plan_config_reload(&current.config, &candidate_path);
 
         assert!(
-            matches!(plan.decision, ConfigReloadDecision::RestartRequired { .. }),
+            matches!(plan.decision, ConfigReloadDecision::ApplyOnline { .. }),
             "{:?}",
             plan.decision
         );
@@ -1201,13 +1190,47 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(
                 ConfigReloadSection::Export,
-                ConfigReloadSectionReloadMode::ProcessRestart,
+                ConfigReloadSectionReloadMode::ApplyOnline,
             )]
         );
         assert!(
             plan.changed_sections[0]
                 .reason
-                .contains("sink id ownership")
+                .contains("retention cursor owners")
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_can_apply_first_exporter_online() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = test_dir("config-reload-first-exporter")?;
+        let current = runtime_plan(base_config(temp.join("spool")))?;
+        let mut candidate = current.config.clone();
+        candidate.exporters.push(webhook_exporter(
+            "collector",
+            "https://collector.example/probe/batches",
+        ));
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current.config, &candidate_path);
+
+        assert!(
+            matches!(plan.decision, ConfigReloadDecision::ApplyOnline { .. }),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.reload_mode))
+                .collect::<Vec<_>>(),
+            vec![(
+                ConfigReloadSection::Export,
+                ConfigReloadSectionReloadMode::ApplyOnline,
+            )]
         );
         fs::remove_dir_all(temp)?;
         Ok(())

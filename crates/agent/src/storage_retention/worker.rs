@@ -4,10 +4,13 @@ use std::{
 };
 
 use pipeline::PARSER_INGRESS_CURSOR_OWNER;
-use runtime::{ExportPlan, ExportRetentionPlan, IngressRetentionPlan, StoragePlan};
+use runtime::{ExportRetentionPlan, IngressRetentionPlan, RuntimePlan, StoragePlan};
 use storage::{DurableSpool, IngressCursorOwner};
 
-use crate::periodic_worker::{PeriodicWorkerHandle, spawn_periodic_worker};
+use crate::{
+    periodic_worker::{PeriodicWorkerHandle, spawn_periodic_worker},
+    runtime_plan::RuntimePlanHandle,
+};
 
 pub(crate) struct StorageRetentionWorkerHandle {
     ingress: Option<PeriodicWorkerHandle>,
@@ -26,9 +29,14 @@ struct IngressRetentionLaneConfig {
 }
 
 struct ExportRetentionLaneConfig {
+    plan_handle: RuntimePlanHandle,
+    interval: Duration,
+}
+
+#[derive(Clone)]
+struct ExportRetentionLaneSnapshot {
     cursor_owners: Vec<String>,
     retention: ExportRetentionPlan,
-    interval: Duration,
 }
 
 #[derive(Clone, Copy)]
@@ -50,9 +58,10 @@ impl StorageRetentionWorkerHandle {
 }
 
 impl StorageRetentionWorkerConfig {
-    pub(crate) fn from_plans(export: &ExportPlan, storage: &StoragePlan) -> Option<Self> {
-        let ingress = IngressRetentionLaneConfig::from_storage_plan(storage);
-        let export = ExportRetentionLaneConfig::from_plans(export, storage);
+    pub(crate) fn from_plan_handle(plan_handle: RuntimePlanHandle) -> Option<Self> {
+        let plan = plan_handle.snapshot();
+        let ingress = IngressRetentionLaneConfig::from_storage_plan(&plan.storage);
+        let export = ExportRetentionLaneConfig::from_plan(plan.as_ref(), plan_handle.clone());
         (ingress.is_some() || export.is_some()).then_some(Self { ingress, export })
     }
 }
@@ -69,17 +78,16 @@ impl IngressRetentionLaneConfig {
 }
 
 impl ExportRetentionLaneConfig {
-    fn from_plans(export: &ExportPlan, storage: &StoragePlan) -> Option<Self> {
-        let retention = &storage.retention.export;
+    fn from_plan(plan: &RuntimePlan, plan_handle: RuntimePlanHandle) -> Option<Self> {
+        let retention = &plan.storage.retention.export;
         retention.enabled().then(|| Self {
-            cursor_owners: export
-                .sinks
-                .iter()
-                .map(|sink| sink.id().to_string())
-                .collect(),
+            plan_handle,
             interval: Duration::from_millis(retention.sweep_interval_ms.get()),
-            retention: retention.clone(),
         })
+    }
+
+    fn snapshot(&self) -> Option<ExportRetentionLaneSnapshot> {
+        export_retention_lane_snapshot(self.plan_handle.snapshot().as_ref())
     }
 }
 
@@ -143,21 +151,24 @@ fn prune_export_retention_once(
     spool: &impl DurableSpool,
     config: &ExportRetentionLaneConfig,
 ) -> Result<(), storage::StorageError> {
-    prune_export_retention_once_at(spool, config, current_unix_time_ns())
+    let Some(snapshot) = config.snapshot() else {
+        return Ok(());
+    };
+    prune_export_retention_once_at(spool, &snapshot, current_unix_time_ns())
 }
 
 fn prune_export_retention_once_at(
     spool: &impl DurableSpool,
-    config: &ExportRetentionLaneConfig,
+    snapshot: &ExportRetentionLaneSnapshot,
     now_unix_ns: u64,
 ) -> Result<(), storage::StorageError> {
-    let cursor_owners = config
+    let cursor_owners = snapshot
         .cursor_owners
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
     prune_retention_limits(
-        RetentionLimits::from(&config.retention),
+        RetentionLimits::from(&snapshot.retention),
         now_unix_ns,
         |cutoff_unix_ns, limit| {
             spool.prune_expired_export_prefix(cutoff_unix_ns, limit, &cursor_owners)
@@ -165,6 +176,19 @@ fn prune_export_retention_once_at(
         |max_records, limit| spool.prune_export_to_max_records(max_records, limit, &cursor_owners),
         |kind, pruned| log_retention("export", "events", kind, pruned, cursor_owners.len()),
     )
+}
+
+fn export_retention_lane_snapshot(plan: &RuntimePlan) -> Option<ExportRetentionLaneSnapshot> {
+    let retention = &plan.storage.retention.export;
+    retention.enabled().then(|| ExportRetentionLaneSnapshot {
+        cursor_owners: plan
+            .export
+            .sinks
+            .iter()
+            .map(|sink| sink.id().to_string())
+            .collect(),
+        retention: retention.clone(),
+    })
 }
 
 fn prune_retention_limits(
@@ -244,13 +268,17 @@ impl From<&ExportRetentionPlan> for RetentionLimits {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, num::NonZeroU64};
+    use std::{cell::RefCell, num::NonZeroU64, path::PathBuf, sync::Arc};
 
-    use probe_config::CompressionCodecName;
-    use probe_core::SpoolPayloadSchema;
+    use probe_config::{
+        AgentConfig, CaptureBackend, CaptureConfig, CaptureSelection, ExportQueueRetentionConfig,
+        ExporterConfig, ExporterTransportConfig, IngressJournalRetentionConfig, StorageConfig,
+        StorageRetentionConfig,
+    };
+    use probe_core::{CapabilityKind, CapabilityState, SpoolPayloadSchema};
     use runtime::{
-        ExportPlan, ExportSinkTlsPlan, ExportWorkerPlan, StorageRetentionPlan,
-        WebhookExportSinkPlan,
+        CaptureProviderBuilder, CaptureProviderDescriptor, OnlineReloadConfigUpdate,
+        ProviderRegistry, RuntimePlan,
     };
     use storage::{FjallSpool, RetentionPrune, SpoolPayload};
     use tempfile::tempdir;
@@ -258,111 +286,88 @@ mod tests {
     use super::*;
 
     #[test]
-    fn storage_retention_worker_config_uses_storage_plan() {
-        let export = ExportPlan {
-            worker: ExportWorkerPlan::Disabled {
-                reason: "test".to_string(),
-            },
-            sinks: vec![
-                WebhookExportSinkPlan {
-                    id: "collector".to_string(),
-                    endpoint: "https://collector.example/batches".to_string(),
-                    codec: CompressionCodecName::None,
-                    headers: Default::default(),
-                    tls: ExportSinkTlsPlan::default(),
-                    worker: runtime::ExportSinkWorkerPlan {
-                        batches_per_tick_override: None,
-                        effective_batches_per_tick: NonZeroU64::new(1).expect("positive quota"),
-                    },
-                }
-                .into(),
-            ],
-        };
-        let storage = StoragePlan {
-            retention: StorageRetentionPlan {
-                ingress: IngressRetentionPlan {
+    fn storage_retention_worker_config_uses_storage_plan() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let plan = runtime_plan(
+            temp.path().join("spool"),
+            StorageRetentionConfig {
+                ingress: IngressJournalRetentionConfig {
                     max_age_ms: Some(60_000),
                     max_records: Some(10_000),
-                    sweep_interval_ms: NonZeroU64::new(5_000).expect("positive sweep interval"),
-                    prune_batch_limit: NonZeroU64::new(128).expect("positive prune limit"),
+                    sweep_interval_ms: 5_000,
+                    prune_batch_limit: 128,
                 },
-                export: ExportRetentionPlan {
+                export: ExportQueueRetentionConfig {
                     max_age_ms: Some(120_000),
                     max_records: Some(50_000),
-                    sweep_interval_ms: NonZeroU64::new(7_000).expect("positive sweep interval"),
-                    prune_batch_limit: NonZeroU64::new(256).expect("positive prune limit"),
+                    sweep_interval_ms: 7_000,
+                    prune_batch_limit: 256,
                 },
             },
-        };
+            vec![webhook_exporter("collector")],
+        )?;
+        let plan_handle = RuntimePlanHandle::new(Arc::new(plan));
 
-        let config = StorageRetentionWorkerConfig::from_plans(&export, &storage)
+        let config = StorageRetentionWorkerConfig::from_plan_handle(plan_handle)
             .expect("configured max age should enable storage retention");
         let ingress = config.ingress.expect("ingress retention should be enabled");
-        let export = config.export.expect("export retention should be enabled");
+        let export_config = config.export.expect("export retention should be enabled");
+        let export = export_config
+            .snapshot()
+            .expect("export retention snapshot should be enabled");
 
         assert_eq!(ingress.cursor_owners, [PARSER_INGRESS_CURSOR_OWNER]);
         assert_eq!(ingress.interval, Duration::from_millis(5_000));
         assert_eq!(ingress.retention.max_age_ms, Some(60_000));
         assert_eq!(ingress.retention.max_records, Some(10_000));
         assert_eq!(export.cursor_owners, ["collector"]);
-        assert_eq!(export.interval, Duration::from_millis(7_000));
+        assert_eq!(export_config.interval, Duration::from_millis(7_000));
         assert_eq!(export.retention.max_age_ms, Some(120_000));
         assert_eq!(export.retention.max_records, Some(50_000));
+        Ok(())
     }
 
     #[test]
-    fn storage_retention_worker_config_is_disabled_without_retention_limit() {
-        let export = ExportPlan {
-            worker: ExportWorkerPlan::Disabled {
-                reason: "test".to_string(),
-            },
-            sinks: Vec::new(),
-        };
+    fn storage_retention_worker_config_is_disabled_without_retention_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let plan = runtime_plan(
+            temp.path().join("spool"),
+            StorageRetentionConfig::default(),
+            Vec::new(),
+        )?;
+        let plan_handle = RuntimePlanHandle::new(Arc::new(plan));
 
-        assert!(
-            StorageRetentionWorkerConfig::from_plans(&export, &StoragePlan::default()).is_none()
-        );
+        assert!(StorageRetentionWorkerConfig::from_plan_handle(plan_handle).is_none());
+        Ok(())
     }
 
     #[test]
-    fn storage_retention_worker_config_is_enabled_by_max_records_only() {
-        let export = ExportPlan {
-            worker: ExportWorkerPlan::Disabled {
-                reason: "test".to_string(),
-            },
-            sinks: vec![
-                WebhookExportSinkPlan {
-                    id: "collector".to_string(),
-                    endpoint: "https://collector.example/batches".to_string(),
-                    codec: CompressionCodecName::None,
-                    headers: Default::default(),
-                    tls: ExportSinkTlsPlan::default(),
-                    worker: runtime::ExportSinkWorkerPlan {
-                        batches_per_tick_override: None,
-                        effective_batches_per_tick: NonZeroU64::new(1).expect("positive quota"),
-                    },
-                }
-                .into(),
-            ],
-        };
-        let storage = StoragePlan {
-            retention: StorageRetentionPlan {
-                ingress: IngressRetentionPlan {
+    fn storage_retention_worker_config_is_enabled_by_max_records_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let plan = runtime_plan(
+            temp.path().join("spool"),
+            StorageRetentionConfig {
+                ingress: IngressJournalRetentionConfig {
                     max_age_ms: None,
                     max_records: Some(10),
-                    sweep_interval_ms: NonZeroU64::new(5_000).expect("positive sweep interval"),
-                    prune_batch_limit: NonZeroU64::new(128).expect("positive prune limit"),
+                    sweep_interval_ms: 5_000,
+                    prune_batch_limit: 128,
                 },
-                export: ExportRetentionPlan {
+                export: ExportQueueRetentionConfig {
                     max_age_ms: None,
                     max_records: Some(20),
-                    sweep_interval_ms: NonZeroU64::new(7_000).expect("positive sweep interval"),
-                    prune_batch_limit: NonZeroU64::new(256).expect("positive prune limit"),
+                    sweep_interval_ms: 7_000,
+                    prune_batch_limit: 256,
                 },
             },
-        };
+            vec![webhook_exporter("collector")],
+        )?;
+        let plan_handle = RuntimePlanHandle::new(Arc::new(plan));
 
-        let config = StorageRetentionWorkerConfig::from_plans(&export, &storage)
+        let config = StorageRetentionWorkerConfig::from_plan_handle(plan_handle)
             .expect("max-records retention should enable storage retention");
 
         assert_eq!(
@@ -373,14 +378,70 @@ mod tests {
                 .max_records,
             Some(10)
         );
+        let export = config
+            .export
+            .expect("export retention should be enabled")
+            .snapshot()
+            .expect("export retention snapshot should be enabled");
+        assert_eq!(export.cursor_owners, ["collector"]);
+        assert_eq!(export.retention.max_records, Some(20));
+        Ok(())
+    }
+
+    #[test]
+    fn export_retention_uses_active_export_plan_for_cursor_retirement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path().join("spool-data"))?;
+        spool.append_export(SpoolPayload::new(
+            SpoolPayloadSchema::EventEnvelopeSubjectOriginJson,
+            b"one",
+        ))?;
+        spool.append_export(SpoolPayload::new(
+            SpoolPayloadSchema::EventEnvelopeSubjectOriginJson,
+            b"two",
+        ))?;
+        spool.append_export(SpoolPayload::new(
+            SpoolPayloadSchema::EventEnvelopeSubjectOriginJson,
+            b"three",
+        ))?;
+        let plan = runtime_plan(
+            temp.path().join("spool"),
+            StorageRetentionConfig {
+                export: ExportQueueRetentionConfig {
+                    max_age_ms: None,
+                    max_records: Some(1),
+                    sweep_interval_ms: 7_000,
+                    prune_batch_limit: 256,
+                },
+                ..StorageRetentionConfig::default()
+            },
+            vec![webhook_exporter("primary")],
+        )?;
+        let plan_handle = RuntimePlanHandle::new(Arc::new(plan.clone()));
+        let config = StorageRetentionWorkerConfig::from_plan_handle(plan_handle.clone())
+            .expect("export retention should be enabled");
+        let export = config.export.expect("export retention should be enabled");
+
+        let updated_plan = plan.with_online_reload_update(OnlineReloadConfigUpdate::Export {
+            export: plan.config.export.clone(),
+            exporters: vec![webhook_exporter("primary"), webhook_exporter("secondary")],
+        });
+        plan_handle.replace(updated_plan);
+
+        prune_export_retention_once(&spool, &export)?;
+
+        assert_eq!(spool.export_cursor("primary")?, 2);
+        assert_eq!(spool.export_cursor("secondary")?, 2);
         assert_eq!(
-            config
-                .export
-                .expect("export retention should be enabled")
-                .retention
-                .max_records,
-            Some(20)
+            spool
+                .read_export_batch("secondary", 10)?
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![3]
         );
+        Ok(())
     }
 
     #[test]
@@ -486,7 +547,7 @@ mod tests {
             SpoolPayloadSchema::EventEnvelopeSubjectOriginJson,
             b"one",
         ))?;
-        let config = ExportRetentionLaneConfig {
+        let snapshot = ExportRetentionLaneSnapshot {
             cursor_owners: vec!["collector".to_string()],
             retention: ExportRetentionPlan {
                 max_age_ms: Some(1),
@@ -494,10 +555,9 @@ mod tests {
                 sweep_interval_ms: NonZeroU64::new(5_000).expect("positive sweep interval"),
                 prune_batch_limit: NonZeroU64::new(10).expect("positive prune limit"),
             },
-            interval: Duration::from_millis(5_000),
         };
 
-        prune_export_retention_once_at(&spool, &config, u64::MAX)?;
+        prune_export_retention_once_at(&spool, &snapshot, u64::MAX)?;
 
         assert_eq!(spool.export_cursor("collector")?, 1);
         assert!(spool.read_export_batch("collector", 10)?.is_empty());
@@ -562,7 +622,7 @@ mod tests {
             SpoolPayloadSchema::EventEnvelopeSubjectOriginJson,
             b"three",
         ))?;
-        let config = ExportRetentionLaneConfig {
+        let snapshot = ExportRetentionLaneSnapshot {
             cursor_owners: vec!["collector".to_string()],
             retention: ExportRetentionPlan {
                 max_age_ms: None,
@@ -570,10 +630,9 @@ mod tests {
                 sweep_interval_ms: NonZeroU64::new(5_000).expect("positive sweep interval"),
                 prune_batch_limit: NonZeroU64::new(10).expect("positive prune limit"),
             },
-            interval: Duration::from_millis(5_000),
         };
 
-        prune_export_retention_once_at(&spool, &config, 42)?;
+        prune_export_retention_once_at(&spool, &snapshot, 42)?;
 
         assert_eq!(spool.export_cursor("collector")?, 2);
         assert_eq!(
@@ -585,5 +644,57 @@ mod tests {
             vec![3]
         );
         Ok(())
+    }
+
+    fn runtime_plan(
+        storage_path: PathBuf,
+        retention: StorageRetentionConfig,
+        exporters: Vec<ExporterConfig>,
+    ) -> Result<RuntimePlan, runtime::RuntimeError> {
+        RuntimePlan::build(
+            AgentConfig {
+                capture: CaptureConfig {
+                    selection: CaptureSelection::Replay,
+                    ..CaptureConfig::default()
+                },
+                storage: StorageConfig {
+                    path: storage_path,
+                    retention,
+                },
+                exporters,
+                ..AgentConfig::default()
+            },
+            &registry(),
+        )
+    }
+
+    fn registry() -> ProviderRegistry {
+        ProviderRegistry::new(
+            vec![CaptureProviderDescriptor::available(
+                CaptureBackend::Replay,
+                CaptureProviderBuilder::Replay,
+            )],
+            vec![
+                CapabilityState::available(CapabilityKind::Http1),
+                CapabilityState::available(CapabilityKind::Sse),
+                CapabilityState::available(CapabilityKind::WebSocketHandoff),
+                CapabilityState::available(CapabilityKind::WebSocketFrame),
+                CapabilityState::available(CapabilityKind::DryRunEnforcement),
+                CapabilityState::unavailable(CapabilityKind::LibsslUprobe, "not built"),
+                CapabilityState::unavailable(CapabilityKind::ConnectionEnforcement, "not built"),
+            ],
+        )
+    }
+
+    fn webhook_exporter(id: &str) -> ExporterConfig {
+        ExporterConfig {
+            id: id.to_string(),
+            transport: ExporterTransportConfig::Webhook {
+                endpoint: format!("https://{id}.example/probe/batches"),
+                headers: Default::default(),
+                tls: Default::default(),
+            },
+            ..ExporterConfig::default()
+        }
     }
 }

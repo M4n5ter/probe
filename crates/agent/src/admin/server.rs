@@ -56,7 +56,7 @@ pub struct AdminRuntimeState {
     pub config_apply_gate: RuntimeReloadGate,
     pub enforcement: Option<EnforcementRuntimeState>,
     pub enforcement_reload_gate: EnforcementReloadGate,
-    pub export_worker: Option<ExportWorkerRuntimeState>,
+    pub export_worker: ExportWorkerRuntimeState,
     pub pipeline: Option<PipelineRuntimeMetrics>,
     pub policy_reload_gate: PolicyReloadGate,
     pub policy_set: PipelinePolicySet,
@@ -456,10 +456,7 @@ fn runtime_status_input(runtime_state: &AdminRuntimeState) -> RuntimeStatusInput
                 active_policy: Box::new(state.active_policy()),
             },
         ),
-        export_worker: runtime_state
-            .export_worker
-            .as_ref()
-            .map(ExportWorkerRuntimeState::snapshot),
+        export_worker: Some(runtime_state.export_worker.snapshot()),
         policy: Some(runtime_state.policy_set.runtime_snapshot()),
         pipeline: runtime_state
             .pipeline
@@ -877,7 +874,7 @@ mod tests {
                 .iter()
                 .any(|change| {
                     change["section"] == json!("export")
-                        && change["reload_mode"] == json!("process_restart")
+                        && change["reload_mode"] == json!("apply_online")
                 })
         );
 

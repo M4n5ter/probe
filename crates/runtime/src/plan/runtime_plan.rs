@@ -8,7 +8,7 @@ use super::{
     capture::{CapturePlan, CapturePlanMode},
     enforcement::EnforcementPlan,
     error::RuntimeError,
-    export::{ExportPlan, ExportReloadOwnership},
+    export::ExportPlan,
     observation::apply_process_observation_projection,
     registry::ProviderRegistry,
     storage::StoragePlan,
@@ -125,11 +125,6 @@ impl RuntimePlan {
 
 pub fn project_runtime_config(config: AgentConfig) -> AgentConfig {
     apply_process_observation_projection(config)
-}
-
-pub fn export_reload_ownership(config: &AgentConfig) -> ExportReloadOwnership {
-    let effective_config = project_runtime_config(config.clone());
-    ExportReloadOwnership::from_plan(&ExportPlan::resolve(&effective_config))
 }
 
 pub fn validate_static_runtime_config(config: &AgentConfig) -> Result<(), RuntimeError> {
