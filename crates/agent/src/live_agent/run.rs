@@ -1,6 +1,5 @@
 use std::{io::Write, os::unix::net::UnixStream, path::PathBuf, sync::Arc};
 
-use exporter::WebhookConnectionOptions;
 use parsers::Http1ParserFactory;
 use pipeline::{
     CapturePipeline, PipelinePolicySet, PipelineRunOptions, PipelineRuntimeMetrics, PipelineSummary,
@@ -30,10 +29,7 @@ use crate::{
     enforcement_reload_poller::{self, EnforcementReloadPollerHandle},
     enforcement_reload_watcher::{self, EnforcementReloadWatcherHandle},
     error::AgentError,
-    export::{
-        ExportDrainError, ExportWorker, ExportWorkerConfig,
-        drain_planned_sinks_with_webhook_connection,
-    },
+    export::{ExportDrainError, ExportWorker, drain_planned_sinks_with_webhook_connection},
     l7_mitm::{
         DurableL7MitmAuditSink, L7MitmBackendLifecycleGuard, L7MitmRuntime, start_backend_lifecycle,
     },
@@ -103,8 +99,6 @@ pub(crate) async fn run_live_agent(
     let reloadable_policies = ReloadablePolicySet::from_loaded(policies);
     let spool = Arc::new(FjallSpool::open(&plan.config.storage.path)?);
     let webhook_connection = webhook_connection_options_from_plan(&plan);
-    let export_worker =
-        export_worker_config_from_plan(&plan, webhook_connection).map(ExportWorker::new);
     let pipeline_metrics = PipelineRuntimeMetrics::default();
     let policy_set = reloadable_policies.policy_set();
     let (enforcement_planner, enforcement_runtime) = EnforcementRuntimeState::from_planner(
@@ -117,6 +111,8 @@ pub(crate) async fn run_live_agent(
         RuntimeGenerationState::for_config_version(plan.config.config_version.clone());
     let config_apply_gate = RuntimeReloadGate::default();
     let transparent_proxy_runtime = transparent_interception.proxy_runtime_handle();
+    let plan_handle = RuntimePlanHandle::new(Arc::new(plan.clone()));
+    let export_worker = ExportWorker::new(plan_handle.clone(), webhook_connection);
     let admin_runtime_state = AdminRuntimeState {
         capture: capture_runtime.clone(),
         config_apply_gate: config_apply_gate.clone(),
@@ -132,7 +128,6 @@ pub(crate) async fn run_live_agent(
         transparent_proxy: Some(transparent_proxy_runtime.clone()),
         ..AdminRuntimeState::default()
     };
-    let plan_handle = RuntimePlanHandle::new(Arc::new(plan.clone()));
     let admin_server = admin_server_config_from_plan(&plan)
         .map(|config| {
             spawn_admin_server(
@@ -276,12 +271,13 @@ pub(crate) async fn run_live_agent(
     if let Some(worker) = storage_retention_worker {
         worker.stop().await;
     }
+    let tail_plan = plan_handle.snapshot();
     let drain_result = drain_planned_sinks_with_webhook_connection(
         spool.as_ref(),
-        &plan.config.agent_id,
-        &plan.export,
-        &plan.tls_material_store,
-        webhook_connection,
+        &tail_plan.config.agent_id,
+        &tail_plan.export,
+        &tail_plan.tls_material_store,
+        webhook_connection_options_from_plan(tail_plan.as_ref()),
     )
     .await;
     let summary = merge_run_results(
@@ -688,18 +684,6 @@ fn merge_run_results(
         return Err(export_error.into());
     }
     Ok(summary)
-}
-
-fn export_worker_config_from_plan(
-    plan: &RuntimePlan,
-    webhook_connection: WebhookConnectionOptions,
-) -> Option<ExportWorkerConfig> {
-    ExportWorkerConfig::from_plans_with_webhook_connection(
-        plan.config.agent_id.clone(),
-        &plan.export,
-        &plan.tls_material_store,
-        webhook_connection,
-    )
 }
 
 fn storage_retention_worker_config_from_plan(

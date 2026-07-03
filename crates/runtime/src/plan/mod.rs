@@ -31,8 +31,9 @@ pub use enforcement::{
 pub use enforcement_policy_source::{EnforcementPolicySourceKind, EnforcementPolicySourcePlan};
 pub use error::RuntimeError;
 pub use export::{
-    ExportFailureBackoffPlan, ExportPlan, ExportSinkPlan, ExportSinkTlsPlan, ExportSinkWorkerPlan,
-    ExportWorkerPlan, FileExportSinkPlan, UnixHttpExportSinkPlan, WebhookExportSinkPlan,
+    ExportFailureBackoffPlan, ExportPlan, ExportReloadOwnership, ExportSinkPlan, ExportSinkTlsPlan,
+    ExportSinkWorkerPlan, ExportWorkerPlan, FileExportSinkPlan, UnixHttpExportSinkPlan,
+    WebhookExportSinkPlan,
 };
 pub use interception_scope::{
     TransparentInterceptionFlowClassifierScopePlan,
@@ -47,7 +48,8 @@ pub use interception_scope::{
 pub use probe_config::RemoteEnforcementPolicyBodyLimitBytes;
 pub use registry::{PlatformProbeResults, ProviderRegistry, default_l7_mitm_unavailable_reason};
 pub use runtime_plan::{
-    OnlineReloadConfigUpdate, RuntimePlan, project_runtime_config, validate_static_runtime_config,
+    OnlineReloadConfigUpdate, RuntimePlan, export_reload_ownership, project_runtime_config,
+    validate_static_runtime_config,
 };
 pub use storage::{ExportRetentionPlan, IngressRetentionPlan, StoragePlan, StorageRetentionPlan};
 pub use tls::{

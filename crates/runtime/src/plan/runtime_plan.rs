@@ -1,4 +1,6 @@
-use probe_config::{AgentConfig, EnforcementPolicySourceConfig, PolicyConfig};
+use probe_config::{
+    AgentConfig, EnforcementPolicySourceConfig, ExportRuntimeConfig, ExporterConfig, PolicyConfig,
+};
 use probe_core::{CapabilityMatrix, Selector};
 use serde::{Deserialize, Serialize};
 
@@ -6,7 +8,7 @@ use super::{
     capture::{CapturePlan, CapturePlanMode},
     enforcement::EnforcementPlan,
     error::RuntimeError,
-    export::ExportPlan,
+    export::{ExportPlan, ExportReloadOwnership},
     observation::apply_process_observation_projection,
     registry::ProviderRegistry,
     storage::StoragePlan,
@@ -33,6 +35,10 @@ pub struct RuntimePlan {
 pub enum OnlineReloadConfigUpdate {
     PipelinePolicies {
         policies: Vec<PolicyConfig>,
+    },
+    Export {
+        export: ExportRuntimeConfig,
+        exporters: Vec<ExporterConfig>,
     },
     EnforcementPolicy {
         selector: Option<Selector>,
@@ -82,21 +88,30 @@ impl RuntimePlan {
 
     pub fn with_online_reload_update(&self, update: OnlineReloadConfigUpdate) -> Self {
         let mut config = self.config.clone();
-        let update_enforcement =
-            matches!(update, OnlineReloadConfigUpdate::EnforcementPolicy { .. });
+        let mut update_export = false;
+        let mut update_enforcement = false;
         match update {
             OnlineReloadConfigUpdate::PipelinePolicies { policies } => {
                 config.policies = policies;
             }
+            OnlineReloadConfigUpdate::Export { export, exporters } => {
+                config.export = export;
+                config.exporters = exporters;
+                update_export = true;
+            }
             OnlineReloadConfigUpdate::EnforcementPolicy { selector, source } => {
                 config.enforcement.selector = selector;
                 config.enforcement.policy.source = source;
+                update_enforcement = true;
             }
         }
         let effective_config = project_runtime_config(config.clone());
         let mut plan = self.clone();
         plan.config = config;
         plan.effective_config = effective_config;
+        if update_export {
+            plan.export = ExportPlan::resolve(&plan.effective_config);
+        }
         if update_enforcement {
             plan.enforcement = EnforcementPlan::resolve(
                 &plan.effective_config,
@@ -112,6 +127,11 @@ pub fn project_runtime_config(config: AgentConfig) -> AgentConfig {
     apply_process_observation_projection(config)
 }
 
+pub fn export_reload_ownership(config: &AgentConfig) -> ExportReloadOwnership {
+    let effective_config = project_runtime_config(config.clone());
+    ExportReloadOwnership::from_plan(&ExportPlan::resolve(&effective_config))
+}
+
 pub fn validate_static_runtime_config(config: &AgentConfig) -> Result<(), RuntimeError> {
     let config = project_runtime_config(config.clone());
     config.validate_basic()?;
@@ -123,7 +143,8 @@ pub fn validate_static_runtime_config(config: &AgentConfig) -> Result<(), Runtim
 mod tests {
     use probe_config::{
         AgentConfig, CaptureBackend, CaptureSelection, EnforcementPolicySourceConfig,
-        ObservationDataPathMode, PolicyConfig, ProcessObservationConfig,
+        ExporterConfig, ExporterTransportConfig, ObservationDataPathMode, PolicyConfig,
+        ProcessObservationConfig,
     };
     use probe_core::{
         CapabilityKind, CapabilityState, Direction, ProcessSelector, RuntimeMode, Selector,
@@ -274,6 +295,54 @@ mod tests {
         assert!(matches!(
             updated.enforcement.policy_source,
             crate::plan::EnforcementPolicySourcePlan::LocalManifest { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn online_export_update_recomputes_export_plan() -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ProviderRegistry::new(
+            vec![capture_provider(
+                CaptureBackend::Replay,
+                CaptureProviderBuilder::Replay,
+                RuntimeMode::Available,
+            )],
+            test_platform_capabilities(),
+        );
+        let config = AgentConfig {
+            exporters: vec![ExporterConfig {
+                id: "collector".to_string(),
+                transport: ExporterTransportConfig::Webhook {
+                    endpoint: "https://collector.example/probe/batches".to_string(),
+                    headers: Default::default(),
+                    tls: Default::default(),
+                },
+                ..ExporterConfig::default()
+            }],
+            ..AgentConfig::default()
+        };
+        let plan = RuntimePlan::build(config, &registry)?;
+        let export = probe_config::ExportRuntimeConfig::default();
+        let exporters = vec![ExporterConfig {
+            id: "collector".to_string(),
+            transport: ExporterTransportConfig::Webhook {
+                endpoint: "https://collector.internal/probe/batches".to_string(),
+                headers: Default::default(),
+                tls: Default::default(),
+            },
+            ..ExporterConfig::default()
+        }];
+
+        let updated =
+            plan.with_online_reload_update(OnlineReloadConfigUpdate::Export { export, exporters });
+
+        assert_eq!(updated.config.exporters.len(), 1);
+        assert_eq!(updated.export.sinks.len(), 1);
+        assert_eq!(updated.export.sinks[0].id(), "collector");
+        assert!(matches!(
+            &updated.export.sinks[0],
+            crate::plan::ExportSinkPlan::Webhook(sink)
+                if sink.endpoint == "https://collector.internal/probe/batches"
         ));
         Ok(())
     }

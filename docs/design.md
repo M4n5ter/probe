@@ -341,6 +341,8 @@ Operator TUI 能力事实：
   为 omission 时通过后台任务使用该命令补齐详情，并在等待、too-large 或失败时保留 tail budget 诊断。
 - Runtime tab 保存配置后通过 admin Unix socket 调用 `apply_config_reload`。该动作先复用主配置 reload planning，
   再应用可在线切换的候选配置段；policy-only 变更在 policy watcher/poller topology 不变且未启用时可在线生效。
+  export sink detail 与 export worker schedule 变更在运行中已经存在 export worker、候选配置仍保留 export
+  worker，且 exporter id 集合不变时可在线生效；endpoint、codec、path、header 和 batch quota 变更会影响后续批次。
   enforcement policy source 和 `enforcement.selector` 变更在 enforcement reload watcher/poller topology
   未启用且 transparent interception 未持有 setup-time host rules 时可在线生效。顶层 `[selectors]`
   registry 变更，包括被 `enforcement.selector` 引用的条目变更，仍需要重启，直到 selector ownership
@@ -350,8 +352,9 @@ Operator TUI 能力事实：
   轮询 `status.runtime_generation`，直到显示 applied、failed 或 still-pending outcome。
   在线 apply 失败、已排队 generation 失败或仍 pending 时，旧 running agent 继续保留；generation
   request 无法入队表示保存的候选配置尚未进入 live data path，TUI-managed agent 可以重启以收敛到保存配置，
-  attached external agent 会提示显式重启或重试。planning 明确要求 setup-time rebuild 的 export、storage、
-  MITM/export TLS material、admin、interception 或 watcher topology 变更仍进入重启提示。
+  attached external agent 会提示显式重启或重试。planning 明确要求 setup-time rebuild 的 export worker
+  首次启动、exporter id 集合变更、storage、MITM/export TLS material、admin、interception 或 watcher
+  topology 变更仍进入重启提示。
 - Runtime tab 也可以调用 `reload_runtime_actions`。该动作只执行 active `RuntimePlan`
   中可安全在线切换的 runtime owners：policy bundle reload 和 enforcement policy source reload。
   响应按 action 独立展示成功或失败；它不替换运行中的主 agent config，也不改变 exporter sink cursor。

@@ -5,7 +5,9 @@ use probe_config::{
     AgentConfig, ConfigError, EnforcementConfig, EnforcementPolicyConfig,
     EnforcementPolicyReloadConfig, TlsConfig, TlsMaterialConfig, TlsMaterialKind,
 };
-use runtime::{OnlineReloadConfigUpdate, RuntimePlan, validate_static_runtime_config};
+use runtime::{
+    OnlineReloadConfigUpdate, RuntimePlan, export_reload_ownership, validate_static_runtime_config,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::artifacts::normalize_embedded_artifact_paths_for_comparison;
@@ -39,7 +41,7 @@ const CONFIG_RELOAD_SECTIONS: [ConfigReloadSectionSpec; 12] = [
     },
     ConfigReloadSectionSpec {
         section: ConfigReloadSection::Export,
-        reason: "export sinks and worker cursors are planned before the export worker starts",
+        reason: "export worker lifecycle is present only when the running plan started an export worker",
     },
     ConfigReloadSectionSpec {
         section: ConfigReloadSection::RuntimeReload,
@@ -479,6 +481,14 @@ fn online_reload_config_update(
                 policies: candidate.policies.clone(),
             })
         }
+        ConfigReloadSection::Export
+            if change.reload_mode == ConfigReloadSectionReloadMode::ApplyOnline =>
+        {
+            Some(OnlineReloadConfigUpdate::Export {
+                export: candidate.export.clone(),
+                exporters: candidate.exporters.clone(),
+            })
+        }
         ConfigReloadSection::Enforcement
             if change.reload_mode == ConfigReloadSectionReloadMode::ApplyOnline =>
         {
@@ -612,6 +622,9 @@ fn section_reload_mode(
         ConfigReloadSection::Policies if policies_can_apply_online(current, candidate) => {
             ConfigReloadSectionReloadMode::ApplyOnline
         }
+        ConfigReloadSection::Export if export_can_apply_online(current, candidate) => {
+            ConfigReloadSectionReloadMode::ApplyOnline
+        }
         ConfigReloadSection::Tls if tls_can_use_runtime_generation(current, candidate) => {
             ConfigReloadSectionReloadMode::RuntimeGeneration
         }
@@ -639,6 +652,12 @@ fn section_change_reason(
         }
         ConfigReloadSection::Policies => {
             "policy watcher or poller topology is still owned by startup background services"
+        }
+        ConfigReloadSection::Export if export_can_apply_online(current, candidate) => {
+            "export sink details and worker schedule are owned by the running export worker lifecycle for subsequent batches"
+        }
+        ConfigReloadSection::Export => {
+            "export worker enablement and sink id ownership cannot change online until background service and retention owners can reconcile them"
         }
         ConfigReloadSection::Tls if tls_can_use_runtime_generation(current, candidate) => {
             "TLS plaintext instrumentation and decrypt hint materials are rebuilt by runtime generation swaps"
@@ -698,6 +717,10 @@ fn policies_can_apply_online(current: &AgentConfig, candidate: &AgentConfig) -> 
     current.policy_reload == candidate.policy_reload
         && !current.policy_reload.watch_local_bundles
         && !current.policy_reload.poll_remote_bundles
+}
+
+fn export_can_apply_online(current: &AgentConfig, candidate: &AgentConfig) -> bool {
+    export_reload_ownership(current).can_apply_online_to(&export_reload_ownership(candidate))
 }
 
 fn enforcement_can_apply_online(current: &AgentConfig, candidate: &AgentConfig) -> bool {
@@ -1104,6 +1127,126 @@ mod tests {
         );
         assert_eq!(request.changed_sections, ["capture"]);
         assert_eq!(request.candidate_config, candidate);
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_can_apply_export_config_changes_online()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-export-online")?;
+        let mut current_config = base_config(temp.join("spool"));
+        current_config.exporters = vec![webhook_exporter(
+            "collector",
+            "https://collector.example/probe/batches",
+        )];
+        let current = runtime_plan(current_config)?;
+        let mut candidate = current.config.clone();
+        candidate.exporters = vec![webhook_exporter(
+            "collector",
+            "https://collector.internal/probe/batches",
+        )];
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current.config, &candidate_path);
+
+        assert!(matches!(
+            plan.decision,
+            ConfigReloadDecision::ApplyOnline { .. }
+        ));
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.reload_mode))
+                .collect::<Vec<_>>(),
+            vec![(
+                ConfigReloadSection::Export,
+                ConfigReloadSectionReloadMode::ApplyOnline,
+            )]
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_keeps_export_sink_id_changes_restart_required()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-export-sink-ids")?;
+        let mut current_config = base_config(temp.join("spool"));
+        current_config.exporters = vec![webhook_exporter(
+            "primary",
+            "https://collector.example/probe/batches",
+        )];
+        let current = runtime_plan(current_config)?;
+        let mut candidate = current.config.clone();
+        candidate.exporters.push(webhook_exporter(
+            "secondary",
+            "https://collector.internal/probe/batches",
+        ));
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current.config, &candidate_path);
+
+        assert!(
+            matches!(plan.decision, ConfigReloadDecision::RestartRequired { .. }),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.reload_mode))
+                .collect::<Vec<_>>(),
+            vec![(
+                ConfigReloadSection::Export,
+                ConfigReloadSectionReloadMode::ProcessRestart,
+            )]
+        );
+        assert!(
+            plan.changed_sections[0]
+                .reason
+                .contains("sink id ownership")
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn complete_config_reload_apply_replaces_plan_for_export_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-export-apply")?;
+        let mut current_config = base_config(temp.join("spool"));
+        current_config.exporters = vec![webhook_exporter(
+            "collector",
+            "https://collector.example/probe/batches",
+        )];
+        let current = runtime_plan(current_config)?;
+        let mut candidate = current.config.clone();
+        candidate.exporters = vec![webhook_exporter(
+            "collector",
+            "https://collector.internal/probe/batches",
+        )];
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+        let plan_handle = RuntimePlanHandle::new(Arc::new(current.clone()));
+
+        let outcome = apply_config_reload(
+            &current,
+            &PipelinePolicySet::default(),
+            &PolicyReloadGate::default(),
+            None,
+            &EnforcementReloadGate::default(),
+            &candidate_path,
+        )
+        .await;
+        let snapshot = complete_config_reload_apply(outcome, &plan_handle, None);
+
+        assert!(snapshot.active_plan_updated);
+        assert!(snapshot.actions.is_empty());
+        assert_eq!(plan_handle.snapshot().config.exporters, candidate.exporters);
+        assert_eq!(plan_handle.snapshot().export.sinks[0].id(), "collector");
         fs::remove_dir_all(temp)?;
         Ok(())
     }
@@ -1693,6 +1836,18 @@ mod tests {
                 ..StorageConfig::default()
             },
             ..AgentConfig::default()
+        }
+    }
+
+    fn webhook_exporter(id: &str, endpoint: &str) -> ExporterConfig {
+        ExporterConfig {
+            id: id.to_string(),
+            transport: ExporterTransportConfig::Webhook {
+                endpoint: endpoint.to_string(),
+                headers: Default::default(),
+                tls: Default::default(),
+            },
+            ..ExporterConfig::default()
         }
     }
 

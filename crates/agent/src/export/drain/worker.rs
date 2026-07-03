@@ -19,9 +19,10 @@ use super::{
     ExportDrainError, ExportDrainFailureReason, mode::SinkDrainMode,
     target::drain_export_sink_with_mode,
 };
-use crate::tls_material::FilesystemTlsMaterialStore;
+use crate::{runtime_plan::RuntimePlanHandle, tls_material::FilesystemTlsMaterialStore};
 
 const EXPORT_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const EXPORT_WORKER_DISABLED_INTERVAL: Duration = Duration::from_secs(1);
 
 pub struct ExportWorkerHandle {
     stop_requested: Arc<AtomicBool>,
@@ -30,11 +31,13 @@ pub struct ExportWorkerHandle {
 }
 
 pub struct ExportWorker {
-    config: ExportWorkerConfig,
+    plan: RuntimePlanHandle,
+    webhook_connection: WebhookConnectionOptions,
     runtime_state: ExportWorkerRuntimeState,
 }
 
-pub struct ExportWorkerConfig {
+#[derive(Debug)]
+struct ExportWorkerConfig {
     agent_id: String,
     sinks: Vec<ExportSinkPlan>,
     interval: Duration,
@@ -51,8 +54,21 @@ pub struct ExportWorkerRuntimeState {
 
 #[derive(Debug)]
 struct ExportWorkerRuntimeInner {
+    sinks: BTreeMap<String, ExportSinkWorkerRuntimeEntry>,
+}
+
+#[derive(Debug)]
+struct ExportSinkWorkerRuntimeEntry {
+    fingerprint: ExportSinkDrainFingerprint,
+    state: ExportSinkWorkerRuntime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExportSinkDrainFingerprint {
+    sink: ExportSinkPlan,
+    sink_timeout: Duration,
     failure_backoff: ExportWorkerBackoffPolicy,
-    sinks: BTreeMap<String, ExportSinkWorkerRuntime>,
+    webhook_connection: WebhookConnectionOptions,
 }
 
 #[derive(Debug)]
@@ -88,12 +104,18 @@ pub enum ExportSinkWorkerRuntimeMode {
 }
 
 impl ExportWorker {
-    pub fn new(config: ExportWorkerConfig) -> Self {
-        let runtime_state = ExportWorkerRuntimeState::from_config(&config);
-        Self {
-            config,
+    pub fn new(
+        plan: RuntimePlanHandle,
+        webhook_connection: WebhookConnectionOptions,
+    ) -> Option<Self> {
+        let initial_config =
+            ExportWorkerConfig::from_runtime_plan(plan.snapshot().as_ref(), webhook_connection)?;
+        let runtime_state = ExportWorkerRuntimeState::from_config(&initial_config);
+        Some(Self {
+            plan,
+            webhook_connection,
             runtime_state,
-        }
+        })
     }
 
     pub fn runtime_state(&self) -> ExportWorkerRuntimeState {
@@ -104,11 +126,28 @@ impl ExportWorker {
     where
         S: ExportSpool + Send + Sync + 'static,
     {
-        spawn_export_worker_with_state(spool, self.config, self.runtime_state)
+        spawn_export_worker_with_state(
+            spool,
+            self.plan,
+            self.webhook_connection,
+            self.runtime_state,
+        )
     }
 }
 
 impl ExportWorkerConfig {
+    fn from_runtime_plan(
+        plan: &runtime::RuntimePlan,
+        webhook_connection: WebhookConnectionOptions,
+    ) -> Option<Self> {
+        Self::from_plans_with_webhook_connection(
+            plan.config.agent_id.clone(),
+            &plan.export,
+            &plan.tls_material_store,
+            webhook_connection,
+        )
+    }
+
     fn fixed_interval_bounded(
         agent_id: String,
         sinks: Vec<ExportSinkPlan>,
@@ -130,7 +169,7 @@ impl ExportWorkerConfig {
     }
 
     #[cfg(test)]
-    pub fn from_plans(agent_id: String, export: &ExportPlan) -> Option<Self> {
+    fn from_plans(agent_id: String, export: &ExportPlan) -> Option<Self> {
         Self::from_plans_with_webhook_connection(
             agent_id,
             export,
@@ -169,11 +208,15 @@ impl ExportWorkerRuntimeState {
     fn from_config(config: &ExportWorkerConfig) -> Self {
         Self {
             inner: Arc::new(Mutex::new(ExportWorkerRuntimeInner {
-                failure_backoff: config.failure_backoff,
                 sinks: config
                     .sinks
                     .iter()
-                    .map(|sink| (sink.id().to_string(), ExportSinkWorkerRuntime::Idle))
+                    .map(|sink| {
+                        (
+                            sink.id().to_string(),
+                            ExportSinkWorkerRuntimeEntry::new(config, sink),
+                        )
+                    })
                     .collect(),
             })),
         }
@@ -185,15 +228,64 @@ impl ExportWorkerRuntimeState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match inner.sinks.get(sink) {
-            Some(ExportSinkWorkerRuntime::BackingOff {
-                retry_after: None, ..
+            Some(ExportSinkWorkerRuntimeEntry {
+                state:
+                    ExportSinkWorkerRuntime::BackingOff {
+                        retry_after: None, ..
+                    },
+                ..
             }) => true,
-            Some(ExportSinkWorkerRuntime::BackingOff {
-                retry_after: Some(retry_after),
+            Some(ExportSinkWorkerRuntimeEntry {
+                state:
+                    ExportSinkWorkerRuntime::BackingOff {
+                        retry_after: Some(retry_after),
+                        ..
+                    },
                 ..
             }) => *retry_after > now,
-            Some(ExportSinkWorkerRuntime::Idle) | None => false,
+            Some(ExportSinkWorkerRuntimeEntry {
+                state: ExportSinkWorkerRuntime::Idle,
+                ..
+            })
+            | None => false,
         }
+    }
+
+    fn reconcile_config(&self, config: &ExportWorkerConfig) {
+        use std::collections::btree_map::Entry;
+
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let planned_sinks = config
+            .sinks
+            .iter()
+            .map(|sink| (sink.id().to_string(), sink))
+            .collect::<BTreeMap<_, _>>();
+        inner
+            .sinks
+            .retain(|sink, _| planned_sinks.contains_key(sink));
+        for (sink_id, sink) in planned_sinks {
+            let fingerprint = ExportSinkDrainFingerprint::from_config_sink(config, sink);
+            match inner.sinks.entry(sink_id) {
+                Entry::Occupied(mut entry) if entry.get().fingerprint != fingerprint => {
+                    entry.insert(ExportSinkWorkerRuntimeEntry::idle(fingerprint));
+                }
+                Entry::Occupied(_) => {}
+                Entry::Vacant(entry) => {
+                    entry.insert(ExportSinkWorkerRuntimeEntry::idle(fingerprint));
+                }
+            }
+        }
+    }
+
+    fn reconcile_disabled(&self) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.sinks.clear();
     }
 
     pub fn snapshot(&self) -> ExportWorkerRuntimeSnapshot {
@@ -206,7 +298,7 @@ impl ExportWorkerRuntimeState {
             sinks: inner
                 .sinks
                 .iter()
-                .map(|(sink, state)| (sink.clone(), state.snapshot(now)))
+                .map(|(sink, entry)| (sink.clone(), entry.state.snapshot(now)))
                 .collect(),
         }
     }
@@ -216,9 +308,9 @@ impl ExportWorkerRuntimeState {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        inner
-            .sinks
-            .insert(sink.to_string(), ExportSinkWorkerRuntime::Idle);
+        if let Some(entry) = inner.sinks.get_mut(sink) {
+            entry.state = ExportSinkWorkerRuntime::Idle;
+        }
     }
 
     fn record_failure(&self, sink: &str, reason: ExportDrainFailureReason) {
@@ -230,23 +322,46 @@ impl ExportWorkerRuntimeState {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let policy = inner.failure_backoff;
-        let current = inner
-            .sinks
-            .entry(sink.to_string())
-            .or_insert(ExportSinkWorkerRuntime::Idle);
-        let (delay, failures) = match current {
+        let Some(entry) = inner.sinks.get_mut(sink) else {
+            return;
+        };
+        let policy = entry.fingerprint.failure_backoff;
+        let (delay, failures) = match &entry.state {
             ExportSinkWorkerRuntime::Idle => (policy.initial, 1),
             ExportSinkWorkerRuntime::BackingOff {
                 delay, failures, ..
             } => (policy.next_delay(*delay), failures.saturating_add(1)),
         };
-        *current = ExportSinkWorkerRuntime::BackingOff {
+        entry.state = ExportSinkWorkerRuntime::BackingOff {
             failures,
             delay,
             retry_after: failed_at.checked_add(delay),
             last_failure_reason: reason,
         };
+    }
+}
+
+impl ExportSinkWorkerRuntimeEntry {
+    fn new(config: &ExportWorkerConfig, sink: &ExportSinkPlan) -> Self {
+        Self::idle(ExportSinkDrainFingerprint::from_config_sink(config, sink))
+    }
+
+    fn idle(fingerprint: ExportSinkDrainFingerprint) -> Self {
+        Self {
+            fingerprint,
+            state: ExportSinkWorkerRuntime::Idle,
+        }
+    }
+}
+
+impl ExportSinkDrainFingerprint {
+    fn from_config_sink(config: &ExportWorkerConfig, sink: &ExportSinkPlan) -> Self {
+        Self {
+            sink: sink.clone(),
+            sink_timeout: config.sink_timeout,
+            failure_backoff: config.failure_backoff,
+            webhook_connection: config.webhook_connection,
+        }
     }
 }
 
@@ -301,7 +416,8 @@ impl ExportWorkerHandle {
 
 fn spawn_export_worker_with_state<S>(
     spool: Arc<S>,
-    config: ExportWorkerConfig,
+    plan: RuntimePlanHandle,
+    webhook_connection: WebhookConnectionOptions,
     runtime_state: ExportWorkerRuntimeState,
 ) -> ExportWorkerHandle
 where
@@ -314,16 +430,29 @@ where
     let task_runtime_state = runtime_state.clone();
     let task = tokio::spawn(async move {
         while !task_stop_requested.load(Ordering::Relaxed) {
-            if let Err(error) =
-                drain_export_sinks_once(spool.as_ref(), &config, &task_runtime_state).await
-            {
-                eprintln!("export worker drain failed: {error}");
-            }
+            let sleep_interval = match ExportWorkerConfig::from_runtime_plan(
+                plan.snapshot().as_ref(),
+                webhook_connection,
+            ) {
+                Some(config) => {
+                    task_runtime_state.reconcile_config(&config);
+                    if let Err(error) =
+                        drain_export_sinks_once(spool.as_ref(), &config, &task_runtime_state).await
+                    {
+                        eprintln!("export worker drain failed: {error}");
+                    }
+                    config.interval
+                }
+                None => {
+                    task_runtime_state.reconcile_disabled();
+                    EXPORT_WORKER_DISABLED_INTERVAL
+                }
+            };
             if task_stop_requested.load(Ordering::Relaxed) {
                 break;
             }
             tokio::select! {
-                () = tokio::time::sleep(config.interval) => {}
+                () = tokio::time::sleep(sleep_interval) => {}
                 () = task_stop_notify.notified() => {}
             }
         }
@@ -380,7 +509,7 @@ async fn drain_export_sinks_once(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ExportWorkerBackoffPolicy {
     initial: Duration,
     max: Duration,
@@ -423,7 +552,7 @@ mod tests {
 
     use probe_config::{
         AgentConfig, CompressionCodecName, ExportWorkerScheduleConfig, ExporterConfig,
-        ExporterTransportConfig,
+        ExporterTransportConfig, ExporterWorkerConfig,
     };
     use probe_core::{CapabilityKind, CapabilityState};
     use runtime::{
@@ -443,7 +572,9 @@ mod tests {
     fn export_worker_backoff_counts_from_failure_completion() {
         let tick_started_at = Instant::now();
         let failure_completed_at = tick_started_at + Duration::from_millis(750);
-        let runtime_state = worker_runtime_from_plan(fixed_failure_backoff(1_000));
+        let config =
+            export_worker_config_with_failure_backoff("slow", fixed_failure_backoff(1_000));
+        let runtime_state = ExportWorkerRuntimeState::from_config(&config);
 
         runtime_state.record_failure_at(
             "slow",
@@ -537,10 +668,7 @@ mod tests {
         };
         config.validate_basic()?;
         let plan = runtime_plan(config)?;
-        let config = ExportWorkerConfig::from_plans(plan.config.agent_id.clone(), &plan.export)
-            .expect("worker should be enabled for planned webhook sink");
-
-        let (worker, _) = spawn_test_export_worker(Arc::clone(&spool), config);
+        let (worker, _, _) = spawn_test_export_worker(Arc::clone(&spool), plan);
         wait_for_export_cursor(spool.as_ref(), "worker", 1).await?;
         append_export_event(spool.as_ref(), 2)?;
         wait_for_export_cursor(spool.as_ref(), "worker", 2).await?;
@@ -573,6 +701,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn export_worker_uses_reloaded_runtime_plan_for_later_ticks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = temp_path("runtime-plan-export-reload");
+        let spool = Arc::new(FjallSpool::open(&temp)?);
+        append_export_event(spool.as_ref(), 1)?;
+        let first_server = WebhookAckServer::accepting(1)?;
+        let second_server = WebhookAckServer::accepting(1)?;
+        let first_plan = runtime_plan(webhook_worker_config("agent-1", "worker", &first_server))?;
+        let second_plan = runtime_plan(webhook_worker_config("agent-1", "worker", &second_server))?;
+
+        let (worker, _, plan_handle) = spawn_test_export_worker(Arc::clone(&spool), first_plan);
+        wait_for_export_cursor(spool.as_ref(), "worker", 1).await?;
+        plan_handle.replace(second_plan);
+        append_export_event(spool.as_ref(), 2)?;
+        wait_for_export_cursor(spool.as_ref(), "worker", 2).await?;
+        worker.stop().await;
+
+        let first_requests = first_server.join_requests()?;
+        let second_requests = second_server.join_requests()?;
+        assert_eq!(first_requests.len(), 1);
+        assert_eq!(second_requests.len(), 1);
+        assert_eq!(
+            request_header(&first_requests[0], "idempotency-key"),
+            Some(export_batch_id("agent-1", "worker", 1, 1))
+        );
+        assert_eq!(
+            request_header(&second_requests[0], "idempotency-key"),
+            Some(export_batch_id("agent-1", "worker", 2, 2))
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn export_worker_retries_when_reloaded_sink_detail_replaces_failed_plan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = temp_path("runtime-plan-export-reload-backoff");
+        let spool = Arc::new(FjallSpool::open(&temp)?);
+        append_export_event(spool.as_ref(), 1)?;
+        let rejecting = WebhookAckServer::recording_rejecting()?;
+        let accepting = WebhookAckServer::accepting(1)?;
+        let first_plan = runtime_plan(webhook_worker_config_with_backoff(
+            "agent-1", "worker", &rejecting, 60_000,
+        ))?;
+        let second_plan = runtime_plan(webhook_worker_config_with_backoff(
+            "agent-1", "worker", &accepting, 60_000,
+        ))?;
+
+        let (worker, runtime_state, plan_handle) =
+            spawn_test_export_worker(Arc::clone(&spool), first_plan);
+        wait_for_sink_backoff(&runtime_state, "worker").await?;
+        plan_handle.replace(second_plan);
+        wait_for_export_cursor(spool.as_ref(), "worker", 1).await?;
+        worker.stop().await;
+
+        let rejected_requests = rejecting.join_requests()?;
+        let accepted_requests = accepting.join_requests()?;
+        assert_eq!(rejected_requests.len(), 1);
+        assert_eq!(accepted_requests.len(), 1);
+        assert_eq!(
+            request_header(&accepted_requests[0], "idempotency-key"),
+            Some(export_batch_id("agent-1", "worker", 1, 1))
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn export_worker_uses_configured_per_tick_batch_budget()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = temp_path("configured-worker-budget");
@@ -580,29 +776,11 @@ mod tests {
         let event_count = (EXPORT_BATCH_LIMIT + 1) as u64;
         append_export_events(spool.as_ref(), event_count)?;
         let server = WebhookAckServer::accepting(2)?;
-        let plan = ExportPlan {
-            worker: ExportWorkerPlan::FixedIntervalBounded {
-                interval_ms: 60_000,
-                batches_per_sink_per_tick: 2,
-                sink_timeout_ms: 5_000,
-                failure_backoff: fixed_failure_backoff(30_000),
-            },
-            sinks: vec![
-                WebhookExportSinkPlan {
-                    id: "budget".to_string(),
-                    endpoint: server.endpoint(),
-                    codec: CompressionCodecName::None,
-                    headers: BTreeMap::new(),
-                    tls: ExportSinkTlsPlan::default(),
-                    worker: inherited_worker_quota(2),
-                }
-                .into(),
-            ],
-        };
-        let config = ExportWorkerConfig::from_plans("agent-1".to_string(), &plan)
-            .expect("worker should be enabled");
+        let plan = runtime_plan(webhook_worker_config_with_schedule(
+            "agent-1", "budget", &server, 60_000, 2, None,
+        ))?;
 
-        let (worker, _) = spawn_test_export_worker(Arc::clone(&spool), config);
+        let (worker, _, _) = spawn_test_export_worker(Arc::clone(&spool), plan);
         wait_for_export_cursor(spool.as_ref(), "budget", event_count).await?;
         worker.stop().await;
 
@@ -636,29 +814,16 @@ mod tests {
         let spool = Arc::new(FjallSpool::open(&temp)?);
         append_export_events(spool.as_ref(), (EXPORT_BATCH_LIMIT + 1) as u64)?;
         let server = WebhookAckServer::recording_accepting()?;
-        let plan = ExportPlan {
-            worker: ExportWorkerPlan::FixedIntervalBounded {
-                interval_ms: 60_000,
-                batches_per_sink_per_tick: 2,
-                sink_timeout_ms: 5_000,
-                failure_backoff: fixed_failure_backoff(30_000),
-            },
-            sinks: vec![
-                WebhookExportSinkPlan {
-                    id: "limited".to_string(),
-                    endpoint: server.endpoint(),
-                    codec: CompressionCodecName::None,
-                    headers: BTreeMap::new(),
-                    tls: ExportSinkTlsPlan::default(),
-                    worker: overridden_worker_quota(1),
-                }
-                .into(),
-            ],
-        };
-        let config = ExportWorkerConfig::from_plans("agent-1".to_string(), &plan)
-            .expect("worker should be enabled");
+        let plan = runtime_plan(webhook_worker_config_with_schedule(
+            "agent-1",
+            "limited",
+            &server,
+            60_000,
+            2,
+            Some(1),
+        ))?;
 
-        let (worker, _) = spawn_test_export_worker(Arc::clone(&spool), config);
+        let (worker, _, _) = spawn_test_export_worker(Arc::clone(&spool), plan);
         wait_for_export_cursor(spool.as_ref(), "limited", EXPORT_BATCH_LIMIT as u64).await?;
         worker.stop().await;
 
@@ -687,38 +852,28 @@ mod tests {
         append_export_events(spool.as_ref(), event_count)?;
         let failing = WebhookAckServer::recording_rejecting()?;
         let successful = WebhookAckServer::accepting(2)?;
-        let plan = ExportPlan {
-            worker: ExportWorkerPlan::FixedIntervalBounded {
-                interval_ms: 10,
-                batches_per_sink_per_tick: 1,
-                sink_timeout_ms: 5_000,
-                failure_backoff: fixed_failure_backoff(60_000),
-            },
-            sinks: vec![
-                WebhookExportSinkPlan {
-                    id: "failing".to_string(),
-                    endpoint: failing.endpoint(),
-                    codec: CompressionCodecName::None,
-                    headers: BTreeMap::new(),
-                    tls: ExportSinkTlsPlan::default(),
-                    worker: inherited_worker_quota(1),
-                }
-                .into(),
-                WebhookExportSinkPlan {
-                    id: "successful".to_string(),
-                    endpoint: successful.endpoint(),
-                    codec: CompressionCodecName::None,
-                    headers: BTreeMap::new(),
-                    tls: ExportSinkTlsPlan::default(),
-                    worker: inherited_worker_quota(1),
-                }
-                .into(),
+        let mut config = AgentConfig {
+            agent_id: "agent-1".to_string(),
+            exporters: vec![
+                webhook_exporter("failing", &failing, None),
+                webhook_exporter("successful", &successful, None),
             ],
+            ..AgentConfig::default()
         };
-        let config = ExportWorkerConfig::from_plans("agent-1".to_string(), &plan)
-            .expect("worker should be enabled");
+        config.export.worker.schedule = ExportWorkerScheduleConfig::FixedIntervalBounded {
+            interval_ms: 10,
+            batches_per_sink_per_tick: 1,
+            sink_timeout_ms: 5_000,
+            failure_backoff: probe_config::ExportFailureBackoffConfig {
+                initial_ms: 60_000,
+                max_ms: 60_000,
+                multiplier: 1,
+            },
+        };
+        config.validate_basic()?;
+        let plan = runtime_plan(config)?;
 
-        let (worker, runtime_state) = spawn_test_export_worker(Arc::clone(&spool), config);
+        let (worker, runtime_state, _) = spawn_test_export_worker(Arc::clone(&spool), plan);
         wait_for_export_cursor(spool.as_ref(), "successful", event_count).await?;
         let runtime_snapshot = runtime_state.snapshot();
         worker.stop().await;
@@ -813,17 +968,27 @@ mod tests {
         .into())
     }
 
+    async fn wait_for_sink_backoff(
+        runtime_state: &ExportWorkerRuntimeState,
+        sink: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for _ in 0..50 {
+            let snapshot = runtime_state.snapshot();
+            if snapshot
+                .sinks
+                .get(sink)
+                .is_some_and(|sink| sink.mode == ExportSinkWorkerRuntimeMode::BackingOff)
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Err(format!("export worker sink {sink} did not enter backoff").into())
+    }
+
     fn inherited_worker_quota(effective_batches_per_tick: u64) -> ExportSinkWorkerPlan {
         ExportSinkWorkerPlan {
             batches_per_tick_override: None,
-            effective_batches_per_tick: NonZeroU64::new(effective_batches_per_tick)
-                .expect("positive batch quota"),
-        }
-    }
-
-    fn overridden_worker_quota(effective_batches_per_tick: u64) -> ExportSinkWorkerPlan {
-        ExportSinkWorkerPlan {
-            batches_per_tick_override: Some(effective_batches_per_tick),
             effective_batches_per_tick: NonZeroU64::new(effective_batches_per_tick)
                 .expect("positive batch quota"),
         }
@@ -891,10 +1056,106 @@ mod tests {
 
     fn spawn_test_export_worker(
         spool: Arc<FjallSpool>,
-        config: ExportWorkerConfig,
-    ) -> (ExportWorkerHandle, ExportWorkerRuntimeState) {
-        let worker = ExportWorker::new(config);
-        let runtime_state = worker.runtime_state();
-        (worker.spawn(spool), runtime_state)
+        plan: RuntimePlan,
+    ) -> (
+        ExportWorkerHandle,
+        ExportWorkerRuntimeState,
+        crate::runtime_plan::RuntimePlanHandle,
+    ) {
+        let config =
+            ExportWorkerConfig::from_runtime_plan(&plan, WebhookConnectionOptions::default())
+                .expect("worker should be enabled");
+        let runtime_state = ExportWorkerRuntimeState::from_config(&config);
+        let plan_handle = crate::runtime_plan::RuntimePlanHandle::new(Arc::new(plan));
+        let worker = spawn_export_worker_with_state(
+            spool,
+            plan_handle.clone(),
+            WebhookConnectionOptions::default(),
+            runtime_state.clone(),
+        );
+        (worker, runtime_state, plan_handle)
+    }
+
+    fn webhook_worker_config(
+        agent_id: &str,
+        sink_id: &str,
+        server: &WebhookAckServer,
+    ) -> AgentConfig {
+        webhook_worker_config_with_schedule(agent_id, sink_id, server, 10, 1, None)
+    }
+
+    fn webhook_worker_config_with_schedule(
+        agent_id: &str,
+        sink_id: &str,
+        server: &WebhookAckServer,
+        interval_ms: u64,
+        batches_per_sink_per_tick: u64,
+        batches_per_tick_override: Option<u64>,
+    ) -> AgentConfig {
+        let mut config = AgentConfig {
+            agent_id: agent_id.to_string(),
+            exporters: vec![webhook_exporter(sink_id, server, batches_per_tick_override)],
+            ..AgentConfig::default()
+        };
+        config.export.worker.schedule = ExportWorkerScheduleConfig::FixedIntervalBounded {
+            interval_ms,
+            batches_per_sink_per_tick,
+            sink_timeout_ms: 5_000,
+            failure_backoff: probe_config::ExportFailureBackoffConfig {
+                initial_ms: 30_000,
+                max_ms: 30_000,
+                multiplier: 1,
+            },
+        };
+        config
+            .validate_basic()
+            .expect("test export config should be valid");
+        config
+    }
+
+    fn webhook_worker_config_with_backoff(
+        agent_id: &str,
+        sink_id: &str,
+        server: &WebhookAckServer,
+        backoff_ms: u64,
+    ) -> AgentConfig {
+        let mut config = AgentConfig {
+            agent_id: agent_id.to_string(),
+            exporters: vec![webhook_exporter(sink_id, server, None)],
+            ..AgentConfig::default()
+        };
+        config.export.worker.schedule = ExportWorkerScheduleConfig::FixedIntervalBounded {
+            interval_ms: 10,
+            batches_per_sink_per_tick: 1,
+            sink_timeout_ms: 5_000,
+            failure_backoff: probe_config::ExportFailureBackoffConfig {
+                initial_ms: backoff_ms,
+                max_ms: backoff_ms,
+                multiplier: 1,
+            },
+        };
+        config
+            .validate_basic()
+            .expect("test export config should be valid");
+        config
+    }
+
+    fn webhook_exporter(
+        sink_id: &str,
+        server: &WebhookAckServer,
+        batches_per_tick_override: Option<u64>,
+    ) -> ExporterConfig {
+        ExporterConfig {
+            id: sink_id.to_string(),
+            transport: ExporterTransportConfig::Webhook {
+                endpoint: server.endpoint(),
+                headers: BTreeMap::new(),
+                tls: Default::default(),
+            },
+            codec: CompressionCodecName::None,
+            worker: ExporterWorkerConfig {
+                batches_per_tick: batches_per_tick_override,
+            },
+        }
     }
 }

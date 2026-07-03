@@ -298,25 +298,35 @@ plaintext bridge and traffic view.
 
 The Runtime tab can call the online admin `reload_runtime_actions` command. It
 reloads the runtime owners that are explicitly safe to update online, currently
-policy bundles and the enforcement policy source, and reports partial
-failures per action. Saving from the TUI uses `apply_config_reload` when an
-active admin socket is available: policy-only main config changes are applied
-online when policy watcher and poller topology does not change; enforcement
-policy source and `enforcement.selector` changes are applied online when
-enforcement reload watcher and poller topology is disabled and transparent
-interception is not owning setup-time host rules. Top-level `[selectors]`
-registry changes, including entries referenced by `enforcement.selector`, still
-require restart until selector ownership has a lifecycle owner. Capture,
-observation, config version, TLS plaintext instrumentation, and TLS decrypt-hint
-material rebuild verdicts are queued as runtime generation requests and swapped
-by the live agent at capture safe points. The queued response includes a
-generation request id; the TUI follows status until that request is applied,
-fails, or remains pending beyond the background wait window.
-Online apply failures keep the old running agent alive and are reported in the
-status line instead of forcing a managed-agent restart. Setup topology such as
-export, storage, admin socket, and watcher topology still requires a process
-rebuild. The same tab edits admin socket settings for future runs; the current
-TUI session keeps using the active socket it attached to at startup.
+policy bundles and the enforcement policy source, and reports partial failures
+per action. Saving from the TUI uses `apply_config_reload` when an active admin
+socket is available.
+
+The main-config reload contract is owner-scoped:
+
+- Policy-only changes apply online when policy watcher and poller topology is
+  disabled.
+- Export sink detail and export worker schedule changes apply online when the
+  running plan already owns an export worker, the candidate plan keeps one, and
+  the exporter id set is unchanged. This covers webhook endpoint, headers,
+  codec, file path, Unix HTTP socket path, and per-sink batch quota changes for
+  existing sinks.
+- Enforcement policy source and `enforcement.selector` changes apply online
+  when enforcement reload watcher and poller topology is disabled and
+  transparent interception is not owning setup-time host rules.
+- Capture, observation, config version, TLS plaintext instrumentation, and TLS
+  decrypt-hint material changes are queued as runtime generation requests and
+  swapped by the live agent at capture safe points.
+
+Top-level `[selectors]` registry changes, including entries referenced by
+`enforcement.selector`, still require restart until selector ownership has a
+lifecycle owner. Export worker enablement and exporter id set changes, storage,
+admin socket, watcher topology, interception topology, and MITM/export TLS
+material changes still require a process rebuild. Online apply failures keep
+the old running agent alive and are reported in the status line instead of
+forcing a managed-agent restart. The same tab edits admin socket settings for
+future runs; the current TUI session keeps using the active socket it attached
+to at startup.
 
 ### Minimal Policy And Webhook Wiring
 
@@ -1125,7 +1135,13 @@ poller topology is disabled. Enforcement policy source and
 watcher and poller topology is disabled and transparent interception is not
 owning setup-time host rules. Top-level `[selectors]` registry changes remain
 restart-required, even when an updated entry is referenced by
-`enforcement.selector`.
+`enforcement.selector`. Export sink detail and export worker schedule changes
+are online-applicable when the running plan already owns an export worker, the
+candidate plan keeps one, and the exporter id set is unchanged; endpoint,
+headers, codec, file path, Unix HTTP socket path, and batch quota changes affect
+subsequent batches. Export worker enablement and exporter id set changes require
+a process rebuild until background service and retention owners can reconcile
+worker start, stop, and cursor-owner topology.
 Data-path rebuild verdicts can queue a `request_runtime_generation` action with
 a request id and appear as a pending runtime generation in status; the live agent
 consumes queued requests at capture safe points and records a runtime generation
@@ -1138,9 +1154,9 @@ candidate without partial commits. If a generation request cannot be queued, the
 old runtime stays active; a TUI-managed agent can restart to converge on the
 saved config, while an attached external agent reports that an explicit restart
 or retry is required. Selectors, MITM/export TLS materials, enforcement
-execution surface changes, export, storage, admin, agent id, and watcher
-topology changes are not silently applied by this path and remain
-`restart_required` until their lifecycle owners exist.
+execution surface changes, storage, admin, agent id, and watcher topology changes
+are not silently applied by this path and remain `restart_required` until their
+lifecycle owners exist.
 The `[runtime_reload]` section controls the watcher topology itself, so changing
 it is also `restart_required`; the running watcher does not rebuild its own
 lifecycle.

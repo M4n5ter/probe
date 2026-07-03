@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, num::NonZeroU64, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    num::NonZeroU64,
+    path::PathBuf,
+};
 
 use probe_config::{
     AgentConfig, CompressionCodecName, ExportFailureBackoffConfig, ExportWorkerScheduleConfig,
@@ -76,6 +80,29 @@ impl ExportPlan {
             (true, false) => ExportWorkerPlan::from(config.export.worker.schedule),
         };
         Self { worker, sinks }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportReloadOwnership {
+    worker_owned: bool,
+    sink_ids: BTreeSet<String>,
+}
+
+impl ExportReloadOwnership {
+    pub(super) fn from_plan(plan: &ExportPlan) -> Self {
+        Self {
+            worker_owned: matches!(plan.worker, ExportWorkerPlan::FixedIntervalBounded { .. }),
+            sink_ids: plan
+                .sinks
+                .iter()
+                .map(|sink| sink.id().to_string())
+                .collect(),
+        }
+    }
+
+    pub fn can_apply_online_to(&self, candidate: &Self) -> bool {
+        self.worker_owned && candidate.worker_owned && self.sink_ids == candidate.sink_ids
     }
 }
 
