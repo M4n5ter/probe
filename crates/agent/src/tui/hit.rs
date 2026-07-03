@@ -27,6 +27,7 @@ pub(crate) enum ScrollTarget {
     ProcessList,
     TrafficProcessList,
     TrafficEvents,
+    TrafficPopup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

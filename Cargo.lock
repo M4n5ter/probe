@@ -55,6 +55,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "transparent-linux",
+ "unicode-width",
  "wiremock",
 ]
 

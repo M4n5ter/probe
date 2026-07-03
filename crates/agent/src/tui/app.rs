@@ -246,6 +246,8 @@ pub(crate) struct TuiApp {
     traffic_detail_request_id: u64,
     traffic_visible_rows: usize,
     traffic_popup: Option<TrafficPopupState>,
+    traffic_popup_content_rows: usize,
+    traffic_popup_viewport_rows: usize,
     runtime_attachment: RuntimeAttachment,
     data_path_diagnostics: DataPathDiagnosticsView,
     dirty: bool,
@@ -281,6 +283,8 @@ impl TuiApp {
             traffic_detail_request_id: 0,
             traffic_visible_rows: 12,
             traffic_popup: None,
+            traffic_popup_content_rows: 0,
+            traffic_popup_viewport_rows: 1,
             runtime_attachment: RuntimeAttachment::default(),
             data_path_diagnostics: DataPathDiagnosticsView::unavailable(
                 "local config diagnostics have not been evaluated yet",
@@ -353,19 +357,26 @@ impl TuiApp {
         self.traffic_popup.is_some()
     }
 
+    pub(crate) fn set_traffic_popup_layout(
+        &mut self,
+        content_rows: usize,
+        viewport_rows: usize,
+    ) -> Option<usize> {
+        self.traffic_popup_content_rows = content_rows;
+        self.traffic_popup_viewport_rows = viewport_rows.max(1);
+        let max_scroll = self.traffic_popup_max_scroll();
+        if let Some(popup) = &mut self.traffic_popup {
+            popup.scroll = popup.scroll.min(max_scroll);
+            return Some(popup.scroll);
+        }
+        None
+    }
+
     pub(crate) fn traffic_popup_view(&self) -> Option<TrafficPopupView> {
-        self.traffic_popup.map(|state| TrafficPopupView {
-            title: match state.kind {
-                TrafficPopup::RowDetail => "Traffic Detail",
-                TrafficPopup::Diagnostics => "Data Path Diagnostics",
-            },
-            lines: match state.kind {
-                TrafficPopup::RowDetail => self
-                    .traffic
-                    .selected_detail_lines()
-                    .unwrap_or_else(|| vec!["No selected traffic row".to_string()]),
-                TrafficPopup::Diagnostics => self.data_path_diagnostics.detail_lines(),
-            },
+        let state = self.traffic_popup?;
+        Some(TrafficPopupView {
+            title: traffic_popup_title_for(state.kind),
+            lines: self.traffic_popup_lines(state.kind),
             scroll: state.scroll,
         })
     }
@@ -1178,6 +1189,8 @@ impl TuiApp {
 
     fn open_traffic_popup(&mut self, kind: TrafficPopup) {
         self.clear_hover();
+        self.traffic_popup_content_rows = 0;
+        self.traffic_popup_viewport_rows = 1;
         self.traffic_popup = Some(TrafficPopupState::new(kind));
     }
 
@@ -1192,6 +1205,8 @@ impl TuiApp {
 
     fn clear_traffic_popup(&mut self) {
         self.traffic_popup = None;
+        self.traffic_popup_content_rows = 0;
+        self.traffic_popup_viewport_rows = 1;
     }
 
     fn handle_traffic_popup_action(&mut self, action: TuiAction) -> Option<TuiEffect> {
@@ -1205,6 +1220,11 @@ impl TuiApp {
             TuiAction::Scroll { delta, .. } => {
                 self.scroll_open_traffic_popup(delta);
             }
+            TuiAction::DragScrollbar {
+                target: ScrollTarget::TrafficPopup,
+                offset,
+                height,
+            } => self.drag_open_traffic_popup(offset, height),
             TuiAction::TextCancel
             | TuiAction::Quit
             | TuiAction::Click(HitTarget::TrafficPopupClose) => self.close_traffic_popup(),
@@ -1223,10 +1243,41 @@ impl TuiApp {
     }
 
     fn scroll_open_traffic_popup(&mut self, delta: isize) {
-        let Some(popup) = &mut self.traffic_popup else {
+        if self.traffic_popup.is_none() {
             return;
-        };
-        popup.scroll = apply_scroll_delta(popup.scroll, delta);
+        }
+        let max_scroll = self.traffic_popup_max_scroll();
+        if let Some(popup) = &mut self.traffic_popup {
+            popup.scroll = apply_scroll_delta(popup.scroll, delta).min(max_scroll);
+        }
+    }
+
+    fn drag_open_traffic_popup(&mut self, offset: usize, height: usize) {
+        if self.traffic_popup.is_none() {
+            return;
+        }
+        self.traffic_popup_viewport_rows = height.max(1);
+        let max_scroll = self.traffic_popup_max_scroll();
+        let track = height.saturating_sub(1).max(1);
+        let scroll = offset.min(track).saturating_mul(max_scroll) / track;
+        if let Some(popup) = &mut self.traffic_popup {
+            popup.scroll = scroll;
+        }
+    }
+
+    fn traffic_popup_lines(&self, kind: TrafficPopup) -> Vec<String> {
+        match kind {
+            TrafficPopup::RowDetail => self
+                .traffic
+                .selected_detail_lines()
+                .unwrap_or_else(|| vec!["No selected traffic row".to_string()]),
+            TrafficPopup::Diagnostics => self.data_path_diagnostics.detail_lines(),
+        }
+    }
+
+    fn traffic_popup_max_scroll(&self) -> usize {
+        self.traffic_popup_content_rows
+            .saturating_sub(self.traffic_popup_viewport_rows.max(1))
     }
 
     fn clear_hover(&mut self) {
@@ -1315,6 +1366,13 @@ fn process_observation_status(mode: ProcessObservationMode, process_name: &str) 
 
 fn process_observation_removed_status(process_name: &str) -> StatusMessage {
     StatusMessage::saved(format!("Stopped observing {process_name}"))
+}
+
+fn traffic_popup_title_for(kind: TrafficPopup) -> &'static str {
+    match kind {
+        TrafficPopup::RowDetail => "Traffic Detail",
+        TrafficPopup::Diagnostics => "Data Path Diagnostics",
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1670,6 +1728,58 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("Select a traffic row"))
         );
+    }
+
+    #[test]
+    fn traffic_popup_scrollbar_drag_uses_rendered_content_height() {
+        let mut app = test_app();
+        app.open_traffic_diagnostics();
+        app.set_traffic_popup_layout(50, 5);
+
+        app.handle_action(TuiAction::DragScrollbar {
+            target: ScrollTarget::TrafficPopup,
+            offset: 4,
+            height: 5,
+        });
+
+        let popup = app
+            .traffic_popup_view()
+            .expect("traffic popup should remain open");
+        assert_eq!(popup.scroll, 45);
+    }
+
+    #[test]
+    fn traffic_popup_wheel_scroll_clamps_to_visible_window() {
+        let mut app = test_app();
+        app.open_traffic_diagnostics();
+        app.set_traffic_popup_layout(50, 5);
+
+        app.handle_action(TuiAction::Scroll {
+            delta: 999,
+            target: Some(ScrollTarget::TrafficPopup),
+        });
+
+        let popup = app
+            .traffic_popup_view()
+            .expect("traffic popup should remain open");
+        assert_eq!(popup.scroll, 45);
+    }
+
+    #[test]
+    fn traffic_popup_scroll_keeps_large_offsets_as_usize() {
+        let mut app = test_app();
+        app.open_traffic_diagnostics();
+        app.set_traffic_popup_layout(70_000, 5);
+
+        app.handle_action(TuiAction::Scroll {
+            delta: 69_995,
+            target: Some(ScrollTarget::TrafficPopup),
+        });
+
+        let popup = app
+            .traffic_popup_view()
+            .expect("traffic popup should remain open");
+        assert_eq!(popup.scroll, 69_995);
     }
 
     #[test]

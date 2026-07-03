@@ -533,6 +533,21 @@ mod tests {
         (0..height).any(|row| (0..width).any(|column| hit_map.scroll_target(column, row) == target))
     }
 
+    fn scrollbar_target_exists(
+        hit_map: &HitMap,
+        target: ScrollTarget,
+        width: u16,
+        height: u16,
+    ) -> bool {
+        (0..height).any(|row| {
+            (0..width).any(|column| {
+                hit_map
+                    .scrollbar_hit(column, row)
+                    .is_some_and(|hit| hit.target == target)
+            })
+        })
+    }
+
     fn first_hit_coordinate(
         hit_map: &HitMap,
         target: HitTarget,
@@ -886,6 +901,36 @@ mod tests {
             Some(HitTarget::TrafficPopupClose),
             110,
             28
+        ));
+        assert!(scroll_target_exists(
+            &hit_map,
+            Some(ScrollTarget::TrafficPopup),
+            110,
+            28
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn render_traffic_popup_registers_scrollbar_hit_when_content_overflows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut app = test_app();
+        app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Traffic)));
+        app.handle_action(TuiAction::Click(HitTarget::Control(
+            ControlId::OpenTrafficDiagnostics,
+        )));
+        let mut terminal = Terminal::new(TestBackend::new(80, 16))?;
+        let mut hit_map = HitMap::default();
+
+        terminal.draw(|frame| {
+            hit_map = draw(frame, &mut app);
+        })?;
+
+        assert!(scrollbar_target_exists(
+            &hit_map,
+            ScrollTarget::TrafficPopup,
+            80,
+            16
         ));
         Ok(())
     }

@@ -7,6 +7,7 @@ use ratatui::{
         Block, Cell, Clear, HighlightSpacing, Paragraph, Row, Shadow, Table, TableState, Wrap,
     },
 };
+use unicode_width::UnicodeWidthChar;
 
 use crate::tui::{
     app::{ProcessArgvHover, TuiApp},
@@ -51,7 +52,7 @@ pub(super) fn render_traffic(
 pub(super) fn render_traffic_popup(
     frame: &mut Frame<'_>,
     area: Rect,
-    app: &TuiApp,
+    app: &mut TuiApp,
     hits: &mut Vec<HitArea>,
 ) {
     let available_width = area.width.saturating_sub(4).max(1);
@@ -71,16 +72,33 @@ pub(super) fn render_traffic_popup(
         .title(popup.title)
         .shadow(Shadow::dark_shade().offset(Offset::new(2, 1)));
     let inner = block.inner(modal);
-    let lines = popup_lines_for_render(popup.lines);
-    let scroll = popup.scroll.min(lines.len().saturating_sub(1));
-    frame.render_widget(
-        Paragraph::new(lines.clone())
-            .block(block)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll as u16, 0)),
-        modal,
+    let content_rows = popup_visual_row_count(&popup.lines, inner.width as usize);
+    let scroll = app
+        .set_traffic_popup_layout(content_rows, inner.height as usize)
+        .unwrap_or(popup.scroll);
+    let visible_lines = popup_visible_lines_for_render(
+        &popup.lines,
+        inner.width as usize,
+        scroll,
+        inner.height as usize,
     );
-    super::render_vertical_scrollbar(frame, inner, lines.len(), scroll, inner.height as usize);
+    hits.push(HitArea::scroll(inner, ScrollTarget::TrafficPopup));
+    frame.render_widget(Paragraph::new(visible_lines).block(block), modal);
+    super::render_vertical_scrollbar(frame, inner, content_rows, scroll, inner.height as usize);
+    if content_rows > inner.height as usize && inner.width > 0 && inner.height > 0 {
+        let hit_width = modal.width.min(3);
+        hits.push(HitArea::scrollbar(
+            Rect::new(
+                modal
+                    .x
+                    .saturating_add(modal.width.saturating_sub(hit_width)),
+                inner.y,
+                hit_width,
+                inner.height,
+            ),
+            ScrollTarget::TrafficPopup,
+        ));
+    }
 
     let close = Rect::new(
         modal.x.saturating_add(modal.width.saturating_sub(10)),
@@ -620,11 +638,95 @@ fn preview_lines_for_render(lines: Vec<String>) -> Vec<Line<'static>> {
     lines.into_iter().map(Line::from).collect()
 }
 
-fn popup_lines_for_render(details: Vec<String>) -> Vec<Line<'static>> {
-    details
-        .iter()
-        .flat_map(|line| [Line::from(line.clone()), Line::from("")])
-        .collect()
+fn popup_visual_row_count(details: &[String], width: usize) -> usize {
+    scan_popup_visual_rows(details, width, |_, _| true)
+}
+
+fn popup_visible_lines_for_render(
+    details: &[String],
+    width: usize,
+    scroll: usize,
+    viewport_rows: usize,
+) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let viewport_rows = viewport_rows.max(1);
+    let mut visible = Vec::with_capacity(viewport_rows);
+    let end = scroll.saturating_add(viewport_rows);
+    scan_popup_visual_rows(details, width, |row_index, row| {
+        if row_index >= scroll && row_index < end {
+            visible.push(row.to_string());
+        }
+        row_index.saturating_add(1) < end
+    });
+    visible.into_iter().map(Line::from).collect()
+}
+
+fn scan_popup_visual_rows(
+    details: &[String],
+    width: usize,
+    mut visitor: impl FnMut(usize, &str) -> bool,
+) -> usize {
+    let width = width.max(1);
+    let mut row_index = 0usize;
+    for line in details {
+        if line.is_empty() {
+            if !emit_scanned_popup_row(&mut row_index, "", &mut visitor) {
+                return row_index;
+            }
+            continue;
+        }
+
+        let mut row_start = 0usize;
+        let mut row_width = 0usize;
+        let mut row_has_content = false;
+        for (byte_index, character) in line.char_indices() {
+            let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+            if row_has_content && row_width.saturating_add(character_width) > width {
+                if !emit_scanned_popup_row(
+                    &mut row_index,
+                    &line[row_start..byte_index],
+                    &mut visitor,
+                ) {
+                    return row_index;
+                }
+                row_start = byte_index;
+                row_width = 0;
+            }
+
+            row_has_content = true;
+            row_width = row_width.saturating_add(character_width);
+            let character_end = byte_index.saturating_add(character.len_utf8());
+            if row_width >= width && character_width > 0 {
+                if !emit_scanned_popup_row(
+                    &mut row_index,
+                    &line[row_start..character_end],
+                    &mut visitor,
+                ) {
+                    return row_index;
+                }
+                row_start = character_end;
+                row_width = 0;
+                row_has_content = false;
+            }
+        }
+
+        if row_has_content
+            && !emit_scanned_popup_row(&mut row_index, &line[row_start..], &mut visitor)
+        {
+            return row_index;
+        }
+    }
+    row_index
+}
+
+fn emit_scanned_popup_row(
+    row_index: &mut usize,
+    row: &str,
+    visitor: &mut impl FnMut(usize, &str) -> bool,
+) -> bool {
+    let should_continue = visitor(*row_index, row);
+    *row_index = (*row_index).saturating_add(1);
+    should_continue
 }
 
 fn traffic_status_color(kind: TrafficStatusKind) -> Color {
@@ -646,5 +748,22 @@ mod tests {
 
         assert_eq!(value, "abcdefg...");
         assert_eq!(value.chars().count(), 10);
+    }
+
+    #[test]
+    fn popup_visual_row_count_counts_wrapped_visual_lines() {
+        let lines = vec![format!("Payload: {}", "body ".repeat(20))];
+
+        assert!(popup_visual_row_count(&lines, 20) > 1);
+    }
+
+    #[test]
+    fn popup_visible_lines_support_large_usize_scroll_offsets() {
+        let lines = vec!["x".repeat(70_000)];
+
+        let visible = popup_visible_lines_for_render(&lines, 1, 69_998, 5);
+
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[0].to_string(), "x");
     }
 }
