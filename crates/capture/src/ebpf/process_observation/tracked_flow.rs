@@ -94,6 +94,12 @@ impl TrackedEbpfFlows {
             .filter(|tracked| !tracked.payload_directions.is_empty())
     }
 
+    pub(super) fn has_active_payload_gap_targets(&self) -> bool {
+        self.by_lease
+            .values_by_recency()
+            .any(|tracked| !tracked.payload_directions.is_empty())
+    }
+
     pub(super) fn has_payload_allowance_for_allow_map_key(&self, key: DescriptorLeaseKey) -> bool {
         self.by_lease.keys().any(|tracked_key| {
             tracked_key.has_same_allow_map_key(key)

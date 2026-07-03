@@ -180,6 +180,10 @@ where
         self.read_next_poll()
             .map_err(|error| CaptureError::provider(PROVIDER_NAME, error.to_string()))
     }
+
+    fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+        self.poll_next()
+    }
 }
 
 #[cfg(test)]

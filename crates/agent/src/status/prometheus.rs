@@ -2265,6 +2265,10 @@ mod tests {
             Ok(CapturePoll::Progress)
         }
 
+        fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+            Ok(CapturePoll::Idle)
+        }
+
         fn runtime_diagnostics(&mut self) -> CaptureProviderRuntimeDiagnostics {
             CaptureProviderRuntimeDiagnostics::from_ebpf_process_observation(
                 EbpfProcessObservationRuntimeDiagnostics {

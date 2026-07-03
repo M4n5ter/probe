@@ -195,6 +195,12 @@ where
         self.record_provider_poll(&poll);
         Ok(poll)
     }
+
+    fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+        let poll = self.provider.drain_before_handoff()?;
+        self.record_provider_poll(&poll);
+        Ok(poll)
+    }
 }
 
 struct FixedIntervalSchedule {
@@ -545,6 +551,10 @@ mod tests {
         fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
             Ok(CapturePoll::Progress)
         }
+
+        fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+            Ok(CapturePoll::Idle)
+        }
     }
 
     impl LibsslUprobePlaintextSidecarProvider for FakeSidecarProvider {
@@ -570,6 +580,10 @@ mod tests {
 
         fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
             self.polled.set(true);
+            Ok(CapturePoll::Idle)
+        }
+
+        fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
             Ok(CapturePoll::Idle)
         }
     }

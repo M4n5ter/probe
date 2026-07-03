@@ -9,7 +9,8 @@ use super::super::flow::{FlowCloseSequence, FlowClosure, FlowFinalization, FlowP
 use super::assembler::{DirectionStreamAssembler, StreamPiece};
 use super::budget::{PendingCount, PendingIndex};
 use super::{
-    FLOW_CLOSE_GAP_REASON, GLOBAL_BUFFER_LIMIT_GAP_REASON, REORDER_TIMEOUT_GAP_REASON, StreamKey,
+    FLOW_CLOSE_GAP_REASON, GLOBAL_BUFFER_LIMIT_GAP_REASON, HANDOFF_GAP_REASON,
+    REORDER_TIMEOUT_GAP_REASON, StreamKey,
 };
 
 #[derive(Debug, Default)]
@@ -47,6 +48,21 @@ impl StreamTracker {
     }
 
     pub(in crate::libpcap) fn flush_pending(&mut self, timestamp: Timestamp) -> Vec<CaptureEvent> {
+        self.flush_pending_with_reason(timestamp, REORDER_TIMEOUT_GAP_REASON)
+    }
+
+    pub(in crate::libpcap) fn flush_pending_for_handoff(
+        &mut self,
+        timestamp: Timestamp,
+    ) -> Vec<CaptureEvent> {
+        self.flush_pending_with_reason(timestamp, HANDOFF_GAP_REASON)
+    }
+
+    fn flush_pending_with_reason(
+        &mut self,
+        timestamp: Timestamp,
+        reason: &'static str,
+    ) -> Vec<CaptureEvent> {
         let keys = self.pending.keys();
         let mut events = Vec::new();
         for key in keys {
@@ -56,7 +72,7 @@ impl StreamTracker {
             };
             events.extend(
                 record_stream_mutation(&mut self.pending, timestamp, &key, entry, |stream| {
-                    stream.flush_pending(REORDER_TIMEOUT_GAP_REASON)
+                    stream.flush_pending(reason)
                 })
                 .events,
             );

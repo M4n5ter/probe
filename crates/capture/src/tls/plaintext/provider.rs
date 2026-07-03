@@ -283,6 +283,22 @@ impl CaptureProvider for LibsslUprobePlaintextProvider {
     fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
         self.poll_event()
     }
+
+    fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+        self.ensure_not_poisoned()?;
+        if let Some(event) = self.pending_events.pop_front() {
+            return Ok(CapturePoll::event(event));
+        }
+        if self.output_loss.should_check_during_drain()
+            && let Some(event) = self.output_loss_events()?
+        {
+            return Ok(CapturePoll::event(event));
+        }
+        if let Some(event) = self.output_loss_events()? {
+            return Ok(CapturePoll::event(event));
+        }
+        Ok(CapturePoll::Idle)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -625,6 +641,74 @@ mod tests {
             .poll_next()
             .expect_err("poisoned provider must not drain pending gap events");
         assert!(error.to_string().contains("reconcile failed"));
+        Ok(())
+    }
+
+    #[test]
+    fn handoff_drain_emits_pending_plaintext_events_without_polling_new_samples()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let resolver = Box::new(StaticFlowResolver {
+            expected: lookup_for_sample_event(),
+            resolved: Some(demo_resolved_flow()),
+            seen: false,
+        });
+        let mut provider = LibsslUprobePlaintextProvider::new(
+            Box::new(VecTlsPlaintextSource::new([
+                truncated_sample_event(),
+                sample_event(),
+            ])),
+            resolver,
+        );
+
+        let CapturePoll::Event(first_event) = provider.poll_next()? else {
+            panic!("expected first truncated sample event");
+        };
+        let crate::CaptureEvent::Bytes(bytes) = *first_event else {
+            panic!("expected plaintext bytes before pending gap");
+        };
+        assert_eq!(bytes.bytes.as_ref(), b"GET /");
+
+        let gap = expect_output_loss_gap(provider.drain_before_handoff()?);
+        assert_eq!(gap.gap.direction, Direction::Outbound);
+        assert_eq!(gap.gap.expected_offset, 105);
+        assert_eq!(gap.gap.next_offset, Some(109));
+        assert!(gap.gap.reason.contains("truncated"));
+        assert!(matches!(
+            provider.drain_before_handoff()?,
+            CapturePoll::Idle
+        ));
+
+        let CapturePoll::Event(next_event) = provider.poll_next()? else {
+            panic!("handoff drain must not consume the next live plaintext sample");
+        };
+        let crate::CaptureEvent::Bytes(bytes) = *next_event else {
+            panic!("expected next live plaintext sample after handoff drain");
+        };
+        assert_eq!(bytes.bytes.as_ref(), b"GET /");
+        Ok(())
+    }
+
+    #[test]
+    fn handoff_drain_does_not_consume_live_plaintext_samples()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let resolver = Box::new(StaticFlowResolver {
+            expected: lookup_for_sample_event(),
+            resolved: Some(demo_resolved_flow()),
+            seen: false,
+        });
+        let mut provider = LibsslUprobePlaintextProvider::new(
+            Box::new(VecTlsPlaintextSource::new([sample_event()])),
+            resolver,
+        );
+
+        assert!(matches!(
+            provider.drain_before_handoff()?,
+            CapturePoll::Idle
+        ));
+        let Some(crate::CaptureEvent::Bytes(bytes)) = provider.next()? else {
+            panic!("live plaintext sample should remain available after handoff drain");
+        };
+        assert_eq!(bytes.bytes.as_ref(), b"GET /");
         Ok(())
     }
 

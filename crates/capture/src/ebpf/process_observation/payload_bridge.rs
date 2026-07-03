@@ -118,6 +118,29 @@ pub(super) fn process_lifecycle_gap_events(
         .collect()
 }
 
+pub(super) fn tracked_flow_handoff_boundary_gap_events(
+    tracked_flows: &TrackedEbpfFlows,
+    timestamp: Timestamp,
+) -> Vec<CaptureEvent> {
+    tracked_flows
+        .active_payload_gap_targets()
+        .flat_map(|tracked| {
+            tracked
+                .payload_directions()
+                .directions()
+                .map(move |direction| {
+                    ebpf_provider_state_boundary_gap(
+                        timestamp,
+                        tracked.flow.clone(),
+                        direction,
+                        stream_offset(tracked, direction),
+                        "eBPF process observation runtime generation handoff replaced provider flow state; affected bytes and next stream offset are unknown".to_string(),
+                    )
+                })
+        })
+        .collect()
+}
+
 pub(super) fn tracked_flow_displacement_gap_events(
     displacement: TrackedEbpfFlowDisplacement,
     timestamp: Timestamp,

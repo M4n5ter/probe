@@ -278,4 +278,8 @@ impl CaptureProvider for PollSequenceProvider {
     fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
         Ok(self.polls.next().unwrap_or(CapturePoll::Finished))
     }
+
+    fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+        self.poll_next()
+    }
 }

@@ -62,14 +62,31 @@ impl Tls13SessionSecretAutoBindingProvider {
     }
 
     fn finish_after_inner_finished(&mut self) -> Result<CapturePoll, CaptureError> {
-        let released_events = self.binder.release_buffered_events();
-        if !released_events.is_empty() {
-            return self.engine.handle_inner_events(
-                TLS13_SESSION_SECRET_AUTO_BINDING_PROVIDER_NAME,
-                released_events,
-            );
+        if let Some(poll) = self.release_buffered_events()? {
+            return Ok(poll);
         }
         self.engine.finish_bound_streams_before_inner_finished()
+    }
+
+    fn finish_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+        if let Some(poll) = self.release_buffered_events()? {
+            return Ok(poll);
+        }
+        self.engine.finish_bound_streams_before_handoff()
+    }
+
+    fn release_buffered_events(&mut self) -> Result<Option<CapturePoll>, CaptureError> {
+        let released_events = self.binder.release_buffered_events();
+        if !released_events.is_empty() {
+            return self
+                .engine
+                .handle_inner_events(
+                    TLS13_SESSION_SECRET_AUTO_BINDING_PROVIDER_NAME,
+                    released_events,
+                )
+                .map(Some);
+        }
+        Ok(None)
     }
 }
 
@@ -100,6 +117,24 @@ impl CaptureProvider for Tls13SessionSecretAutoBindingProvider {
                 self.inner_finished = true;
                 self.finish_after_inner_finished()
             }
+            other => Ok(other),
+        }
+    }
+
+    fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+        if let Some(event) = self.engine.pop_pending_event() {
+            return Ok(CapturePoll::event(event));
+        }
+        if self.inner_finished {
+            return self.finish_after_inner_finished();
+        }
+        match self.inner.drain_before_handoff()? {
+            CapturePoll::Event(event) => self.handle_inner_event(*event),
+            CapturePoll::Finished => {
+                self.inner_finished = true;
+                self.finish_after_inner_finished()
+            }
+            CapturePoll::Idle => self.finish_before_handoff(),
             other => Ok(other),
         }
     }
@@ -686,6 +721,45 @@ mod tests {
         assert_next_libpcap_bytes(&mut provider, client_hello.as_slice())?;
         assert_next_libpcap_bytes(&mut provider, &application_record[..split_at])?;
         assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn auto_binding_provider_releases_held_raw_bytes_before_handoff_idle()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let AutoBindingFixture {
+            store,
+            flow,
+            client_hello,
+            application_record,
+        } = auto_binding_fixture()?;
+        let split_at = 4;
+        let held = outbound_captured_bytes(
+            &flow,
+            client_hello.len() as u64,
+            application_record[..split_at].to_vec(),
+        );
+        let mut provider = Tls13SessionSecretAutoBindingProvider::new(
+            Box::new(IdleAfterEventsProvider::new([
+                outbound_bytes_event(&flow, 0, client_hello.clone()),
+                CaptureEvent::Bytes(held.clone()),
+            ])),
+            store,
+        );
+
+        assert_next_libpcap_bytes(&mut provider, client_hello.as_slice())?;
+        assert!(matches!(provider.poll_next()?, CapturePoll::Progress));
+        let CapturePoll::Event(event) = provider.drain_before_handoff()? else {
+            panic!("expected held raw bytes before handoff idle");
+        };
+        let CaptureEvent::Bytes(bytes) = *event else {
+            panic!("expected held raw bytes event, got {event:?}");
+        };
+        assert_eq!(bytes, held);
+        assert!(matches!(
+            provider.drain_before_handoff()?,
+            CapturePoll::Idle
+        ));
         Ok(())
     }
 

@@ -71,6 +71,12 @@ pub struct PipelineSummary {
     pub export_events_written: u64,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PipelineHandoffDrainSummary {
+    pub pipeline: PipelineSummary,
+    pub drained: bool,
+}
+
 impl PipelineSummary {
     pub fn merge(&mut self, other: Self) {
         self.capture_events_read = self
@@ -417,16 +423,10 @@ where
         while options.should_poll_next_provider(summary.capture_events_read, polls_read) {
             let poll = provider.poll_next()?;
             polls_read = polls_read.saturating_add(1);
-            if let Some(metrics) = &self.runtime_metrics {
-                metrics.record_capture_poll(&poll);
-            }
+            self.record_capture_poll(&poll);
             match poll {
                 CapturePoll::Event(capture_event) => {
-                    summary.capture_events_read = summary.capture_events_read.saturating_add(1);
-                    if let Some(metrics) = &self.runtime_metrics {
-                        metrics.record_capture_event_read();
-                    }
-                    self.handle_capture_event(*capture_event, &mut summary)?;
+                    self.handle_capture_poll_event(capture_event, &mut summary)?;
                 }
                 CapturePoll::Progress => {}
                 CapturePoll::Idle => thread::sleep(PROVIDER_IDLE_SLEEP),
@@ -437,6 +437,48 @@ where
             }
         }
         Ok(summary)
+    }
+
+    pub fn drain_provider_before_handoff(
+        &mut self,
+        provider: &mut dyn CaptureProvider,
+        options: PipelineRunOptions,
+    ) -> Result<PipelineHandoffDrainSummary, PipelineError> {
+        let mut summary = PipelineSummary::default();
+        let mut polls_read = 0_u64;
+        while options.should_poll_next_provider(summary.capture_events_read, polls_read) {
+            let poll = provider.drain_before_handoff()?;
+            polls_read = polls_read.saturating_add(1);
+            self.record_capture_poll(&poll);
+            match poll {
+                CapturePoll::Event(capture_event) => {
+                    self.handle_capture_poll_event(capture_event, &mut summary)?;
+                }
+                CapturePoll::Progress => {
+                    return Ok(PipelineHandoffDrainSummary {
+                        pipeline: summary,
+                        drained: false,
+                    });
+                }
+                CapturePoll::Idle => {
+                    return Ok(PipelineHandoffDrainSummary {
+                        pipeline: summary,
+                        drained: true,
+                    });
+                }
+                CapturePoll::Finished => {
+                    summary.capture_provider_finished = true;
+                    return Ok(PipelineHandoffDrainSummary {
+                        pipeline: summary,
+                        drained: true,
+                    });
+                }
+            }
+        }
+        Ok(PipelineHandoffDrainSummary {
+            pipeline: summary,
+            drained: false,
+        })
     }
 
     pub fn recover_ingress_journal_until_idle(
@@ -484,6 +526,24 @@ where
             last_sequence = Some(stored_event.sequence);
         }
         Ok((summary, last_sequence))
+    }
+
+    fn record_capture_poll(&self, poll: &CapturePoll) {
+        if let Some(metrics) = &self.runtime_metrics {
+            metrics.record_capture_poll(poll);
+        }
+    }
+
+    fn handle_capture_poll_event(
+        &mut self,
+        capture_event: Box<CaptureEvent>,
+        summary: &mut PipelineSummary,
+    ) -> Result<(), PipelineError> {
+        summary.capture_events_read = summary.capture_events_read.saturating_add(1);
+        if let Some(metrics) = &self.runtime_metrics {
+            metrics.record_capture_event_read();
+        }
+        self.handle_capture_event(*capture_event, summary)
     }
 
     fn handle_capture_event(

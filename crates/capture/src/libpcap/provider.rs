@@ -199,6 +199,21 @@ impl LibpcapProvider {
         None
     }
 
+    fn flush_pending_for_handoff(&mut self) -> Option<CapturePoll> {
+        if !self.streams.has_pending() {
+            return None;
+        }
+        let timestamp = self.timeout_timestamp();
+        self.pending_events
+            .extend(self.streams.flush_pending_for_handoff(timestamp));
+        self.pending_flush
+            .after_flush(self.streams.has_pending(), Instant::now());
+        if let Some(event) = self.pending_events.pop_front() {
+            return Some(CapturePoll::event(event));
+        }
+        Some(CapturePoll::Progress)
+    }
+
     fn refresh_pending_flush_deadline(&mut self) {
         self.pending_flush
             .observe(self.streams.has_pending(), Instant::now());
@@ -327,6 +342,15 @@ impl CaptureProvider for LibpcapProvider {
 
     fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
         self.poll_decoded()
+    }
+
+    fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+        if let Some(event) = self.pending_events.pop_front() {
+            return Ok(CapturePoll::event(event));
+        }
+        Ok(self
+            .flush_pending_for_handoff()
+            .unwrap_or(CapturePoll::Idle))
     }
 }
 

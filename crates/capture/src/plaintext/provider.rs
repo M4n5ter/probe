@@ -85,6 +85,10 @@ impl CaptureProvider for PlaintextEventProvider {
             .map(CapturePoll::event)
             .unwrap_or(CapturePoll::Finished))
     }
+
+    fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+        self.poll_next()
+    }
 }
 
 #[cfg(test)]

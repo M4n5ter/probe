@@ -29,6 +29,22 @@ impl Tls13SessionSecretDecryptingEngine {
         }
     }
 
+    pub(super) fn drain_pending_or_inner_before_handoff(
+        &mut self,
+        provider_name: &'static str,
+        inner: &mut dyn CaptureProvider,
+    ) -> Result<CapturePoll, CaptureError> {
+        if let Some(event) = self.pop_pending_event() {
+            return Ok(CapturePoll::event(event));
+        }
+        match inner.drain_before_handoff()? {
+            CapturePoll::Event(event) => self.handle_inner_event(provider_name, *event),
+            CapturePoll::Finished => self.finish_bound_streams_before_inner_finished(),
+            CapturePoll::Idle => self.finish_bound_streams_before_handoff(),
+            other => Ok(other),
+        }
+    }
+
     pub(super) fn pop_pending_event(&mut self) -> Option<CaptureEvent> {
         self.pending_events.pop_front()
     }
@@ -253,6 +269,19 @@ impl Tls13SessionSecretDecryptingEngine {
     pub(super) fn finish_bound_streams_before_inner_finished(
         &mut self,
     ) -> Result<CapturePoll, CaptureError> {
+        self.finish_bound_streams(CapturePoll::Finished)
+    }
+
+    pub(super) fn finish_bound_streams_before_handoff(
+        &mut self,
+    ) -> Result<CapturePoll, CaptureError> {
+        self.finish_bound_streams(CapturePoll::Idle)
+    }
+
+    fn finish_bound_streams(
+        &mut self,
+        empty_poll: CapturePoll,
+    ) -> Result<CapturePoll, CaptureError> {
         let mut ready_events = Vec::new();
         for (flow, timestamp) in self.flow_registry.bound_flow_finish_events() {
             let mut plaintext_events = self.decryptor.finish_flow_observation(timestamp, &flow);
@@ -283,7 +312,7 @@ impl Tls13SessionSecretDecryptingEngine {
         }
 
         self.flow_registry.clear_streams();
-        Ok(self.emit_ready_events(ready_events, CapturePoll::Finished))
+        Ok(self.emit_ready_events(ready_events, empty_poll))
     }
 
     fn emit_ready_events(

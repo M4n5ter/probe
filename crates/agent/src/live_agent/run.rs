@@ -56,7 +56,8 @@ use crate::{
 };
 
 const INGRESS_RECOVERY_BATCH_SIZE: usize = 1_024;
-const LIVE_CAPTURE_BATCH_POLLS: u64 = 128;
+const LIVE_CAPTURE_BATCH_POLLS: u64 = 8;
+const LIVE_CAPTURE_HANDOFF_DRAIN_POLLS: u64 = 1_024;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RunOptions {
     pub max_events: Option<u64>,
@@ -432,20 +433,47 @@ impl BlockingCaptureRun {
             active_interception_guard.transparent_interception =
                 transparent_interception.activate(transparent_interception_setup_scope)?;
             signal_readiness(readiness)?;
-            while let Some(run_options) = live_capture_run_options(
-                max_events,
-                summary.capture_events_read,
-                &shutdown_requested,
-            ) {
+            loop {
+                if shutdown::requested(&shutdown_requested) {
+                    break;
+                }
+                if runtime_generation.has_pending_or_applying_reload() {
+                    let Some(drain_options) = live_capture_handoff_drain_options(
+                        max_events,
+                        summary.capture_events_read,
+                        &shutdown_requested,
+                    ) else {
+                        break;
+                    };
+                    let drain_summary =
+                        pipeline.drain_provider_before_handoff(provider.as_mut(), drain_options)?;
+                    let provider_finished = drain_summary.pipeline.capture_provider_finished;
+                    let handoff_drained = drain_summary.drained;
+                    summary.merge(drain_summary.pipeline);
+                    if provider_finished || shutdown::requested(&shutdown_requested) {
+                        break;
+                    }
+                    if !handoff_drained {
+                        continue;
+                    }
+                    runtime_generation.record_capture_safe_point();
+                    let _runtime_generation_result = runtime_generation_executor
+                        .process_capture_safe_point(&mut plan, &mut provider, |config_version| {
+                            pipeline.set_config_version(config_version);
+                        });
+                }
+                let Some(run_options) = live_capture_run_options(
+                    max_events,
+                    summary.capture_events_read,
+                    &shutdown_requested,
+                ) else {
+                    break;
+                };
                 let capture_summary =
                     pipeline.run_provider_with_options(provider.as_mut(), run_options)?;
                 let provider_finished = capture_summary.capture_provider_finished;
                 summary.merge(capture_summary);
                 runtime_generation.record_capture_safe_point();
-                let _runtime_generation_result = runtime_generation_executor
-                    .process_capture_safe_point(&mut plan, &mut provider, |config_version| {
-                        pipeline.set_config_version(config_version);
-                    });
                 if provider_finished || shutdown::requested(&shutdown_requested) {
                     break;
                 }
@@ -472,6 +500,33 @@ fn live_capture_run_options(
     events_read: u64,
     shutdown_requested: &shutdown::ShutdownFlag,
 ) -> Option<PipelineRunOptions> {
+    live_capture_run_options_with_max_polls(
+        max_events,
+        events_read,
+        shutdown_requested,
+        LIVE_CAPTURE_BATCH_POLLS,
+    )
+}
+
+fn live_capture_handoff_drain_options(
+    max_events: Option<u64>,
+    events_read: u64,
+    shutdown_requested: &shutdown::ShutdownFlag,
+) -> Option<PipelineRunOptions> {
+    live_capture_run_options_with_max_polls(
+        max_events,
+        events_read,
+        shutdown_requested,
+        LIVE_CAPTURE_HANDOFF_DRAIN_POLLS,
+    )
+}
+
+fn live_capture_run_options_with_max_polls(
+    max_events: Option<u64>,
+    events_read: u64,
+    shutdown_requested: &shutdown::ShutdownFlag,
+    max_polls: u64,
+) -> Option<PipelineRunOptions> {
     if shutdown::requested(shutdown_requested) {
         return None;
     }
@@ -479,7 +534,7 @@ fn live_capture_run_options(
     if remaining_events == Some(0) {
         return None;
     }
-    let mut options = PipelineRunOptions::max_polls(LIVE_CAPTURE_BATCH_POLLS)
+    let mut options = PipelineRunOptions::max_polls(max_polls)
         .with_shutdown_signal(Arc::clone(shutdown_requested));
     options.max_events = remaining_events;
     Some(options)
@@ -675,6 +730,17 @@ mod tests {
 
         assert_eq!(options.max_events, Some(2));
         assert_eq!(options.max_polls, Some(LIVE_CAPTURE_BATCH_POLLS));
+    }
+
+    #[test]
+    fn live_capture_handoff_drain_options_keep_the_remaining_event_budget() {
+        let shutdown_requested = shutdown::new_flag();
+
+        let options = live_capture_handoff_drain_options(Some(7), 5, &shutdown_requested)
+            .expect("remaining events should produce a handoff drain batch");
+
+        assert_eq!(options.max_events, Some(2));
+        assert_eq!(options.max_polls, Some(LIVE_CAPTURE_HANDOFF_DRAIN_POLLS));
     }
 
     #[tokio::test]

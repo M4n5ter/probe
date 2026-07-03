@@ -125,6 +125,14 @@ impl RuntimeGenerationState {
             .clone()
     }
 
+    pub(crate) fn has_pending_or_applying_reload(&self) -> bool {
+        let control = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        control.snapshot.pending.is_some() || control.snapshot.applying.is_some()
+    }
+
     pub(crate) fn request_reload(
         &self,
         request: RuntimeGenerationReloadRequestInput,
@@ -298,6 +306,25 @@ mod tests {
                 .last_safe_point_unix_ns
                 .is_some_and(|timestamp| timestamp > 0)
         );
+    }
+
+    #[test]
+    fn runtime_generation_reports_pending_or_applying_reload() {
+        let state = RuntimeGenerationState::for_config_version("local");
+        assert!(!state.has_pending_or_applying_reload());
+
+        state
+            .request_reload(reload_request("candidate.toml", "candidate"))
+            .expect("request should queue");
+        assert!(state.has_pending_or_applying_reload());
+
+        let applying = state
+            .begin_pending_reload()
+            .expect("queued request should begin");
+        assert!(state.has_pending_or_applying_reload());
+
+        state.record_reload_applied(applying.snapshot.request_id, "candidate");
+        assert!(!state.has_pending_or_applying_reload());
     }
 
     #[test]

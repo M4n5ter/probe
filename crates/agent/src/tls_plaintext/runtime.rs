@@ -1112,6 +1112,10 @@ mod tests {
         fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
             Ok(CapturePoll::Finished)
         }
+
+        fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+            Ok(CapturePoll::Finished)
+        }
     }
 
     fn runtime_plan_from_config(

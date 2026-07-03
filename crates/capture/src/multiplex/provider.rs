@@ -22,6 +22,17 @@ impl CaptureMultiplexer {
     }
 
     fn poll_round(&mut self) -> Result<CapturePoll, CaptureError> {
+        self.poll_with(|provider| provider.poll_next())
+    }
+
+    fn drain_round_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+        self.poll_with(|provider| provider.drain_before_handoff())
+    }
+
+    fn poll_with(
+        &mut self,
+        mut poll: impl FnMut(&mut dyn CaptureProvider) -> Result<CapturePoll, CaptureError>,
+    ) -> Result<CapturePoll, CaptureError> {
         if self.providers.is_empty() || self.providers.iter().all(|provider| !provider.is_active())
         {
             return Ok(CapturePoll::Finished);
@@ -36,7 +47,7 @@ impl CaptureMultiplexer {
             if !provider.is_active() {
                 continue;
             }
-            match provider.poll_next() {
+            match provider.poll_with(&mut poll) {
                 Ok(CapturePoll::Event(event)) => return Ok(CapturePoll::Event(event)),
                 Ok(CapturePoll::Progress) => made_progress = true,
                 Ok(CapturePoll::Idle) => {}
@@ -75,6 +86,10 @@ impl CaptureProvider for CaptureMultiplexer {
 
     fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
         self.poll_round()
+    }
+
+    fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+        self.drain_round_before_handoff()
     }
 
     fn runtime_diagnostics(&mut self) -> CaptureProviderRuntimeDiagnostics {
@@ -128,9 +143,12 @@ impl MultiplexedProvider {
         matches!(self.state, MultiplexedProviderState::Active { .. })
     }
 
-    fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
+    fn poll_with(
+        &mut self,
+        poll: impl FnOnce(&mut dyn CaptureProvider) -> Result<CapturePoll, CaptureError>,
+    ) -> Result<CapturePoll, CaptureError> {
         match &mut self.state {
-            MultiplexedProviderState::Active { provider } => provider.poll_next(),
+            MultiplexedProviderState::Active { provider } => poll(provider.as_mut()),
             _ => Ok(CapturePoll::Finished),
         }
     }
@@ -281,6 +299,31 @@ mod tests {
             b"after-progress",
         );
         assert_eq!(provider.poll_next()?, CapturePoll::Finished);
+        Ok(())
+    }
+
+    #[test]
+    fn multiplexer_drains_handoff_without_polling_regular_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let poll_count = Rc::new(Cell::new(0));
+        let drain_count = Rc::new(Cell::new(0));
+        let source = HandoffDrainProvider {
+            poll_count: Rc::clone(&poll_count),
+            drain_count: Rc::clone(&drain_count),
+            handoff_event: Some(captured_bytes("handoff")),
+        };
+        let mut provider = CaptureMultiplexer::new([Box::new(source) as Box<dyn CaptureProvider>]);
+
+        assert_bytes_payload(
+            Some(match provider.drain_before_handoff()? {
+                CapturePoll::Event(event) => *event,
+                other => panic!("expected handoff event, got {other:?}"),
+            }),
+            b"handoff",
+        );
+
+        assert_eq!(poll_count.get(), 0);
+        assert_eq!(drain_count.get(), 1);
         Ok(())
     }
 
@@ -484,6 +527,10 @@ mod tests {
                 .map(CapturePoll::event)
                 .unwrap_or(CapturePoll::Finished))
         }
+
+        fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+            self.poll_next()
+        }
     }
 
     struct ErrorProvider;
@@ -502,6 +549,10 @@ mod tests {
 
         fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
             Err(CaptureError::provider("error", "boom"))
+        }
+
+        fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+            self.poll_next()
         }
     }
 
@@ -524,6 +575,10 @@ mod tests {
         fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
             Err(CaptureError::provider("drop_notify_error", "boom"))
         }
+
+        fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+            self.poll_next()
+        }
     }
 
     impl Drop for DropNotifyErrorProvider {
@@ -545,6 +600,10 @@ mod tests {
 
         fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
             Ok(CapturePoll::Progress)
+        }
+
+        fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+            Ok(CapturePoll::Idle)
         }
 
         fn runtime_diagnostics(&mut self) -> CaptureProviderRuntimeDiagnostics {
@@ -592,6 +651,10 @@ mod tests {
                 .map(CapturePoll::event)
                 .unwrap_or(CapturePoll::Finished))
         }
+
+        fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+            Ok(CapturePoll::Idle)
+        }
     }
 
     struct ProgressThenProvider {
@@ -618,6 +681,41 @@ mod tests {
                 .take()
                 .map(CapturePoll::event)
                 .unwrap_or(CapturePoll::Finished))
+        }
+
+        fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+            Ok(CapturePoll::Idle)
+        }
+    }
+
+    struct HandoffDrainProvider {
+        poll_count: Rc<Cell<u64>>,
+        drain_count: Rc<Cell<u64>>,
+        handoff_event: Option<CaptureEvent>,
+    }
+
+    impl CaptureProvider for HandoffDrainProvider {
+        fn name(&self) -> &'static str {
+            "handoff_drain"
+        }
+
+        fn capabilities(&self) -> Vec<CapabilityState> {
+            Vec::new()
+        }
+
+        fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
+            self.poll_count.set(self.poll_count.get().saturating_add(1));
+            Ok(CapturePoll::Idle)
+        }
+
+        fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+            self.drain_count
+                .set(self.drain_count.get().saturating_add(1));
+            Ok(self
+                .handoff_event
+                .take()
+                .map(CapturePoll::event)
+                .unwrap_or(CapturePoll::Idle))
         }
     }
 }

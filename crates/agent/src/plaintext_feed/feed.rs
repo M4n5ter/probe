@@ -98,6 +98,10 @@ where
             })
             .map_err(|error| CaptureError::provider(PROVIDER_NAME, error.to_string()))
     }
+
+    fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+        self.poll_next()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

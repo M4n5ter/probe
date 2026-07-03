@@ -60,6 +60,10 @@ impl CaptureProvider for ReplayProvider {
             enforcement_evidence_propagation: EnforcementEvidencePropagation::Event,
         })))
     }
+
+    fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+        self.poll_next()
+    }
 }
 
 #[cfg(test)]

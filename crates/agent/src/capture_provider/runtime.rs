@@ -632,6 +632,13 @@ impl CaptureProvider for RuntimeObservedCaptureInput {
         Ok(poll)
     }
 
+    fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+        let poll = self.inner.drain_before_handoff()?;
+        self.runtime
+            .record_diagnostics(self.inner.runtime_diagnostics());
+        Ok(poll)
+    }
+
     fn runtime_diagnostics(&mut self) -> CaptureProviderRuntimeDiagnostics {
         self.inner.runtime_diagnostics()
     }
@@ -760,6 +767,10 @@ mod tests {
         fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
             Ok(CapturePoll::Progress)
         }
+
+        fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+            Ok(CapturePoll::Idle)
+        }
     }
 
     struct DiagnosticProvider;
@@ -775,6 +786,10 @@ mod tests {
 
         fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
             Ok(CapturePoll::Progress)
+        }
+
+        fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+            Ok(CapturePoll::Idle)
         }
 
         fn runtime_diagnostics(&mut self) -> CaptureProviderRuntimeDiagnostics {

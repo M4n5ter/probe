@@ -15,6 +15,8 @@ const BUFFER_LIMIT_GAP_REASON: &str =
 const GLOBAL_BUFFER_LIMIT_GAP_REASON: &str = "libpcap TCP stream gap: global out-of-order buffer limit reached before missing payload arrived";
 const REORDER_TIMEOUT_GAP_REASON: &str =
     "libpcap TCP stream gap: read timeout expired before missing payload arrived";
+const HANDOFF_GAP_REASON: &str =
+    "libpcap TCP stream gap: runtime generation handoff before missing payload arrived";
 const FLOW_CLOSE_GAP_REASON: &str =
     "libpcap TCP stream gap: flow closed with unresolved out-of-order payload";
 

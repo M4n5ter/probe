@@ -111,6 +111,13 @@ impl CaptureProvider for Tls13SessionSecretDecryptingProvider {
         )
     }
 
+    fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+        self.engine.drain_pending_or_inner_before_handoff(
+            TLS13_SESSION_SECRET_DECRYPTING_PROVIDER_NAME,
+            self.inner.as_mut(),
+        )
+    }
+
     fn runtime_diagnostics(&mut self) -> crate::CaptureProviderRuntimeDiagnostics {
         self.inner.runtime_diagnostics()
     }

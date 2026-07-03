@@ -33,6 +33,10 @@ impl CaptureProvider for SequenceProvider {
             .map(CapturePoll::event)
             .unwrap_or(CapturePoll::Finished))
     }
+
+    fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+        self.poll_next()
+    }
 }
 
 pub(super) fn captured_bytes(flow: FlowContext, bytes: &'static [u8]) -> CaptureEvent {

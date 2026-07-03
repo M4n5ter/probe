@@ -28,7 +28,8 @@ use super::super::{
     payload_authorization::{ProcessPayloadSampleAuthorization, SocketPayloadSampleAuthorization},
     payload_bridge::{
         output_loss_gap_events, process_lifecycle_gap_events, read_events,
-        tracked_flow_displacement_gap_events, write_events,
+        tracked_flow_displacement_gap_events, tracked_flow_handoff_boundary_gap_events,
+        write_events,
     },
     payload_direction::PayloadDirections,
     tracked_flow::{TrackedEbpfFlow, TrackedEbpfFlows},
@@ -39,6 +40,12 @@ const DEFAULT_RESOLUTION_RETRY_SLEEP: Duration = Duration::from_millis(5);
 const DEFAULT_RUNTIME_DIAGNOSTICS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_TRACKED_EBPF_FLOWS: usize = 8192;
 const MAX_PENDING_EBPF_FLOW_RESOLUTIONS: usize = 8192;
+
+#[derive(Debug, Clone, Copy)]
+enum PendingFlowRetryDelay {
+    Respect,
+    Ignore,
+}
 
 pub struct EbpfProcessObservationProvider {
     observations: Box<dyn EbpfObservationSource>,
@@ -52,6 +59,7 @@ pub struct EbpfProcessObservationProvider {
     tracked_flows: TrackedEbpfFlows,
     pending_flows: VecDeque<PendingEbpfFlowResolution>,
     pending_events: VecDeque<CaptureEvent>,
+    handoff_boundary_emitted: bool,
     output_loss: OutputLossTracker,
     probe_snapshot: EbpfProcessObservationProbeSnapshot,
     runtime_diagnostics: EbpfProcessObservationRuntimeDiagnosticsCache,
@@ -81,6 +89,7 @@ impl EbpfProcessObservationProvider {
             tracked_flows: TrackedEbpfFlows::bounded(MAX_TRACKED_EBPF_FLOWS),
             pending_flows: VecDeque::new(),
             pending_events: VecDeque::new(),
+            handoff_boundary_emitted: false,
             output_loss: OutputLossTracker::default(),
             probe_snapshot,
             runtime_diagnostics: EbpfProcessObservationRuntimeDiagnosticsCache::default(),
@@ -209,9 +218,33 @@ impl EbpfProcessObservationProvider {
 
     fn poll_pending_flow_resolution_attempt(
         &mut self,
-        mut pending: PendingEbpfFlowResolution,
+        pending: PendingEbpfFlowResolution,
     ) -> Result<CapturePoll, CaptureError> {
-        if let Some(retry_at) = pending.retry_at
+        self.poll_pending_flow_resolution_attempt_with_retry_delay(
+            pending,
+            PendingFlowRetryDelay::Respect,
+        )
+    }
+
+    fn drain_pending_flow_resolution_before_handoff(
+        &mut self,
+    ) -> Result<CapturePoll, CaptureError> {
+        let Some(pending) = self.pending_flows.pop_front() else {
+            return Ok(CapturePoll::Idle);
+        };
+        self.poll_pending_flow_resolution_attempt_with_retry_delay(
+            pending,
+            PendingFlowRetryDelay::Ignore,
+        )
+    }
+
+    fn poll_pending_flow_resolution_attempt_with_retry_delay(
+        &mut self,
+        mut pending: PendingEbpfFlowResolution,
+        retry_delay: PendingFlowRetryDelay,
+    ) -> Result<CapturePoll, CaptureError> {
+        if matches!(retry_delay, PendingFlowRetryDelay::Respect)
+            && let Some(retry_at) = pending.retry_at
             && Instant::now() < retry_at
         {
             return Ok(self.queue_pending_flow_resolution(pending));
@@ -325,6 +358,23 @@ impl EbpfProcessObservationProvider {
             lost_events,
         ));
         Ok(self.pending_events.pop_front())
+    }
+
+    fn handoff_boundary_events(&mut self) -> Option<CaptureEvent> {
+        if self.handoff_boundary_emitted {
+            return None;
+        }
+        self.handoff_boundary_emitted = true;
+        if !self.tracked_flows.has_active_payload_gap_targets() {
+            return None;
+        }
+        let timestamp = self.clock.next_timestamp();
+        self.pending_events
+            .extend(tracked_flow_handoff_boundary_gap_events(
+                &self.tracked_flows,
+                timestamp,
+            ));
+        self.pending_events.pop_front()
     }
 
     fn close_event(&mut self, close: &EbpfCloseTracepointObservation) -> Option<CaptureEvent> {
@@ -577,7 +627,29 @@ impl CaptureProvider for EbpfProcessObservationProvider {
     }
 
     fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
+        self.handoff_boundary_emitted = false;
         self.poll_event()
+    }
+
+    fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+        if let Some(event) = self.pending_events.pop_front() {
+            return Ok(CapturePoll::event(event));
+        }
+        if self.output_loss.should_check_during_drain()
+            && let Some(event) = self.output_loss_events()?
+        {
+            return Ok(CapturePoll::event(event));
+        }
+        if !self.pending_flows.is_empty() {
+            return self.drain_pending_flow_resolution_before_handoff();
+        }
+        if let Some(event) = self.output_loss_events()? {
+            return Ok(CapturePoll::event(event));
+        }
+        if let Some(event) = self.handoff_boundary_events() {
+            return Ok(CapturePoll::event(event));
+        }
+        Ok(CapturePoll::Idle)
     }
 
     fn runtime_diagnostics(&mut self) -> CaptureProviderRuntimeDiagnostics {
@@ -646,6 +718,7 @@ mod tests {
                 tracked_flows: TrackedEbpfFlows::bounded(MAX_TRACKED_EBPF_FLOWS),
                 pending_flows: VecDeque::new(),
                 pending_events: VecDeque::new(),
+                handoff_boundary_emitted: false,
                 output_loss: OutputLossTracker::default(),
                 probe_snapshot: EbpfProcessObservationProbeSnapshot::unreported(),
                 runtime_diagnostics: EbpfProcessObservationRuntimeDiagnosticsCache::default(),
@@ -1986,6 +2059,175 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn handoff_drain_emits_pending_payload_events_without_polling_new_observations() -> TestResult {
+        let (local, remote) = outbound_loopback();
+        let process = observed_process(101, 100);
+        let observations = [
+            connect_observation(process.clone(), 7, remote),
+            EbpfProcessObservation::Read(EbpfSocketReadObservation {
+                process: process.clone(),
+                fd: 7,
+                fd_generation: 10,
+                original_len: 9,
+                buffer: b"HTTP/".to_vec(),
+                truncated: true,
+                read_failed: false,
+            }),
+            connect_observation(process, 8, remote),
+        ];
+        let selector = Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        )
+        .compile()?;
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source_from_observations(observations),
+            static_resolver(local, remote),
+            Some(selector),
+        );
+
+        expect_connection_opened(&mut provider)?;
+        let bytes = expect_bytes(&mut provider)?;
+        assert_eq!(bytes.bytes.as_ref(), b"HTTP/");
+
+        let gap = expect_gap_event(provider.drain_before_handoff()?);
+        assert_eq!(gap.gap.direction, Direction::Inbound);
+        assert_eq!(gap.gap.expected_offset, 5);
+        assert_eq!(gap.gap.next_offset, Some(9));
+        assert!(gap.gap.reason.contains("truncated payload"));
+        let gap = expect_gap_event(provider.drain_before_handoff()?);
+        assert_eq!(gap.gap.direction, Direction::Inbound);
+        assert_eq!(gap.gap.expected_offset, 9);
+        assert!(gap.gap.reason.contains("runtime generation handoff"));
+        assert!(matches!(
+            provider.drain_before_handoff()?,
+            CapturePoll::Idle
+        ));
+
+        let (timestamp, _) = expect_connection_opened(&mut provider)?;
+        assert_eq!(timestamp.monotonic_ns, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn handoff_drain_retries_pending_flow_resolution_until_safe_point() -> TestResult {
+        let (local, remote) = outbound_loopback();
+        let process = observed_process(101, 100);
+        let resolver = Box::new(RetryResolver {
+            calls: 0,
+            resolved: EbpfResolvedSocketFlow {
+                process: demo_process(),
+                confidence: 90,
+                connection: TcpConnection::new(local, remote),
+                socket_cookie: None,
+            },
+        });
+        let mut provider = EbpfProcessObservationProvider::from_observations_for_test([], resolver);
+        provider.resolution_retries = 1;
+        provider.resolution_retry_sleep = Duration::from_secs(60);
+        provider
+            .pending_flows
+            .push_back(pending_missing_connect_resolution(process, 7));
+
+        assert!(matches!(
+            provider.drain_before_handoff()?,
+            CapturePoll::Progress
+        ));
+        assert_eq!(provider.pending_flows.len(), 1);
+
+        let CapturePoll::Event(event) = provider.drain_before_handoff()? else {
+            panic!("expected pending flow resolution event before handoff safe point");
+        };
+        let CaptureEvent::ConnectionOpened { flow, .. } = *event else {
+            panic!("expected connection opened event, got {event:?}");
+        };
+        assert_eq!(flow.local.port, 50_000);
+        assert_eq!(flow.remote.port, 443);
+        assert!(matches!(
+            provider.drain_before_handoff()?,
+            CapturePoll::Idle
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn handoff_drain_does_not_consume_live_observations() -> TestResult {
+        let (local, remote) = outbound_loopback();
+        let process = observed_process(101, 100);
+        let mut provider =
+            provider_from_observations([connect_observation(process, 7, remote)], local, remote);
+
+        assert!(matches!(
+            provider.drain_before_handoff()?,
+            CapturePoll::Idle
+        ));
+        let (timestamp, flow) = expect_connection_opened(&mut provider)?;
+        assert_eq!(timestamp.monotonic_ns, 1);
+        assert_eq!(flow.remote.port, 443);
+        Ok(())
+    }
+
+    #[test]
+    fn handoff_drain_emits_boundary_gap_without_discarding_tracked_flow() -> TestResult {
+        let (local, remote) = outbound_loopback();
+        let process = observed_process(101, 100);
+        let payload = b"GET /".to_vec();
+        let observations = [
+            connect_observation(process.clone(), 7, remote),
+            EbpfProcessObservation::Write(EbpfSocketWriteObservation {
+                process,
+                fd: 7,
+                fd_generation: 10,
+                original_len: payload.len() as u32,
+                buffer: payload.clone(),
+                truncated: false,
+                read_failed: false,
+                kernel_transfer: false,
+            }),
+        ];
+        let selector = Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        )
+        .compile()?;
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source_from_observations(observations),
+            static_resolver(local, remote),
+            Some(selector),
+        );
+
+        expect_connection_opened(&mut provider)?;
+        let gap = expect_gap_event(provider.drain_before_handoff()?);
+        assert_eq!(gap.gap.direction, Direction::Outbound);
+        assert_eq!(gap.gap.expected_offset, 0);
+        assert!(gap.gap.next_offset.is_none());
+        assert!(gap.gap.reason.contains("runtime generation handoff"));
+        assert!(matches!(
+            provider.drain_before_handoff()?,
+            CapturePoll::Idle
+        ));
+
+        let bytes = expect_bytes(&mut provider)?;
+        assert_eq!(bytes.bytes.as_ref(), payload.as_slice());
+
+        let gap = expect_gap_event(provider.drain_before_handoff()?);
+        assert_eq!(gap.gap.expected_offset, payload.len() as u64);
+        assert!(matches!(
+            provider.drain_before_handoff()?,
+            CapturePoll::Idle
+        ));
+        Ok(())
+    }
+
     struct StaticResolver {
         resolved: Option<EbpfResolvedSocketFlow>,
     }
@@ -2459,6 +2701,23 @@ mod tests {
         let EbpfProcessObservation::Connect(connect) = connect_observation(process, fd, remote)
         else {
             unreachable!("connect_observation always creates a connect observation");
+        };
+        PendingEbpfFlowResolution::new(
+            PendingEbpfFlowStart::Connect(connect),
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+        )
+    }
+
+    fn pending_missing_connect_resolution(
+        process: EbpfObservedProcess,
+        fd: i32,
+    ) -> PendingEbpfFlowResolution {
+        let EbpfProcessObservation::Connect(connect) = missing_connect_observation(process, fd)
+        else {
+            unreachable!("missing_connect_observation always creates a connect observation");
         };
         PendingEbpfFlowResolution::new(
             PendingEbpfFlowStart::Connect(connect),

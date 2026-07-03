@@ -137,6 +137,10 @@ impl CaptureProvider for TlsSessionSecretRefreshingAutoBindingProvider {
         self.provider.poll_next()
     }
 
+    fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+        self.provider.drain_before_handoff()
+    }
+
     fn runtime_diagnostics(&mut self) -> capture::CaptureProviderRuntimeDiagnostics {
         self.provider.runtime_diagnostics()
     }
@@ -539,6 +543,10 @@ mod tests {
         fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
             Ok(CapturePoll::Finished)
         }
+
+        fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+            Ok(CapturePoll::Finished)
+        }
     }
 
     struct VecCaptureProvider {
@@ -568,6 +576,10 @@ mod tests {
                 .pop_front()
                 .map(CapturePoll::event)
                 .unwrap_or(CapturePoll::Finished))
+        }
+
+        fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+            self.poll_next()
         }
     }
 

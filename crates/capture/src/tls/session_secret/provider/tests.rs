@@ -114,6 +114,51 @@ fn decrypting_provider_buffers_partial_bound_ciphertext_without_leaking_raw_byte
 }
 
 #[test]
+fn decrypting_provider_finishes_partial_bound_ciphertext_before_handoff_idle()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store = session_secret_store()?;
+    let record = store.records()[0].clone();
+    let flow = demo_flow(1);
+    let wire_record = protected_application_record(&record, 0, b"ok")?;
+    let split_at = 8;
+    let mut provider = Tls13SessionSecretDecryptingProvider::with_bindings(
+        Box::new(IdleAfterEventsProvider::new([CaptureEvent::Bytes(
+            captured_bytes(
+                flow.clone(),
+                Direction::Outbound,
+                0,
+                wire_record[..split_at].to_vec(),
+            ),
+        )])),
+        [binding(
+            &store,
+            flow,
+            Direction::Outbound,
+            Tls13ApplicationTrafficSecretKind::Client,
+        )?],
+    )?;
+
+    assert_eq!(provider.poll_next()?, CapturePoll::Progress);
+    let CapturePoll::Event(event) = provider.drain_before_handoff()? else {
+        panic!("expected incomplete-record gap before handoff idle");
+    };
+    let CaptureEvent::Gap(gap) = *event else {
+        panic!("expected incomplete-record gap, got {event:?}");
+    };
+    assert_eq!(gap.origin.source(), CaptureSource::TlsSessionSecret);
+    assert!(
+        gap.gap
+            .reason
+            .contains("closed with incomplete protected record")
+    );
+    assert!(matches!(
+        provider.drain_before_handoff()?,
+        CapturePoll::Idle
+    ));
+    Ok(())
+}
+
+#[test]
 fn decrypting_provider_carries_upstream_enforcement_evidence_to_plaintext()
 -> Result<(), Box<dyn std::error::Error>> {
     let store = session_secret_store()?;
@@ -980,5 +1025,44 @@ impl CaptureProvider for VecProvider {
             .pop_front()
             .map(CapturePoll::event)
             .unwrap_or(CapturePoll::Finished))
+    }
+
+    fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+        self.poll_next()
+    }
+}
+
+#[derive(Debug)]
+struct IdleAfterEventsProvider {
+    events: VecDeque<CaptureEvent>,
+}
+
+impl IdleAfterEventsProvider {
+    fn new(events: impl IntoIterator<Item = CaptureEvent>) -> Self {
+        Self {
+            events: events.into_iter().collect(),
+        }
+    }
+}
+
+impl CaptureProvider for IdleAfterEventsProvider {
+    fn name(&self) -> &'static str {
+        "idle_after_events"
+    }
+
+    fn capabilities(&self) -> Vec<CapabilityState> {
+        vec![CapabilityState::available(CapabilityKind::Libpcap)]
+    }
+
+    fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
+        Ok(self
+            .events
+            .pop_front()
+            .map(CapturePoll::event)
+            .unwrap_or(CapturePoll::Idle))
+    }
+
+    fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+        self.poll_next()
     }
 }

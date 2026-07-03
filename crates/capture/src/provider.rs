@@ -45,6 +45,8 @@ pub trait CaptureProvider {
 
     fn poll_next(&mut self) -> Result<CapturePoll, CaptureError>;
 
+    fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError>;
+
     fn runtime_diagnostics(&mut self) -> CaptureProviderRuntimeDiagnostics {
         CaptureProviderRuntimeDiagnostics::default()
     }

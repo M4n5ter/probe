@@ -639,5 +639,9 @@ mod tests {
         fn poll_next(&mut self) -> Result<capture::CapturePoll, capture::CaptureError> {
             Ok(capture::CapturePoll::Finished)
         }
+
+        fn drain_before_handoff(&mut self) -> Result<capture::CapturePoll, capture::CaptureError> {
+            Ok(capture::CapturePoll::Finished)
+        }
     }
 }

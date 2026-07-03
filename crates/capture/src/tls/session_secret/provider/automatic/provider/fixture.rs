@@ -438,6 +438,45 @@ impl CaptureProvider for VecProvider {
             .map(CapturePoll::event)
             .unwrap_or(CapturePoll::Finished))
     }
+
+    fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+        self.poll_next()
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct IdleAfterEventsProvider {
+    events: VecDeque<CaptureEvent>,
+}
+
+impl IdleAfterEventsProvider {
+    pub(super) fn new(events: impl IntoIterator<Item = CaptureEvent>) -> Self {
+        Self {
+            events: events.into_iter().collect(),
+        }
+    }
+}
+
+impl CaptureProvider for IdleAfterEventsProvider {
+    fn name(&self) -> &'static str {
+        "idle_after_events"
+    }
+
+    fn capabilities(&self) -> Vec<CapabilityState> {
+        vec![CapabilityState::available(CapabilityKind::Libpcap)]
+    }
+
+    fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
+        Ok(self
+            .events
+            .pop_front()
+            .map(CapturePoll::event)
+            .unwrap_or(CapturePoll::Idle))
+    }
+
+    fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+        self.poll_next()
+    }
 }
 
 #[derive(Debug)]
@@ -476,5 +515,9 @@ impl CaptureProvider for StrictFinishedProvider {
         }
         self.finished_returned = true;
         Ok(CapturePoll::Finished)
+    }
+
+    fn drain_before_handoff(&mut self) -> Result<CapturePoll, CaptureError> {
+        self.poll_next()
     }
 }
