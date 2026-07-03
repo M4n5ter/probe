@@ -2,7 +2,10 @@ use std::collections::BTreeMap;
 
 use probe_core::{Direction, EventEnvelope, EventKind, HttpHeaders};
 
-use super::rows::TrafficRow;
+use super::{
+    rows::TrafficRow,
+    text::{bytes_detail, direction_label, escape_text, fit_preview_lines},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HttpExchangeRow {
@@ -21,6 +24,10 @@ pub(crate) struct HttpExchangeRow {
 }
 
 impl HttpExchangeRow {
+    pub(crate) fn order_sequence(&self) -> u64 {
+        self.sequence
+    }
+
     pub(crate) fn detail_lines(&self) -> Vec<String> {
         let mut lines = vec![
             format!("Sequence: {}", self.sequence),
@@ -45,7 +52,7 @@ impl HttpExchangeRow {
     }
 
     pub(crate) fn preview_lines(&self, max_lines: usize) -> Vec<String> {
-        let mut lines = vec![
+        let lines = vec![
             format!("Sequence: {}", self.sequence),
             "View: HTTP exchange".to_string(),
             format!("Process: {}", self.process),
@@ -56,7 +63,7 @@ impl HttpExchangeRow {
             format!("Response body: {} bytes", self.response.body_len()),
             "Open detail for headers and full payloads".to_string(),
         ];
-        fit_preview_lines(&mut lines, max_lines)
+        fit_preview_lines(lines, max_lines)
     }
 }
 
@@ -355,10 +362,12 @@ pub(super) fn build_http_exchange_rows(rows: &[TrafficRow]) -> Vec<HttpExchangeR
             .or_insert_with(|| HttpExchangeBuilder::new(row))
             .observe(row, event);
     }
-    exchanges
+    let mut rows = exchanges
         .into_values()
         .map(HttpExchangeBuilder::into_row)
-        .collect()
+        .collect::<Vec<_>>();
+    rows.sort_by_key(HttpExchangeRow::order_sequence);
+    rows
 }
 
 fn http_exchange_key(event: &EventEnvelope) -> Option<HttpExchangeKey> {
@@ -380,57 +389,6 @@ fn sorted_body_chunks(chunks: &[BodyChunk]) -> Vec<&BodyChunk> {
     let mut chunks = chunks.iter().collect::<Vec<_>>();
     chunks.sort_by_key(|chunk| chunk.offset);
     chunks
-}
-
-fn fit_preview_lines(lines: &mut Vec<String>, max_lines: usize) -> Vec<String> {
-    let max_lines = max_lines.max(1);
-    if lines.len() <= max_lines {
-        return std::mem::take(lines);
-    }
-    let prompt = lines.pop().unwrap_or_else(|| "Open detail".to_string());
-    lines.truncate(max_lines);
-    if let Some(last) = lines.last_mut() {
-        *last = prompt;
-    }
-    std::mem::take(lines)
-}
-
-fn direction_label(direction: Direction) -> &'static str {
-    match direction {
-        Direction::Inbound => "in",
-        Direction::Outbound => "out",
-    }
-}
-
-fn bytes_detail(bytes: &[u8]) -> String {
-    match std::str::from_utf8(bytes) {
-        Ok(text) => escape_text(text),
-        Err(_) => format!("hex: {}", hex_full(bytes)),
-    }
-}
-
-fn hex_full(bytes: &[u8]) -> String {
-    if bytes.is_empty() {
-        return "-".to_string();
-    }
-    bytes
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join("")
-}
-
-fn escape_text(value: &str) -> String {
-    if value.is_empty() {
-        return "-".to_string();
-    }
-    let mut output = String::new();
-    for character in value.chars() {
-        for escaped in character.escape_default() {
-            output.push(escaped);
-        }
-    }
-    output
 }
 
 #[cfg(test)]
@@ -778,13 +736,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn orders_http_exchanges_by_first_observed_sequence() {
+        let rows = vec![
+            TrafficRow::from_event(
+                10,
+                event_with_flow_id(
+                    "a-late-flow",
+                    EventKind::HttpRequestHeaders(HttpHeaders {
+                        direction: Direction::Outbound,
+                        stream_sequence: 1,
+                        method: Some("GET".to_string()),
+                        target: Some("/late".to_string()),
+                        status: None,
+                        reason: None,
+                        version: "HTTP/1.1".to_string(),
+                        headers: Vec::new(),
+                    }),
+                ),
+            ),
+            TrafficRow::from_event(
+                1,
+                event_with_flow_id(
+                    "z-early-flow",
+                    EventKind::HttpRequestHeaders(HttpHeaders {
+                        direction: Direction::Outbound,
+                        stream_sequence: 1,
+                        method: Some("GET".to_string()),
+                        target: Some("/early".to_string()),
+                        status: None,
+                        reason: None,
+                        version: "HTTP/1.1".to_string(),
+                        headers: Vec::new(),
+                    }),
+                ),
+            ),
+        ];
+
+        let exchanges = build_http_exchange_rows(&rows);
+
+        assert_eq!(
+            exchanges
+                .iter()
+                .map(|exchange| exchange.target.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/early", "/late"]
+        );
+    }
+
     fn event(kind: EventKind) -> EventEnvelope {
+        event_with_flow_id("flow-a", kind)
+    }
+
+    fn event_with_flow_id(flow_id: &str, kind: EventKind) -> EventEnvelope {
+        let mut flow = test_flow();
+        flow.id = FlowIdentity(flow_id.to_string());
         EventEnvelope::from_flow(
             Timestamp {
                 monotonic_ns: 1,
                 wall_time_unix_ns: 1,
             },
-            test_flow(),
+            flow,
             CaptureOrigin::from_source(CaptureSource::Replay),
             "test",
             kind,

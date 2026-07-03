@@ -10,6 +10,7 @@ use super::{
     filter::TrafficEventFilter,
     http::{HttpExchangeRow, build_http_exchange_rows},
     rows::TrafficRow,
+    websocket::{WebSocketSessionIdentity, WebSocketSessionRow, build_websocket_session_rows},
 };
 use crate::{
     admin::{
@@ -71,8 +72,10 @@ pub(crate) struct TrafficState {
     selector_key: Option<String>,
     rows: Vec<TrafficRow>,
     http_exchanges: Vec<HttpExchangeRow>,
+    websocket_sessions: Vec<WebSocketSessionRow>,
     event_view: TrafficViewport,
     http_view: TrafficViewport,
+    websocket_view: TrafficViewport,
     viewport_rows: usize,
     follow_tail: bool,
     status: TrafficStatus,
@@ -206,6 +209,18 @@ impl TrafficViewport {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrafficProjection {
+    mode: TrafficViewMode,
+    len: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebSocketSelection {
+    identity: WebSocketSessionIdentity,
+    order_sequence: u64,
+}
+
 impl Default for TrafficState {
     fn default() -> Self {
         Self {
@@ -214,8 +229,10 @@ impl Default for TrafficState {
             selector_key: None,
             rows: Vec::new(),
             http_exchanges: Vec::new(),
+            websocket_sessions: Vec::new(),
             event_view: TrafficViewport::default(),
             http_view: TrafficViewport::default(),
+            websocket_view: TrafficViewport::default(),
             viewport_rows: 12,
             follow_tail: true,
             status: TrafficStatus::idle("Traffic view uses the running admin socket"),
@@ -246,31 +263,53 @@ impl TrafficState {
         &self.http_exchanges
     }
 
+    pub(crate) fn websocket_sessions(&self) -> &[WebSocketSessionRow] {
+        &self.websocket_sessions
+    }
+
     pub(crate) fn selected_http_exchange_index(&self) -> usize {
         self.http_view.selected_index()
+    }
+
+    pub(crate) fn selected_websocket_session_index(&self) -> usize {
+        self.websocket_view.selected_index()
     }
 
     pub(crate) fn http_scroll(&self) -> usize {
         self.http_view.scroll()
     }
 
+    pub(crate) fn websocket_scroll(&self) -> usize {
+        self.websocket_view.scroll()
+    }
+
     pub(crate) fn active_row_count(&self) -> usize {
-        match self.active_view().active {
-            TrafficViewMode::Http => self.http_exchanges.len(),
-            TrafficViewMode::Events => self.rows.len(),
-        }
+        self.active_projection().len
     }
 
     pub(crate) fn showing_http_exchanges(&self) -> bool {
         self.active_view().active == TrafficViewMode::Http
     }
 
+    pub(crate) fn showing_websocket_sessions(&self) -> bool {
+        self.active_view().active == TrafficViewMode::WebSocket
+    }
+
     pub(crate) fn selected_detail_lines(&self) -> Option<Vec<String>> {
-        if self.active_view().active == TrafficViewMode::Http {
-            return self
-                .http_exchanges
-                .get(self.http_view.selected_index())
-                .map(HttpExchangeRow::detail_lines);
+        match self.active_view().active {
+            TrafficViewMode::Http => {
+                return self
+                    .http_exchanges
+                    .get(self.http_view.selected_index())
+                    .map(HttpExchangeRow::detail_lines);
+            }
+            TrafficViewMode::WebSocket => {
+                return self
+                    .websocket_sessions
+                    .get(self.websocket_view.selected_index())
+                    .map(WebSocketSessionRow::detail_lines);
+            }
+            TrafficViewMode::Events => {}
         }
         let row = self.selected_row()?;
         let mut lines = row.detail_lines();
@@ -299,7 +338,10 @@ impl TrafficState {
     }
 
     pub(crate) fn selected_detail_fetch_sequence(&self) -> Option<u64> {
-        if self.active_view().active == TrafficViewMode::Http {
+        if matches!(
+            self.active_view().active,
+            TrafficViewMode::Http | TrafficViewMode::WebSocket
+        ) {
             return None;
         }
         let row = self.selected_row()?;
@@ -337,10 +379,7 @@ impl TrafficState {
         if self.follow_tail {
             self.select_tail(self.viewport_rows);
         } else {
-            self.event_view
-                .clamp_selection_to_viewport(self.rows.len(), self.viewport_rows);
-            self.http_view
-                .clamp_selection_to_viewport(self.http_exchanges.len(), self.viewport_rows);
+            self.clamp_viewports_to_visible_rows();
         }
     }
 
@@ -376,12 +415,22 @@ impl TrafficState {
     }
 
     pub(crate) fn detail_preview_lines(&self, max_lines: usize) -> Vec<String> {
-        if self.active_view().active == TrafficViewMode::Http {
-            return self
-                .http_exchanges
-                .get(self.http_view.selected_index)
-                .map(|exchange| exchange.preview_lines(max_lines.max(1)))
-                .unwrap_or_else(|| self.diagnostic_lines());
+        match self.active_view().active {
+            TrafficViewMode::Http => {
+                return self
+                    .http_exchanges
+                    .get(self.http_view.selected_index)
+                    .map(|exchange| exchange.preview_lines(max_lines.max(1)))
+                    .unwrap_or_else(|| self.diagnostic_lines());
+            }
+            TrafficViewMode::WebSocket => {
+                return self
+                    .websocket_sessions
+                    .get(self.websocket_view.selected_index)
+                    .map(|session| session.preview_lines(max_lines.max(1)))
+                    .unwrap_or_else(|| self.diagnostic_lines());
+            }
+            TrafficViewMode::Events => {}
         }
         self.selected_row()
             .map(|row| row.preview_lines(max_lines.max(1)))
@@ -519,8 +568,10 @@ impl TrafficState {
         self.selector_key = None;
         self.rows.clear();
         self.http_exchanges.clear();
+        self.websocket_sessions.clear();
         self.event_view.reset();
         self.http_view.reset();
+        self.websocket_view.reset();
         self.follow_tail = true;
         self.clear_detail_state();
         self.attribution_mode = EventTailAttributionMode::Strict;
@@ -529,48 +580,30 @@ impl TrafficState {
     }
 
     pub(crate) fn move_selection(&mut self, delta: isize, visible_rows: usize) {
-        let follow_tail = match self.active_view().active {
-            TrafficViewMode::Http => {
-                self.http_view
-                    .move_selection(self.http_exchanges.len(), delta, visible_rows)
-            }
-            TrafficViewMode::Events => {
-                self.event_view
-                    .move_selection(self.rows.len(), delta, visible_rows)
-            }
-        };
+        let projection = self.active_projection();
+        let follow_tail =
+            self.viewport_mut(projection.mode)
+                .move_selection(projection.len, delta, visible_rows);
         if let Some(follow_tail) = follow_tail {
             self.follow_tail = follow_tail;
         }
     }
 
     pub(crate) fn select_row(&mut self, index: usize, visible_rows: usize) {
-        let follow_tail = match self.active_view().active {
-            TrafficViewMode::Http => {
-                self.http_view
-                    .select_row(self.http_exchanges.len(), index, visible_rows)
-            }
-            TrafficViewMode::Events => {
-                self.event_view
-                    .select_row(self.rows.len(), index, visible_rows)
-            }
-        };
+        let projection = self.active_projection();
+        let follow_tail =
+            self.viewport_mut(projection.mode)
+                .select_row(projection.len, index, visible_rows);
         if let Some(follow_tail) = follow_tail {
             self.follow_tail = follow_tail;
         }
     }
 
     pub(crate) fn scroll_viewport(&mut self, delta: isize, visible_rows: usize) {
-        let follow_tail = match self.active_view().active {
-            TrafficViewMode::Http => {
-                self.http_view
-                    .scroll_viewport(self.http_exchanges.len(), delta, visible_rows)
-            }
-            TrafficViewMode::Events => {
-                self.event_view
-                    .scroll_viewport(self.rows.len(), delta, visible_rows)
-            }
-        };
+        let projection = self.active_projection();
+        let follow_tail =
+            self.viewport_mut(projection.mode)
+                .scroll_viewport(projection.len, delta, visible_rows);
         if let Some(follow_tail) = follow_tail {
             self.follow_tail = follow_tail;
             if self.follow_tail {
@@ -580,18 +613,13 @@ impl TrafficState {
     }
 
     pub(crate) fn drag_scrollbar(&mut self, offset: usize, height: usize, visible_rows: usize) {
-        let follow_tail = match self.active_view().active {
-            TrafficViewMode::Http => self.http_view.drag_scrollbar(
-                self.http_exchanges.len(),
-                offset,
-                height,
-                visible_rows,
-            ),
-            TrafficViewMode::Events => {
-                self.event_view
-                    .drag_scrollbar(self.rows.len(), offset, height, visible_rows)
-            }
-        };
+        let projection = self.active_projection();
+        let follow_tail = self.viewport_mut(projection.mode).drag_scrollbar(
+            projection.len,
+            offset,
+            height,
+            visible_rows,
+        );
         if let Some(follow_tail) = follow_tail {
             self.follow_tail = follow_tail;
             if self.follow_tail {
@@ -602,8 +630,7 @@ impl TrafficState {
 
     pub(crate) fn jump_to_tail(&mut self, visible_rows: usize) {
         if self.active_row_count() == 0 {
-            self.event_view.reset();
-            self.http_view.reset();
+            self.reset_viewports();
             self.follow_tail = true;
             self.status = TrafficStatus::idle("Following latest matching traffic events");
             return;
@@ -623,8 +650,10 @@ impl TrafficState {
         self.latest_window = true;
         self.rows.clear();
         self.http_exchanges.clear();
+        self.websocket_sessions.clear();
         self.event_view.reset();
         self.http_view.reset();
+        self.websocket_view.reset();
         self.follow_tail = true;
         self.detail_state = TrafficDetailState::Idle;
         self.attribution_mode = EventTailAttributionMode::Strict;
@@ -637,6 +666,23 @@ impl TrafficState {
         self.latest_window = false;
         self.last_export_sequence = snapshot.last_export_sequence;
         let received = snapshot.events.len();
+        let selected_http_sequence = (!self.follow_tail)
+            .then(|| {
+                self.http_exchanges
+                    .get(self.http_view.selected_index())
+                    .map(HttpExchangeRow::order_sequence)
+            })
+            .flatten();
+        let selected_websocket = (!self.follow_tail)
+            .then(|| {
+                self.websocket_sessions
+                    .get(self.websocket_view.selected_index())
+                    .map(|row| WebSocketSelection {
+                        identity: row.identity(),
+                        order_sequence: row.order_sequence(),
+                    })
+            })
+            .flatten();
         let status = traffic_status_for_snapshot(
             received,
             &snapshot.omissions,
@@ -644,15 +690,17 @@ impl TrafficState {
             self.attribution_mode,
         );
         self.rows.extend(traffic_rows_for_snapshot(snapshot));
-        self.rebuild_http_exchanges();
+        self.rebuild_protocol_views();
         if self.rows.len() > MAX_ROWS {
             let drop_count = self.rows.len() - MAX_ROWS;
             self.rows.drain(0..drop_count);
-            self.rebuild_http_exchanges();
+            self.rebuild_protocol_views();
             self.event_view.subtract_dropped_rows(drop_count);
         }
         if self.follow_tail && received > 0 {
             self.select_tail(self.viewport_rows);
+        } else if !self.follow_tail {
+            self.restore_protocol_selections(selected_http_sequence, selected_websocket);
         } else {
             self.clamp_selection();
         }
@@ -686,51 +734,136 @@ impl TrafficState {
     }
 
     fn clamp_selection(&mut self) {
-        self.event_view.clamp_to_len(self.rows.len());
-        self.http_view.clamp_to_len(self.http_exchanges.len());
+        for mode in TrafficViewMode::all() {
+            let len = self.projection_len(mode);
+            self.viewport_mut(mode).clamp_to_len(len);
+        }
     }
 
     fn select_tail(&mut self, visible_rows: usize) {
-        match self.active_view().active {
-            TrafficViewMode::Http => self
-                .http_view
-                .select_tail(self.http_exchanges.len(), visible_rows),
-            TrafficViewMode::Events => self.event_view.select_tail(self.rows.len(), visible_rows),
-        }
+        let projection = self.active_projection();
+        self.viewport_mut(projection.mode)
+            .select_tail(projection.len, visible_rows);
         self.follow_tail = true;
     }
 
-    fn rebuild_http_exchanges(&mut self) {
+    fn clamp_viewports_to_visible_rows(&mut self) {
+        for mode in TrafficViewMode::all() {
+            let len = self.projection_len(mode);
+            let visible_rows = self.viewport_rows;
+            self.viewport_mut(mode)
+                .clamp_selection_to_viewport(len, visible_rows);
+        }
+    }
+
+    fn reset_viewports(&mut self) {
+        for mode in TrafficViewMode::all() {
+            self.viewport_mut(mode).reset();
+        }
+    }
+
+    fn rebuild_protocol_views(&mut self) {
         self.http_exchanges = build_http_exchange_rows(&self.rows);
+        self.websocket_sessions = build_websocket_session_rows(&self.rows);
         self.http_view.clamp_to_len(self.http_exchanges.len());
+        self.websocket_view
+            .clamp_to_len(self.websocket_sessions.len());
+    }
+
+    fn restore_protocol_selections(
+        &mut self,
+        http_sequence: Option<u64>,
+        websocket_selection: Option<WebSocketSelection>,
+    ) {
+        let http_index = http_sequence.and_then(|sequence| {
+            nearest_sequence_index(
+                &self.http_exchanges,
+                sequence,
+                HttpExchangeRow::order_sequence,
+            )
+        });
+        if let Some(index) = http_index {
+            let len = self.http_exchanges.len();
+            self.http_view.select_row(len, index, self.viewport_rows);
+        }
+
+        let websocket_index = websocket_selection.and_then(|selection| {
+            self.websocket_sessions
+                .iter()
+                .position(|row| row.matches_identity(&selection.identity))
+                .or_else(|| {
+                    nearest_sequence_index(
+                        &self.websocket_sessions,
+                        selection.order_sequence,
+                        WebSocketSessionRow::order_sequence,
+                    )
+                })
+        });
+        if let Some(index) = websocket_index {
+            let len = self.websocket_sessions.len();
+            self.websocket_view
+                .select_row(len, index, self.viewport_rows);
+        }
     }
 
     fn active_view(&self) -> TrafficActiveView {
         TrafficActiveView::from_state(
             self.view_mode,
             !self.http_exchanges.is_empty(),
+            !self.websocket_sessions.is_empty(),
             !self.rows.is_empty(),
         )
+    }
+
+    fn active_projection(&self) -> TrafficProjection {
+        let mode = self.active_view().active;
+        TrafficProjection {
+            mode,
+            len: self.projection_len(mode),
+        }
+    }
+
+    fn projection_len(&self, mode: TrafficViewMode) -> usize {
+        match mode {
+            TrafficViewMode::Http => self.http_exchanges.len(),
+            TrafficViewMode::WebSocket => self.websocket_sessions.len(),
+            TrafficViewMode::Events => self.rows.len(),
+        }
+    }
+
+    fn viewport_mut(&mut self, mode: TrafficViewMode) -> &mut TrafficViewport {
+        match mode {
+            TrafficViewMode::Http => &mut self.http_view,
+            TrafficViewMode::WebSocket => &mut self.websocket_view,
+            TrafficViewMode::Events => &mut self.event_view,
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TrafficViewMode {
     Http,
+    WebSocket,
     Events,
 }
 
 impl TrafficViewMode {
+    const fn all() -> [Self; 3] {
+        [Self::Http, Self::WebSocket, Self::Events]
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Http => "HTTP",
+            Self::WebSocket => "WebSocket",
             Self::Events => "Events",
         }
     }
 
     fn next(self) -> Self {
         match self {
-            Self::Http => Self::Events,
+            Self::Http => Self::WebSocket,
+            Self::WebSocket => Self::Events,
             Self::Events => Self::Http,
         }
     }
@@ -744,12 +877,32 @@ struct TrafficActiveView {
 }
 
 impl TrafficActiveView {
-    fn from_state(requested: TrafficViewMode, has_http_exchanges: bool, has_events: bool) -> Self {
-        match (requested, has_http_exchanges, has_events) {
-            (TrafficViewMode::Http, false, true) => Self {
+    fn from_state(
+        requested: TrafficViewMode,
+        has_http_exchanges: bool,
+        has_websocket_sessions: bool,
+        has_events: bool,
+    ) -> Self {
+        match (
+            requested,
+            has_http_exchanges,
+            has_websocket_sessions,
+            has_events,
+        ) {
+            (TrafficViewMode::Http, false, true, _) => Self {
+                requested,
+                active: TrafficViewMode::WebSocket,
+                fallback: Some(TrafficViewFallback::NoHttpExchanges),
+            },
+            (TrafficViewMode::Http, false, false, true) => Self {
                 requested,
                 active: TrafficViewMode::Events,
                 fallback: Some(TrafficViewFallback::NoHttpExchanges),
+            },
+            (TrafficViewMode::WebSocket, _, false, true) => Self {
+                requested,
+                active: TrafficViewMode::Events,
+                fallback: Some(TrafficViewFallback::NoWebSocketSessions),
             },
             _ => Self {
                 requested,
@@ -764,6 +917,9 @@ impl TrafficActiveView {
             Some(TrafficViewFallback::NoHttpExchanges) => {
                 format!("{} (no HTTP)", self.active.label())
             }
+            Some(TrafficViewFallback::NoWebSocketSessions) => {
+                format!("{} (no WebSocket)", self.active.label())
+            }
             None => self.requested.label().to_string(),
         }
     }
@@ -772,6 +928,7 @@ impl TrafficActiveView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrafficViewFallback {
     NoHttpExchanges,
+    NoWebSocketSessions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -941,6 +1098,19 @@ fn traffic_rows_for_snapshot(snapshot: EventTailSnapshot) -> Vec<TrafficRow> {
     rows
 }
 
+fn nearest_sequence_index<T>(
+    rows: &[T],
+    sequence: u64,
+    row_sequence: impl Fn(&T) -> u64,
+) -> Option<usize> {
+    if rows.is_empty() {
+        return None;
+    }
+    rows.iter()
+        .position(|row| row_sequence(row) >= sequence)
+        .or_else(|| Some(rows.len() - 1))
+}
+
 fn omission_summary(omissions: &[EventTailOmission]) -> Option<String> {
     let first = omissions.first()?;
     let suffix = match omissions.len() {
@@ -993,11 +1163,14 @@ fn traffic_refresh_error_message(error: &TrafficClientError) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::RangeInclusive;
+
     use probe_config::{CaptureBackend, CaptureSelection};
     use probe_core::{
         AddressPort, BodyChunk, CaptureOrigin, CaptureSource, EventEnvelope, EventKind,
         FlowContext, FlowIdentity, Gap, ProcessContext, ProcessIdentity, RuntimeMode,
-        SpoolPayloadSchema, Timestamp, TransportProtocol,
+        SpoolPayloadSchema, Timestamp, TransportProtocol, WebSocketHandoff, WebSocketMessage,
+        WebSocketMessageOpcode,
     };
     use runtime::{CaptureEvidenceMode, CaptureInputSource, CapturePlanMode};
 
@@ -1231,6 +1404,116 @@ mod tests {
             }
         );
         assert!(!traffic.showing_http_exchanges());
+    }
+
+    #[test]
+    fn default_view_uses_websocket_sessions_when_http_is_empty() {
+        let mut traffic = TrafficState::default();
+
+        traffic.apply_snapshot(tail_snapshot_with_websocket_session());
+
+        assert_eq!(traffic.view_mode_label(), "WebSocket (no HTTP)");
+        assert!(traffic.showing_websocket_sessions());
+        assert_eq!(traffic.active_row_count(), 1);
+        assert_eq!(
+            traffic.websocket_sessions()[0].summary,
+            "/ws (0 frames, 1 messages, 5 B)"
+        );
+        assert!(
+            traffic
+                .detail_preview_lines(9)
+                .iter()
+                .any(|line| line == "Message payload: 5 bytes")
+        );
+        assert!(
+            traffic
+                .selected_detail_lines()
+                .expect("WebSocket session detail")
+                .iter()
+                .any(|line| line == "    Payload: hello")
+        );
+    }
+
+    #[test]
+    fn websocket_view_falls_back_to_events_when_no_websocket_sessions_are_visible() {
+        let mut traffic = TrafficState::default();
+        traffic.cycle_view_mode();
+        assert_eq!(traffic.view_mode_label(), "WebSocket");
+
+        traffic.apply_snapshot(tail_snapshot_with_gap_events(1..=3));
+
+        assert_eq!(traffic.view_mode_label(), "Events (no WebSocket)");
+        assert!(!traffic.showing_websocket_sessions());
+    }
+
+    #[test]
+    fn empty_tail_jump_resets_all_projection_viewports() {
+        let mut traffic = TrafficState {
+            event_view: TrafficViewport {
+                selected_index: 3,
+                scroll: 2,
+            },
+            http_view: TrafficViewport {
+                selected_index: 4,
+                scroll: 3,
+            },
+            websocket_view: TrafficViewport {
+                selected_index: 5,
+                scroll: 4,
+            },
+            ..Default::default()
+        };
+
+        traffic.jump_to_tail(10);
+
+        assert_eq!(traffic.scroll(), 0);
+        assert_eq!(traffic.selected_index(), 0);
+        assert_eq!(traffic.http_scroll(), 0);
+        assert_eq!(traffic.selected_http_exchange_index(), 0);
+        assert_eq!(traffic.websocket_scroll(), 0);
+        assert_eq!(traffic.selected_websocket_session_index(), 0);
+    }
+
+    #[test]
+    fn paused_websocket_selection_moves_to_nearest_surviving_session_after_window_rolls() {
+        let mut traffic = TrafficState::default();
+        traffic.set_viewport_rows(10);
+        traffic.apply_snapshot(tail_snapshot_with_websocket_handoffs(1..=MAX_ROWS as u64));
+
+        traffic.select_row(5, 10);
+        assert!(!traffic.following_tail());
+        assert_eq!(traffic.websocket_sessions()[5].sequence, 6);
+
+        traffic.apply_snapshot(tail_snapshot_with_websocket_handoffs(
+            (MAX_ROWS as u64 + 1)..=(MAX_ROWS as u64 + 10),
+        ));
+
+        assert_eq!(traffic.selected_websocket_session_index(), 0);
+        assert_eq!(traffic.websocket_sessions()[0].sequence, 11);
+        assert_eq!(traffic.websocket_sessions()[0].target, "/ws/11");
+    }
+
+    #[test]
+    fn paused_websocket_selection_restores_same_surviving_session_when_order_moves() {
+        let mut traffic = TrafficState::default();
+        traffic.set_viewport_rows(10);
+        traffic.apply_snapshot(tail_snapshot_from_records(vec![
+            (1, websocket_handoff_event_with_flow("flow-b", 1, "/b")),
+            (20, websocket_message_event_with_flow("flow-b", 20, b"b1")),
+            (25, websocket_handoff_event_with_flow("flow-d", 25, "/d")),
+        ]));
+
+        assert_eq!(traffic.websocket_sessions()[0].target, "/b");
+        traffic.select_row(0, 10);
+        assert!(!traffic.following_tail());
+
+        traffic.apply_snapshot(tail_snapshot_from_records(vec![
+            (30, websocket_handoff_event_with_flow("flow-c", 30, "/c")),
+            (40, websocket_message_event_with_flow("flow-b", 40, b"b2")),
+        ]));
+
+        let selected = traffic.selected_websocket_session_index();
+        assert_eq!(traffic.websocket_sessions()[selected].target, "/b");
     }
 
     #[test]
@@ -1665,6 +1948,94 @@ mod tests {
         }
     }
 
+    fn tail_snapshot_with_websocket_session() -> EventTailSnapshot {
+        let events = vec![
+            EventTailRecord {
+                sequence: 1,
+                stored_at_unix_ns: 100,
+                event: websocket_handoff_event("/ws"),
+            },
+            EventTailRecord {
+                sequence: 2,
+                stored_at_unix_ns: 200,
+                event: websocket_message_event(b"hello"),
+            },
+        ];
+        EventTailSnapshot {
+            after_sequence: 0,
+            next_after_sequence: 2,
+            last_export_sequence: 2,
+            limit: events.len(),
+            scanned: events.len(),
+            budget: EventTailBudgetSnapshot {
+                max_event_payload_bytes: 512,
+                max_response_payload_bytes: 4096,
+                included_payload_bytes: 0,
+                truncated: false,
+            },
+            events,
+            omissions: Vec::new(),
+        }
+    }
+
+    fn tail_snapshot_with_websocket_handoffs(range: RangeInclusive<u64>) -> EventTailSnapshot {
+        let after_sequence = range.start().saturating_sub(1);
+        let next_after_sequence = *range.end();
+        let events = range
+            .map(|sequence| EventTailRecord {
+                sequence,
+                stored_at_unix_ns: sequence,
+                event: websocket_handoff_event_for_flow(sequence),
+            })
+            .collect::<Vec<_>>();
+        EventTailSnapshot {
+            after_sequence,
+            next_after_sequence,
+            last_export_sequence: next_after_sequence,
+            limit: events.len(),
+            scanned: events.len(),
+            budget: EventTailBudgetSnapshot {
+                max_event_payload_bytes: 512,
+                max_response_payload_bytes: 4096,
+                included_payload_bytes: 0,
+                truncated: false,
+            },
+            events,
+            omissions: Vec::new(),
+        }
+    }
+
+    fn tail_snapshot_from_records(records: Vec<(u64, EventEnvelope)>) -> EventTailSnapshot {
+        let next_after_sequence = records
+            .iter()
+            .map(|(sequence, _)| *sequence)
+            .max()
+            .unwrap_or_default();
+        let events = records
+            .into_iter()
+            .map(|(sequence, event)| EventTailRecord {
+                sequence,
+                stored_at_unix_ns: sequence,
+                event,
+            })
+            .collect::<Vec<_>>();
+        EventTailSnapshot {
+            after_sequence: 0,
+            next_after_sequence,
+            last_export_sequence: next_after_sequence,
+            limit: events.len(),
+            scanned: events.len(),
+            budget: EventTailBudgetSnapshot {
+                max_event_payload_bytes: 512,
+                max_response_payload_bytes: 4096,
+                included_payload_bytes: 0,
+                truncated: false,
+            },
+            events,
+            omissions: Vec::new(),
+        }
+    }
+
     fn request_event(method: &str, target: &str) -> EventEnvelope {
         EventEnvelope::from_flow(
             Timestamp {
@@ -1683,6 +2054,110 @@ mod tests {
                 reason: None,
                 version: "HTTP/1.1".to_string(),
                 headers: Vec::new(),
+            }),
+        )
+    }
+
+    fn websocket_handoff_event(target: &str) -> EventEnvelope {
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            test_flow(),
+            CaptureOrigin::from_source(CaptureSource::Replay),
+            "test",
+            EventKind::WebSocketHandoff(WebSocketHandoff {
+                direction: probe_core::Direction::Outbound,
+                stream_sequence: 1,
+                target: Some(target.to_string()),
+                subprotocol: None,
+                extensions: Vec::new(),
+            }),
+        )
+    }
+
+    fn websocket_handoff_event_for_flow(sequence: u64) -> EventEnvelope {
+        websocket_handoff_event_with_flow(
+            &format!("websocket-flow-{sequence}"),
+            sequence,
+            &format!("/ws/{sequence}"),
+        )
+    }
+
+    fn websocket_handoff_event_with_flow(
+        flow_id: &str,
+        sequence: u64,
+        target: &str,
+    ) -> EventEnvelope {
+        let mut flow = test_flow();
+        flow.id = FlowIdentity(flow_id.to_string());
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: sequence,
+                wall_time_unix_ns: sequence as i64,
+            },
+            flow,
+            CaptureOrigin::from_source(CaptureSource::Replay),
+            "test",
+            EventKind::WebSocketHandoff(WebSocketHandoff {
+                direction: probe_core::Direction::Outbound,
+                stream_sequence: 1,
+                target: Some(target.to_string()),
+                subprotocol: None,
+                extensions: Vec::new(),
+            }),
+        )
+    }
+
+    fn websocket_message_event_with_flow(
+        flow_id: &str,
+        sequence: u64,
+        payload: &[u8],
+    ) -> EventEnvelope {
+        let mut flow = test_flow();
+        flow.id = FlowIdentity(flow_id.to_string());
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: sequence,
+                wall_time_unix_ns: sequence as i64,
+            },
+            flow,
+            CaptureOrigin::from_source(CaptureSource::Replay),
+            "test",
+            EventKind::WebSocketMessage(WebSocketMessage {
+                direction: probe_core::Direction::Outbound,
+                stream_sequence: 1,
+                message_sequence: sequence,
+                first_frame_sequence: sequence,
+                final_frame_sequence: sequence,
+                opcode: WebSocketMessageOpcode::Text,
+                payload_len: payload.len() as u64,
+                payload: payload.to_vec().into(),
+                payload_fingerprint: vec![0xab],
+            }),
+        )
+    }
+
+    fn websocket_message_event(payload: &[u8]) -> EventEnvelope {
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            test_flow(),
+            CaptureOrigin::from_source(CaptureSource::Replay),
+            "test",
+            EventKind::WebSocketMessage(WebSocketMessage {
+                direction: probe_core::Direction::Outbound,
+                stream_sequence: 1,
+                message_sequence: 1,
+                first_frame_sequence: 1,
+                final_frame_sequence: 1,
+                opcode: WebSocketMessageOpcode::Text,
+                payload_len: payload.len() as u64,
+                payload: payload.to_vec().into(),
+                payload_fingerprint: vec![0xab],
             }),
         )
     }
@@ -1749,6 +2224,7 @@ mod tests {
 
     fn traffic_in_events_view() -> TrafficState {
         let mut traffic = TrafficState::default();
+        traffic.cycle_view_mode();
         traffic.cycle_view_mode();
         traffic
     }

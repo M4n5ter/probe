@@ -350,6 +350,10 @@ fn render_traffic_events(
         render_http_exchanges(frame, area, app, hits);
         return;
     }
+    if app.traffic().showing_websocket_sessions() {
+        render_websocket_sessions(frame, area, app, hits);
+        return;
+    }
     render_traffic_event_rows(frame, area, app, hits);
 }
 
@@ -359,66 +363,19 @@ fn render_http_exchanges(
     app: &mut TuiApp,
     hits: &mut Vec<HitArea>,
 ) {
-    hits.push(HitArea::scroll(area, ScrollTarget::TrafficEvents));
     let visible_rows = area.height.saturating_sub(3) as usize;
     app.set_traffic_viewport_rows(visible_rows);
     let traffic = app.traffic();
-    let start = traffic
-        .http_scroll()
-        .min(traffic.http_exchanges().len().saturating_sub(visible_rows));
-    let end = start
-        .saturating_add(visible_rows)
-        .min(traffic.http_exchanges().len());
-    let rows = traffic.http_exchanges()[start..end]
-        .iter()
-        .enumerate()
-        .map(|(visible_index, exchange)| {
-            let absolute_index = start + visible_index;
-            let marker = if absolute_index == traffic.selected_http_exchange_index() {
-                ">"
-            } else {
-                " "
-            };
-            let row = Row::new([
-                Cell::from(marker),
-                Cell::from(exchange.sequence.to_string()),
-                Cell::from(exchange.process.clone()),
-                Cell::from(exchange.method.clone()),
-                Cell::from(super::truncate(&exchange.target, 40)),
-                Cell::from(exchange.status.clone()),
-                Cell::from(exchange.direction.clone()),
-                Cell::from(exchange.endpoint.clone()),
-                Cell::from(super::truncate(&exchange.summary, TRAFFIC_SUMMARY_WIDTH)),
-            ]);
-            if app.is_hovered(HitTarget::TrafficRow(absolute_index)) {
-                row.style(Style::default().fg(Color::Black).bg(Color::Gray))
-            } else {
-                row
-            }
-        })
-        .collect::<Vec<_>>();
-
-    let row_start = super::table_data_row_start(area);
-    for visible_index in 0..end.saturating_sub(start) {
-        hits.push(HitArea::new(
-            Rect::new(
-                area.x + 1,
-                row_start + visible_index as u16,
-                area.width.saturating_sub(2),
-                1,
-            ),
-            HitTarget::TrafficRow(start + visible_index),
-        ));
-    }
-
-    let mut state = TableState::new().with_selected(
-        (!traffic.http_exchanges().is_empty())
-            .then_some(traffic.selected_http_exchange_index().saturating_sub(start)),
-    );
-    frame.render_stateful_widget(
-        Table::new(
-            rows,
-            [
+    render_traffic_table(
+        frame,
+        area,
+        hits,
+        TrafficTableSpec {
+            title: "HTTP Exchanges",
+            headers: vec![
+                "", "Seq", "Process", "Method", "Target", "Status", "Dir", "Remote", "Summary",
+            ],
+            constraints: vec![
                 Constraint::Length(2),
                 Constraint::Length(8),
                 Constraint::Length(20),
@@ -429,46 +386,82 @@ fn render_http_exchanges(
                 Constraint::Length(22),
                 Constraint::Min(20),
             ],
-        )
-        .header(
+            total_len: traffic.http_exchanges().len(),
+            scroll: traffic.http_scroll(),
+            selected_index: traffic.selected_http_exchange_index(),
+            visible_rows,
+        },
+        |absolute_index| app.is_hovered(HitTarget::TrafficRow(absolute_index)),
+        |absolute_index, marker| {
+            let exchange = &traffic.http_exchanges()[absolute_index];
             Row::new([
-                "", "Seq", "Process", "Method", "Target", "Status", "Dir", "Remote", "Summary",
+                Cell::from(marker),
+                Cell::from(exchange.sequence.to_string()),
+                Cell::from(exchange.process.clone()),
+                Cell::from(exchange.method.clone()),
+                Cell::from(super::truncate(&exchange.target, 40)),
+                Cell::from(exchange.status.clone()),
+                Cell::from(exchange.direction.clone()),
+                Cell::from(exchange.endpoint.clone()),
+                Cell::from(super::truncate(&exchange.summary, TRAFFIC_SUMMARY_WIDTH)),
             ])
-            .style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        )
-        .highlight_spacing(HighlightSpacing::Always)
-        .row_highlight_style(Style::default().fg(Color::Black).bg(Color::LightBlue))
-        .block(Block::bordered().title("HTTP Exchanges")),
-        area,
-        &mut state,
+        },
     );
-    let scroll_track = super::table_scroll_track(area);
-    super::render_vertical_scrollbar(
+}
+
+fn render_websocket_sessions(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut TuiApp,
+    hits: &mut Vec<HitArea>,
+) {
+    let visible_rows = area.height.saturating_sub(3) as usize;
+    app.set_traffic_viewport_rows(visible_rows);
+    let traffic = app.traffic();
+    render_traffic_table(
         frame,
-        scroll_track,
-        traffic.http_exchanges().len(),
-        traffic.http_scroll(),
-        visible_rows,
+        area,
+        hits,
+        TrafficTableSpec {
+            title: "WebSocket Sessions",
+            headers: vec![
+                "", "Seq", "Process", "Target", "Dir", "Remote", "Frames", "Messages", "Payload",
+                "Summary",
+            ],
+            constraints: vec![
+                Constraint::Length(2),
+                Constraint::Length(8),
+                Constraint::Length(20),
+                Constraint::Length(30),
+                Constraint::Length(5),
+                Constraint::Length(22),
+                Constraint::Length(8),
+                Constraint::Length(9),
+                Constraint::Length(10),
+                Constraint::Min(20),
+            ],
+            total_len: traffic.websocket_sessions().len(),
+            scroll: traffic.websocket_scroll(),
+            selected_index: traffic.selected_websocket_session_index(),
+            visible_rows,
+        },
+        |absolute_index| app.is_hovered(HitTarget::TrafficRow(absolute_index)),
+        |absolute_index, marker| {
+            let session = &traffic.websocket_sessions()[absolute_index];
+            Row::new([
+                Cell::from(marker),
+                Cell::from(session.sequence.to_string()),
+                Cell::from(session.process.clone()),
+                Cell::from(super::truncate(&session.target, 36)),
+                Cell::from(session.direction.clone()),
+                Cell::from(session.endpoint.clone()),
+                Cell::from(session.frames.to_string()),
+                Cell::from(session.messages.to_string()),
+                Cell::from(format!("{} B", session.payload_bytes)),
+                Cell::from(super::truncate(&session.summary, TRAFFIC_SUMMARY_WIDTH)),
+            ])
+        },
     );
-    if traffic.http_exchanges().len() > visible_rows
-        && scroll_track.width > 0
-        && scroll_track.height > 0
-    {
-        let hit_width = area.width.min(3);
-        hits.push(HitArea::scrollbar(
-            Rect::new(
-                area.x.saturating_add(area.width.saturating_sub(hit_width)),
-                scroll_track.y,
-                hit_width,
-                scroll_track.height,
-            ),
-            ScrollTarget::TrafficEvents,
-        ));
-    }
 }
 
 fn render_traffic_event_rows(
@@ -477,25 +470,37 @@ fn render_traffic_event_rows(
     app: &mut TuiApp,
     hits: &mut Vec<HitArea>,
 ) {
-    hits.push(HitArea::scroll(area, ScrollTarget::TrafficEvents));
     let visible_rows = area.height.saturating_sub(3) as usize;
     app.set_traffic_viewport_rows(visible_rows);
     let traffic = app.traffic();
-    let start = traffic
-        .scroll()
-        .min(traffic.rows().len().saturating_sub(visible_rows));
-    let end = start.saturating_add(visible_rows).min(traffic.rows().len());
-    let rows = traffic.rows()[start..end]
-        .iter()
-        .enumerate()
-        .map(|(visible_index, event)| {
-            let absolute_index = start + visible_index;
-            let marker = if absolute_index == traffic.selected_index() {
-                ">"
-            } else {
-                " "
-            };
-            let row = Row::new([
+    render_traffic_table(
+        frame,
+        area,
+        hits,
+        TrafficTableSpec {
+            title: "Traffic Events",
+            headers: vec![
+                "", "Seq", "Process", "Path", "Event", "Dir", "Remote", "Summary",
+            ],
+            constraints: vec![
+                Constraint::Length(2),
+                Constraint::Length(8),
+                Constraint::Length(20),
+                Constraint::Length(12),
+                Constraint::Length(22),
+                Constraint::Length(5),
+                Constraint::Length(22),
+                Constraint::Min(20),
+            ],
+            total_len: traffic.rows().len(),
+            scroll: traffic.scroll(),
+            selected_index: traffic.selected_index(),
+            visible_rows,
+        },
+        |absolute_index| app.is_hovered(HitTarget::TrafficRow(absolute_index)),
+        |absolute_index, marker| {
+            let event = &traffic.rows()[absolute_index];
+            Row::new([
                 Cell::from(marker),
                 Cell::from(event.sequence.to_string()),
                 Cell::from(event.process.clone()),
@@ -504,15 +509,49 @@ fn render_traffic_event_rows(
                 Cell::from(event.direction.clone()),
                 Cell::from(event.endpoint.clone()),
                 Cell::from(super::truncate(&event.summary, TRAFFIC_SUMMARY_WIDTH)),
-            ]);
-            if app.is_hovered(HitTarget::TrafficRow(absolute_index)) {
+            ])
+        },
+    );
+}
+
+struct TrafficTableSpec {
+    title: &'static str,
+    headers: Vec<&'static str>,
+    constraints: Vec<Constraint>,
+    total_len: usize,
+    scroll: usize,
+    selected_index: usize,
+    visible_rows: usize,
+}
+
+fn render_traffic_table<'a>(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hits: &mut Vec<HitArea>,
+    spec: TrafficTableSpec,
+    mut is_hovered: impl FnMut(usize) -> bool,
+    mut row_at: impl FnMut(usize, &'static str) -> Row<'a>,
+) {
+    hits.push(HitArea::scroll(area, ScrollTarget::TrafficEvents));
+    let start = spec
+        .scroll
+        .min(spec.total_len.saturating_sub(spec.visible_rows));
+    let end = start.saturating_add(spec.visible_rows).min(spec.total_len);
+    let rows = (start..end)
+        .map(|absolute_index| {
+            let marker = if absolute_index == spec.selected_index {
+                ">"
+            } else {
+                " "
+            };
+            let row = row_at(absolute_index, marker);
+            if is_hovered(absolute_index) {
                 row.style(Style::default().fg(Color::Black).bg(Color::Gray))
             } else {
                 row
             }
         })
         .collect::<Vec<_>>();
-
     let row_start = super::table_data_row_start(area);
     for visible_index in 0..end.saturating_sub(start) {
         hits.push(HitArea::new(
@@ -526,36 +565,20 @@ fn render_traffic_event_rows(
         ));
     }
 
-    let mut state = TableState::new().with_selected(
-        (!traffic.rows().is_empty()).then_some(traffic.selected_index().saturating_sub(start)),
-    );
+    let mut state = TableState::new()
+        .with_selected((spec.total_len > 0).then_some(spec.selected_index.saturating_sub(start)));
     frame.render_stateful_widget(
-        Table::new(
-            rows,
-            [
-                Constraint::Length(2),
-                Constraint::Length(8),
-                Constraint::Length(20),
-                Constraint::Length(12),
-                Constraint::Length(22),
-                Constraint::Length(5),
-                Constraint::Length(22),
-                Constraint::Min(20),
-            ],
-        )
-        .header(
-            Row::new([
-                "", "Seq", "Process", "Path", "Event", "Dir", "Remote", "Summary",
-            ])
-            .style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        )
-        .highlight_spacing(HighlightSpacing::Always)
-        .row_highlight_style(Style::default().fg(Color::Black).bg(Color::LightBlue))
-        .block(Block::bordered().title("Traffic Events")),
+        Table::new(rows, spec.constraints)
+            .header(
+                Row::new(spec.headers).style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            )
+            .highlight_spacing(HighlightSpacing::Always)
+            .row_highlight_style(Style::default().fg(Color::Black).bg(Color::LightBlue))
+            .block(Block::bordered().title(spec.title)),
         area,
         &mut state,
     );
@@ -563,11 +586,11 @@ fn render_traffic_event_rows(
     super::render_vertical_scrollbar(
         frame,
         scroll_track,
-        traffic.rows().len(),
-        traffic.scroll(),
-        visible_rows,
+        spec.total_len,
+        spec.scroll,
+        spec.visible_rows,
     );
-    if traffic.rows().len() > visible_rows && scroll_track.width > 0 && scroll_track.height > 0 {
+    if spec.total_len > spec.visible_rows && scroll_track.width > 0 && scroll_track.height > 0 {
         let hit_width = area.width.min(3);
         hits.push(HitArea::scrollbar(
             Rect::new(

@@ -1,13 +1,13 @@
 use std::fmt;
 
-use probe_core::{
-    CaptureOrigin, CaptureSource, CaptureTrafficSecurity, Direction, EventEnvelope, EventKind,
-};
+use probe_core::{CaptureOrigin, CaptureSource, CaptureTrafficSecurity, EventEnvelope, EventKind};
 
 use crate::{
     admin::{EventDetailSnapshot, EventTailBudgetSnapshot, EventTailOmission, EventTailRecord},
     tui::copy::{MITM_HTTP_PATH_LABEL, MITM_TLS_PATH_LABEL},
 };
+
+use super::text::{bytes_detail, direction_label, escape_text, fit_preview_lines};
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct TrafficRow {
@@ -225,13 +225,6 @@ fn capture_source_detail_label(source: CaptureSource) -> &'static str {
         CaptureSource::L7MitmControlPlane => "MITM control plane",
         CaptureSource::Replay => "replay",
         CaptureSource::Mock => "mock",
-    }
-}
-
-fn direction_label(direction: Direction) -> &'static str {
-    match direction {
-        Direction::Inbound => "in",
-        Direction::Outbound => "out",
     }
 }
 
@@ -480,19 +473,6 @@ fn http_header_detail_lines(headers: &probe_core::HttpHeaders) -> Vec<String> {
     lines
 }
 
-fn fit_preview_lines(mut lines: Vec<String>, max_lines: usize) -> Vec<String> {
-    let max_lines = max_lines.max(1);
-    if lines.len() <= max_lines {
-        return lines;
-    }
-    let prompt = lines.pop().unwrap_or_else(|| "Open detail".to_string());
-    lines.truncate(max_lines);
-    if let Some(last) = lines.last_mut() {
-        *last = prompt;
-    }
-    lines
-}
-
 fn event_detail_lines(sequence: u64, event: &EventEnvelope) -> Vec<String> {
     let mut lines = vec![
         format!("Sequence: {sequence}"),
@@ -578,41 +558,10 @@ fn hex_preview(bytes: &[u8]) -> String {
     }
 }
 
-fn bytes_detail(bytes: &[u8]) -> String {
-    match std::str::from_utf8(bytes) {
-        Ok(text) => escape_text(text),
-        Err(_) => format!("hex: {}", hex_full(bytes)),
-    }
-}
-
-fn hex_full(bytes: &[u8]) -> String {
-    if bytes.is_empty() {
-        return "-".to_string();
-    }
-    bytes
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join("")
-}
-
-fn escape_text(value: &str) -> String {
-    if value.is_empty() {
-        return "-".to_string();
-    }
-    let mut output = String::new();
-    for character in value.chars() {
-        for escaped in character.escape_default() {
-            output.push(escaped);
-        }
-    }
-    output
-}
-
 #[cfg(test)]
 mod tests {
     use probe_core::{
-        AddressPort, BodyChunk, CaptureOrigin, CaptureSource, FlowContext, FlowIdentity,
+        AddressPort, BodyChunk, CaptureOrigin, CaptureSource, Direction, FlowContext, FlowIdentity,
         HttpHeaders, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
     };
 

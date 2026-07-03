@@ -315,6 +315,13 @@ Operator TUI 能力事实：
   该路径返回完整 `EventEnvelope` 给 admin client，但 TUI 只保留事件表展示摘要，不在 TUI model 中保留 raw argv。
   当选中进程有 readable executable path 时，Traffic tab 使用同一 selector model 过滤事件；选中进程无法形成 executable-path
   selector 时 fail-closed，不退回全机流量。
+  Traffic tab 有三个观察层级：HTTP exchange、WebSocket session 和 raw event。HTTP exchange
+  将 request/response headers 和 body chunks 合并成面向请求/响应的行；WebSocket session 将
+  Upgrade handoff、frame metadata 和有界 message payload 合并成面向连接语义的行；raw event
+  保留逐事件诊断能力，用于 SSE event、connection lifecycle、parser gap、provider loss、
+  capture_loss 和其它低层事件排查。
+  HTTP 与 WebSocket 聚合详情使用 `tail_events` 已返回的 bounded event payload；raw omission
+  row 需要完整 retained payload 详情时才通过 `event_detail` 后台补齐。
   Traffic tab 的 action bar 将 `[Watch]`、`[Out MITM]` 和 `[In MITM]` 放在事件浏览入口；键盘 `w`、`o`、`i`
   与鼠标点击进入同一 typed action path。`Watch` 仅改变 traffic selector；MITM quick actions 会为选中进程写入 scoped
   product-proxy MITM、client trust、plaintext bridge 和 policy hook contract。出站 quick action 默认约束
@@ -363,6 +370,7 @@ Operator TUI 能力事实：
   exporter header/TLS material ref 或完整 MITM backend contract。它可以把常见 selector、export sink target
   和运行面开关转成配置，但复杂策略仍由配置文件、policy bundle 和专门文档表达。
 - TUI 验证路径分三层：状态机单测覆盖 action、config mutation、storage retention mutation、键鼠 action 等价和 process selector fail-closed；
+  Traffic 状态机单测覆盖 HTTP exchange fallback、WebSocket session projection、raw event fallback 和 tail-follow selection；
   ratatui `TestBackend` 覆盖主要画面、文本编辑面板和 hit map；保存器单测覆盖 format-preserving update、selector TOML contract、
   stale file rejection、unsupported TOML shape rejection、static validation fail-closed、atomic save、mode preservation、
   lock file mode、symlink rejection、exporter target/transport synchronization、editable field persistence contract 和 load path。

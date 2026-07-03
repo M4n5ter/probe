@@ -65,7 +65,9 @@ impl ControlId {
         match self {
             Self::ReloadRuntimeActions => "uses active TUI runtime".to_string(),
             Self::OpenTrafficDiagnostics => "capture and MITM runtime diagnostics".to_string(),
-            Self::TrafficViewMode => "HTTP exchanges or raw traffic events".to_string(),
+            Self::TrafficViewMode => {
+                "HTTP exchanges, WebSocket sessions, or raw traffic events".to_string()
+            }
             Self::TrafficEventFilter => {
                 "parsed protocol, security, diagnostics, or all events".to_string()
             }
