@@ -1,6 +1,8 @@
 use crate::tui::{
     copy::{MITM_PLAINTEXT_COVERAGE, MITM_PROXY_FALLBACK_LABEL},
-    runtime_status::{TrafficRuntimeDiagnostics, missing_mitm_quick_setup_action},
+    runtime_status::{
+        TrafficRuntimeDiagnostics, missing_mitm_quick_setup_action, mitm_visibility_lines,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +179,7 @@ impl DataPathDiagnosticsView {
                 lines.push(format!(
                     "MITM: not evaluated; {MITM_PROXY_FALLBACK_LABEL} can capture {MITM_PLAINTEXT_COVERAGE}"
                 ));
+                lines.extend(mitm_visibility_lines());
                 lines.push(format!("MITM setup: {}", missing_mitm_quick_setup_action()));
             }
         }
@@ -219,5 +222,14 @@ mod tests {
                 .any(|line| line.kind == DataPathOverviewLineKind::NextAction
                     && line.value == "fix runtime config; use Data Path")
         );
+    }
+
+    #[test]
+    fn unavailable_details_still_explain_mitm_plain_and_tls_visibility() {
+        let lines = DataPathDiagnosticsView::unavailable("startup failed").detail_lines();
+
+        for expected in mitm_visibility_lines() {
+            assert!(lines.contains(&expected), "missing {expected}");
+        }
     }
 }

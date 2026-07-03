@@ -11,7 +11,10 @@ use self::{
 };
 use crate::{
     admin::{AdminClientError, EventDetailSnapshot, EventTailOmission, EventTailSnapshot},
-    tui::runtime_status::CaptureDiagnosticMessage,
+    tui::runtime_status::{
+        CaptureDiagnosticMessage, missing_mitm_quick_setup_action, mitm_fallback_coverage_line,
+        mitm_visibility_lines,
+    },
 };
 
 pub(crate) use rows::TrafficRow as TrafficTableRow;
@@ -149,8 +152,13 @@ impl TrafficState {
     }
 
     pub(crate) fn diagnostic_lines(&self) -> Vec<String> {
-        let mut lines = vec!["Select a traffic row to inspect details".to_string()];
-        lines.push("Open Data Path diagnostics for capture and MITM readiness".to_string());
+        let mut lines = vec![
+            "Select a traffic row to inspect details".to_string(),
+            "Open Data Path diagnostics for capture and MITM readiness".to_string(),
+            mitm_fallback_coverage_line(),
+        ];
+        lines.extend(mitm_visibility_lines());
+        lines.push(format!("MITM setup: {}", missing_mitm_quick_setup_action()));
         lines
     }
 
@@ -507,6 +515,22 @@ mod tests {
 
         assert_eq!(traffic.status().kind, TrafficStatusKind::Idle);
         assert_eq!(traffic.status().text, diagnostics.running_status_text(true));
+    }
+
+    #[test]
+    fn empty_traffic_diagnostics_explain_mitm_visibility_labels() {
+        let traffic = TrafficState::default();
+        let lines = traffic.diagnostic_lines();
+
+        assert!(lines.contains(&mitm_fallback_coverage_line()));
+        for expected in mitm_visibility_lines() {
+            assert!(lines.contains(&expected), "missing {expected}");
+        }
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("MITM Out") && line.contains("MITM In"))
+        );
     }
 
     #[test]

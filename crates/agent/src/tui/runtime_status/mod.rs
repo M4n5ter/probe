@@ -18,7 +18,10 @@ use crate::{
     },
     tui::{
         controls::ControlId,
-        copy::{MITM_PLAINTEXT_COVERAGE, MITM_PROXY_FALLBACK_LABEL, MITM_QUICK_SETUP_APPLY},
+        copy::{
+            MITM_HTTP_PATH_LABEL, MITM_PLAINTEXT_COVERAGE, MITM_PROXY_FALLBACK_LABEL,
+            MITM_QUICK_SETUP_APPLY, MITM_TLS_PATH_LABEL, MITM_TLS_TRUST_ACTION,
+        },
     },
 };
 
@@ -140,14 +143,18 @@ impl TrafficRuntimeDiagnostics {
     fn mitm_detail_lines(&self) -> Vec<String> {
         self.mitm.as_ref().map_or_else(
             || {
-                vec![
+                let mut lines = vec![
                     "MITM diagnostics".to_string(),
                     "strategy: disabled".to_string(),
                     format!("coverage: {MITM_PLAINTEXT_COVERAGE}"),
+                ];
+                lines.extend(mitm_visibility_lines());
+                lines.extend([
                     format!("quick setup: {}", missing_mitm_quick_setup_action()),
                     format!("apply: {MITM_QUICK_SETUP_APPLY}"),
                     format!("next action: {}", missing_mitm_next_step()),
-                ]
+                ]);
+                lines
             },
             MitmDiagnostics::detail_lines,
         )
@@ -200,6 +207,36 @@ pub(crate) fn missing_mitm_quick_setup_action() -> String {
         ControlId::ConfigureOutboundMitm.traffic_action_label(),
         ControlId::ConfigureInboundMitm.traffic_action_label()
     )
+}
+
+pub(crate) fn mitm_fallback_coverage_line() -> String {
+    format!(
+        "{MITM_PROXY_FALLBACK_LABEL} covers {MITM_PLAINTEXT_COVERAGE} when passive capture is unavailable"
+    )
+}
+
+pub(crate) fn mitm_visibility_lines() -> Vec<String> {
+    vec![
+        mitm_path_labels_line(),
+        mitm_plain_http_visibility_line(),
+        mitm_tls_http_visibility_line(),
+    ]
+}
+
+fn mitm_path_labels_line() -> String {
+    format!(
+        "path labels: {MITM_HTTP_PATH_LABEL}=plain HTTP, {MITM_TLS_PATH_LABEL}=TLS-decrypted HTTP"
+    )
+}
+
+fn mitm_plain_http_visibility_line() -> String {
+    format!(
+        "plain HTTP: visible as {MITM_HTTP_PATH_LABEL} after scoped MITM proxy event feed is active"
+    )
+}
+
+fn mitm_tls_http_visibility_line() -> String {
+    format!("TLS-decrypted HTTP: visible as {MITM_TLS_PATH_LABEL} after {MITM_TLS_TRUST_ACTION}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -421,6 +458,24 @@ mod tests {
         );
         let lines = diagnostics.detail_lines();
         assert!(lines.iter().any(|line| line == "strategy: disabled"));
+        assert_detail_line(
+            &lines,
+            format!(
+                "path labels: {MITM_HTTP_PATH_LABEL}=plain HTTP, {MITM_TLS_PATH_LABEL}=TLS-decrypted HTTP"
+            ),
+        );
+        assert_detail_line(
+            &lines,
+            format!(
+                "plain HTTP: visible as {MITM_HTTP_PATH_LABEL} after scoped MITM proxy event feed is active"
+            ),
+        );
+        assert_detail_line(
+            &lines,
+            format!(
+                "TLS-decrypted HTTP: visible as {MITM_TLS_PATH_LABEL} after {MITM_TLS_TRUST_ACTION}"
+            ),
+        );
         assert!(lines.iter().any(|line| {
             line.contains(ControlId::ConfigureOutboundMitm.traffic_action_label())
                 && line.contains(ControlId::ConfigureInboundMitm.traffic_action_label())

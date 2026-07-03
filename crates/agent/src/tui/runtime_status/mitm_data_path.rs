@@ -1,5 +1,3 @@
-use crate::tui::copy::{MITM_HTTP_PATH_LABEL, MITM_TLS_PATH_LABEL};
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct MitmDataPathDiagnosis {
     path_labels: String,
@@ -37,9 +35,7 @@ impl MitmDataPathDiagnosis {
         next_action: impl Into<String>,
     ) -> Self {
         Self {
-            path_labels: format!(
-                "path labels: {MITM_HTTP_PATH_LABEL}=plain HTTP, {MITM_TLS_PATH_LABEL}=TLS-decrypted HTTP"
-            ),
+            path_labels: super::mitm_path_labels_line(),
             plain_http: plain_http.into(),
             tls_http: tls_http.into(),
             plain_http_status,
