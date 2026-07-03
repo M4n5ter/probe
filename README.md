@@ -291,9 +291,13 @@ plaintext bridge and traffic view.
 The Runtime tab can call the online admin `reload_runtime_actions` command. It
 reloads the runtime owners that are explicitly safe to update online, currently
 policy bundles and the external enforcement manifest, and reports partial
-failures per action. It does not replace the active main agent config; use it
-after saving policy or enforcement inputs that are already referenced by the
-running config. The same tab edits admin socket settings for future runs; the
+failures per action. Saving from the TUI uses `apply_config_reload` when an
+active admin socket is available: policy-only main config changes are applied
+online when policy watcher and poller topology does not change; capture and
+observation data-path rebuild verdicts are queued as runtime generation
+requests and swapped by the live agent at capture safe points. Setup topology
+such as export, storage, admin socket, and watcher topology still requires a
+process rebuild. The same tab edits admin socket settings for future runs; the
 current TUI session keeps using the active socket it attached to at startup.
 
 ### Minimal Policy And Webhook Wiring
@@ -561,7 +565,9 @@ fallback_backends = ["ebpf", "libpcap"]
 # object_path = "/opt/traffic-probe/ebpf-process-observation.bpf.o"
 
 [capture.libpcap]
-interface = "any"
+# Leave unset for Linux host-wide capture through the "any" device.
+# Set a concrete interface only to narrow the capture scope.
+# interface = "eth0"
 bpf_filter = "tcp"
 snaplen = 65535
 promisc = false
@@ -1075,13 +1081,22 @@ state. `reload-runtime-actions` runs every runtime action that is safe under the
 active `RuntimePlan` and reports each outcome independently, so a failed
 enforcement reload does not hide a successful policy reload. The CLI exits
 non-zero when any action outcome is `failed` after printing the full JSON
-response. Candidate main configs can also be parsed and statically validated,
-then reported as
-`no_change`, `restart_required`, or `invalid_candidate`; this is a planning
-surface, not live owner replacement for capture, export, TLS, admin, or
-interception resources, and it does not run setup-time active probes. Candidate
-config reads require a regular file, reject symlinks and oversized files, and do
-not echo raw config lines in parse errors.
+response. Candidate main configs can be parsed and statically validated with
+`plan-config-reload`, which reports `no_change`, `apply_online`,
+`restart_required`, or `invalid_candidate`. `apply-config-reload` executes the
+online subset and updates the active plan when every online action succeeds.
+Policy-only config changes are online-applicable when local watcher and remote
+poller topology is disabled. Data-path rebuild verdicts can queue a
+`request_runtime_generation` action and appear as a pending runtime generation in
+status; the live agent consumes queued requests at capture safe points and
+records a runtime generation outcome. Capture and observation changes rebuild a
+candidate capture provider, swap it into the live loop, update capture runtime
+status, and replace the shared active plan only after the candidate opens.
+Selectors, TLS, enforcement, export, storage, admin, agent identity, and watcher
+topology changes are not silently applied by this path and remain
+`restart_required` until their lifecycle owners exist.
+Candidate config reads require a regular file, reject symlinks and oversized
+files, and do not echo raw config lines in parse errors.
 
 The Prometheus listener is read-only, loopback-only, and serves only
 `GET /metrics`; control commands stay on the private Unix socket. Runtime status
@@ -1109,6 +1124,10 @@ cargo run -p agent -- admin \
 cargo run -p agent -- admin \
   --socket /run/traffic-probe/admin.sock \
   plan-config-reload --config /etc/probe/agent.toml
+
+cargo run -p agent -- admin \
+  --socket /run/traffic-probe/admin.sock \
+  apply-config-reload --config /etc/probe/agent.toml
 
 cargo run -p agent -- admin \
   --socket /run/traffic-probe/admin.sock \

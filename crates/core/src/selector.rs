@@ -214,6 +214,28 @@ impl CompiledSelector {
         )
     }
 
+    /// Matches an event when process identity is explicitly unknown but traffic dimensions match.
+    ///
+    /// This is for observation and diagnostics queries that want to surface weak-attribution
+    /// candidates. Policy decisions and enforcement scopes should keep using `matches_event`.
+    pub fn matches_event_with_unknown_process(&self, event: &EventEnvelope) -> bool {
+        let Some(flow) = event.flow() else {
+            return false;
+        };
+        event.kind().direction().map_or_else(
+            || {
+                self.node
+                    .matches_flow_with_unknown_process(flow, None)
+                    .unwrap_or(false)
+            },
+            |direction| {
+                self.node
+                    .matches_flow_with_unknown_process(flow, Some(direction))
+                    .unwrap_or(false)
+            },
+        )
+    }
+
     /// Returns false only when `process` can be ruled out before flow attribution.
     ///
     /// This is a conservative prefilter for process-scoped setup. A true result keeps a candidate;
@@ -285,6 +307,29 @@ impl CompiledSelectorNode {
             ),
             Self::Not(selector) => selector
                 .matches_flow(flow, direction)
+                .map(|matched| !matched),
+        }
+    }
+
+    fn matches_flow_with_unknown_process(
+        &self,
+        flow: &FlowContext,
+        direction: Option<Direction>,
+    ) -> Option<bool> {
+        match self {
+            Self::Match(term) => term.matches_flow_with_unknown_process(flow, direction),
+            Self::All(selectors) => all_selector_matches(
+                selectors
+                    .iter()
+                    .map(|selector| selector.matches_flow_with_unknown_process(flow, direction)),
+            ),
+            Self::Any(selectors) => any_selector_matches(
+                selectors
+                    .iter()
+                    .map(|selector| selector.matches_flow_with_unknown_process(flow, direction)),
+            ),
+            Self::Not(selector) => selector
+                .matches_flow_with_unknown_process(flow, direction)
                 .map(|matched| !matched),
         }
     }
@@ -450,6 +495,17 @@ impl CompiledSelectorTerm {
 
     fn matches_flow(&self, flow: &FlowContext, direction: Option<Direction>) -> Option<bool> {
         if !self.matches_process(&flow.process) {
+            return Some(false);
+        }
+        self.matches_traffic(flow, direction)
+    }
+
+    fn matches_flow_with_unknown_process(
+        &self,
+        flow: &FlowContext,
+        direction: Option<Direction>,
+    ) -> Option<bool> {
+        if self.matches_process_with_unknowns(&flow.process) == Some(false) {
             return Some(false);
         }
         self.matches_traffic(flow, direction)
@@ -827,6 +883,61 @@ mod tests {
                 reason: "lost".to_string(),
             }),
         )));
+        Ok(())
+    }
+
+    #[test]
+    fn selector_can_match_event_when_process_is_unknown_for_observation_queries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let selector = Selector::term(
+            ProcessSelector {
+                exe_path_globs: vec!["/app/backend".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector {
+                remote_ports: vec![80],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        )
+        .compile()?;
+        let mut flow = demo_flow();
+        flow.process.identity.pid = 0;
+        flow.process.identity.exe_path = "unknown".to_string();
+        flow.process.identity.cmdline_hash = "unknown".to_string();
+        flow.process.name = "unknown".to_string();
+        flow.process.cmdline.clear();
+        let event = http_event_with_flow(flow, Direction::Outbound);
+
+        assert!(!selector.matches_event(&event));
+        assert!(selector.matches_event_with_unknown_process(&event));
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_process_event_still_respects_traffic_dimensions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let selector = Selector::term(
+            ProcessSelector {
+                exe_path_globs: vec!["/app/backend".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        )
+        .compile()?;
+        let mut flow = demo_flow();
+        flow.process.identity.pid = 0;
+        flow.process.identity.exe_path = "unknown".to_string();
+        flow.process.identity.cmdline_hash = "unknown".to_string();
+        flow.process.name = "unknown".to_string();
+        flow.process.cmdline.clear();
+        let event = http_event_with_flow(flow, Direction::Outbound);
+
+        assert!(!selector.matches_event_with_unknown_process(&event));
         Ok(())
     }
 
@@ -1332,12 +1443,16 @@ mod tests {
     }
 
     fn http_event(direction: Direction) -> EventEnvelope {
+        http_event_with_flow(demo_flow(), direction)
+    }
+
+    fn http_event_with_flow(flow: FlowContext, direction: Direction) -> EventEnvelope {
         EventEnvelope::from_flow(
             Timestamp {
                 monotonic_ns: 1,
                 wall_time_unix_ns: 1,
             },
-            demo_flow(),
+            flow,
             CaptureOrigin::from_source(CaptureSource::Replay),
             "test",
             EventKind::HttpRequestHeaders(HttpHeaders {

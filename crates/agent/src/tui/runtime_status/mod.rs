@@ -34,10 +34,13 @@ const STATUS_TIMEOUT: Duration = Duration::from_millis(500);
 pub(crate) async fn request_traffic_runtime_diagnostics(
     socket_path: &Path,
 ) -> Result<TrafficRuntimeDiagnostics, RuntimeStatusClientError> {
-    let response =
-        send_admin_json_request_with_timeout(socket_path, AdminRequest::Status, STATUS_TIMEOUT)
-            .await
-            .map_err(RuntimeStatusClientError::AdminClient)?;
+    let response = send_admin_json_request_with_timeout(
+        socket_path,
+        AdminRequest::TrafficStatus,
+        STATUS_TIMEOUT,
+    )
+    .await
+    .map_err(RuntimeStatusClientError::AdminClient)?;
     parse_traffic_runtime_diagnostics_response(&response)
 }
 
@@ -121,6 +124,14 @@ impl TrafficRuntimeDiagnostics {
             return mitm_message.map(|message| message.with_prefix(prefix));
         }
         combine_diagnostic_messages(capture_message, mitm_message)
+    }
+
+    pub(crate) fn tail_attribution_mode(&self) -> crate::admin::EventTailAttributionMode {
+        if self.capture.using_libpcap_live_host() {
+            crate::admin::EventTailAttributionMode::IncludeUnknownProcess
+        } else {
+            crate::admin::EventTailAttributionMode::Strict
+        }
     }
 
     fn mitm_bridge_status_message(
@@ -315,13 +326,13 @@ enum CaptureDiagnosticMessageKind {
 pub(crate) enum RuntimeStatusClientError {
     #[error("admin client error: {0}")]
     AdminClient(AdminClientError),
-    #[error("admin status response is missing snapshot.capture")]
+    #[error("admin traffic_status response is missing projection.capture")]
     MissingCapture,
-    #[error("admin status failed: {0}")]
+    #[error("admin traffic_status failed: {0}")]
     Admin(String),
     #[error("unexpected admin response kind: {kind}")]
     UnexpectedResponse { kind: String },
-    #[error("failed to parse admin status response: {0}")]
+    #[error("failed to parse admin traffic_status response: {0}")]
     Json(serde_json::Error),
 }
 
@@ -337,25 +348,31 @@ fn parse_traffic_runtime_diagnostics_response(
     response: &Value,
 ) -> Result<TrafficRuntimeDiagnostics, RuntimeStatusClientError> {
     match response.get("kind").and_then(Value::as_str) {
-        Some("status") => {
-            let snapshot = response
-                .get("snapshot")
+        Some("traffic_status") => {
+            let projection = response
+                .get("projection")
                 .ok_or(RuntimeStatusClientError::MissingCapture)?;
-            let capture = snapshot
+            let capture = projection
                 .get("capture")
                 .cloned()
                 .ok_or(RuntimeStatusClientError::MissingCapture)?;
+            let provider_reported = json_field_present(&capture, "provider");
+            let input_activity_reported = json_field_present(&capture, "input_activity");
             let capture = serde_json::from_value::<CaptureStatusSnapshot>(capture)
                 .map_err(RuntimeStatusClientError::Json)?;
-            let tls = snapshot.get("tls").cloned();
-            let mitm = snapshot
+            let tls = projection.get("tls").cloned();
+            let mitm = projection
                 .get("enforcement")
                 .cloned()
                 .map(|enforcement| parse_mitm_diagnostics(enforcement, tls))
                 .transpose()?
                 .flatten();
             Ok(TrafficRuntimeDiagnostics {
-                capture: CaptureDiagnostics::new(capture),
+                capture: CaptureDiagnostics::from_admin_status(
+                    capture,
+                    provider_reported,
+                    input_activity_reported,
+                ),
                 mitm,
             })
         }
@@ -370,6 +387,10 @@ fn parse_traffic_runtime_diagnostics_response(
             kind: other.unwrap_or("<missing>").to_string(),
         }),
     }
+}
+
+fn json_field_present(value: &Value, field: &str) -> bool {
+    value.get(field).is_some_and(|value| !value.is_null())
 }
 
 fn parse_mitm_diagnostics(
@@ -441,8 +462,8 @@ mod tests {
     fn traffic_diagnostics_summarize_unavailable_capture_and_missing_mitm()
     -> Result<(), Box<dyn std::error::Error>> {
         let response = json!({
-            "kind": "status",
-            "snapshot": {
+            "kind": "traffic_status",
+                "projection": {
                 "capture": {
                     "selection": "auto",
                     "selected_backend": null,
@@ -509,8 +530,8 @@ mod tests {
     fn traffic_diagnostics_do_not_report_ladder_when_mitm_is_disabled()
     -> Result<(), Box<dyn std::error::Error>> {
         let response = json!({
-            "kind": "status",
-            "snapshot": {
+            "kind": "traffic_status",
+                "projection": {
                 "capture": {
                     "selection": "ebpf",
                     "selected_backend": null,
@@ -607,8 +628,8 @@ mod tests {
     #[test]
     fn traffic_diagnostics_report_configured_mitm_path() -> Result<(), Box<dyn std::error::Error>> {
         let response = json!({
-            "kind": "status",
-            "snapshot": {
+            "kind": "traffic_status",
+                "projection": {
                 "capture": {
                     "selection": "auto",
                     "selected_backend": null,
@@ -688,8 +709,8 @@ mod tests {
     fn traffic_diagnostics_report_live_capture_with_active_mitm_bridge()
     -> Result<(), Box<dyn std::error::Error>> {
         let response = json!({
-            "kind": "status",
-            "snapshot": {
+            "kind": "traffic_status",
+                "projection": {
                 "capture": {
                     "selection": "auto",
                     "selected_backend": "ebpf",
@@ -726,6 +747,151 @@ mod tests {
     }
 
     #[test]
+    fn traffic_diagnostics_reports_live_capture_provider_starting()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "kind": "traffic_status",
+                "projection": {
+                "capture": {
+                    "selection": "auto",
+                    "selected_backend": "ebpf",
+                    "selected_input_source": "live_host",
+                    "provider_runtime_mode": "available",
+                    "mode": "live",
+                    "reason": null,
+                    "candidates": [],
+                    "open_failures": []
+                }
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+
+        assert_eq!(
+            diagnostics.status_message(true),
+            Some(CaptureDiagnosticMessage::Info(
+                "Capture ebpf is starting; waiting for provider".to_string()
+            ))
+        );
+        assert_eq!(diagnostics.status_message(false), None);
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_do_not_report_provider_starting_after_input_activity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "kind": "traffic_status",
+                "projection": {
+                "capture": {
+                    "selection": "auto",
+                    "selected_backend": "ebpf",
+                    "selected_input_source": "live_host",
+                    "provider_runtime_mode": "available",
+                    "mode": "live",
+                    "reason": null,
+                    "candidates": [],
+                    "open_failures": [],
+                    "input_activity": {
+                        "polls": {
+                            "total": 1,
+                            "events": 1,
+                            "progress": 0,
+                            "idle": 0,
+                            "finished": 0
+                        },
+                        "capture_events": 1,
+                        "output_loss_events": 0,
+                        "lost_events": 0,
+                        "providers": [],
+                        "last_signal": null
+                    }
+                }
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+
+        assert_eq!(
+            diagnostics.status_message(true),
+            Some(CaptureDiagnosticMessage::Info(
+                "Capture ebpf active; no matching events yet".to_string()
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_warn_when_empty_traffic_has_capture_loss()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "kind": "traffic_status",
+                "projection": {
+                "capture": {
+                    "selection": "auto",
+                    "selected_backend": "ebpf",
+                    "selected_input_source": "live_host",
+                    "provider_runtime_mode": "available",
+                    "mode": "live",
+                    "reason": null,
+                    "candidates": [],
+                    "open_failures": [],
+                    "input_activity": {
+                        "polls": {
+                            "total": 12,
+                            "events": 9,
+                            "progress": 3,
+                            "idle": 0,
+                            "finished": 0
+                        },
+                        "capture_events": 8,
+                        "output_loss_events": 1,
+                        "lost_events": 2245,
+                        "providers": [
+                            {
+                                "provider": "ebpf",
+                                "capture_events": 8,
+                                "output_loss_events": 1,
+                                "lost_events": 2245
+                            }
+                        ],
+                        "last_signal": {
+                            "kind": "output_loss",
+                            "sequence": 12,
+                            "observed_unix_ns": 1783060723710836934_u64,
+                            "source": "ebpf_syscall",
+                            "provider": "ebpf",
+                            "event_wall_time_unix_ns": 1783060723000000000_i64,
+                            "lost_events": 2245
+                        }
+                    }
+                }
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+
+        assert_eq!(
+            diagnostics.status_message(true),
+            Some(CaptureDiagnosticMessage::Warning(
+                "Capture ebpf lost 2245 input event(s) across 1 output-loss signal(s) (ebpf lost 2245 event(s)); parsed HTTP may be incomplete, switch to Diagnostics/All or use MITM for reliable full payload visibility".to_string()
+            ))
+        );
+        assert_eq!(diagnostics.status_message(false), None);
+        let lines = diagnostics.detail_lines();
+        assert_detail_line(
+            &lines,
+            "input activity: capture_events=8, output_loss_events=1, lost_events=2245",
+        );
+        assert_detail_line(
+            &lines,
+            "input provider ebpf: capture_events=8, output_loss_events=1, lost_events=2245",
+        );
+        assert_detail_line(&lines, "last input signal: output_loss");
+        Ok(())
+    }
+
+    #[test]
     fn traffic_diagnostics_warn_when_active_mitm_bridge_data_path_is_blocked()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut enforcement = configured_mitm_enforcement_status_json()?;
@@ -734,8 +900,8 @@ mod tests {
         enforcement["interception"]["runtime_l7_mitm"]["backend_health"]["last_failure_reason"] =
             json!("readiness probe failed");
         let response = json!({
-            "kind": "status",
-            "snapshot": {
+            "kind": "traffic_status",
+                "projection": {
                 "capture": {
                     "selection": "auto",
                     "selected_backend": "ebpf",
@@ -773,8 +939,8 @@ mod tests {
         let mut enforcement = configured_mitm_enforcement_status_json()?;
         enforcement["interception"]["runtime_l7_mitm"]["plaintext_bridge"]["mode"] = json!("ready");
         let response = json!({
-            "kind": "status",
-            "snapshot": {
+            "kind": "traffic_status",
+                "projection": {
                 "capture": {
                     "selection": "auto",
                     "selected_backend": "libpcap",
@@ -809,8 +975,8 @@ mod tests {
     fn traffic_diagnostics_report_unavailable_mitm_tls_material()
     -> Result<(), Box<dyn std::error::Error>> {
         let response = json!({
-            "kind": "status",
-            "snapshot": {
+            "kind": "traffic_status",
+                "projection": {
                 "capture": mitm_bridge_capture_status_json(),
                 "enforcement": configured_mitm_enforcement_status_json()?,
                 "tls": mitm_tls_material_status_json(
@@ -850,8 +1016,8 @@ mod tests {
     fn traffic_diagnostics_report_unavailable_static_leaf_mitm_tls_material()
     -> Result<(), Box<dyn std::error::Error>> {
         let response = json!({
-            "kind": "status",
-            "snapshot": {
+            "kind": "traffic_status",
+                "projection": {
                 "capture": mitm_bridge_capture_status_json(),
                 "enforcement": configured_static_leaf_mitm_enforcement_status_json()?,
                 "tls": mitm_static_leaf_tls_material_status_json(
@@ -891,8 +1057,8 @@ mod tests {
     fn traffic_diagnostics_report_unavailable_ca_and_leaf_mitm_tls_material()
     -> Result<(), Box<dyn std::error::Error>> {
         let response = json!({
-            "kind": "status",
-            "snapshot": {
+            "kind": "traffic_status",
+                "projection": {
                 "capture": mitm_bridge_capture_status_json(),
                 "enforcement": configured_ca_and_leaf_mitm_enforcement_status_json()?,
                 "tls": mitm_ca_and_leaf_tls_material_status_json(
@@ -936,8 +1102,8 @@ mod tests {
     fn traffic_diagnostics_allow_degraded_mitm_tls_material()
     -> Result<(), Box<dyn std::error::Error>> {
         let response = json!({
-            "kind": "status",
-            "snapshot": {
+            "kind": "traffic_status",
+                "projection": {
                 "capture": mitm_bridge_capture_status_json(),
                 "enforcement": configured_mitm_enforcement_status_json()?,
                 "tls": mitm_tls_material_status_json(
@@ -971,8 +1137,8 @@ mod tests {
     fn traffic_diagnostics_report_unknown_mitm_tls_material_status()
     -> Result<(), Box<dyn std::error::Error>> {
         let response = json!({
-            "kind": "status",
-            "snapshot": {
+            "kind": "traffic_status",
+                "projection": {
                 "capture": mitm_bridge_capture_status_json(),
                 "enforcement": configured_mitm_enforcement_status_json()?
             }
@@ -1002,8 +1168,8 @@ mod tests {
         let mut enforcement = configured_mitm_enforcement_status_json()?;
         enforcement["interception"]["mitm"]["client_trust"] = json!({ "mode": "disabled" });
         let response = json!({
-            "kind": "status",
-            "snapshot": {
+            "kind": "traffic_status",
+                "projection": {
                 "capture": {
                     "selection": "auto",
                     "selected_backend": null,
@@ -1040,8 +1206,8 @@ mod tests {
         enforcement["interception"]["runtime_l7_mitm"]["plaintext_bridge"]["disable_reason"] =
             json!("feed writer closed");
         let response = json!({
-            "kind": "status",
-            "snapshot": {
+            "kind": "traffic_status",
+                "projection": {
                 "capture": {
                     "selection": "auto",
                     "selected_backend": "capture_event_feed",
@@ -1091,8 +1257,8 @@ mod tests {
         enforcement["interception"]["runtime_l7_mitm"]["plaintext_bridge"]["disable_reason"] =
             json!("feed writer closed");
         let response = json!({
-            "kind": "status",
-            "snapshot": {
+            "kind": "traffic_status",
+                "projection": {
                 "capture": {
                     "selection": "auto",
                     "selected_backend": "libpcap",
@@ -1126,8 +1292,8 @@ mod tests {
     #[test]
     fn traffic_diagnostics_reports_runtime_fallback() -> Result<(), Box<dyn std::error::Error>> {
         let response = json!({
-            "kind": "status",
-            "snapshot": {
+            "kind": "traffic_status",
+                "projection": {
                 "capture": {
                     "selection": "auto",
                     "selected_backend": "libpcap",
@@ -1153,6 +1319,10 @@ mod tests {
                     .to_string()
             ))
         );
+        assert_eq!(
+            diagnostics.tail_attribution_mode(),
+            crate::admin::EventTailAttributionMode::IncludeUnknownProcess
+        );
         Ok(())
     }
 
@@ -1160,8 +1330,8 @@ mod tests {
     fn traffic_diagnostics_label_mitm_bridge_capture_fallback()
     -> Result<(), Box<dyn std::error::Error>> {
         let response = json!({
-            "kind": "status",
-            "snapshot": {
+            "kind": "traffic_status",
+                "projection": {
                 "capture": {
                     "selection": "auto",
                     "selected_backend": "capture_event_feed",
@@ -1230,8 +1400,8 @@ mod tests {
     fn traffic_diagnostics_surface_plain_and_tls_mitm_visibility_when_bridge_replaces_passive_capture()
     -> Result<(), Box<dyn std::error::Error>> {
         let response = json!({
-            "kind": "status",
-            "snapshot": {
+            "kind": "traffic_status",
+                "projection": {
                 "capture": {
                     "selection": "auto",
                     "selected_backend": "capture_event_feed",
@@ -1278,8 +1448,8 @@ mod tests {
     fn mitm_bridge_ready_status_uses_data_path_message_once_without_passive_context()
     -> Result<(), Box<dyn std::error::Error>> {
         let response = json!({
-            "kind": "status",
-            "snapshot": {
+            "kind": "traffic_status",
+                "projection": {
                 "capture": mitm_bridge_capture_status_json(),
                 "tls": mitm_tls_material_status_json("available", None, "available", None),
                 "enforcement": configured_mitm_enforcement_status_json()?
@@ -1308,8 +1478,8 @@ mod tests {
         enforcement["interception"]["runtime_l7_mitm"]["plaintext_bridge"]["disable_reason"] =
             json!("feed writer closed");
         let response = json!({
-            "kind": "status",
-            "snapshot": {
+            "kind": "traffic_status",
+                "projection": {
                 "capture": mitm_bridge_capture_status_json(),
                 "enforcement": enforcement
             }
@@ -1334,8 +1504,8 @@ mod tests {
     fn traffic_diagnostics_report_configured_passive_fallback_order_for_mitm_bridge()
     -> Result<(), Box<dyn std::error::Error>> {
         let response = json!({
-            "kind": "status",
-            "snapshot": {
+            "kind": "traffic_status",
+                "projection": {
                 "capture": {
                     "selection": "auto",
                     "selected_backend": "capture_event_feed",
@@ -1394,8 +1564,8 @@ mod tests {
     fn local_status_text_does_not_claim_mitm_bridge_is_running()
     -> Result<(), Box<dyn std::error::Error>> {
         let response = json!({
-            "kind": "status",
-            "snapshot": {
+            "kind": "traffic_status",
+                "projection": {
                 "capture": {
                     "selection": "auto",
                     "selected_backend": "capture_event_feed",
@@ -1427,8 +1597,8 @@ mod tests {
     fn traffic_diagnostics_warn_when_mitm_bridge_replaces_unavailable_passive_capture()
     -> Result<(), Box<dyn std::error::Error>> {
         let response = json!({
-            "kind": "status",
-            "snapshot": {
+            "kind": "traffic_status",
+                "projection": {
                 "capture": {
                     "selection": "auto",
                     "selected_backend": "capture_event_feed",
@@ -1488,8 +1658,8 @@ mod tests {
     fn traffic_diagnostics_do_not_label_generic_feed_as_mitm()
     -> Result<(), Box<dyn std::error::Error>> {
         let response = json!({
-            "kind": "status",
-            "snapshot": {
+            "kind": "traffic_status",
+                "projection": {
                 "capture": {
                     "selection": "auto",
                     "selected_backend": "capture_event_feed",

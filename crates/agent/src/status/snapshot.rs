@@ -8,6 +8,7 @@ use serde::Serialize;
 use crate::configured_enforcement::ActiveEnforcementPolicy;
 use crate::export::ExportWorkerRuntimeSnapshot;
 use crate::l7_mitm::L7MitmRuntimeSnapshot;
+use crate::runtime_generation::RuntimeGenerationSnapshot;
 use crate::tls_plaintext::{TlsDecryptHintRuntimeSnapshot, TlsPlaintextRuntimeSnapshot};
 use crate::transparent_interception::TransparentProxyRuntimeSnapshot;
 
@@ -34,6 +35,7 @@ pub struct AgentStatusSnapshot {
     pub agent_id: String,
     pub config_version: String,
     pub health: HealthSnapshot,
+    pub runtime_generation: RuntimeGenerationSnapshot,
     pub capture: CaptureStatusSnapshot,
     pub policy: PolicyStatusSnapshot,
     pub enforcement: EnforcementStatusSnapshot,
@@ -69,6 +71,7 @@ pub struct RuntimeStatusInput {
     pub tls_decrypt_hints: Option<TlsDecryptHintRuntimeSnapshot>,
     pub tls_plaintext: Option<TlsPlaintextRuntimeSnapshot>,
     pub l7_mitm: Option<L7MitmRuntimeSnapshot>,
+    pub runtime_generation: Option<RuntimeGenerationSnapshot>,
     pub transparent_proxy: Option<TransparentProxyRuntimeSnapshot>,
 }
 
@@ -99,6 +102,39 @@ pub fn build_traffic_status_projection(plan: &RuntimePlan) -> TrafficStatusProje
         capture: capture_status(plan, None, None),
         enforcement: enforcement_status_with_transparent_proxy(plan, None, None),
         tls: tls_status(plan, &capabilities, None, None),
+    }
+}
+
+pub fn build_traffic_status_projection_with_runtime(
+    plan: &RuntimePlan,
+    runtime: RuntimeStatusInput,
+) -> TrafficStatusProjection {
+    let capabilities = capabilities_with_runtime(
+        plan,
+        runtime.capture.as_ref(),
+        runtime.tls_plaintext.as_ref(),
+    );
+    let capture = capture_status(plan, runtime.capture.clone(), runtime.capture_input);
+    let transparent_proxy = runtime.transparent_proxy;
+    let l7_mitm = runtime.l7_mitm;
+    let enforcement = match runtime.enforcement {
+        EnforcementRuntimeStatusInput::OfflineInspect => {
+            enforcement_status_with_transparent_proxy(plan, l7_mitm, transparent_proxy)
+        }
+        EnforcementRuntimeStatusInput::Runtime { active_policy } => {
+            enforcement_status_with_active_policy(plan, &active_policy, l7_mitm, transparent_proxy)
+        }
+    };
+    let tls = tls_status(
+        plan,
+        &capabilities,
+        runtime.tls_plaintext,
+        runtime.tls_decrypt_hints,
+    );
+    TrafficStatusProjection {
+        capture,
+        enforcement,
+        tls,
     }
 }
 
@@ -196,6 +232,7 @@ fn build_status_snapshot_at_with_runtime(
         agent_id: plan.config.agent_id.clone(),
         config_version: plan.config.config_version.clone(),
         health,
+        runtime_generation: runtime.runtime_generation.unwrap_or_default(),
         capture,
         policy,
         enforcement,

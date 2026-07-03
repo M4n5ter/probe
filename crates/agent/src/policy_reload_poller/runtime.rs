@@ -1,4 +1,4 @@
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{convert::Infallible, time::Duration};
 
 use pipeline::PipelinePolicySet;
 use probe_config::has_enabled_remote_policy_bundle_source;
@@ -8,26 +8,34 @@ use tracing::{info, warn};
 use crate::{
     periodic_worker::{PeriodicWorkerHandle, spawn_delayed_async_periodic_worker},
     policy_reload::{PolicyReloadGate, reload_policies},
+    runtime_plan::RuntimePlanHandle,
+    runtime_reload::RuntimeReloadGate,
 };
 
 pub(crate) type PolicyReloadPollerHandle = PeriodicWorkerHandle;
 
 pub(crate) fn spawn_poller(
-    plan: Arc<RuntimePlan>,
+    plan: RuntimePlanHandle,
     policy_set: PipelinePolicySet,
     gate: PolicyReloadGate,
+    config_apply_gate: RuntimeReloadGate,
 ) -> Option<PolicyReloadPollerHandle> {
-    if !plan.config.policy_reload.poll_remote_bundles
-        || !has_enabled_remote_policy_bundle_source(&plan.config.policies)
+    let initial_plan = plan.snapshot();
+    if !initial_plan.config.policy_reload.poll_remote_bundles
+        || !has_enabled_remote_policy_bundle_source(&initial_plan.config.policies)
     {
         return None;
     }
-    let interval = Duration::from_millis(plan.config.policy_reload.remote_poll_interval_ms);
+    let interval = Duration::from_millis(initial_plan.config.policy_reload.remote_poll_interval_ms);
+    drop(initial_plan);
     let inner = spawn_delayed_async_periodic_worker("remote policy reload", interval, move || {
-        let plan = Arc::clone(&plan);
+        let plan = plan.clone();
         let policy_set = policy_set.clone();
         let gate = gate.clone();
+        let config_apply_gate = config_apply_gate.clone();
         async move {
+            let _config_apply_guard = config_apply_gate.lock().await;
+            let plan = plan.snapshot();
             reload_remote_policies_once(&plan, &policy_set, &gate).await;
             Ok::<(), Infallible>(())
         }
@@ -136,8 +144,13 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             remote_policy_bundle_document("new", "new");
-        let poller = spawn_poller(Arc::clone(&plan), policy_set.clone(), reload_gate)
-            .expect("remote policy poller should start");
+        let poller = spawn_poller(
+            RuntimePlanHandle::new(Arc::clone(&plan)),
+            policy_set.clone(),
+            reload_gate,
+            RuntimeReloadGate::default(),
+        )
+        .expect("remote policy poller should start");
 
         wait_until_policy_message(&spool, policy_set, "new ").await?;
 
@@ -178,8 +191,13 @@ mod tests {
                 .any(|message| message == "counter 1")
         );
 
-        let poller = spawn_poller(Arc::clone(&plan), policy_set.clone(), reload_gate)
-            .expect("remote policy poller should start");
+        let poller = spawn_poller(
+            RuntimePlanHandle::new(Arc::clone(&plan)),
+            policy_set.clone(),
+            reload_gate,
+            RuntimeReloadGate::default(),
+        )
+        .expect("remote policy poller should start");
         wait_until_remote_requests(&server, 2).await?;
         run_policy_request(&spool, policy_set, "/after", 2)?;
 

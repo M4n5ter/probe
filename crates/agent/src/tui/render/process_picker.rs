@@ -83,7 +83,7 @@ fn render_process_picker(
     );
     super::render_vertical_scrollbar(
         frame,
-        table_area,
+        super::table_scroll_track(table_area),
         filtered_indices.len(),
         app.process_scroll(),
         visible_rows,

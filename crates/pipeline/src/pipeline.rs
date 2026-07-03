@@ -64,6 +64,7 @@ impl From<ExportEventWriteError> for PipelineError {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PipelineSummary {
     pub capture_events_read: u64,
+    pub capture_provider_finished: bool,
     pub ingress_records_journaled: u64,
     pub ingress_records_recovered: u64,
     pub ingress_records_processed: u64,
@@ -75,6 +76,7 @@ impl PipelineSummary {
         self.capture_events_read = self
             .capture_events_read
             .saturating_add(other.capture_events_read);
+        self.capture_provider_finished |= other.capture_provider_finished;
         self.ingress_records_journaled = self
             .ingress_records_journaled
             .saturating_add(other.ingress_records_journaled);
@@ -95,6 +97,7 @@ const PROVIDER_IDLE_SLEEP: Duration = Duration::from_millis(10);
 #[derive(Default, Clone)]
 pub struct PipelineRunOptions {
     pub max_events: Option<u64>,
+    pub max_polls: Option<u64>,
     pub shutdown_requested: Option<Arc<AtomicBool>>,
 }
 
@@ -102,6 +105,15 @@ impl PipelineRunOptions {
     pub fn max_events(max_events: u64) -> Self {
         Self {
             max_events: Some(max_events),
+            max_polls: None,
+            shutdown_requested: None,
+        }
+    }
+
+    pub fn max_polls(max_polls: u64) -> Self {
+        Self {
+            max_events: None,
+            max_polls: Some(max_polls),
             shutdown_requested: None,
         }
     }
@@ -111,9 +123,12 @@ impl PipelineRunOptions {
         self
     }
 
-    fn should_poll_next_event(&self, events_read: u64) -> bool {
+    fn should_poll_next_provider(&self, events_read: u64, polls_read: u64) -> bool {
         self.max_events
             .is_none_or(|max_events| events_read < max_events)
+            && self
+                .max_polls
+                .is_none_or(|max_polls| polls_read < max_polls)
             && !self
                 .shutdown_requested
                 .as_ref()
@@ -394,8 +409,10 @@ where
         options: PipelineRunOptions,
     ) -> Result<PipelineSummary, PipelineError> {
         let mut summary = PipelineSummary::default();
-        while options.should_poll_next_event(summary.capture_events_read) {
+        let mut polls_read = 0_u64;
+        while options.should_poll_next_provider(summary.capture_events_read, polls_read) {
             let poll = provider.poll_next()?;
+            polls_read = polls_read.saturating_add(1);
             if let Some(metrics) = &self.runtime_metrics {
                 metrics.record_capture_poll(&poll);
             }
@@ -409,7 +426,10 @@ where
                 }
                 CapturePoll::Progress => {}
                 CapturePoll::Idle => thread::sleep(PROVIDER_IDLE_SLEEP),
-                CapturePoll::Finished => break,
+                CapturePoll::Finished => {
+                    summary.capture_provider_finished = true;
+                    break;
+                }
             }
         }
         Ok(summary)

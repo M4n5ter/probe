@@ -37,6 +37,10 @@ impl TrafficEventFilter {
         }
     }
 
+    pub(super) fn is_filtered(self) -> bool {
+        !matches!(self, Self::All)
+    }
+
     pub(super) fn next(self) -> Self {
         match self {
             Self::Application => Self::Http,

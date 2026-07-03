@@ -1,7 +1,7 @@
 use std::{thread, time::Duration};
 
 pub use probe_core::CaptureProviderKind;
-use probe_core::{CapabilityState, ProcessContext, TcpConnection};
+use probe_core::{CapabilityState, ProcessContext, TcpConnection, TcpEndpoint};
 use thiserror::Error;
 
 use crate::ebpf::EbpfProcessObservationRuntimeDiagnostics;
@@ -97,6 +97,13 @@ pub trait ProcessResolver {
         &mut self,
         connection: TcpConnection,
     ) -> Result<Option<ResolvedProcess>, CaptureError>;
+
+    fn resolve_tcp_listener(
+        &mut self,
+        _local_endpoint: TcpEndpoint,
+    ) -> Result<Option<ResolvedProcess>, CaptureError> {
+        Ok(None)
+    }
 
     fn invalidate_cached_resolution(&mut self) {}
 }

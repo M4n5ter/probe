@@ -19,6 +19,7 @@ use crate::reload_watcher::{
     ReloadFuture, ReloadWatchPath, ReloadWatcherError, ReloadWatcherHandle, absolute_path,
     spawn_reload_watcher,
 };
+use crate::runtime_plan::RuntimePlanHandle;
 
 #[derive(Debug, Error)]
 pub(crate) enum EnforcementReloadWatcherError {
@@ -61,19 +62,27 @@ impl EnforcementReloadWatcherHandle {
 }
 
 pub(crate) fn spawn_watcher(
-    plan: Arc<RuntimePlan>,
+    plan: RuntimePlanHandle,
     runtime_state: EnforcementRuntimeState,
     gate: EnforcementReloadGate,
 ) -> Result<Option<EnforcementReloadWatcherHandle>, EnforcementReloadWatcherError> {
-    if !plan.config.enforcement.policy.reload.watch_local_manifest {
+    let initial_plan = plan.snapshot();
+    if !initial_plan
+        .config
+        .enforcement
+        .policy
+        .reload
+        .watch_local_manifest
+    {
         return Ok(None);
     }
-    let target = local_enforcement_manifest_watch_target(&plan)
+    let target = local_enforcement_manifest_watch_target(&initial_plan)
         .ok_or(EnforcementReloadWatcherError::UnsupportedSource)?;
-    validate_enforcement_policy_reload_plan(&plan)?;
+    validate_enforcement_policy_reload_plan(&initial_plan)?;
     let watch_paths = enforcement_reload_watch_paths(&target)?;
     let manifest_path = Arc::new(target.manifest_path.clone());
-    let debounce = Duration::from_millis(plan.config.enforcement.policy.reload.debounce_ms);
+    let debounce = Duration::from_millis(initial_plan.config.enforcement.policy.reload.debounce_ms);
+    drop(initial_plan);
     let inner = spawn_reload_watcher(
         "enforcement policy reload watcher",
         watch_paths,
@@ -93,7 +102,7 @@ pub(crate) fn spawn_watcher(
 }
 
 struct WatcherReloadContext {
-    plan: Arc<RuntimePlan>,
+    plan: RuntimePlanHandle,
     runtime_state: EnforcementRuntimeState,
     gate: EnforcementReloadGate,
     target: LocalEnforcementManifestWatchTarget,
@@ -219,9 +228,8 @@ fn inspect_manifest_dir(path: &Path) -> Result<ManifestDirState, io::Error> {
 }
 
 async fn reload_after_enforcement_policy_change(context: &WatcherReloadContext) {
-    match reload_enforcement_policy(&context.plan, Some(&context.runtime_state), &context.gate)
-        .await
-    {
+    let plan = context.plan.snapshot();
+    match reload_enforcement_policy(&plan, Some(&context.runtime_state), &context.gate).await {
         Ok(summary) => {
             info!(
                 manifest_selector_configured = summary.active_policy.manifest_selector_configured(),
@@ -411,7 +419,7 @@ mod tests {
         )?;
 
         let watcher = spawn_watcher(
-            Arc::clone(&plan),
+            RuntimePlanHandle::new(Arc::clone(&plan)),
             runtime_state,
             EnforcementReloadGate::default(),
         )?
@@ -459,7 +467,7 @@ mod tests {
         let (mut planner_view, runtime_state) =
             EnforcementRuntimeState::from_planner(configured.planner, configured.active_policy);
         let watcher = spawn_watcher(
-            Arc::clone(&plan),
+            RuntimePlanHandle::new(Arc::clone(&plan)),
             runtime_state,
             EnforcementReloadGate::default(),
         )?
@@ -511,7 +519,7 @@ mod tests {
         let (mut planner_view, runtime_state) =
             EnforcementRuntimeState::from_planner(configured.planner, configured.active_policy);
         let watcher = spawn_watcher(
-            Arc::clone(&plan),
+            RuntimePlanHandle::new(Arc::clone(&plan)),
             runtime_state,
             EnforcementReloadGate::default(),
         )?
@@ -563,7 +571,7 @@ mod tests {
         let (mut planner_view, runtime_state) =
             EnforcementRuntimeState::from_planner(configured.planner, configured.active_policy);
         let watcher = spawn_watcher(
-            Arc::clone(&plan),
+            RuntimePlanHandle::new(Arc::clone(&plan)),
             runtime_state,
             EnforcementReloadGate::default(),
         )?
@@ -610,8 +618,11 @@ mod tests {
         let plan = Arc::new(runtime_plan_from_config(config)?);
         let runtime_state = empty_runtime_state().await?;
 
-        let Err(error) = spawn_watcher(plan, runtime_state, EnforcementReloadGate::default())
-        else {
+        let Err(error) = spawn_watcher(
+            RuntimePlanHandle::new(plan),
+            runtime_state,
+            EnforcementReloadGate::default(),
+        ) else {
             panic!("symlink enforcement manifest must not be watched");
         };
 
@@ -651,8 +662,11 @@ mod tests {
         )?);
         let runtime_state = empty_runtime_state().await?;
 
-        let Err(error) = spawn_watcher(plan, runtime_state, EnforcementReloadGate::default())
-        else {
+        let Err(error) = spawn_watcher(
+            RuntimePlanHandle::new(plan),
+            runtime_state,
+            EnforcementReloadGate::default(),
+        ) else {
             panic!("setup-time interception plan must reject watcher reload");
         };
 

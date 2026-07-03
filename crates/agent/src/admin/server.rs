@@ -20,7 +20,6 @@ use tokio::{
 use pipeline::{PipelinePolicySet, PipelineRuntimeMetrics};
 
 use super::{
-    config_reload::plan_config_reload,
     debug_dump::AdminDebugDump,
     event_tail::{EventTailRequest, read_event_detail, read_event_tail},
     protocol::{AdminRequest, AdminResponse, read_admin_request},
@@ -33,9 +32,19 @@ use crate::enforcement_reload::EnforcementReloadGate;
 use crate::export::ExportWorkerRuntimeState;
 use crate::l7_mitm::L7MitmRuntimeHandle;
 use crate::policy_reload::PolicyReloadGate;
+use crate::runtime_generation::RuntimeGenerationState;
+use crate::runtime_plan::RuntimePlanHandle;
+use crate::runtime_reload::{
+    RuntimeReloadGate,
+    config_reload::{
+        ConfigReloadApplyAction, ConfigReloadApplyActionOutcome, ConfigReloadRuntimeAction,
+        apply_config_reload, plan_config_reload,
+    },
+};
 use crate::status::{
     AgentStatusSnapshot, EnforcementRuntimeStatusInput, PROMETHEUS_TEXT_CONTENT_TYPE,
-    RuntimeStatusInput, build_status_snapshot_with_runtime, collect_running_spool_status,
+    RuntimeStatusInput, TrafficStatusProjection, build_status_snapshot_with_runtime,
+    build_traffic_status_projection_with_runtime, collect_running_spool_status,
     render_prometheus_metrics,
 };
 use crate::tls_plaintext::{TlsDecryptHintRuntimeState, TlsPlaintextRuntimeState};
@@ -47,6 +56,7 @@ const ADMIN_SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone, Default)]
 pub struct AdminRuntimeState {
     pub capture: CaptureProviderRuntimeState,
+    pub config_apply_gate: RuntimeReloadGate,
     pub enforcement: Option<EnforcementRuntimeState>,
     pub enforcement_reload_gate: EnforcementReloadGate,
     pub export_worker: Option<ExportWorkerRuntimeState>,
@@ -56,6 +66,7 @@ pub struct AdminRuntimeState {
     pub tls_decrypt_hints: Option<TlsDecryptHintRuntimeState>,
     pub tls_plaintext: Option<TlsPlaintextRuntimeState>,
     pub l7_mitm: Option<L7MitmRuntimeHandle>,
+    pub runtime_generation: Option<RuntimeGenerationState>,
     pub transparent_proxy: Option<TransparentProxyRuntimeHandle>,
 }
 
@@ -69,7 +80,7 @@ pub struct AdminServerHandle {
 }
 
 pub fn spawn_admin_server(
-    plan: Arc<RuntimePlan>,
+    plan: RuntimePlanHandle,
     spool: Arc<FjallSpool>,
     config: AdminServerConfig,
     runtime_state: AdminRuntimeState,
@@ -155,7 +166,7 @@ impl AdminServerHandle {
 async fn run_admin_surfaces(
     listener: UnixListener,
     prometheus_listener: Option<TcpListener>,
-    plan: Arc<RuntimePlan>,
+    plan: RuntimePlanHandle,
     spool: Arc<FjallSpool>,
     runtime_state: Arc<AdminRuntimeState>,
     stop_requested: Arc<AtomicBool>,
@@ -164,7 +175,7 @@ async fn run_admin_surfaces(
     let mut surfaces = JoinSet::new();
     surfaces.spawn(accept_admin_connections(
         listener,
-        Arc::clone(&plan),
+        plan.clone(),
         Arc::clone(&spool),
         Arc::clone(&runtime_state),
         Arc::clone(&stop_requested),
@@ -173,7 +184,7 @@ async fn run_admin_surfaces(
     if let Some(prometheus_listener) = prometheus_listener {
         surfaces.spawn(super::prometheus::accept_connections(
             prometheus_listener,
-            plan,
+            plan.clone(),
             spool,
             runtime_state,
             stop_requested,
@@ -191,7 +202,7 @@ async fn run_admin_surfaces(
 
 async fn accept_admin_connections(
     listener: UnixListener,
-    plan: Arc<RuntimePlan>,
+    plan: RuntimePlanHandle,
     spool: Arc<FjallSpool>,
     runtime_state: Arc<AdminRuntimeState>,
     stop_requested: Arc<AtomicBool>,
@@ -203,7 +214,7 @@ async fn accept_admin_connections(
             result = listener.accept() => {
                 match result {
                     Ok((stream, _)) => {
-                        let plan = Arc::clone(&plan);
+                        let plan = plan.clone();
                         let spool = Arc::clone(&spool);
                         let runtime_state = Arc::clone(&runtime_state);
                         handlers.spawn(async move {
@@ -239,20 +250,14 @@ async fn accept_admin_connections(
 
 async fn handle_admin_connection(
     mut stream: UnixStream,
-    plan: Arc<RuntimePlan>,
+    plan: RuntimePlanHandle,
     spool: Arc<FjallSpool>,
     runtime_state: Arc<AdminRuntimeState>,
 ) -> Result<(), std::io::Error> {
     let response =
         match tokio::time::timeout(ADMIN_REQUEST_TIMEOUT, read_admin_request(&mut stream)).await {
             Ok(Ok(request)) => {
-                handle_admin_request(
-                    request,
-                    plan.as_ref(),
-                    spool.as_ref(),
-                    runtime_state.as_ref(),
-                )
-                .await
+                handle_admin_request(request, &plan, spool.as_ref(), runtime_state.as_ref()).await
             }
             Ok(Err(error)) => AdminResponse::Error {
                 message: error.to_string(),
@@ -271,13 +276,22 @@ async fn handle_admin_connection(
 
 async fn handle_admin_request(
     request: AdminRequest,
-    plan: &RuntimePlan,
+    plan_handle: &RuntimePlanHandle,
     spool: &FjallSpool,
     runtime_state: &AdminRuntimeState,
 ) -> AdminResponse {
+    let plan = plan_handle.snapshot();
+    let plan = plan.as_ref();
     match request {
         AdminRequest::ReloadPolicies => {
-            reload_action_response(RuntimeReloadAction::ReloadPolicies, plan, runtime_state).await
+            let _config_apply_guard = runtime_state.config_apply_gate.lock().await;
+            let plan = plan_handle.snapshot();
+            reload_action_response(
+                RuntimeReloadAction::ReloadPolicies,
+                plan.as_ref(),
+                runtime_state,
+            )
+            .await
         }
         AdminRequest::ReloadEnforcementPolicy => {
             reload_action_response(
@@ -288,12 +302,20 @@ async fn handle_admin_request(
             .await
         }
         AdminRequest::ReloadRuntimeActions => {
-            reload_runtime_actions_response(plan, runtime_state).await
+            let _config_apply_guard = runtime_state.config_apply_gate.lock().await;
+            let plan = plan_handle.snapshot();
+            reload_runtime_actions_response(plan.as_ref(), runtime_state).await
         }
         AdminRequest::Status => {
             let snapshot = build_admin_status_snapshot(plan, spool, runtime_state);
             AdminResponse::Status {
                 snapshot: Box::new(snapshot),
+            }
+        }
+        AdminRequest::TrafficStatus => {
+            let projection = build_admin_traffic_status_projection(plan, runtime_state);
+            AdminResponse::TrafficStatus {
+                projection: Box::new(projection),
             }
         }
         AdminRequest::Metrics => {
@@ -317,15 +339,19 @@ async fn handle_admin_request(
         }
         AdminRequest::TailEvents {
             after_sequence,
+            latest,
             limit,
             selector,
+            attribution_mode,
             event_types,
         } => match read_event_tail(
             spool,
             EventTailRequest {
                 after_sequence,
+                latest,
                 limit,
                 selector,
+                attribution_mode,
                 event_types,
             },
         ) {
@@ -350,6 +376,9 @@ async fn handle_admin_request(
             },
         },
         AdminRequest::PlanConfigReload { path } => plan_config_reload_response(plan, path).await,
+        AdminRequest::ApplyConfigReload { path } => {
+            apply_config_reload_response(plan_handle, runtime_state, path).await
+        }
     }
 }
 
@@ -365,6 +394,56 @@ async fn plan_config_reload_response(plan: &RuntimePlan, path: PathBuf) -> Admin
     }
 }
 
+async fn apply_config_reload_response(
+    plan_handle: &RuntimePlanHandle,
+    runtime_state: &AdminRuntimeState,
+    path: PathBuf,
+) -> AdminResponse {
+    let _apply_guard = runtime_state.config_apply_gate.lock().await;
+    let plan = plan_handle.snapshot();
+    let plan = plan.as_ref();
+    let mut outcome = apply_config_reload(
+        plan,
+        &runtime_state.policy_set,
+        &runtime_state.policy_reload_gate,
+        &path,
+    )
+    .await;
+    if let Some(applied_plan) = outcome.applied_plan {
+        plan_handle.replace(applied_plan);
+    } else if let Some(runtime_generation) = &runtime_state.runtime_generation
+        && let Some(request) = outcome.runtime_generation_request.take()
+    {
+        outcome
+            .snapshot
+            .actions
+            .push(match runtime_generation.request_reload(request) {
+                Ok(request) => ConfigReloadApplyAction {
+                    action: ConfigReloadRuntimeAction::RequestRuntimeGeneration,
+                    outcome: ConfigReloadApplyActionOutcome::Queued {
+                        detail: format!(
+                            "runtime generation reload request {} queued for {}",
+                            request.request_id,
+                            request
+                                .candidate_config_version
+                                .as_deref()
+                                .unwrap_or("<unknown config_version>")
+                        ),
+                    },
+                },
+                Err(error) => ConfigReloadApplyAction {
+                    action: ConfigReloadRuntimeAction::RequestRuntimeGeneration,
+                    outcome: ConfigReloadApplyActionOutcome::Failed {
+                        message: error.to_string(),
+                    },
+                },
+            });
+    }
+    AdminResponse::ConfigReloadApply {
+        apply: Box::new(outcome.snapshot),
+    }
+}
+
 pub(super) fn build_admin_status_snapshot(
     plan: &RuntimePlan,
     spool: &FjallSpool,
@@ -373,42 +452,57 @@ pub(super) fn build_admin_status_snapshot(
     build_status_snapshot_with_runtime(
         plan,
         collect_running_spool_status(plan, spool),
-        RuntimeStatusInput {
-            capture: runtime_state.capture.snapshot(),
-            capture_input: runtime_state.capture.input_activity_snapshot(),
-            enforcement: runtime_state.enforcement.as_ref().map_or(
-                EnforcementRuntimeStatusInput::OfflineInspect,
-                |state| EnforcementRuntimeStatusInput::Runtime {
-                    active_policy: Box::new(state.active_policy()),
-                },
-            ),
-            export_worker: runtime_state
-                .export_worker
-                .as_ref()
-                .map(ExportWorkerRuntimeState::snapshot),
-            policy: Some(runtime_state.policy_set.runtime_snapshot()),
-            pipeline: runtime_state
-                .pipeline
-                .as_ref()
-                .map(PipelineRuntimeMetrics::snapshot),
-            tls_decrypt_hints: runtime_state
-                .tls_decrypt_hints
-                .as_ref()
-                .map(TlsDecryptHintRuntimeState::snapshot),
-            tls_plaintext: runtime_state
-                .tls_plaintext
-                .as_ref()
-                .map(TlsPlaintextRuntimeState::snapshot),
-            l7_mitm: runtime_state
-                .l7_mitm
-                .as_ref()
-                .map(L7MitmRuntimeHandle::snapshot),
-            transparent_proxy: runtime_state
-                .transparent_proxy
-                .as_ref()
-                .map(TransparentProxyRuntimeHandle::snapshot),
-        },
+        runtime_status_input(runtime_state),
     )
+}
+
+fn build_admin_traffic_status_projection(
+    plan: &RuntimePlan,
+    runtime_state: &AdminRuntimeState,
+) -> TrafficStatusProjection {
+    build_traffic_status_projection_with_runtime(plan, runtime_status_input(runtime_state))
+}
+
+fn runtime_status_input(runtime_state: &AdminRuntimeState) -> RuntimeStatusInput {
+    RuntimeStatusInput {
+        capture: runtime_state.capture.snapshot(),
+        capture_input: runtime_state.capture.input_activity_snapshot(),
+        enforcement: runtime_state.enforcement.as_ref().map_or(
+            EnforcementRuntimeStatusInput::OfflineInspect,
+            |state| EnforcementRuntimeStatusInput::Runtime {
+                active_policy: Box::new(state.active_policy()),
+            },
+        ),
+        export_worker: runtime_state
+            .export_worker
+            .as_ref()
+            .map(ExportWorkerRuntimeState::snapshot),
+        policy: Some(runtime_state.policy_set.runtime_snapshot()),
+        pipeline: runtime_state
+            .pipeline
+            .as_ref()
+            .map(PipelineRuntimeMetrics::snapshot),
+        tls_decrypt_hints: runtime_state
+            .tls_decrypt_hints
+            .as_ref()
+            .map(TlsDecryptHintRuntimeState::snapshot),
+        tls_plaintext: runtime_state
+            .tls_plaintext
+            .as_ref()
+            .map(TlsPlaintextRuntimeState::snapshot),
+        l7_mitm: runtime_state
+            .l7_mitm
+            .as_ref()
+            .map(L7MitmRuntimeHandle::snapshot),
+        runtime_generation: runtime_state
+            .runtime_generation
+            .as_ref()
+            .map(RuntimeGenerationState::snapshot),
+        transparent_proxy: runtime_state
+            .transparent_proxy
+            .as_ref()
+            .map(TransparentProxyRuntimeHandle::snapshot),
+    }
 }
 
 #[cfg(test)]
@@ -426,7 +520,8 @@ mod tests {
     use pipeline::{CapturePipeline, ExportEventWriter, PipelineRuntimeMetrics};
     use probe_config::{
         AgentConfig, CaptureBackend, CaptureSelection, EnforcementPolicyManifest,
-        EnforcementPolicySourceConfig, ExporterConfig, LiveCaptureBackend,
+        EnforcementPolicySourceConfig, ExporterConfig, LiveCaptureBackend, PolicyConfig,
+        PolicySourceConfig,
     };
     use probe_core::{
         Action, AddressPort, CapabilityKind, CapabilityState, CaptureOrigin, CaptureSource,
@@ -447,7 +542,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::configured_enforcement::LoadedEnforcementPolicySource;
+    use crate::{
+        configured_enforcement::LoadedEnforcementPolicySource,
+        runtime_generation::RuntimeGenerationState, runtime_plan::RuntimePlanHandle,
+    };
 
     #[tokio::test]
     async fn admin_status_request_returns_running_spool_snapshot()
@@ -462,7 +560,7 @@ mod tests {
         ))?;
         let plan = Arc::new(runtime_plan(spool_path)?);
         let server = spawn_admin_server(
-            Arc::clone(&plan),
+            RuntimePlanHandle::new(Arc::clone(&plan)),
             Arc::clone(&spool),
             AdminServerConfig::unix_socket(socket_path.clone()),
             AdminRuntimeState::default(),
@@ -509,7 +607,7 @@ mod tests {
         ExportEventWriter::new(spool.as_ref()).append_occurrence(&request_event(8080))?;
         let plan = Arc::new(runtime_plan(spool_path)?);
         let server = spawn_admin_server(
-            Arc::clone(&plan),
+            RuntimePlanHandle::new(Arc::clone(&plan)),
             Arc::clone(&spool),
             AdminServerConfig::unix_socket(socket_path.clone()),
             AdminRuntimeState::default(),
@@ -519,6 +617,7 @@ mod tests {
             &socket_path,
             crate::admin::AdminRequest::TailEvents {
                 after_sequence: 0,
+                latest: false,
                 limit: 10,
                 selector: Some(Selector::term(
                     ProcessSelector::default(),
@@ -528,6 +627,7 @@ mod tests {
                         ..TrafficSelector::default()
                     },
                 )),
+                attribution_mode: crate::admin::EventTailAttributionMode::Strict,
                 event_types: Vec::new(),
             },
         )
@@ -566,7 +666,7 @@ mod tests {
         ExportEventWriter::new(spool.as_ref()).append_occurrence(&request_event(8080))?;
         let plan = Arc::new(runtime_plan(spool_path)?);
         let server = spawn_admin_server(
-            Arc::clone(&plan),
+            RuntimePlanHandle::new(Arc::clone(&plan)),
             Arc::clone(&spool),
             AdminServerConfig::unix_socket(socket_path.clone()),
             AdminRuntimeState::default(),
@@ -600,7 +700,7 @@ mod tests {
         let spool = Arc::new(FjallSpool::open(&spool_path)?);
         let plan = Arc::new(runtime_plan(spool_path)?);
         let server = spawn_admin_server(
-            Arc::clone(&plan),
+            RuntimePlanHandle::new(Arc::clone(&plan)),
             Arc::clone(&spool),
             AdminServerConfig::unix_socket(socket_path.clone()),
             AdminRuntimeState::default(),
@@ -637,7 +737,7 @@ mod tests {
         ))?;
         let plan = Arc::new(runtime_plan(spool_path)?);
         let server = spawn_admin_server(
-            Arc::clone(&plan),
+            RuntimePlanHandle::new(Arc::clone(&plan)),
             Arc::clone(&spool),
             AdminServerConfig::unix_socket(socket_path.clone()),
             AdminRuntimeState::default(),
@@ -673,7 +773,7 @@ mod tests {
         ))?;
         let plan = Arc::new(runtime_plan(spool_path)?);
         let server = spawn_admin_server(
-            Arc::clone(&plan),
+            RuntimePlanHandle::new(Arc::clone(&plan)),
             Arc::clone(&spool),
             AdminServerConfig::unix_socket(socket_path.clone()),
             AdminRuntimeState::default(),
@@ -695,12 +795,14 @@ mod tests {
             response["dump"]["protocol"]["commands"],
             json!([
                 { "name": "status", "mutating": false },
+                { "name": "traffic_status", "mutating": false },
                 { "name": "metrics", "mutating": false },
                 { "name": "prometheus_metrics", "mutating": false },
                 { "name": "debug_dump", "mutating": false },
                 { "name": "tail_events", "mutating": false },
                 { "name": "event_detail", "mutating": false },
                 { "name": "plan_config_reload", "mutating": false },
+                { "name": "apply_config_reload", "mutating": true },
                 { "name": "reload_runtime_actions", "mutating": true },
                 { "name": "reload_policies", "mutating": true },
                 { "name": "reload_enforcement_policy", "mutating": true },
@@ -732,7 +834,7 @@ mod tests {
         config.config_version = "current".to_string();
         let plan = Arc::new(runtime_plan_from_config(config.clone())?);
         let server = spawn_admin_server(
-            Arc::clone(&plan),
+            RuntimePlanHandle::new(Arc::clone(&plan)),
             Arc::clone(&spool),
             AdminServerConfig::unix_socket(socket_path.clone()),
             AdminRuntimeState::default(),
@@ -774,6 +876,197 @@ mod tests {
                 .expect("changed sections should be an array")
                 .iter()
                 .any(|change| change["section"] == json!("capture"))
+        );
+
+        server.stop().await;
+        drop(spool);
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_apply_config_reload_applies_policy_config_online_and_updates_plan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-config-reload-apply")?;
+        let socket_path = temp.join("admin.sock");
+        let spool_path = temp.join("spool");
+        let policy_path = temp.join("guard.bundle");
+        write_policy_bundle(&policy_path, "online")?;
+        let spool = Arc::new(FjallSpool::open(&spool_path)?);
+        let config = config_with_storage_path(spool_path.clone());
+        let plan_handle =
+            RuntimePlanHandle::new(Arc::new(runtime_plan_from_config(config.clone())?));
+        let server = spawn_admin_server(
+            plan_handle.clone(),
+            Arc::clone(&spool),
+            AdminServerConfig::unix_socket(socket_path.clone()),
+            AdminRuntimeState::default(),
+        )?;
+        let mut candidate = config;
+        candidate.policies.push(PolicyConfig {
+            id: "guard".to_string(),
+            source: PolicySourceConfig::LocalDirectory {
+                path: policy_path.clone(),
+            },
+            ..PolicyConfig::default()
+        });
+        let candidate_path = temp.join("candidate.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let response = send_admin_request(
+            &socket_path,
+            json!({
+                "command": "apply_config_reload",
+                "path": candidate_path,
+            }),
+        )
+        .await?;
+
+        assert_eq!(response["kind"], json!("config_reload_apply"));
+        assert_eq!(
+            response["apply"]["plan"]["decision"]["kind"],
+            json!("apply_online")
+        );
+        assert_eq!(response["apply"]["active_plan_updated"], json!(true));
+        assert_eq!(
+            response["apply"]["actions"][0]["action"],
+            json!("reload_policies")
+        );
+        assert_eq!(
+            response["apply"]["actions"][0]["outcome"]["result"],
+            json!("succeeded")
+        );
+
+        let status = send_admin_request(&socket_path, json!({ "command": "status" })).await?;
+        assert_eq!(status["snapshot"]["policy"]["configured_count"], json!(1));
+        assert_eq!(status["snapshot"]["policy"]["enabled_count"], json!(1));
+        assert_eq!(
+            status["snapshot"]["policy"]["active"][0]["id"],
+            json!("guard")
+        );
+        assert_eq!(
+            status["snapshot"]["policy"]["active"][0]["runtime"]["policy_version"],
+            json!("guard@online")
+        );
+        assert_eq!(plan_handle.snapshot().config.policies.len(), 1);
+
+        server.stop().await;
+        drop(spool);
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_apply_config_reload_reports_queueable_generation_without_runtime_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-config-reload-apply-restart")?;
+        let socket_path = temp.join("admin.sock");
+        let spool_path = temp.join("spool");
+        let spool = Arc::new(FjallSpool::open(&spool_path)?);
+        let config = config_with_storage_path(spool_path.clone());
+        let plan = Arc::new(runtime_plan_from_config(config.clone())?);
+        let server = spawn_admin_server(
+            RuntimePlanHandle::new(Arc::clone(&plan)),
+            Arc::clone(&spool),
+            AdminServerConfig::unix_socket(socket_path.clone()),
+            AdminRuntimeState::default(),
+        )?;
+        let mut candidate = config;
+        candidate.capture.fallback_backends = vec![LiveCaptureBackend::Libpcap];
+        let candidate_path = temp.join("candidate.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let response = send_admin_request(
+            &socket_path,
+            json!({
+                "command": "apply_config_reload",
+                "path": candidate_path,
+            }),
+        )
+        .await?;
+
+        assert_eq!(response["kind"], json!("config_reload_apply"));
+        assert_eq!(
+            response["apply"]["plan"]["decision"]["kind"],
+            json!("queue_runtime_generation")
+        );
+        assert_eq!(response["apply"]["active_plan_updated"], json!(false));
+        assert_eq!(response["apply"]["actions"], json!([]));
+
+        let status = send_admin_request(&socket_path, json!({ "command": "status" })).await?;
+        assert_eq!(status["snapshot"]["policy"]["configured_count"], json!(0));
+
+        server.stop().await;
+        drop(spool);
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_apply_config_reload_queues_data_path_generation_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-config-reload-apply-generation")?;
+        let socket_path = temp.join("admin.sock");
+        let spool_path = temp.join("spool");
+        let spool = Arc::new(FjallSpool::open(&spool_path)?);
+        let config = config_with_storage_path(spool_path.clone());
+        let runtime_generation =
+            RuntimeGenerationState::for_config_version(config.config_version.clone());
+        let plan = Arc::new(runtime_plan_from_config(config.clone())?);
+        let server = spawn_admin_server(
+            RuntimePlanHandle::new(Arc::clone(&plan)),
+            Arc::clone(&spool),
+            AdminServerConfig::unix_socket(socket_path.clone()),
+            AdminRuntimeState {
+                runtime_generation: Some(runtime_generation),
+                ..AdminRuntimeState::default()
+            },
+        )?;
+        let mut candidate = config;
+        candidate.capture.fallback_backends = vec![LiveCaptureBackend::Libpcap];
+        let candidate_path = temp.join("candidate.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let response = send_admin_request(
+            &socket_path,
+            json!({
+                "command": "apply_config_reload",
+                "path": candidate_path,
+            }),
+        )
+        .await?;
+
+        assert_eq!(response["kind"], json!("config_reload_apply"));
+        assert_eq!(
+            response["apply"]["plan"]["decision"]["kind"],
+            json!("queue_runtime_generation")
+        );
+        assert_eq!(response["apply"]["active_plan_updated"], json!(false));
+        assert_eq!(
+            response["apply"]["actions"][0]["action"],
+            json!("request_runtime_generation")
+        );
+        assert_eq!(
+            response["apply"]["actions"][0]["outcome"]["result"],
+            json!("queued")
+        );
+
+        let status = send_admin_request(&socket_path, json!({ "command": "status" })).await?;
+        assert_eq!(
+            status["snapshot"]["runtime_generation"]["active"]["config_version"],
+            json!("local")
+        );
+        assert_eq!(
+            status["snapshot"]["runtime_generation"]["pending"]["request_id"],
+            json!(1)
+        );
+        assert_eq!(
+            status["snapshot"]["runtime_generation"]["pending"]["candidate_config_version"],
+            json!("local")
+        );
+        assert_eq!(
+            status["snapshot"]["runtime_generation"]["pending"]["changed_sections"],
+            json!(["capture"])
         );
 
         server.stop().await;
@@ -839,7 +1132,7 @@ mod tests {
         .proxy_runtime_handle();
         let l7_mitm_runtime = crate::l7_mitm::resolve(&plan.config).handle();
         let server = spawn_admin_server(
-            Arc::clone(&plan),
+            RuntimePlanHandle::new(Arc::clone(&plan)),
             Arc::clone(&spool),
             AdminServerConfig::unix_socket(socket_path.clone()),
             AdminRuntimeState {
@@ -987,7 +1280,7 @@ mod tests {
         };
         fs::remove_file(&manifest_path)?;
         let server = spawn_admin_server(
-            Arc::clone(&plan),
+            RuntimePlanHandle::new(Arc::clone(&plan)),
             Arc::clone(&spool),
             AdminServerConfig::unix_socket(socket_path.clone()),
             runtime_state,
@@ -1045,7 +1338,7 @@ mod tests {
         assert_eq!(initial_decision.outcome, EnforcementOutcome::DryRun);
         assert!(initial_decision.selector_matched);
         let server = spawn_admin_server(
-            Arc::clone(&plan),
+            RuntimePlanHandle::new(Arc::clone(&plan)),
             Arc::clone(&spool),
             AdminServerConfig::unix_socket(socket_path.clone()),
             AdminRuntimeState {
@@ -1117,7 +1410,7 @@ mod tests {
         let spool = Arc::new(FjallSpool::open(&spool_path)?);
         let plan = Arc::new(runtime_plan(spool_path)?);
         let server = spawn_admin_server(
-            Arc::clone(&plan),
+            RuntimePlanHandle::new(Arc::clone(&plan)),
             Arc::clone(&spool),
             AdminServerConfig::unix_socket(socket_path.clone()),
             AdminRuntimeState::default(),
@@ -1167,7 +1460,7 @@ mod tests {
         let spool = Arc::new(FjallSpool::open(&spool_path)?);
         let plan = Arc::new(runtime_plan(spool_path)?);
         let server = spawn_admin_server(
-            Arc::clone(&plan),
+            RuntimePlanHandle::new(Arc::clone(&plan)),
             Arc::clone(&spool),
             AdminServerConfig::unix_socket(socket_path.clone()),
             AdminRuntimeState::default(),
@@ -1311,6 +1604,27 @@ mod tests {
         };
         fs::write(path, toml::to_string(&manifest)?)?;
         Ok(())
+    }
+
+    fn write_policy_bundle(path: &Path, version: &str) -> Result<(), std::io::Error> {
+        fs::create_dir_all(path)?;
+        fs::write(
+            path.join("manifest.toml"),
+            format!(
+                r#"id = "guard"
+version = "{version}"
+hooks = ["on_http_request_headers"]
+"#
+            ),
+        )?;
+        fs::write(
+            path.join("main.lua"),
+            r#"
+function on_http_request_headers(event)
+  return probe.emit_alert(event.kind.target)
+end
+"#,
+        )
     }
 
     fn enforcement_decision(

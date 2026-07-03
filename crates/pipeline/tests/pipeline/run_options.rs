@@ -82,6 +82,41 @@ fn run_provider_stops_when_shutdown_is_requested_before_poll()
     Ok(())
 }
 
+#[test]
+fn run_provider_stops_after_max_idle_polls() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let spool = storage::FjallSpool::open(temp.path())?;
+    let mut parser_factory = Http1ParserFactory::default();
+    let mut provider = IdleProvider::default();
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
+
+    let summary =
+        pipeline.run_provider_with_options(&mut provider, PipelineRunOptions::max_polls(3))?;
+
+    assert_eq!(summary.capture_events_read, 0);
+    assert!(!summary.capture_provider_finished);
+    assert_eq!(provider.polls, 3);
+    assert!(spool.read_ingress_batch_after(0, 10)?.is_empty());
+    assert!(spool.read_export_batch("sink", 10)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn run_provider_summary_reports_provider_finished() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let spool = storage::FjallSpool::open(temp.path())?;
+    let mut parser_factory = Http1ParserFactory::default();
+    let mut provider = SequenceProvider::new(Vec::new());
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
+
+    let summary =
+        pipeline.run_provider_with_options(&mut provider, PipelineRunOptions::max_polls(1))?;
+
+    assert_eq!(summary.capture_events_read, 0);
+    assert!(summary.capture_provider_finished);
+    Ok(())
+}
+
 struct UnreadableProvider;
 
 impl CaptureProvider for UnreadableProvider {
@@ -98,5 +133,25 @@ impl CaptureProvider for UnreadableProvider {
             "unreadable",
             "provider.poll_next must not be called when max_events is zero",
         ))
+    }
+}
+
+#[derive(Default)]
+struct IdleProvider {
+    polls: u64,
+}
+
+impl CaptureProvider for IdleProvider {
+    fn name(&self) -> &'static str {
+        "idle"
+    }
+
+    fn capabilities(&self) -> Vec<CapabilityState> {
+        Vec::new()
+    }
+
+    fn poll_next(&mut self) -> Result<CapturePoll, CaptureError> {
+        self.polls = self.polls.saturating_add(1);
+        Ok(CapturePoll::Idle)
     }
 }

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
 };
@@ -27,10 +27,11 @@ pub(super) struct ProcfsTcpTable {
     pub(super) policy: ProcfsTcpTablePolicy,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct ProcfsTcpListenerEntry {
     pub(super) local: TcpEndpoint,
     pub(super) inode: u64,
+    pub(super) namespace: Option<String>,
 }
 
 const TCP_LISTEN_STATE_VALUE: u8 = 0x0A;
@@ -87,14 +88,30 @@ pub(super) fn tcp_inode_map_from_entries(
 pub(super) fn tcp_listener_entries_from_entries(
     entries: &[ProcfsTcpEntry],
 ) -> Vec<ProcfsTcpListenerEntry> {
+    tcp_listener_entries_from_entries_with_namespace(entries, None)
+}
+
+pub(super) fn tcp_listener_entries_from_entries_with_namespace(
+    entries: &[ProcfsTcpEntry],
+    namespace: Option<String>,
+) -> Vec<ProcfsTcpListenerEntry> {
     entries
         .iter()
         .filter_map(|entry| {
             entry.is_listener.then_some(ProcfsTcpListenerEntry {
                 local: entry.local,
                 inode: entry.inode,
+                namespace: namespace.clone(),
             })
         })
+        .collect()
+}
+
+pub(super) fn tcp_local_addresses_from_entries(entries: &[ProcfsTcpEntry]) -> HashSet<IpAddr> {
+    entries
+        .iter()
+        .map(|entry| entry.local.address)
+        .filter(|address| !address.is_unspecified())
         .collect()
 }
 

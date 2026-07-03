@@ -3,7 +3,7 @@ use capture::{
     CaptureError, EbpfResolvedSocketFlow, EbpfSocketFlowLookup, EbpfSocketFlowResolver,
     ProcessResolver, ResolvedProcess,
 };
-use probe_core::{CapabilityKind, ProcessContext, RuntimeMode, TcpConnection};
+use probe_core::{CapabilityKind, ProcessContext, RuntimeMode, TcpConnection, TcpEndpoint};
 use runtime::RuntimePlan;
 
 pub(super) fn procfs_tcp_process_resolver_for_plan(
@@ -39,6 +39,24 @@ impl ProcessResolver for ProcfsTcpProcessResolver {
                 resolved.map(|resolved| ResolvedProcess {
                     process: resolved.process,
                     confidence: resolved.confidence,
+                })
+            })
+            .map_err(|error| CaptureError::provider("procfs_socket_attribution", error.to_string()))
+    }
+
+    fn resolve_tcp_listener(
+        &mut self,
+        local_endpoint: TcpEndpoint,
+    ) -> Result<Option<ResolvedProcess>, CaptureError> {
+        self.resolver
+            .resolve_tcp_listeners_by_local_endpoint(local_endpoint)
+            .map(|lookup| {
+                let [listener] = lookup.listeners.as_slice() else {
+                    return None;
+                };
+                Some(ResolvedProcess {
+                    process: listener.process.clone(),
+                    confidence: listener.confidence,
                 })
             })
             .map_err(|error| CaptureError::provider("procfs_socket_attribution", error.to_string()))

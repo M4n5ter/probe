@@ -1,5 +1,4 @@
 mod client;
-mod config_reload;
 mod debug_dump;
 mod event_tail;
 mod prometheus;
@@ -14,8 +13,8 @@ pub(crate) use client::{
 #[cfg(test)]
 pub(crate) use event_tail::EventTailOmissionReason;
 pub(crate) use event_tail::{
-    EventDetailSnapshot, EventDetailTooLargeSnapshot, EventTailBudgetSnapshot, EventTailOmission,
-    EventTailRecord, EventTailSnapshot,
+    EventDetailSnapshot, EventDetailTooLargeSnapshot, EventTailAttributionMode,
+    EventTailBudgetSnapshot, EventTailOmission, EventTailRecord, EventTailSnapshot,
 };
 pub(crate) use protocol::AdminRequest;
 pub(crate) use server::{AdminRuntimeState, AdminServerHandle, spawn_admin_server};

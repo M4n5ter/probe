@@ -1,4 +1,4 @@
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{convert::Infallible, time::Duration};
 
 use runtime::{EnforcementPolicySourcePlan, RuntimePlan};
 use tracing::{info, warn};
@@ -10,39 +10,49 @@ use crate::{
         validate_enforcement_policy_reload_plan,
     },
     periodic_worker::{PeriodicWorkerHandle, spawn_delayed_async_periodic_worker},
+    runtime_plan::RuntimePlanHandle,
 };
 
 pub(crate) type EnforcementReloadPollerHandle = PeriodicWorkerHandle;
 
 pub(crate) fn spawn_poller(
-    plan: Arc<RuntimePlan>,
+    plan: RuntimePlanHandle,
     runtime_state: EnforcementRuntimeState,
     gate: EnforcementReloadGate,
 ) -> Result<Option<EnforcementReloadPollerHandle>, EnforcementReloadError> {
-    if !plan.config.enforcement.policy.reload.poll_remote_manifest
+    let initial_plan = plan.snapshot();
+    if !initial_plan
+        .config
+        .enforcement
+        .policy
+        .reload
+        .poll_remote_manifest
         || !matches!(
-            plan.enforcement.policy_source,
+            initial_plan.enforcement.policy_source,
             EnforcementPolicySourcePlan::Remote { .. }
         )
     {
         return Ok(None);
     }
-    validate_enforcement_policy_reload_plan(&plan)?;
+    validate_enforcement_policy_reload_plan(&initial_plan)?;
     let interval = Duration::from_millis(
-        plan.config
+        initial_plan
+            .config
             .enforcement
             .policy
             .reload
             .remote_poll_interval_ms,
     );
+    drop(initial_plan);
     let inner = spawn_delayed_async_periodic_worker(
         "remote enforcement policy reload",
         interval,
         move || {
-            let plan = Arc::clone(&plan);
+            let plan = plan.clone();
             let runtime_state = runtime_state.clone();
             let gate = gate.clone();
             async move {
+                let plan = plan.snapshot();
                 reload_remote_enforcement_policy_once(&plan, &runtime_state, &gate).await;
                 Ok::<(), Infallible>(())
             }
@@ -159,7 +169,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             enforcement_manifest("new", Action::Reset);
         let poller = spawn_poller(
-            Arc::clone(&plan),
+            RuntimePlanHandle::new(Arc::clone(&plan)),
             runtime_state,
             EnforcementReloadGate::default(),
         )?
@@ -199,7 +209,11 @@ mod tests {
         )?);
         let runtime_state = empty_runtime_state().await?;
 
-        let Err(error) = spawn_poller(plan, runtime_state, EnforcementReloadGate::default()) else {
+        let Err(error) = spawn_poller(
+            RuntimePlanHandle::new(plan),
+            runtime_state,
+            EnforcementReloadGate::default(),
+        ) else {
             panic!("setup-time interception plan must reject remote poller reload");
         };
 

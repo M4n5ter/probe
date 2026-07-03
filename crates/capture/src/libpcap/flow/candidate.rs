@@ -76,28 +76,21 @@ pub(super) fn select_flow_candidate(
     process_resolver: &mut Option<Box<dyn ProcessResolver>>,
 ) -> SelectedFlowCandidate {
     let mut attribution_failure = None;
+    if let Some(selected) =
+        select_listener_candidate(&secondary, process_resolver, &mut attribution_failure)
+    {
+        return selected;
+    }
     match resolve_candidate_process(&primary, process_resolver) {
         Ok(Some(process)) => {
-            return SelectedFlowCandidate {
-                direction: primary.direction,
-                local_endpoint: primary.local_endpoint,
-                process: process.process,
-                confidence: process.confidence,
-                attribution_failure: None,
-            };
+            return selected_candidate(primary, process);
         }
         Ok(None) => {}
         Err(error) => attribution_failure = Some(error.to_string()),
     }
     match resolve_candidate_process(&secondary, process_resolver) {
         Ok(Some(process)) => {
-            return SelectedFlowCandidate {
-                direction: secondary.direction,
-                local_endpoint: secondary.local_endpoint,
-                process: process.process,
-                confidence: process.confidence,
-                attribution_failure: None,
-            };
+            return selected_candidate(secondary, process);
         }
         Ok(None) => {}
         Err(error) => {
@@ -106,12 +99,44 @@ pub(super) fn select_flow_candidate(
             }
         }
     }
+    if let Some(selected) =
+        select_listener_candidate(&primary, process_resolver, &mut attribution_failure)
+    {
+        return selected;
+    }
     SelectedFlowCandidate {
         direction: primary.direction,
         local_endpoint: primary.local_endpoint,
         process: synthetic_libpcap_process(),
         confidence: 0,
         attribution_failure,
+    }
+}
+
+fn selected_candidate(candidate: FlowCandidate, process: ResolvedProcess) -> SelectedFlowCandidate {
+    SelectedFlowCandidate {
+        direction: candidate.direction,
+        local_endpoint: candidate.local_endpoint,
+        process: process.process,
+        confidence: process.confidence,
+        attribution_failure: None,
+    }
+}
+
+fn select_listener_candidate(
+    candidate: &FlowCandidate,
+    process_resolver: &mut Option<Box<dyn ProcessResolver>>,
+    attribution_failure: &mut Option<String>,
+) -> Option<SelectedFlowCandidate> {
+    match resolve_candidate_listener(candidate, process_resolver) {
+        Ok(Some(process)) => Some(selected_candidate(candidate.clone(), process)),
+        Ok(None) => None,
+        Err(error) => {
+            if attribution_failure.is_none() {
+                *attribution_failure = Some(error.to_string());
+            }
+            None
+        }
     }
 }
 
@@ -175,6 +200,16 @@ fn resolve_candidate_process(
         candidate.local_endpoint,
         candidate.remote_endpoint,
     ))
+}
+
+fn resolve_candidate_listener(
+    candidate: &FlowCandidate,
+    process_resolver: &mut Option<Box<dyn ProcessResolver>>,
+) -> Result<Option<ResolvedProcess>, CaptureError> {
+    let Some(resolver) = process_resolver.as_deref_mut() else {
+        return Ok(None);
+    };
+    resolver.resolve_tcp_listener(candidate.local_endpoint)
 }
 
 fn looks_like_http_request(payload: &[u8]) -> bool {

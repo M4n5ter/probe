@@ -34,6 +34,7 @@ pub(crate) struct HitArea {
     rect: Rect,
     target: Option<HitTarget>,
     scroll_target: Option<ScrollTarget>,
+    scrollbar_target: Option<ScrollTarget>,
 }
 
 impl HitArea {
@@ -42,6 +43,7 @@ impl HitArea {
             rect,
             target: Some(target),
             scroll_target: None,
+            scrollbar_target: None,
         }
     }
 
@@ -50,8 +52,25 @@ impl HitArea {
             rect,
             target: None,
             scroll_target: Some(target),
+            scrollbar_target: None,
         }
     }
+
+    pub(crate) fn scrollbar(rect: Rect, target: ScrollTarget) -> Self {
+        Self {
+            rect,
+            target: None,
+            scroll_target: Some(target),
+            scrollbar_target: Some(target),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScrollbarHit {
+    pub(crate) target: ScrollTarget,
+    pub(crate) offset: usize,
+    pub(crate) height: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -78,6 +97,20 @@ impl HitMap {
             .rev()
             .filter(|area| contains(area.rect, column, row))
             .find_map(|area| area.scroll_target)
+    }
+
+    pub(crate) fn scrollbar_hit(&self, column: u16, row: u16) -> Option<ScrollbarHit> {
+        self.areas
+            .iter()
+            .rev()
+            .filter(|area| contains(area.rect, column, row))
+            .find_map(|area| {
+                area.scrollbar_target.map(|target| ScrollbarHit {
+                    target,
+                    offset: row.saturating_sub(area.rect.y) as usize,
+                    height: area.rect.height.max(1) as usize,
+                })
+            })
     }
 }
 

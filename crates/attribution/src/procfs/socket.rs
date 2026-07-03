@@ -1,6 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs, io,
+    net::IpAddr,
     path::Path,
     time::{Duration, Instant},
 };
@@ -14,11 +15,13 @@ use super::{
         read_socket_cookie_for_pid_fd, socket_fd_candidates_for_lookup, socket_inode_owner_scan,
     },
     io::read_tcp_table_to_string,
+    pid_scan::{ProcfsPidEntry, numeric_pid_dirs},
     process::{ProcessAttributor, ProcfsAttributor},
     tcp_table::{
         ProcfsTcpListenerEntry, ProcfsTcpTableFamily, ProcfsTcpTablePolicy, connection_uses_family,
         connections_by_inode, endpoint_uses_family, procfs_tcp_tables, tcp_entries_from_table,
         tcp_inode_map_from_entries, tcp_listener_entries_from_entries,
+        tcp_listener_entries_from_entries_with_namespace, tcp_local_addresses_from_entries,
     },
 };
 
@@ -76,10 +79,20 @@ pub struct SocketProcessHint {
 struct ProcfsSocketSnapshot {
     tcp_inodes: HashMap<TcpConnection, u64>,
     tcp_listeners: Vec<ProcfsTcpListenerEntry>,
+    namespace_local_addresses: HashMap<String, HashSet<IpAddr>>,
     connections_by_inode: HashMap<u64, Vec<TcpConnection>>,
     inode_pids: HashMap<u64, Vec<u32>>,
     inode_owner_scan_complete: bool,
+    listener_snapshot_loaded: bool,
+    listener_namespace_scan_complete: bool,
     optional_table_errors: HashMap<ProcfsTcpTableFamily, AttributionError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessNamespaceTcpListenerScan {
+    listeners: Vec<ProcfsTcpListenerEntry>,
+    namespace_local_addresses: HashMap<String, HashSet<IpAddr>>,
+    complete: bool,
 }
 
 #[derive(Debug)]
@@ -152,7 +165,7 @@ impl ProcfsSocketResolver {
         &mut self,
         local_port: u16,
     ) -> Result<TcpListenerProcessLookup, AttributionError> {
-        self.refresh_snapshot_if_needed()?;
+        self.refresh_listener_snapshot_if_needed()?;
         let Some(snapshot) = self.snapshot.as_ref().map(|cached| &cached.snapshot) else {
             return Ok(TcpListenerProcessLookup {
                 listeners: Vec::new(),
@@ -163,8 +176,23 @@ impl ProcfsSocketResolver {
             .identify_tcp_listeners_by_local_port_in_snapshot(local_port, snapshot)
     }
 
+    pub fn resolve_tcp_listeners_by_local_endpoint(
+        &mut self,
+        local_endpoint: TcpEndpoint,
+    ) -> Result<TcpListenerProcessLookup, AttributionError> {
+        self.refresh_listener_snapshot_if_needed()?;
+        let Some(snapshot) = self.snapshot.as_ref().map(|cached| &cached.snapshot) else {
+            return Ok(TcpListenerProcessLookup {
+                listeners: Vec::new(),
+                unattributed_socket_inodes: Vec::new(),
+            });
+        };
+        self.attributor
+            .identify_tcp_listeners_by_local_endpoint_in_snapshot(local_endpoint, snapshot)
+    }
+
     pub fn resolve_tcp_listeners(&mut self) -> Result<TcpListenerProcessLookup, AttributionError> {
-        self.refresh_snapshot_if_needed()?;
+        self.refresh_listener_snapshot_if_needed()?;
         let Some(snapshot) = self.snapshot.as_ref().map(|cached| &cached.snapshot) else {
             return Ok(TcpListenerProcessLookup {
                 listeners: Vec::new(),
@@ -195,7 +223,22 @@ impl ProcfsSocketResolver {
         if self.snapshot_needs_refresh() {
             self.snapshot = Some(CachedProcfsSocketSnapshot {
                 loaded_at: Instant::now(),
-                snapshot: self.attributor.snapshot()?,
+                snapshot: self.attributor.base_snapshot()?,
+            });
+        }
+        Ok(())
+    }
+
+    fn refresh_listener_snapshot_if_needed(&mut self) -> Result<(), AttributionError> {
+        if self.snapshot_needs_refresh()
+            || !self
+                .snapshot
+                .as_ref()
+                .is_some_and(|cached| cached.snapshot.listener_snapshot_loaded)
+        {
+            self.snapshot = Some(CachedProcfsSocketSnapshot {
+                loaded_at: Instant::now(),
+                snapshot: self.attributor.listener_snapshot()?,
             });
         }
         Ok(())
@@ -281,6 +324,15 @@ impl ProcfsSocketAttributor {
         snapshot: &ProcfsSocketSnapshot,
     ) -> Result<TcpListenerProcessLookup, AttributionError> {
         self.identify_tcp_listeners_in_snapshot(Some(local_port), snapshot)
+    }
+
+    fn identify_tcp_listeners_by_local_endpoint_in_snapshot(
+        &self,
+        local_endpoint: TcpEndpoint,
+        snapshot: &ProcfsSocketSnapshot,
+    ) -> Result<TcpListenerProcessLookup, AttributionError> {
+        self.identify_tcp_listeners_in_snapshot(Some(local_endpoint.port), snapshot)
+            .map(|lookup| filter_listener_lookup_by_endpoint(lookup, local_endpoint, snapshot))
     }
 
     fn identify_tcp_listeners_in_snapshot(
@@ -500,7 +552,7 @@ impl ProcfsSocketAttributor {
     }
 
     fn probe_tcp_listener_process_attribution(&self) -> Result<(), AttributionError> {
-        let snapshot = self.snapshot()?;
+        let snapshot = self.listener_snapshot()?;
         if let Some(error) = snapshot
             .optional_table_errors
             .get(&ProcfsTcpTableFamily::Ipv6)
@@ -513,10 +565,15 @@ impl ProcfsSocketAttributor {
                 reason: "procfs fd scan skipped at least one process or socket fd because it was not readable".to_string(),
             });
         }
+        if !snapshot.listener_namespace_scan_complete {
+            return Err(AttributionError::IncompleteSocketOwnerScan {
+                reason: "procfs listener namespace scan skipped at least one process namespace because it was not readable".to_string(),
+            });
+        }
         Ok(())
     }
 
-    fn snapshot(&self) -> Result<ProcfsSocketSnapshot, AttributionError> {
+    fn base_snapshot(&self) -> Result<ProcfsSocketSnapshot, AttributionError> {
         let mut tcp_inodes = HashMap::new();
         let mut tcp_listeners = Vec::new();
         let mut optional_table_errors = HashMap::new();
@@ -545,10 +602,27 @@ impl ProcfsSocketAttributor {
             connections_by_inode: connections_by_inode(&tcp_inodes),
             tcp_inodes,
             tcp_listeners,
+            namespace_local_addresses: HashMap::new(),
             inode_pids: owner_scan.pids_by_inode,
             inode_owner_scan_complete: owner_scan.complete,
+            listener_snapshot_loaded: false,
+            listener_namespace_scan_complete: false,
             optional_table_errors,
         })
+    }
+
+    fn listener_snapshot(&self) -> Result<ProcfsSocketSnapshot, AttributionError> {
+        let mut snapshot = self.base_snapshot()?;
+        let process_namespace_listener_scan =
+            process_namespace_tcp_listener_entries(&self.process_attributor.proc_root)?;
+        for listener in process_namespace_listener_scan.listeners {
+            push_unique_listener(&mut snapshot.tcp_listeners, listener);
+        }
+        snapshot.namespace_local_addresses =
+            process_namespace_listener_scan.namespace_local_addresses;
+        snapshot.listener_snapshot_loaded = true;
+        snapshot.listener_namespace_scan_complete = process_namespace_listener_scan.complete;
+        Ok(snapshot)
     }
 }
 
@@ -618,6 +692,203 @@ fn push_unique(values: &mut Vec<u64>, value: u64) {
     }
 }
 
+fn push_unique_listener(
+    listeners: &mut Vec<ProcfsTcpListenerEntry>,
+    listener: ProcfsTcpListenerEntry,
+) {
+    if let Some(existing) = listeners
+        .iter_mut()
+        .find(|existing| existing.local == listener.local && existing.inode == listener.inode)
+    {
+        if existing.namespace.is_none() && listener.namespace.is_some() {
+            existing.namespace = listener.namespace;
+        }
+        return;
+    }
+    listeners.push(listener);
+}
+
+fn filter_listener_lookup_by_endpoint(
+    lookup: TcpListenerProcessLookup,
+    observed: TcpEndpoint,
+    snapshot: &ProcfsSocketSnapshot,
+) -> TcpListenerProcessLookup {
+    let mut exact = Vec::new();
+    let mut namespace_wildcard = Vec::new();
+    let mut unmatched_wildcard = Vec::new();
+    for listener in lookup.listeners {
+        match listener_endpoint_match(&listener, observed, snapshot) {
+            ListenerEndpointMatch::Exact => exact.push(listener),
+            ListenerEndpointMatch::NamespaceWildcard => namespace_wildcard.push(listener),
+            ListenerEndpointMatch::UnmatchedWildcard => unmatched_wildcard.push(listener),
+            ListenerEndpointMatch::NoMatch => {}
+        }
+    }
+    let listeners = if !exact.is_empty() {
+        exact
+    } else if !namespace_wildcard.is_empty() {
+        namespace_wildcard
+    } else {
+        unique_listener(unmatched_wildcard)
+    };
+    TcpListenerProcessLookup {
+        listeners,
+        unattributed_socket_inodes: lookup.unattributed_socket_inodes,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListenerEndpointMatch {
+    Exact,
+    NamespaceWildcard,
+    UnmatchedWildcard,
+    NoMatch,
+}
+
+fn listener_endpoint_match(
+    listener: &TcpListenerProcessContext,
+    observed: TcpEndpoint,
+    snapshot: &ProcfsSocketSnapshot,
+) -> ListenerEndpointMatch {
+    if listener.local.port != observed.port {
+        return ListenerEndpointMatch::NoMatch;
+    }
+    if listener.local.address == observed.address {
+        return ListenerEndpointMatch::Exact;
+    }
+    if !listener.local.address.is_unspecified()
+        || !listener_wildcard_matches_observed_family(listener, observed)
+    {
+        return ListenerEndpointMatch::NoMatch;
+    }
+    if listener_namespace_contains_address(listener, observed.address, snapshot) {
+        ListenerEndpointMatch::NamespaceWildcard
+    } else {
+        ListenerEndpointMatch::UnmatchedWildcard
+    }
+}
+
+fn listener_wildcard_matches_observed_family(
+    listener: &TcpListenerProcessContext,
+    observed: TcpEndpoint,
+) -> bool {
+    if endpoint_uses_family(listener.local, ProcfsTcpTableFamily::Ipv4) {
+        return endpoint_uses_family(observed, ProcfsTcpTableFamily::Ipv4);
+    }
+    if endpoint_uses_family(listener.local, ProcfsTcpTableFamily::Ipv6) {
+        return true;
+    }
+    false
+}
+
+fn unique_listener(listeners: Vec<TcpListenerProcessContext>) -> Vec<TcpListenerProcessContext> {
+    match listeners.as_slice() {
+        [_] => listeners,
+        _ => Vec::new(),
+    }
+}
+
+fn listener_namespace_contains_address(
+    listener: &TcpListenerProcessContext,
+    observed_address: IpAddr,
+    snapshot: &ProcfsSocketSnapshot,
+) -> bool {
+    snapshot
+        .tcp_listeners
+        .iter()
+        .find(|entry| entry.local == listener.local && entry.inode == listener.socket_inode)
+        .and_then(|entry| entry.namespace.as_ref())
+        .and_then(|namespace| snapshot.namespace_local_addresses.get(namespace))
+        .is_some_and(|addresses| addresses.contains(&observed_address))
+}
+
+fn process_namespace_tcp_listener_entries(
+    proc_root: &Path,
+) -> Result<ProcessNamespaceTcpListenerScan, AttributionError> {
+    let mut listeners = Vec::new();
+    let mut namespace_local_addresses = HashMap::new();
+    let mut seen_namespaces = HashSet::new();
+    let mut complete = true;
+    for ProcfsPidEntry { path, .. } in numeric_pid_dirs(proc_root)? {
+        let namespace_path = path.join("ns/net");
+        let namespace = match fs::read_link(&namespace_path) {
+            Ok(namespace) => namespace.display().to_string(),
+            Err(source) if is_disappearing_process_error_kind(&source) => continue,
+            Err(source) if source.kind() == io::ErrorKind::PermissionDenied => {
+                complete = false;
+                continue;
+            }
+            Err(source) => {
+                return Err(AttributionError::ReadLink {
+                    path: namespace_path.display().to_string(),
+                    source,
+                });
+            }
+        };
+        if !seen_namespaces.insert(namespace.clone()) {
+            continue;
+        }
+        append_process_namespace_tcp_listeners(
+            &path,
+            &namespace,
+            &mut listeners,
+            &mut namespace_local_addresses,
+        )
+        .map(|namespace_complete| {
+            complete &= namespace_complete;
+        })?;
+    }
+    Ok(ProcessNamespaceTcpListenerScan {
+        listeners,
+        namespace_local_addresses,
+        complete,
+    })
+}
+
+fn append_process_namespace_tcp_listeners(
+    process_root: &Path,
+    namespace: &str,
+    listeners: &mut Vec<ProcfsTcpListenerEntry>,
+    namespace_local_addresses: &mut HashMap<String, HashSet<IpAddr>>,
+) -> Result<bool, AttributionError> {
+    let mut complete = true;
+    for table in procfs_tcp_tables(process_root) {
+        let content = match read_tcp_table_to_string(&table) {
+            Ok(content) => content,
+            Err(_) if table.policy == ProcfsTcpTablePolicy::OptionalBestEffort => continue,
+            Err(AttributionError::Read { source, .. })
+                if is_disappearing_process_error_kind(&source) =>
+            {
+                return Ok(complete);
+            }
+            Err(AttributionError::Read { source, .. })
+                if source.kind() == io::ErrorKind::PermissionDenied =>
+            {
+                complete = false;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        match tcp_entries_from_table(&table, &content) {
+            Ok(entries) => {
+                namespace_local_addresses
+                    .entry(namespace.to_string())
+                    .or_default()
+                    .extend(tcp_local_addresses_from_entries(&entries));
+                for listener in tcp_listener_entries_from_entries_with_namespace(
+                    &entries,
+                    Some(namespace.to_string()),
+                ) {
+                    push_unique_listener(listeners, listener);
+                }
+            }
+            Err(_) if table.policy == ProcfsTcpTablePolicy::OptionalBestEffort => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(complete)
+}
+
 fn is_disappearing_process_error(error: &AttributionError, proc_root: &Path, pid: u32) -> bool {
     let pid_path = proc_root.join(pid.to_string());
     match error {
@@ -629,6 +900,10 @@ fn is_disappearing_process_error(error: &AttributionError, proc_root: &Path, pid
         | AttributionError::InvalidNetTcp { .. }
         | AttributionError::IncompleteSocketOwnerScan { .. } => false,
     }
+}
+
+fn is_disappearing_process_error_kind(source: &io::Error) -> bool {
+    source.kind() == io::ErrorKind::NotFound || source.raw_os_error() == Some(3)
 }
 
 #[cfg(test)]
@@ -703,6 +978,173 @@ mod tests {
     }
 
     #[test]
+    fn resolves_tcp_listener_from_process_network_namespace()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[])?;
+        proc.write_process_with_socket(321, "container-api", 424_242)?;
+        proc.write_process_tcp_table(
+            321,
+            "net:[4026532661]",
+            &[tcp_line(0, "00000000:1F90", "00000000:0000", "0A", 424_242)],
+        )?;
+        let mut resolver = ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path());
+
+        let lookup = resolver.resolve_tcp_listeners_by_local_port(8080)?;
+
+        assert_eq!(lookup.unattributed_socket_inodes, Vec::<u64>::new());
+        let [listener] = lookup.listeners.as_slice() else {
+            panic!("expected one process-namespace listener: {lookup:?}");
+        };
+        assert_eq!(listener.process.identity.pid, 321);
+        assert_eq!(listener.process.name, "container-api");
+        assert_eq!(listener.socket_inode, 424_242);
+        assert_eq!(listener.local.port, 8080);
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_listener_lookup_uses_process_namespace_addresses()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[])?;
+        proc.write_process_with_socket(321, "target-api", 424_242)?;
+        proc.write_process_tcp_table(
+            321,
+            "net:[4026532661]",
+            &[
+                tcp_line(0, "00000000:1F90", "00000000:0000", "0A", 424_242),
+                tcp_line(1, "030013AC:1F90", "010013AC:C001", "01", 111_111),
+            ],
+        )?;
+        proc.write_process_with_socket(654, "other-api", 535_353)?;
+        proc.write_process_tcp_table(
+            654,
+            "net:[4026532777]",
+            &[
+                tcp_line(0, "00000000:1F90", "00000000:0000", "0A", 535_353),
+                tcp_line(1, "020014AC:1F90", "010014AC:C001", "01", 222_222),
+            ],
+        )?;
+        let mut resolver = ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path());
+
+        let lookup = resolver.resolve_tcp_listeners_by_local_endpoint(TcpEndpoint::new(
+            "172.19.0.3".parse()?,
+            8080,
+        ))?;
+
+        let [listener] = lookup.listeners.as_slice() else {
+            panic!("expected one endpoint-matched listener: {lookup:?}");
+        };
+        assert_eq!(listener.process.identity.pid, 321);
+        assert_eq!(listener.process.name, "target-api");
+        assert_eq!(listener.socket_inode, 424_242);
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_listener_lookup_merges_namespace_for_host_table_listener()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[tcp_line(0, "00000000:1F90", "00000000:0000", "0A", 424_242)])?;
+        proc.write_process_with_socket(321, "host-api", 424_242)?;
+        proc.write_process_tcp_table(
+            321,
+            "net:[4026532661]",
+            &[
+                tcp_line(0, "00000000:1F90", "00000000:0000", "0A", 424_242),
+                tcp_line(1, "030013AC:1F90", "010013AC:C001", "01", 111_111),
+            ],
+        )?;
+        let mut resolver = ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path());
+
+        let lookup = resolver.resolve_tcp_listeners_by_local_endpoint(TcpEndpoint::new(
+            "172.19.0.3".parse()?,
+            8080,
+        ))?;
+
+        let [listener] = lookup.listeners.as_slice() else {
+            panic!("expected namespace-merged listener: {lookup:?}");
+        };
+        assert_eq!(listener.process.identity.pid, 321);
+        assert_eq!(listener.process.name, "host-api");
+        assert_eq!(listener.socket_inode, 424_242);
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_listener_lookup_uses_unique_wildcard_listener_when_address_is_unknown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[tcp_line(0, "00000000:1F90", "00000000:0000", "0A", 424_242)])?;
+        proc.write_process_with_socket(321, "wildcard-api", 424_242)?;
+        let mut resolver = ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path());
+
+        let lookup = resolver.resolve_tcp_listeners_by_local_endpoint(TcpEndpoint::new(
+            "172.19.0.3".parse()?,
+            8080,
+        ))?;
+
+        let [listener] = lookup.listeners.as_slice() else {
+            panic!("expected unique wildcard listener fallback: {lookup:?}");
+        };
+        assert_eq!(listener.process.identity.pid, 321);
+        assert_eq!(listener.process.name, "wildcard-api");
+        assert_eq!(listener.socket_inode, 424_242);
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_listener_lookup_accepts_ipv6_wildcard_for_ipv4_endpoint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[])?;
+        proc.write_tcp6_table(&[tcp_line(
+            0,
+            "00000000000000000000000000000000:1F90",
+            "00000000000000000000000000000000:0000",
+            "0A",
+            424_242,
+        )])?;
+        proc.write_process_with_socket(321, "dual-stack-api", 424_242)?;
+        let mut resolver = ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path());
+
+        let lookup = resolver.resolve_tcp_listeners_by_local_endpoint(TcpEndpoint::new(
+            "172.19.0.3".parse()?,
+            8080,
+        ))?;
+
+        let [listener] = lookup.listeners.as_slice() else {
+            panic!("expected dual-stack wildcard listener fallback: {lookup:?}");
+        };
+        assert_eq!(listener.process.identity.pid, 321);
+        assert_eq!(listener.process.name, "dual-stack-api");
+        assert_eq!(listener.socket_inode, 424_242);
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_listener_lookup_rejects_ambiguous_wildcard_listeners()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[
+            tcp_line(0, "00000000:1F90", "00000000:0000", "0A", 424_242),
+            tcp_line(1, "00000000:1F90", "00000000:0000", "0A", 535_353),
+        ])?;
+        proc.write_process_with_socket(321, "first-api", 424_242)?;
+        proc.write_process_with_socket(654, "second-api", 535_353)?;
+        let mut resolver = ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path());
+
+        let lookup = resolver.resolve_tcp_listeners_by_local_endpoint(TcpEndpoint::new(
+            "172.19.0.3".parse()?,
+            8080,
+        ))?;
+
+        assert!(lookup.listeners.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn resolves_tcp_listeners_across_all_local_ports() -> Result<(), Box<dyn std::error::Error>> {
         let proc = FakeProc::new()?;
         proc.write_tcp_table(&[
@@ -724,6 +1166,28 @@ mod tests {
             .collect::<Vec<_>>();
         listeners.sort_unstable();
         assert_eq!(listeners, vec![(8443, 321), (9443, 654)]);
+        Ok(())
+    }
+
+    #[test]
+    fn tcp_connection_lookup_does_not_scan_process_listener_namespaces()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[tcp_line(0, "0100007F:20FB", "0100007F:CAFE", "01", 424_242)])?;
+        proc.write_process_with_socket(321, "connected-api", 424_242)?;
+        proc.write_invalid_process_namespace_marker(321)?;
+        let mut resolver = ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path());
+
+        let process = resolver
+            .resolve_tcp_connection(TcpConnection::new(
+                TcpEndpoint::new("127.0.0.1".parse()?, 8443),
+                TcpEndpoint::new("127.0.0.1".parse()?, 51966),
+            ))?
+            .expect("connection should resolve without listener namespace scan");
+
+        assert_eq!(process.process.identity.pid, 321);
+        assert_eq!(process.process.name, "connected-api");
+        assert_eq!(process.socket_inode, 424_242);
         Ok(())
     }
 
@@ -757,6 +1221,13 @@ mod tests {
             )
         }
 
+        fn write_tcp6_table(&self, lines: &[String]) -> Result<(), std::io::Error> {
+            fs::write(
+                self.root.path().join("net/tcp6"),
+                format!("{}{}", tcp_header(), lines.join("")),
+            )
+        }
+
         fn write_process_with_socket(
             &self,
             pid: u32,
@@ -780,6 +1251,37 @@ mod tests {
             )?;
             symlink("/usr/bin/demo-listener", process_root.join("exe"))?;
             symlink(format!("socket:[{inode}]"), process_root.join("fd/7"))?;
+            Ok(())
+        }
+
+        fn write_invalid_process_namespace_marker(
+            &self,
+            pid: u32,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let process_root = self.root.path().join(pid.to_string());
+            fs::create_dir_all(process_root.join("ns"))?;
+            fs::write(process_root.join("ns/net"), "not a symlink")?;
+            Ok(())
+        }
+
+        fn write_process_tcp_table(
+            &self,
+            pid: u32,
+            network_namespace: &str,
+            lines: &[String],
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let process_root = self.root.path().join(pid.to_string());
+            fs::create_dir_all(process_root.join("net"))?;
+            fs::create_dir_all(process_root.join("ns"))?;
+            let namespace_path = process_root.join("ns/net");
+            if !namespace_path.exists() {
+                symlink(network_namespace, &namespace_path)?;
+            }
+            fs::write(
+                process_root.join("net/tcp"),
+                format!("{}{}", tcp_header(), lines.join("")),
+            )?;
+            fs::write(process_root.join("net/tcp6"), tcp_header())?;
             Ok(())
         }
     }

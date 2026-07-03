@@ -1,0 +1,1753 @@
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
+
+use probe_core::Selector;
+
+use super::{
+    client::{TrafficClientError, request_event_detail, request_tail_events},
+    filter::TrafficEventFilter,
+    http::{HttpExchangeRow, build_http_exchange_rows},
+    rows::TrafficRow,
+};
+use crate::{
+    admin::{
+        AdminClientError, EventDetailSnapshot, EventTailAttributionMode, EventTailOmission,
+        EventTailSnapshot,
+    },
+    tui::{
+        runtime_status::{
+            CaptureDiagnosticMessage, missing_mitm_configuration_action,
+            mitm_data_path_coverage_line, mitm_visibility_lines,
+        },
+        text::terminal_safe_inline_text,
+    },
+};
+
+const MAX_ROWS: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrafficDetailLoadRequest {
+    pub(crate) socket_path: PathBuf,
+    pub(crate) sequence: u64,
+    pub(crate) request_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrafficDetailLoadResult {
+    pub(crate) sequence: u64,
+    request_id: u64,
+    result: Result<EventDetailSnapshot, String>,
+}
+
+impl TrafficDetailLoadResult {
+    pub(crate) fn failed(sequence: u64, request_id: u64, message: impl Into<String>) -> Self {
+        Self {
+            sequence,
+            request_id,
+            result: Err(terminal_safe_inline_text(message)),
+        }
+    }
+}
+
+pub(crate) async fn load_traffic_detail(
+    request: TrafficDetailLoadRequest,
+) -> TrafficDetailLoadResult {
+    let result = request_event_detail(&request.socket_path, request.sequence)
+        .await
+        .map_err(|error| error.to_string());
+    TrafficDetailLoadResult {
+        sequence: request.sequence,
+        request_id: request.request_id,
+        result,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrafficState {
+    after_sequence: u64,
+    latest_window: bool,
+    selector_key: Option<String>,
+    rows: Vec<TrafficRow>,
+    http_exchanges: Vec<HttpExchangeRow>,
+    event_view: TrafficViewport,
+    http_view: TrafficViewport,
+    viewport_rows: usize,
+    follow_tail: bool,
+    status: TrafficStatus,
+    last_export_sequence: u64,
+    detail_state: TrafficDetailState,
+    event_filter: TrafficEventFilter,
+    view_mode: TrafficViewMode,
+    attribution_mode: EventTailAttributionMode,
+    empty_filter_diagnostics: Option<EmptyFilterDiagnostics>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TrafficViewport {
+    selected_index: usize,
+    scroll: usize,
+}
+
+impl TrafficViewport {
+    fn selected_index(self) -> usize {
+        self.selected_index
+    }
+
+    fn scroll(self) -> usize {
+        self.scroll
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn clamp_to_len(&mut self, len: usize) {
+        self.selected_index = self.selected_index.min(len.saturating_sub(1));
+        self.scroll = self.scroll.min(len.saturating_sub(1));
+    }
+
+    fn subtract_dropped_rows(&mut self, drop_count: usize) {
+        self.selected_index = self.selected_index.saturating_sub(drop_count);
+        self.scroll = self.scroll.saturating_sub(drop_count);
+    }
+
+    fn select_tail(&mut self, len: usize, visible_rows: usize) {
+        self.selected_index = len.saturating_sub(1);
+        self.scroll = Self::max_scroll(len, visible_rows);
+    }
+
+    fn move_selection(&mut self, len: usize, delta: isize, visible_rows: usize) -> Option<bool> {
+        if len == 0 {
+            return None;
+        }
+        let raw = self.selected_index as isize + delta;
+        self.selected_index = raw.clamp(0, len.saturating_sub(1) as isize) as usize;
+        self.keep_selected_visible(visible_rows);
+        Some(self.selected_index == len.saturating_sub(1))
+    }
+
+    fn select_row(&mut self, len: usize, index: usize, visible_rows: usize) -> Option<bool> {
+        if index >= len {
+            return None;
+        }
+        self.selected_index = index;
+        self.keep_selected_visible(visible_rows);
+        Some(self.selected_index == len.saturating_sub(1))
+    }
+
+    fn scroll_viewport(&mut self, len: usize, delta: isize, visible_rows: usize) -> Option<bool> {
+        if len == 0 {
+            return None;
+        }
+        let max_scroll = Self::max_scroll(len, visible_rows);
+        self.scroll = scroll_position(self.scroll, delta, max_scroll);
+        self.clamp_selection_to_viewport(len, visible_rows);
+        Some(self.is_at_tail(len, visible_rows))
+    }
+
+    fn drag_scrollbar(
+        &mut self,
+        len: usize,
+        offset: usize,
+        height: usize,
+        visible_rows: usize,
+    ) -> Option<bool> {
+        if len == 0 {
+            return None;
+        }
+        let max_scroll = Self::max_scroll(len, visible_rows);
+        if max_scroll == 0 {
+            self.scroll = 0;
+            self.selected_index = len.saturating_sub(1);
+            return Some(true);
+        }
+        let track = height.saturating_sub(1).max(1);
+        self.scroll = offset.min(track).saturating_mul(max_scroll) / track;
+        self.clamp_selection_to_viewport(len, visible_rows);
+        Some(self.is_at_tail(len, visible_rows))
+    }
+
+    fn keep_selected_visible(&mut self, visible_rows: usize) {
+        if self.selected_index < self.scroll {
+            self.scroll = self.selected_index;
+        }
+        if visible_rows > 0 {
+            let end = self.scroll.saturating_add(visible_rows);
+            if self.selected_index >= end {
+                self.scroll = self
+                    .selected_index
+                    .saturating_sub(visible_rows.saturating_sub(1));
+            }
+        }
+    }
+
+    fn clamp_selection_to_viewport(&mut self, len: usize, visible_rows: usize) {
+        let max_index = len.saturating_sub(1);
+        if self.selected_index < self.scroll {
+            self.selected_index = self.scroll;
+        }
+        if visible_rows > 0 {
+            let bottom = self.scroll.saturating_add(visible_rows.saturating_sub(1));
+            if self.selected_index > bottom {
+                self.selected_index = bottom.min(max_index);
+            }
+        }
+        self.selected_index = self.selected_index.min(max_index);
+    }
+
+    fn is_at_tail(self, len: usize, visible_rows: usize) -> bool {
+        self.scroll >= Self::max_scroll(len, visible_rows)
+    }
+
+    fn max_scroll(len: usize, visible_rows: usize) -> usize {
+        len.saturating_sub(visible_rows.max(1))
+    }
+}
+
+impl Default for TrafficState {
+    fn default() -> Self {
+        Self {
+            after_sequence: 0,
+            latest_window: true,
+            selector_key: None,
+            rows: Vec::new(),
+            http_exchanges: Vec::new(),
+            event_view: TrafficViewport::default(),
+            http_view: TrafficViewport::default(),
+            viewport_rows: 12,
+            follow_tail: true,
+            status: TrafficStatus::idle("Traffic view uses the running admin socket"),
+            last_export_sequence: 0,
+            detail_state: TrafficDetailState::Idle,
+            event_filter: TrafficEventFilter::Application,
+            view_mode: TrafficViewMode::Http,
+            attribution_mode: EventTailAttributionMode::Strict,
+            empty_filter_diagnostics: None,
+        }
+    }
+}
+
+impl TrafficState {
+    pub(crate) fn rows(&self) -> &[TrafficRow] {
+        &self.rows
+    }
+
+    pub(crate) fn selected_index(&self) -> usize {
+        self.event_view.selected_index()
+    }
+
+    pub(crate) fn selected_row(&self) -> Option<&TrafficRow> {
+        self.rows.get(self.event_view.selected_index())
+    }
+
+    pub(crate) fn http_exchanges(&self) -> &[HttpExchangeRow] {
+        &self.http_exchanges
+    }
+
+    pub(crate) fn selected_http_exchange_index(&self) -> usize {
+        self.http_view.selected_index()
+    }
+
+    pub(crate) fn http_scroll(&self) -> usize {
+        self.http_view.scroll()
+    }
+
+    pub(crate) fn active_row_count(&self) -> usize {
+        match self.effective_view_mode() {
+            TrafficViewMode::Http => self.http_exchanges.len(),
+            TrafficViewMode::Events => self.rows.len(),
+        }
+    }
+
+    pub(crate) fn showing_http_exchanges(&self) -> bool {
+        self.effective_view_mode() == TrafficViewMode::Http
+    }
+
+    pub(crate) fn selected_detail_lines(&self) -> Option<Vec<String>> {
+        if self.effective_view_mode() == TrafficViewMode::Http {
+            return self
+                .http_exchanges
+                .get(self.http_view.selected_index())
+                .map(HttpExchangeRow::detail_lines);
+        }
+        let row = self.selected_row()?;
+        let mut lines = row.detail_lines();
+        match (&self.detail_state, row.detail_fetch_sequence()) {
+            (
+                TrafficDetailState::Loaded {
+                    sequence,
+                    row: detail,
+                },
+                Some(row_sequence),
+            ) if *sequence == row_sequence => return Some(detail.detail_lines()),
+            (TrafficDetailState::Loading { sequence, .. }, Some(row_sequence))
+                if *sequence == row_sequence =>
+            {
+                lines.push("Full event detail: loading from admin event_detail".to_string());
+            }
+            (TrafficDetailState::Failed { sequence, message }, Some(row_sequence))
+                if *sequence == row_sequence =>
+            {
+                lines.push("Full event detail fetch failed".to_string());
+                lines.push(format!("Reason: {message}"));
+            }
+            _ => {}
+        }
+        Some(lines)
+    }
+
+    pub(crate) fn selected_detail_fetch_sequence(&self) -> Option<u64> {
+        if self.effective_view_mode() == TrafficViewMode::Http {
+            return None;
+        }
+        let row = self.selected_row()?;
+        let sequence = row.detail_fetch_sequence()?;
+        match &self.detail_state {
+            TrafficDetailState::Loading {
+                sequence: loading, ..
+            }
+            | TrafficDetailState::Loaded {
+                sequence: loading, ..
+            } if *loading == sequence => None,
+            _ => Some(sequence),
+        }
+    }
+
+    pub(crate) fn scroll(&self) -> usize {
+        self.event_view.scroll()
+    }
+
+    #[cfg(test)]
+    fn following_tail(&self) -> bool {
+        self.follow_tail
+    }
+
+    pub(crate) fn tail_mode_label(&self) -> &'static str {
+        if self.follow_tail { "Live" } else { "Paused" }
+    }
+
+    pub(crate) fn view_mode_label(&self) -> &'static str {
+        self.view_mode.label()
+    }
+
+    pub(crate) fn set_viewport_rows(&mut self, rows: usize) {
+        self.viewport_rows = rows.max(1);
+        if self.follow_tail {
+            self.select_tail(self.viewport_rows);
+        } else {
+            self.event_view
+                .clamp_selection_to_viewport(self.rows.len(), self.viewport_rows);
+            self.http_view
+                .clamp_selection_to_viewport(self.http_exchanges.len(), self.viewport_rows);
+        }
+    }
+
+    pub(crate) fn status(&self) -> &TrafficStatus {
+        &self.status
+    }
+
+    pub(crate) fn last_export_sequence(&self) -> u64 {
+        self.last_export_sequence
+    }
+
+    pub(crate) fn event_filter_label(&self) -> &'static str {
+        self.event_filter.label()
+    }
+
+    pub(crate) fn diagnostic_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(diagnostics) = &self.empty_filter_diagnostics {
+            lines.extend(diagnostics.lines());
+            lines.push(String::new());
+        }
+        lines.extend([
+            "Select a traffic row to inspect details".to_string(),
+            "Open Data Path diagnostics for capture and MITM readiness".to_string(),
+            mitm_data_path_coverage_line(),
+        ]);
+        lines.extend(mitm_visibility_lines());
+        lines.push(format!(
+            "configuration: {}",
+            missing_mitm_configuration_action()
+        ));
+        lines
+    }
+
+    pub(crate) fn detail_preview_lines(&self, max_lines: usize) -> Vec<String> {
+        if self.effective_view_mode() == TrafficViewMode::Http {
+            return self
+                .http_exchanges
+                .get(self.http_view.selected_index)
+                .map(|exchange| exchange.preview_lines(max_lines.max(1)))
+                .unwrap_or_else(|| self.diagnostic_lines());
+        }
+        self.selected_row()
+            .map(|row| row.preview_lines(max_lines.max(1)))
+            .unwrap_or_else(|| self.diagnostic_lines())
+    }
+
+    pub(crate) async fn refresh(
+        &mut self,
+        socket_path: &Path,
+        selector: Selector,
+        attribution_mode: EventTailAttributionMode,
+    ) {
+        let selector_key = selector_key(&selector);
+        if Some(selector_key.clone()) != self.selector_key {
+            self.reset_for_selector(selector_key);
+        }
+        let event_types = self.event_filter.event_type_filter().to_admin_event_types();
+        let tail_after_sequence = self.after_sequence;
+        let tail_latest_window = self.latest_window;
+        let event_filter = self.event_filter;
+
+        self.attribution_mode = attribution_mode;
+        match request_tail_events(
+            socket_path,
+            tail_after_sequence,
+            tail_latest_window,
+            selector.clone(),
+            attribution_mode,
+            &event_types,
+        )
+        .await
+        {
+            Ok(snapshot) => {
+                let empty_filter_diagnostics = if should_probe_empty_filter(event_filter, &snapshot)
+                {
+                    request_tail_events(
+                        socket_path,
+                        tail_after_sequence,
+                        tail_latest_window,
+                        selector,
+                        attribution_mode,
+                        &[],
+                    )
+                    .await
+                    .ok()
+                    .and_then(|snapshot| {
+                        EmptyFilterDiagnostics::from_snapshot(event_filter.label(), snapshot)
+                    })
+                } else {
+                    None
+                };
+                self.apply_snapshot(snapshot);
+                self.apply_empty_filter_diagnostics(empty_filter_diagnostics);
+            }
+            Err(error) => {
+                self.status = TrafficStatus::error(traffic_refresh_error_message(&error));
+            }
+        }
+    }
+
+    pub(crate) fn mark_detail_loading(&mut self, sequence: u64, request_id: u64) {
+        self.detail_state = TrafficDetailState::Loading {
+            sequence,
+            request_id,
+        };
+        self.status = TrafficStatus::active(format!("Loading full event detail {sequence}"));
+    }
+
+    pub(crate) fn mark_detail_failed(&mut self, sequence: u64, message: impl Into<String>) {
+        self.mark_detail_error(sequence, message.into());
+    }
+
+    pub(crate) fn apply_detail_load_result(&mut self, result: TrafficDetailLoadResult) -> bool {
+        if !matches!(
+            self.detail_state,
+            TrafficDetailState::Loading {
+                sequence,
+                request_id
+            } if sequence == result.sequence && request_id == result.request_id
+        ) {
+            return false;
+        }
+        match result.result {
+            Ok(detail) => self.apply_detail(detail),
+            Err(message) => self.mark_detail_error(result.sequence, message),
+        }
+        true
+    }
+
+    pub(crate) fn clear_detail_state(&mut self) {
+        self.detail_state = TrafficDetailState::Idle;
+    }
+
+    pub(crate) fn mark_admin_unavailable(&mut self, message: impl Into<String>) {
+        self.clear_detail_state();
+        self.status = TrafficStatus::error(message);
+    }
+
+    pub(crate) fn cycle_event_filter(&mut self) {
+        self.event_filter = self.event_filter.next();
+        self.reset_tail();
+        self.status = TrafficStatus::idle(format!(
+            "Traffic event filter changed to {}",
+            self.event_filter.label()
+        ));
+    }
+
+    pub(crate) fn cycle_view_mode(&mut self) {
+        self.view_mode = self.view_mode.next();
+        self.clamp_selection();
+        self.status = TrafficStatus::idle(format!(
+            "Traffic view changed to {}",
+            self.view_mode.label()
+        ));
+    }
+
+    pub(crate) fn apply_runtime_diagnostic_message(
+        &mut self,
+        message: Option<CaptureDiagnosticMessage>,
+    ) {
+        if self.status.kind != TrafficStatusKind::Error
+            && let Some(message) = message
+        {
+            self.status = match message {
+                CaptureDiagnosticMessage::Info(message) => TrafficStatus::idle(message),
+                CaptureDiagnosticMessage::Warning(message) => TrafficStatus::warning(message),
+                CaptureDiagnosticMessage::Error(message) => TrafficStatus::error(message),
+            };
+        }
+    }
+
+    pub(crate) fn mark_filter_unavailable(&mut self, message: impl Into<String>) {
+        self.after_sequence = 0;
+        self.latest_window = true;
+        self.selector_key = None;
+        self.rows.clear();
+        self.http_exchanges.clear();
+        self.event_view.reset();
+        self.http_view.reset();
+        self.follow_tail = true;
+        self.clear_detail_state();
+        self.attribution_mode = EventTailAttributionMode::Strict;
+        self.empty_filter_diagnostics = None;
+        self.status = TrafficStatus::error(message);
+    }
+
+    pub(crate) fn move_selection(&mut self, delta: isize, visible_rows: usize) {
+        let follow_tail = match self.effective_view_mode() {
+            TrafficViewMode::Http => {
+                self.http_view
+                    .move_selection(self.http_exchanges.len(), delta, visible_rows)
+            }
+            TrafficViewMode::Events => {
+                self.event_view
+                    .move_selection(self.rows.len(), delta, visible_rows)
+            }
+        };
+        if let Some(follow_tail) = follow_tail {
+            self.follow_tail = follow_tail;
+        }
+    }
+
+    pub(crate) fn select_row(&mut self, index: usize, visible_rows: usize) {
+        let follow_tail = match self.effective_view_mode() {
+            TrafficViewMode::Http => {
+                self.http_view
+                    .select_row(self.http_exchanges.len(), index, visible_rows)
+            }
+            TrafficViewMode::Events => {
+                self.event_view
+                    .select_row(self.rows.len(), index, visible_rows)
+            }
+        };
+        if let Some(follow_tail) = follow_tail {
+            self.follow_tail = follow_tail;
+        }
+    }
+
+    pub(crate) fn scroll_viewport(&mut self, delta: isize, visible_rows: usize) {
+        let follow_tail = match self.effective_view_mode() {
+            TrafficViewMode::Http => {
+                self.http_view
+                    .scroll_viewport(self.http_exchanges.len(), delta, visible_rows)
+            }
+            TrafficViewMode::Events => {
+                self.event_view
+                    .scroll_viewport(self.rows.len(), delta, visible_rows)
+            }
+        };
+        if let Some(follow_tail) = follow_tail {
+            self.follow_tail = follow_tail;
+            if self.follow_tail {
+                self.select_tail(visible_rows);
+            }
+        }
+    }
+
+    pub(crate) fn drag_scrollbar(&mut self, offset: usize, height: usize, visible_rows: usize) {
+        let follow_tail = match self.effective_view_mode() {
+            TrafficViewMode::Http => self.http_view.drag_scrollbar(
+                self.http_exchanges.len(),
+                offset,
+                height,
+                visible_rows,
+            ),
+            TrafficViewMode::Events => {
+                self.event_view
+                    .drag_scrollbar(self.rows.len(), offset, height, visible_rows)
+            }
+        };
+        if let Some(follow_tail) = follow_tail {
+            self.follow_tail = follow_tail;
+            if self.follow_tail {
+                self.select_tail(visible_rows);
+            }
+        }
+    }
+
+    pub(crate) fn jump_to_tail(&mut self, visible_rows: usize) {
+        if self.active_row_count() == 0 {
+            self.event_view.reset();
+            self.http_view.reset();
+            self.follow_tail = true;
+            self.status = TrafficStatus::idle("Following latest matching traffic events");
+            return;
+        }
+        self.select_tail(visible_rows);
+        self.status = TrafficStatus::active("Following latest matching traffic events");
+    }
+
+    fn reset_for_selector(&mut self, selector_key: String) {
+        self.reset_tail();
+        self.selector_key = Some(selector_key);
+        self.status = TrafficStatus::idle("Traffic filter changed");
+    }
+
+    fn reset_tail(&mut self) {
+        self.after_sequence = 0;
+        self.latest_window = true;
+        self.rows.clear();
+        self.http_exchanges.clear();
+        self.event_view.reset();
+        self.http_view.reset();
+        self.follow_tail = true;
+        self.detail_state = TrafficDetailState::Idle;
+        self.attribution_mode = EventTailAttributionMode::Strict;
+        self.empty_filter_diagnostics = None;
+    }
+
+    fn apply_snapshot(&mut self, snapshot: EventTailSnapshot) {
+        self.empty_filter_diagnostics = None;
+        self.after_sequence = snapshot.next_after_sequence;
+        self.latest_window = false;
+        self.last_export_sequence = snapshot.last_export_sequence;
+        let received = snapshot.events.len();
+        let status = traffic_status_for_snapshot(
+            received,
+            &snapshot.omissions,
+            snapshot.scanned,
+            self.attribution_mode,
+        );
+        self.rows.extend(traffic_rows_for_snapshot(snapshot));
+        self.rebuild_http_exchanges();
+        if self.rows.len() > MAX_ROWS {
+            let drop_count = self.rows.len() - MAX_ROWS;
+            self.rows.drain(0..drop_count);
+            self.rebuild_http_exchanges();
+            self.event_view.subtract_dropped_rows(drop_count);
+        }
+        if self.follow_tail && received > 0 {
+            self.select_tail(self.viewport_rows);
+        } else {
+            self.clamp_selection();
+        }
+        self.status = status;
+    }
+
+    fn apply_empty_filter_diagnostics(&mut self, diagnostics: Option<EmptyFilterDiagnostics>) {
+        let Some(diagnostics) = diagnostics else {
+            return;
+        };
+        self.status = TrafficStatus::warning(diagnostics.status_line());
+        self.empty_filter_diagnostics = Some(diagnostics);
+    }
+
+    fn apply_detail(&mut self, detail: EventDetailSnapshot) {
+        let row = TrafficRow::from_detail(detail);
+        self.status = TrafficStatus::active(format!("Loaded full event detail {}", row.sequence));
+        self.detail_state = TrafficDetailState::Loaded {
+            sequence: row.sequence,
+            row: Box::new(row),
+        };
+    }
+
+    fn mark_detail_error(&mut self, sequence: u64, message: String) {
+        self.detail_state = TrafficDetailState::Failed {
+            sequence,
+            message: terminal_safe_inline_text(message),
+        };
+        self.status =
+            TrafficStatus::warning(format!("Failed to load full event detail {sequence}"));
+    }
+
+    fn clamp_selection(&mut self) {
+        self.event_view.clamp_to_len(self.rows.len());
+        self.http_view.clamp_to_len(self.http_exchanges.len());
+    }
+
+    fn select_tail(&mut self, visible_rows: usize) {
+        match self.effective_view_mode() {
+            TrafficViewMode::Http => self
+                .http_view
+                .select_tail(self.http_exchanges.len(), visible_rows),
+            TrafficViewMode::Events => self.event_view.select_tail(self.rows.len(), visible_rows),
+        }
+        self.follow_tail = true;
+    }
+
+    fn rebuild_http_exchanges(&mut self) {
+        self.http_exchanges = build_http_exchange_rows(&self.rows);
+        self.http_view.clamp_to_len(self.http_exchanges.len());
+    }
+
+    fn effective_view_mode(&self) -> TrafficViewMode {
+        if self.view_mode == TrafficViewMode::Http && self.http_exchanges.is_empty() {
+            TrafficViewMode::Events
+        } else {
+            self.view_mode
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrafficViewMode {
+    Http,
+    Events,
+}
+
+impl TrafficViewMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Http => "HTTP",
+            Self::Events => "Events",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Http => Self::Events,
+            Self::Events => Self::Http,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EmptyFilterDiagnostics {
+    filter_label: &'static str,
+    scanned: usize,
+    event_count: usize,
+    type_counts: Vec<(String, usize)>,
+}
+
+impl EmptyFilterDiagnostics {
+    fn from_snapshot(filter_label: &'static str, snapshot: EventTailSnapshot) -> Option<Self> {
+        if snapshot.events.is_empty() {
+            return None;
+        }
+        let mut type_counts = BTreeMap::<String, usize>::new();
+        for record in &snapshot.events {
+            let event_type = record.event.kind().event_type().as_str().to_string();
+            *type_counts.entry(event_type).or_default() += 1;
+        }
+        Some(Self {
+            filter_label,
+            scanned: snapshot.scanned,
+            event_count: snapshot.events.len(),
+            type_counts: type_counts.into_iter().collect(),
+        })
+    }
+
+    fn status_line(&self) -> String {
+        format!(
+            "{} view is empty; saw {} matching event(s) outside this filter: {}",
+            self.filter_label,
+            self.event_count,
+            self.type_summary()
+        )
+    }
+
+    fn lines(&self) -> Vec<String> {
+        vec![
+            "Current traffic view is filtered".to_string(),
+            format!("View: {}", self.filter_label),
+            format!("Scanned records: {}", self.scanned),
+            format!("Matching events outside this view: {}", self.event_count),
+            format!("Event types: {}", self.type_summary()),
+            "Use Events to switch to All or Diagnostics when parsed protocol rows are empty"
+                .to_string(),
+        ]
+    }
+
+    fn type_summary(&self) -> String {
+        self.type_counts
+            .iter()
+            .map(|(event_type, count)| format!("{event_type}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn should_probe_empty_filter(
+    event_filter: TrafficEventFilter,
+    snapshot: &EventTailSnapshot,
+) -> bool {
+    event_filter.is_filtered() && snapshot.events.is_empty() && snapshot.omissions.is_empty()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrafficDetailState {
+    Idle,
+    Loading { sequence: u64, request_id: u64 },
+    Loaded { sequence: u64, row: Box<TrafficRow> },
+    Failed { sequence: u64, message: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrafficStatusKind {
+    Idle,
+    Active,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrafficStatus {
+    pub(crate) kind: TrafficStatusKind,
+    pub(crate) text: String,
+}
+
+impl TrafficStatus {
+    fn idle(text: impl Into<String>) -> Self {
+        Self {
+            kind: TrafficStatusKind::Idle,
+            text: terminal_safe_inline_text(text),
+        }
+    }
+
+    fn active(text: impl Into<String>) -> Self {
+        Self {
+            kind: TrafficStatusKind::Active,
+            text: terminal_safe_inline_text(text),
+        }
+    }
+
+    fn warning(text: impl Into<String>) -> Self {
+        Self {
+            kind: TrafficStatusKind::Warning,
+            text: terminal_safe_inline_text(text),
+        }
+    }
+
+    fn error(text: impl Into<String>) -> Self {
+        Self {
+            kind: TrafficStatusKind::Error,
+            text: terminal_safe_inline_text(text),
+        }
+    }
+}
+
+fn traffic_status_for_snapshot(
+    received: usize,
+    omissions: &[EventTailOmission],
+    scanned: usize,
+    attribution_mode: EventTailAttributionMode,
+) -> TrafficStatus {
+    let attribution_note = tail_attribution_status_note(attribution_mode);
+    if let Some(reason) = omission_summary(omissions) {
+        TrafficStatus::error(format!(
+            "Received {received} events{attribution_note}; {reason}"
+        ))
+    } else if received == 0 {
+        TrafficStatus::idle(format!(
+            "No new matching events{attribution_note}; scanned {scanned} records"
+        ))
+    } else {
+        TrafficStatus::active(format!(
+            "Received {received} matching events{attribution_note}"
+        ))
+    }
+}
+
+fn tail_attribution_status_note(mode: EventTailAttributionMode) -> &'static str {
+    match mode {
+        EventTailAttributionMode::Strict => "",
+        EventTailAttributionMode::IncludeUnknownProcess => {
+            " including libpcap unknown-process candidates"
+        }
+    }
+}
+
+fn traffic_rows_for_snapshot(snapshot: EventTailSnapshot) -> Vec<TrafficRow> {
+    let EventTailSnapshot {
+        scanned,
+        budget,
+        events,
+        omissions,
+        ..
+    } = snapshot;
+    let mut rows = events
+        .into_iter()
+        .map(TrafficRow::from_record)
+        .chain(
+            omissions
+                .into_iter()
+                .map(|omission| TrafficRow::from_omission(omission, scanned, budget.clone())),
+        )
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|row| row.sequence);
+    rows
+}
+
+fn omission_summary(omissions: &[EventTailOmission]) -> Option<String> {
+    let first = omissions.first()?;
+    let suffix = match omissions.len() {
+        1 => String::new(),
+        extra => format!(" and {} more", extra - 1),
+    };
+    Some(format!(
+        "omitted {}: {}{}",
+        event_count_label(omissions.len()),
+        first.reason.label(),
+        suffix
+    ))
+}
+
+fn event_count_label(count: usize) -> String {
+    match count {
+        1 => "1 event".to_string(),
+        count => format!("{count} events"),
+    }
+}
+
+fn scroll_position(current: usize, delta: isize, max_scroll: usize) -> usize {
+    if delta.is_negative() {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        current.saturating_add(delta as usize).min(max_scroll)
+    }
+}
+
+fn selector_key(selector: &Selector) -> String {
+    serde_json::to_string(selector).unwrap_or_else(|_| format!("{selector:?}"))
+}
+
+fn traffic_refresh_error_message(error: &TrafficClientError) -> String {
+    match error {
+        TrafficClientError::AdminClient(AdminClientError::Connect { path, source })
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            format!(
+                "No running agent is listening on admin socket {}; restart the TUI agent or check the configured socket",
+                path.display()
+            )
+        }
+        _ => error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use probe_config::{CaptureBackend, CaptureSelection};
+    use probe_core::{
+        AddressPort, BodyChunk, CaptureOrigin, CaptureSource, EventEnvelope, EventKind,
+        FlowContext, FlowIdentity, Gap, ProcessContext, ProcessIdentity, RuntimeMode,
+        SpoolPayloadSchema, Timestamp, TransportProtocol,
+    };
+    use runtime::{CaptureEvidenceMode, CaptureInputSource, CapturePlanMode};
+
+    use super::*;
+    use crate::{
+        admin::{
+            EventDetailSnapshot, EventTailBudgetSnapshot, EventTailOmissionReason, EventTailRecord,
+            EventTailSnapshot,
+        },
+        status::{
+            CaptureCandidateStatusSnapshot, CaptureOpenFailureStatusSnapshot, CaptureStatusSnapshot,
+        },
+        tui::{runtime_status::TrafficRuntimeDiagnostics, text::INLINE_TEXT_MAX_CHARS},
+    };
+
+    #[test]
+    fn traffic_status_text_is_terminal_safe() {
+        let raw = format!(
+            "tail_events failed\nstderr: \x1b[32m{}",
+            "x".repeat(INLINE_TEXT_MAX_CHARS * 2)
+        );
+
+        let status = TrafficStatus::error(raw);
+
+        assert_eq!(status.kind, TrafficStatusKind::Error);
+        assert!(!status.text.chars().any(char::is_control));
+        assert!(status.text.chars().count() <= INLINE_TEXT_MAX_CHARS);
+        assert!(status.text.contains("tail_events failed stderr:"));
+        assert!(status.text.ends_with("..."));
+    }
+
+    #[test]
+    fn traffic_detail_error_text_is_terminal_safe() {
+        let mut traffic = TrafficState::default();
+        traffic.apply_snapshot(tail_snapshot_with_response_budget_omission());
+        traffic.mark_detail_loading(2, 11);
+        traffic.apply_detail_load_result(TrafficDetailLoadResult::failed(
+            2,
+            11,
+            format!(
+                "admin error\nstderr: \x1b[31m{}",
+                "x".repeat(INLINE_TEXT_MAX_CHARS * 2)
+            ),
+        ));
+
+        let lines = traffic
+            .selected_detail_lines()
+            .expect("selected detail should remain visible")
+            .into_iter()
+            .filter(|line| line.starts_with("Reason: "))
+            .collect::<Vec<_>>();
+        let detail_error = lines
+            .iter()
+            .find(|line| line.contains("admin error"))
+            .expect("detail error reason should be visible");
+
+        assert!(!detail_error.chars().any(char::is_control));
+        assert!(detail_error.chars().count() <= INLINE_TEXT_MAX_CHARS + "Reason: ".len());
+    }
+
+    #[test]
+    fn filter_reset_scans_existing_matching_events() {
+        let mut traffic = TrafficState::default();
+        traffic.apply_snapshot(tail_snapshot_with_response_budget_omission());
+
+        traffic.reset_for_selector("exe:/app/backend".to_string());
+
+        assert_eq!(traffic.after_sequence, 0);
+        assert_eq!(traffic.last_export_sequence(), 2);
+        assert!(traffic.rows().is_empty());
+        assert_eq!(traffic.status().kind, TrafficStatusKind::Idle);
+        assert_eq!(traffic.status().text, "Traffic filter changed");
+    }
+
+    #[test]
+    fn empty_filtered_view_explains_matching_events_outside_filter() {
+        let mut traffic = TrafficState::default();
+        let empty_filtered = empty_tail_snapshot(3);
+        let diagnostics =
+            EmptyFilterDiagnostics::from_snapshot("Parsed", tail_snapshot_with_gap_events(1..=3));
+
+        assert!(should_probe_empty_filter(
+            TrafficEventFilter::Application,
+            &empty_filtered
+        ));
+        traffic.apply_snapshot(empty_filtered);
+        traffic.apply_empty_filter_diagnostics(diagnostics);
+
+        assert!(traffic.rows().is_empty());
+        assert_eq!(traffic.status().kind, TrafficStatusKind::Warning);
+        assert_eq!(
+            traffic.status().text,
+            "Parsed view is empty; saw 3 matching event(s) outside this filter: gap=3"
+        );
+        let lines = traffic.detail_preview_lines(12);
+        assert!(lines.iter().any(|line| line == "View: Parsed"));
+        assert!(lines.iter().any(|line| line == "Event types: gap=3"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("switch to All or Diagnostics"))
+        );
+    }
+
+    #[test]
+    fn event_filter_defaults_to_parsed_application_events_and_cycles_with_tail_reset() {
+        let mut traffic = TrafficState::default();
+        traffic.apply_snapshot(tail_snapshot_with_response_budget_omission());
+
+        assert_eq!(traffic.event_filter_label(), "Parsed");
+        assert!(!traffic.rows().is_empty());
+
+        traffic.cycle_event_filter();
+
+        assert_eq!(traffic.event_filter_label(), "HTTP");
+        assert!(traffic.rows().is_empty());
+        assert_eq!(traffic.after_sequence, 0);
+        assert_eq!(
+            traffic.status().text,
+            "Traffic event filter changed to HTTP"
+        );
+    }
+
+    #[test]
+    fn diagnostics_preserve_warning_severity() {
+        let mut traffic = TrafficState::default();
+
+        let diagnostics =
+            TrafficRuntimeDiagnostics::from_capture_snapshot(fallback_capture_snapshot());
+        traffic.apply_runtime_diagnostic_message(diagnostics.status_message(true));
+
+        assert_eq!(traffic.status().kind, TrafficStatusKind::Warning);
+        assert_eq!(
+            traffic.status().text,
+            "Capture using libpcap; passive fallback occurred (ebpf: permission denied)"
+        );
+    }
+
+    #[test]
+    fn diagnostics_do_not_overwrite_existing_refresh_error() {
+        let mut traffic = TrafficState::default();
+        traffic.mark_admin_unavailable("tail_events failed");
+
+        let diagnostics =
+            TrafficRuntimeDiagnostics::from_capture_snapshot(fallback_capture_snapshot());
+        traffic.apply_runtime_diagnostic_message(diagnostics.status_message(true));
+
+        assert_eq!(traffic.status().kind, TrafficStatusKind::Error);
+        assert_eq!(traffic.status().text, "tail_events failed");
+    }
+
+    #[test]
+    fn diagnostics_explain_active_mitm_plaintext_bridge_coverage() {
+        let mut traffic = TrafficState::default();
+
+        let diagnostics =
+            TrafficRuntimeDiagnostics::from_capture_snapshot(active_mitm_bridge_capture_snapshot());
+        traffic.apply_runtime_diagnostic_message(diagnostics.status_message(true));
+
+        assert_eq!(traffic.status().kind, TrafficStatusKind::Idle);
+        assert_eq!(traffic.status().text, diagnostics.running_status_text(true));
+    }
+
+    #[test]
+    fn empty_traffic_diagnostics_explain_mitm_visibility_labels() {
+        let traffic = TrafficState::default();
+        let lines = traffic.diagnostic_lines();
+
+        assert!(lines.contains(&mitm_data_path_coverage_line()));
+        for expected in mitm_visibility_lines() {
+            assert!(lines.contains(&expected), "missing {expected}");
+        }
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("MITM") && line.contains("bidirectional"))
+        );
+    }
+
+    #[test]
+    fn default_view_groups_http_events_into_exchange_rows() {
+        let mut traffic = TrafficState::default();
+
+        traffic.apply_snapshot(tail_snapshot_with_http_exchange());
+
+        assert_eq!(traffic.view_mode_label(), "HTTP");
+        assert!(traffic.showing_http_exchanges());
+        assert_eq!(traffic.active_row_count(), 1);
+        assert_eq!(
+            traffic.http_exchanges()[0].summary,
+            "POST /api/tasks -> 200 OK (req 5 B, resp 2 B)"
+        );
+        assert!(
+            traffic
+                .detail_preview_lines(9)
+                .iter()
+                .any(|line| line == "Request body: 5 bytes")
+        );
+        assert!(
+            traffic
+                .selected_detail_lines()
+                .expect("HTTP exchange detail")
+                .iter()
+                .any(|line| line == "  Body chunk offset=0 end_stream=true: hello")
+        );
+    }
+
+    #[test]
+    fn traffic_tail_follows_new_events_by_default() {
+        let mut traffic = traffic_in_events_view();
+        traffic.set_viewport_rows(5);
+
+        traffic.apply_snapshot(tail_snapshot_with_body_events(1..=10));
+
+        assert_eq!(traffic.rows().len(), 10);
+        assert_eq!(traffic.selected_index(), 9);
+        assert_eq!(traffic.scroll(), 5);
+        assert!(traffic.following_tail());
+
+        traffic.apply_snapshot(tail_snapshot_with_body_events(11..=12));
+
+        assert_eq!(traffic.rows().len(), 12);
+        assert_eq!(traffic.selected_index(), 11);
+        assert_eq!(traffic.scroll(), 7);
+        assert!(traffic.following_tail());
+    }
+
+    #[test]
+    fn traffic_scroll_pauses_tail_follow_until_user_returns_to_bottom() {
+        let mut traffic = traffic_in_events_view();
+        traffic.set_viewport_rows(5);
+        traffic.apply_snapshot(tail_snapshot_with_body_events(1..=10));
+
+        traffic.scroll_viewport(-3, 5);
+
+        assert_eq!(traffic.scroll(), 2);
+        assert_eq!(traffic.selected_index(), 6);
+        assert!(!traffic.following_tail());
+
+        traffic.apply_snapshot(tail_snapshot_with_body_events(11..=12));
+
+        assert_eq!(traffic.selected_index(), 6);
+        assert_eq!(traffic.scroll(), 2);
+        assert!(!traffic.following_tail());
+
+        traffic.drag_scrollbar(9, 10, 5);
+
+        assert_eq!(traffic.selected_index(), 11);
+        assert_eq!(traffic.scroll(), 7);
+        assert!(traffic.following_tail());
+    }
+
+    #[test]
+    fn traffic_jump_to_tail_resumes_live_follow_after_scroll_pause() {
+        let mut traffic = traffic_in_events_view();
+        traffic.set_viewport_rows(5);
+        traffic.apply_snapshot(tail_snapshot_with_body_events(1..=10));
+
+        traffic.scroll_viewport(-3, 5);
+        traffic.apply_snapshot(tail_snapshot_with_body_events(11..=12));
+        assert_eq!(traffic.tail_mode_label(), "Paused");
+        assert!(!traffic.following_tail());
+
+        traffic.jump_to_tail(5);
+
+        assert_eq!(traffic.tail_mode_label(), "Live");
+        assert_eq!(traffic.selected_index(), 11);
+        assert_eq!(traffic.scroll(), 7);
+        assert!(traffic.following_tail());
+    }
+
+    #[test]
+    fn tail_omissions_are_visible_as_selectable_traffic_rows() {
+        let mut traffic = TrafficState::default();
+
+        traffic.apply_snapshot(tail_snapshot_with_response_budget_omission());
+
+        assert_eq!(traffic.status().kind, TrafficStatusKind::Error);
+        assert_eq!(
+            traffic.status().text,
+            "Received 0 events; omitted 1 event: response budget exceeded"
+        );
+        assert_eq!(traffic.rows().len(), 1);
+        let row = traffic.selected_row().expect("omission row is selected");
+        assert_eq!(row.event_type, "tail omission");
+        assert_eq!(row.summary, "response budget exceeded, payload 4096 bytes");
+        assert!(
+            traffic
+                .detail_preview_lines(8)
+                .iter()
+                .any(|line| line == "Reason: response budget exceeded")
+        );
+        let details = row.detail_lines();
+        assert!(details.iter().any(|line| line == "Tail diagnostics"));
+        assert!(
+            details
+                .iter()
+                .any(|line| line == "response budget: 128/256 bytes (truncated)")
+        );
+        assert!(details.iter().any(|line| {
+            line == "Payload schema: traffic.probe.event_envelope.subject_origin.json"
+        }));
+    }
+
+    #[test]
+    fn omitted_tail_row_can_be_replaced_by_full_event_detail() {
+        let mut traffic = TrafficState::default();
+        traffic.apply_snapshot(tail_snapshot_with_response_budget_omission());
+
+        assert_eq!(traffic.selected_detail_fetch_sequence(), Some(2));
+        traffic.mark_detail_loading(2, 11);
+        assert!(
+            traffic
+                .selected_detail_lines()
+                .expect("selected detail")
+                .iter()
+                .any(|line| line == "Full event detail: loading from admin event_detail")
+        );
+
+        let payload = "large response body ".repeat(128);
+        traffic.apply_detail_load_result(TrafficDetailLoadResult {
+            sequence: 2,
+            request_id: 11,
+            result: Ok(EventDetailSnapshot {
+                sequence: 2,
+                stored_at_unix_ns: 99,
+                payload_schema: SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON.to_string(),
+                payload_bytes: payload.len(),
+                event: body_event(payload.as_bytes()),
+            }),
+        });
+
+        assert_eq!(traffic.selected_detail_fetch_sequence(), None);
+        assert!(
+            traffic
+                .selected_detail_lines()
+                .expect("selected detail")
+                .iter()
+                .any(|line| line == &format!("Body payload: {payload}"))
+        );
+    }
+
+    #[test]
+    fn omitted_tail_row_detail_reports_fetch_errors() {
+        let mut traffic = TrafficState::default();
+        traffic.apply_snapshot(tail_snapshot_with_response_budget_omission());
+
+        traffic.mark_detail_loading(2, 11);
+        traffic.apply_detail_load_result(TrafficDetailLoadResult::failed(
+            2,
+            11,
+            "admin socket is unavailable",
+        ));
+
+        let lines = traffic
+            .selected_detail_lines()
+            .expect("selected detail should remain visible");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "Full event detail fetch failed")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "Reason: admin socket is unavailable")
+        );
+    }
+
+    #[test]
+    fn stale_detail_result_does_not_override_current_request() {
+        let mut traffic = TrafficState::default();
+        traffic.apply_snapshot(tail_snapshot_with_response_budget_omission());
+        traffic.mark_detail_loading(2, 11);
+        traffic.mark_detail_loading(2, 12);
+
+        let stale_payload = b"stale detail";
+        assert!(!traffic.apply_detail_load_result(TrafficDetailLoadResult {
+            sequence: 2,
+            request_id: 11,
+            result: Ok(EventDetailSnapshot {
+                sequence: 2,
+                stored_at_unix_ns: 99,
+                payload_schema: SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON.to_string(),
+                payload_bytes: stale_payload.len(),
+                event: body_event(stale_payload),
+            }),
+        }));
+        assert!(
+            traffic
+                .selected_detail_lines()
+                .expect("selected detail")
+                .iter()
+                .any(|line| line == "Full event detail: loading from admin event_detail")
+        );
+
+        let current_payload = b"current detail";
+        assert!(traffic.apply_detail_load_result(TrafficDetailLoadResult {
+            sequence: 2,
+            request_id: 12,
+            result: Ok(EventDetailSnapshot {
+                sequence: 2,
+                stored_at_unix_ns: 99,
+                payload_schema: SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON.to_string(),
+                payload_bytes: current_payload.len(),
+                event: body_event(current_payload),
+            }),
+        }));
+        assert!(
+            traffic
+                .selected_detail_lines()
+                .expect("selected detail")
+                .iter()
+                .any(|line| line == "Body payload: current detail")
+        );
+    }
+
+    #[test]
+    fn stale_detail_result_after_filter_unavailable_is_ignored() {
+        let mut traffic = TrafficState::default();
+        traffic.apply_snapshot(tail_snapshot_with_response_budget_omission());
+        traffic.mark_detail_loading(2, 11);
+
+        traffic.mark_filter_unavailable("Selected process has no readable executable path");
+
+        assert!(!traffic.apply_detail_load_result(TrafficDetailLoadResult {
+            sequence: 2,
+            request_id: 11,
+            result: Ok(EventDetailSnapshot {
+                sequence: 2,
+                stored_at_unix_ns: 99,
+                payload_schema: SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON.to_string(),
+                payload_bytes: 0,
+                event: body_event(b"stale detail"),
+            }),
+        }));
+        assert!(traffic.selected_detail_lines().is_none());
+        assert_eq!(traffic.status().kind, TrafficStatusKind::Error);
+    }
+
+    fn fallback_capture_snapshot() -> CaptureStatusSnapshot {
+        CaptureStatusSnapshot {
+            selection: CaptureSelection::Auto,
+            selected_backend: Some(CaptureBackend::Libpcap),
+            selected_input_source: None,
+            provider_runtime_mode: Some(RuntimeMode::Available),
+            mode: CapturePlanMode::Live,
+            reason: None,
+            evidence_mode: Some(CaptureEvidenceMode::BestEffort),
+            evidence_reason: Some("libpcap stream assembly is best-effort".to_string()),
+            candidates: vec![
+                CaptureCandidateStatusSnapshot {
+                    backend: CaptureBackend::Ebpf,
+                    runtime_mode: RuntimeMode::Unavailable,
+                    capability_mode: RuntimeMode::Unavailable,
+                    evidence_mode: CaptureEvidenceMode::Nominal,
+                    reason: Some("permission denied".to_string()),
+                    evidence_reason: None,
+                },
+                CaptureCandidateStatusSnapshot {
+                    backend: CaptureBackend::Libpcap,
+                    runtime_mode: RuntimeMode::Available,
+                    capability_mode: RuntimeMode::Degraded,
+                    evidence_mode: CaptureEvidenceMode::BestEffort,
+                    reason: None,
+                    evidence_reason: Some("best-effort attribution".to_string()),
+                },
+            ],
+            auto_mitm_plaintext_bridge_candidate: None,
+            open_failures: vec![CaptureOpenFailureStatusSnapshot {
+                backend: CaptureBackend::Ebpf,
+                reason: "permission denied".to_string(),
+            }],
+            provider: None,
+            input_activity: None,
+        }
+    }
+
+    fn active_mitm_bridge_capture_snapshot() -> CaptureStatusSnapshot {
+        CaptureStatusSnapshot {
+            selection: CaptureSelection::Auto,
+            selected_backend: Some(CaptureBackend::CaptureEventFeed),
+            selected_input_source: Some(CaptureInputSource::MitmPlaintextBridge),
+            provider_runtime_mode: Some(RuntimeMode::Available),
+            mode: CapturePlanMode::CaptureEventFeed,
+            reason: None,
+            evidence_mode: Some(CaptureEvidenceMode::Nominal),
+            evidence_reason: None,
+            candidates: vec![CaptureCandidateStatusSnapshot {
+                backend: CaptureBackend::CaptureEventFeed,
+                runtime_mode: RuntimeMode::Available,
+                capability_mode: RuntimeMode::Available,
+                evidence_mode: CaptureEvidenceMode::Nominal,
+                reason: None,
+                evidence_reason: None,
+            }],
+            auto_mitm_plaintext_bridge_candidate: None,
+            open_failures: Vec::new(),
+            provider: None,
+            input_activity: None,
+        }
+    }
+
+    fn tail_snapshot_with_response_budget_omission() -> EventTailSnapshot {
+        EventTailSnapshot {
+            after_sequence: 0,
+            next_after_sequence: 2,
+            last_export_sequence: 2,
+            limit: 64,
+            scanned: 2,
+            budget: EventTailBudgetSnapshot {
+                max_event_payload_bytes: 512,
+                max_response_payload_bytes: 256,
+                included_payload_bytes: 128,
+                truncated: true,
+            },
+            events: Vec::new(),
+            omissions: vec![EventTailOmission {
+                sequence: 2,
+                stored_at_unix_ns: 200,
+                payload_schema: SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON.to_string(),
+                payload_bytes: 4096,
+                reason: EventTailOmissionReason::ResponseBudgetExceeded,
+            }],
+        }
+    }
+
+    fn empty_tail_snapshot(scanned: usize) -> EventTailSnapshot {
+        EventTailSnapshot {
+            after_sequence: 0,
+            next_after_sequence: scanned as u64,
+            last_export_sequence: scanned as u64,
+            limit: 64,
+            scanned,
+            budget: EventTailBudgetSnapshot {
+                max_event_payload_bytes: 512,
+                max_response_payload_bytes: 4096,
+                included_payload_bytes: 0,
+                truncated: false,
+            },
+            events: Vec::new(),
+            omissions: Vec::new(),
+        }
+    }
+
+    fn tail_snapshot_with_gap_events(range: std::ops::RangeInclusive<u64>) -> EventTailSnapshot {
+        let after_sequence = range.start().saturating_sub(1);
+        let last_export_sequence = *range.end();
+        let events = range
+            .map(|sequence| EventTailRecord {
+                sequence,
+                stored_at_unix_ns: sequence * 100,
+                event: gap_event(sequence),
+            })
+            .collect::<Vec<_>>();
+        EventTailSnapshot {
+            after_sequence,
+            next_after_sequence: last_export_sequence,
+            last_export_sequence,
+            limit: events.len(),
+            scanned: events.len(),
+            budget: EventTailBudgetSnapshot {
+                max_event_payload_bytes: 512,
+                max_response_payload_bytes: 4096,
+                included_payload_bytes: 0,
+                truncated: false,
+            },
+            events,
+            omissions: Vec::new(),
+        }
+    }
+
+    fn tail_snapshot_with_body_events(range: std::ops::RangeInclusive<u64>) -> EventTailSnapshot {
+        let after_sequence = range.start().saturating_sub(1);
+        let last_export_sequence = *range.end();
+        let events = range
+            .map(|sequence| EventTailRecord {
+                sequence,
+                stored_at_unix_ns: sequence * 100,
+                event: body_event(format!("body {sequence}").as_bytes()),
+            })
+            .collect::<Vec<_>>();
+        EventTailSnapshot {
+            after_sequence,
+            next_after_sequence: last_export_sequence,
+            last_export_sequence,
+            limit: events.len(),
+            scanned: events.len(),
+            budget: EventTailBudgetSnapshot {
+                max_event_payload_bytes: 512,
+                max_response_payload_bytes: 4096,
+                included_payload_bytes: 0,
+                truncated: false,
+            },
+            events,
+            omissions: Vec::new(),
+        }
+    }
+
+    fn tail_snapshot_with_http_exchange() -> EventTailSnapshot {
+        let events = vec![
+            EventTailRecord {
+                sequence: 1,
+                stored_at_unix_ns: 100,
+                event: request_event("POST", "/api/tasks"),
+            },
+            EventTailRecord {
+                sequence: 2,
+                stored_at_unix_ns: 200,
+                event: body_event(b"hello"),
+            },
+            EventTailRecord {
+                sequence: 3,
+                stored_at_unix_ns: 300,
+                event: response_event(200, "OK"),
+            },
+            EventTailRecord {
+                sequence: 4,
+                stored_at_unix_ns: 400,
+                event: response_body_event(b"ok"),
+            },
+        ];
+        EventTailSnapshot {
+            after_sequence: 0,
+            next_after_sequence: 4,
+            last_export_sequence: 4,
+            limit: events.len(),
+            scanned: events.len(),
+            budget: EventTailBudgetSnapshot {
+                max_event_payload_bytes: 512,
+                max_response_payload_bytes: 4096,
+                included_payload_bytes: 0,
+                truncated: false,
+            },
+            events,
+            omissions: Vec::new(),
+        }
+    }
+
+    fn request_event(method: &str, target: &str) -> EventEnvelope {
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            test_flow(),
+            CaptureOrigin::from_source(CaptureSource::Replay),
+            "test",
+            EventKind::HttpRequestHeaders(probe_core::HttpHeaders {
+                direction: probe_core::Direction::Outbound,
+                stream_sequence: 1,
+                method: Some(method.to_string()),
+                target: Some(target.to_string()),
+                status: None,
+                reason: None,
+                version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+            }),
+        )
+    }
+
+    fn response_event(status: u16, reason: &str) -> EventEnvelope {
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            test_flow(),
+            CaptureOrigin::from_source(CaptureSource::Replay),
+            "test",
+            EventKind::HttpResponseHeaders(probe_core::HttpHeaders {
+                direction: probe_core::Direction::Inbound,
+                stream_sequence: 1,
+                method: None,
+                target: None,
+                status: Some(status),
+                reason: Some(reason.to_string()),
+                version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+            }),
+        )
+    }
+
+    fn body_event(body: &[u8]) -> EventEnvelope {
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            test_flow(),
+            CaptureOrigin::from_source(CaptureSource::Replay),
+            "test",
+            EventKind::HttpBodyChunk(BodyChunk {
+                direction: probe_core::Direction::Outbound,
+                stream_sequence: 1,
+                offset: 0,
+                data: body.to_vec().into(),
+                end_stream: true,
+            }),
+        )
+    }
+
+    fn response_body_event(body: &[u8]) -> EventEnvelope {
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            test_flow(),
+            CaptureOrigin::from_source(CaptureSource::Replay),
+            "test",
+            EventKind::HttpBodyChunk(BodyChunk {
+                direction: probe_core::Direction::Inbound,
+                stream_sequence: 1,
+                offset: 0,
+                data: body.to_vec().into(),
+                end_stream: true,
+            }),
+        )
+    }
+
+    fn traffic_in_events_view() -> TrafficState {
+        let mut traffic = TrafficState::default();
+        traffic.cycle_view_mode();
+        traffic
+    }
+
+    fn gap_event(sequence: u64) -> EventEnvelope {
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: sequence,
+                wall_time_unix_ns: sequence as i64,
+            },
+            test_flow(),
+            CaptureOrigin::from_source(CaptureSource::Replay),
+            "test",
+            EventKind::Gap(Gap {
+                direction: probe_core::Direction::Inbound,
+                expected_offset: sequence,
+                next_offset: Some(sequence + 1),
+                reason: "test gap".to_string(),
+            }),
+        )
+    }
+
+    fn test_flow() -> FlowContext {
+        let process = ProcessContext {
+            identity: ProcessIdentity {
+                pid: 42,
+                tgid: 42,
+                start_time_ticks: 7,
+                boot_id: "boot".to_string(),
+                exe_path: "/usr/bin/curl".to_string(),
+                cmdline_hash: "hash".to_string(),
+                uid: 1000,
+                gid: 1000,
+                cgroup: None,
+                systemd_service: None,
+                container_id: None,
+                runtime_hint: None,
+            },
+            name: "curl".to_string(),
+            cmdline: vec!["curl".to_string()],
+        };
+        let local = AddressPort {
+            address: "127.0.0.1".to_string(),
+            port: 50_000,
+        };
+        let remote = AddressPort {
+            address: "127.0.0.1".to_string(),
+            port: 80,
+        };
+        FlowContext {
+            id: FlowIdentity::stable(
+                &process.identity,
+                &local,
+                &remote,
+                TransportProtocol::Tcp,
+                1,
+                None,
+            ),
+            process,
+            local,
+            remote,
+            protocol: TransportProtocol::Tcp,
+            start_monotonic_ns: 1,
+            socket_cookie: None,
+            attribution_confidence: 100,
+        }
+    }
+}

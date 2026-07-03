@@ -73,7 +73,14 @@ impl TrafficRow {
         matches!(self.payload, TrafficRowPayload::Omission(_)).then_some(self.sequence)
     }
 
-    fn from_event(sequence: u64, event: EventEnvelope) -> Self {
+    pub(super) fn event(&self) -> Option<&EventEnvelope> {
+        match &self.payload {
+            TrafficRowPayload::Event(event) => Some(event),
+            TrafficRowPayload::Omission(_) => None,
+        }
+    }
+
+    pub(super) fn from_event(sequence: u64, event: EventEnvelope) -> Self {
         let flow = event.flow();
         let event_kind = event_kind_display(event.kind(), false);
         Self {

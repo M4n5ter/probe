@@ -9,7 +9,9 @@ use super::{
 pub(crate) enum ControlId {
     ReloadRuntimeActions,
     OpenTrafficDiagnostics,
+    TrafficViewMode,
     TrafficEventFilter,
+    TrafficTailFollow,
     ObserveAuto,
     ObserveEbpf,
     ObserveLibpcap,
@@ -22,7 +24,9 @@ impl ControlId {
         match self {
             Self::ReloadRuntimeActions => "Reload runtime actions",
             Self::OpenTrafficDiagnostics => "Show data path",
+            Self::TrafficViewMode => "Toggle traffic view",
             Self::TrafficEventFilter => "Cycle traffic event filter",
+            Self::TrafficTailFollow => "Follow latest traffic events",
             Self::ObserveAuto => "Observe selected process with auto data path",
             Self::ObserveEbpf => "Observe selected process with eBPF",
             Self::ObserveLibpcap => "Observe selected process with libpcap",
@@ -35,7 +39,9 @@ impl ControlId {
         match self {
             Self::ReloadRuntimeActions => "run action",
             Self::OpenTrafficDiagnostics => "open diagnostics",
+            Self::TrafficViewMode => "toggle view",
             Self::TrafficEventFilter => "cycle filter",
+            Self::TrafficTailFollow => "jump to live",
             Self::ObserveAuto | Self::ObserveEbpf | Self::ObserveLibpcap => "observe process",
             Self::SearchProcesses => "search",
             Self::ClearProcessSearch => "clear",
@@ -45,7 +51,9 @@ impl ControlId {
     pub(crate) fn traffic_action_label(self) -> &'static str {
         match self {
             Self::OpenTrafficDiagnostics => "Data Path",
+            Self::TrafficViewMode => "View",
             Self::TrafficEventFilter => "Events",
+            Self::TrafficTailFollow => "Live",
             Self::ObserveAuto => "Auto",
             Self::ObserveEbpf => "eBPF",
             Self::ObserveLibpcap => "libpcap",
@@ -57,8 +65,12 @@ impl ControlId {
         match self {
             Self::ReloadRuntimeActions => "uses active TUI runtime".to_string(),
             Self::OpenTrafficDiagnostics => "capture and MITM runtime diagnostics".to_string(),
+            Self::TrafficViewMode => "HTTP exchanges or raw traffic events".to_string(),
             Self::TrafficEventFilter => {
                 "parsed protocol, security, diagnostics, or all events".to_string()
+            }
+            Self::TrafficTailFollow => {
+                "jump to the newest traffic event and resume live follow".to_string()
             }
             Self::ObserveAuto => {
                 "selected process, inbound and outbound, auto data path".to_string()

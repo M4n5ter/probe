@@ -10,9 +10,9 @@ use capture::{
     CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CaptureProviderRuntimeDiagnostics,
 };
 use probe_core::{CapabilityState, CaptureProviderKind, CaptureSource};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CaptureInputActivityRuntimeSnapshot {
     pub(crate) polls: CaptureInputPollActivityRuntimeSnapshot,
     pub(crate) capture_events: u64,
@@ -22,7 +22,7 @@ pub(crate) struct CaptureInputActivityRuntimeSnapshot {
     pub(crate) last_signal: Option<CaptureInputSignalRuntimeSnapshot>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CaptureInputProviderActivityRuntimeSnapshot {
     pub(crate) provider: CaptureProviderKind,
     pub(crate) capture_events: u64,
@@ -41,7 +41,7 @@ impl CaptureInputActivityRuntimeSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CaptureInputPollActivityRuntimeSnapshot {
     pub(crate) total: u64,
     pub(crate) events: u64,
@@ -50,7 +50,7 @@ pub(crate) struct CaptureInputPollActivityRuntimeSnapshot {
     pub(crate) finished: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub(crate) enum CaptureInputSignalRuntimeSnapshot {
     Event {

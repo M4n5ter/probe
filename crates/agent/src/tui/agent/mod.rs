@@ -1,7 +1,7 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::{fs::OpenOptionsExt, net::UnixListener as StdUnixListener},
     path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -18,9 +18,10 @@ use super::{
 use crate::admin::{AdminRequest, send_admin_json_request_with_timeout};
 
 const ADMIN_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
-const MANAGED_AGENT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const MANAGED_AGENT_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const MANAGED_AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const LOG_TAIL_BYTES: u64 = 8 * 1024;
+const READY_SOCKET_ENV: &str = "TRAFFIC_PROBE_READY_SOCKET";
 
 #[derive(Debug)]
 pub(crate) struct TuiAgentSupervisor {
@@ -39,6 +40,7 @@ struct ManagedAgent {
     runtime_dir: PathBuf,
     runtime_config_path: PathBuf,
     socket_path: PathBuf,
+    readiness_path: PathBuf,
     log_path: PathBuf,
 }
 
@@ -113,6 +115,7 @@ async fn stop_managed_agent(mut agent: ManagedAgent) {
             agent.runtime_config_path.display()
         );
     }
+    remove_runtime_file(&agent.readiness_path, "TUI managed agent readiness socket");
     if let Err(error) = fs::remove_dir(&agent.runtime_dir)
         && error.kind() != std::io::ErrorKind::NotFound
         && error.kind() != std::io::ErrorKind::DirectoryNotEmpty
@@ -129,11 +132,14 @@ async fn spawn_managed_agent(config: &AgentConfig) -> Result<TuiAgentSupervisor,
     let mut startup_guard = ManagedStartupGuard::new(&layout);
     let runtime_config = managed_runtime_config(config, &layout.socket_path);
     write_runtime_config(&runtime_config, &layout.config_path)?;
+    let readiness_listener = bind_readiness_socket(&layout.readiness_path)?;
     let log = open_log_file(&layout.log_path)?;
-    let mut child = Command::new(current_exe()?)
+    let mut command = Command::new(current_exe()?);
+    command
         .arg("run")
         .arg("--config")
         .arg(&layout.config_path)
+        .env(READY_SOCKET_ENV, &layout.readiness_path)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone().map_err(|source| {
             TuiError::AgentSupervisor {
@@ -142,13 +148,20 @@ async fn spawn_managed_agent(config: &AgentConfig) -> Result<TuiAgentSupervisor,
             }
         })?))
         .stderr(Stdio::from(log))
+        .kill_on_drop(true);
+    let mut child = command
         .spawn()
         .map_err(|source| TuiError::AgentSupervisor {
             action: "spawn TUI managed agent",
             source,
         })?;
-    if let Err(error) =
-        wait_for_managed_agent(&mut child, &layout.socket_path, &layout.log_path).await
+    if let Err(error) = wait_for_managed_agent(
+        &mut child,
+        &readiness_listener,
+        &layout.socket_path,
+        &layout.log_path,
+    )
+    .await
     {
         terminate_child(&mut child).await;
         startup_guard.keep_log();
@@ -161,6 +174,7 @@ async fn spawn_managed_agent(config: &AgentConfig) -> Result<TuiAgentSupervisor,
             runtime_dir: layout.runtime_dir,
             runtime_config_path: layout.config_path,
             socket_path: layout.socket_path,
+            readiness_path: layout.readiness_path,
             log_path: layout.log_path,
         })),
     })
@@ -171,6 +185,7 @@ struct ManagedRuntimeLayout {
     runtime_dir: PathBuf,
     config_path: PathBuf,
     socket_path: PathBuf,
+    readiness_path: PathBuf,
     log_path: PathBuf,
 }
 
@@ -185,6 +200,7 @@ impl ManagedRuntimeLayout {
         Ok(Self {
             config_path: runtime_dir.join("agent.toml"),
             socket_path: runtime_dir.join("admin.sock"),
+            readiness_path: runtime_dir.join("ready.sock"),
             log_path: runtime_dir.join("agent.log"),
             runtime_dir,
         })
@@ -195,6 +211,7 @@ impl ManagedRuntimeLayout {
 struct ManagedStartupGuard {
     runtime_dir: PathBuf,
     config_path: PathBuf,
+    readiness_path: PathBuf,
     log_path: PathBuf,
     keep_log: bool,
     armed: bool,
@@ -205,6 +222,7 @@ impl ManagedStartupGuard {
         Self {
             runtime_dir: layout.runtime_dir.clone(),
             config_path: layout.config_path.clone(),
+            readiness_path: layout.readiness_path.clone(),
             log_path: layout.log_path.clone(),
             keep_log: false,
             armed: true,
@@ -229,6 +247,7 @@ impl Drop for ManagedStartupGuard {
         if !self.keep_log {
             remove_startup_file(&self.log_path, "TUI managed agent log");
         }
+        remove_startup_file(&self.readiness_path, "TUI managed agent readiness socket");
         if let Err(error) = fs::remove_dir(&self.runtime_dir)
             && error.kind() != std::io::ErrorKind::NotFound
             && error.kind() != std::io::ErrorKind::DirectoryNotEmpty
@@ -238,6 +257,14 @@ impl Drop for ManagedStartupGuard {
                 self.runtime_dir.display()
             );
         }
+    }
+}
+
+fn remove_runtime_file(path: &Path, label: &str) {
+    if let Err(error) = fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("failed to remove {label} {}: {error}", path.display());
     }
 }
 
@@ -295,6 +322,20 @@ fn open_log_file(path: &Path) -> Result<File, TuiError> {
         })
 }
 
+fn bind_readiness_socket(path: &Path) -> Result<StdUnixListener, TuiError> {
+    let listener = StdUnixListener::bind(path).map_err(|source| TuiError::AgentSupervisor {
+        action: "bind TUI managed agent readiness socket",
+        source,
+    })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|source| TuiError::AgentSupervisor {
+            action: "configure TUI managed agent readiness socket",
+            source,
+        })?;
+    Ok(listener)
+}
+
 fn runtime_config_suffix() -> String {
     let pid = std::process::id();
     let nanos = SystemTime::now()
@@ -306,12 +347,58 @@ fn runtime_config_suffix() -> String {
 
 async fn wait_for_managed_agent(
     child: &mut tokio::process::Child,
-    socket_path: &Path,
+    readiness_listener: &StdUnixListener,
+    admin_socket_path: &Path,
     log_path: &Path,
 ) -> Result<(), TuiError> {
     let deadline = Instant::now() + MANAGED_AGENT_STARTUP_TIMEOUT;
     loop {
-        if admin_socket_responds(socket_path).await {
+        match readiness_listener.accept() {
+            Ok((_stream, _address)) => {
+                wait_for_admin_socket_after_readiness(child, admin_socket_path, log_path, deadline)
+                    .await?;
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(source) => {
+                return Err(TuiError::AgentSupervisor {
+                    action: "accept TUI managed agent readiness signal",
+                    source,
+                });
+            }
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|source| TuiError::AgentSupervisor {
+                action: "poll TUI managed agent startup",
+                source,
+            })?
+        {
+            return Err(TuiError::ManagedAgentExited {
+                status,
+                log_path: log_path.to_path_buf(),
+                log_tail: managed_startup_log_tail(log_path),
+            });
+        }
+        if Instant::now() >= deadline {
+            return Err(TuiError::ManagedAgentStartupTimeout {
+                socket_path: admin_socket_path.display().to_string(),
+                log_path: log_path.to_path_buf(),
+                log_tail: managed_startup_log_tail(log_path),
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_admin_socket_after_readiness(
+    child: &mut tokio::process::Child,
+    admin_socket_path: &Path,
+    log_path: &Path,
+    deadline: Instant,
+) -> Result<(), TuiError> {
+    loop {
+        if admin_socket_responds(admin_socket_path).await {
             return Ok(());
         }
         if let Some(status) = child
@@ -329,7 +416,7 @@ async fn wait_for_managed_agent(
         }
         if Instant::now() >= deadline {
             return Err(TuiError::ManagedAgentStartupTimeout {
-                socket_path: socket_path.display().to_string(),
+                socket_path: admin_socket_path.display().to_string(),
                 log_path: log_path.to_path_buf(),
                 log_tail: managed_startup_log_tail(log_path),
             });
@@ -510,6 +597,7 @@ mod tests {
         ManagedRuntimeLayout {
             config_path: runtime_dir.join("agent.toml"),
             socket_path: runtime_dir.join("admin.sock"),
+            readiness_path: runtime_dir.join("ready.sock"),
             log_path: runtime_dir.join("agent.log"),
             runtime_dir,
         }

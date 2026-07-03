@@ -801,99 +801,103 @@ mod tests {
         assert_eq!(EBPF_PROCESS_MAP_SPECS.len(), 14);
         assert_unique(EBPF_PROCESS_MAP_SPECS.map(|spec| spec.name));
 
-        let allow_map = process_map(EBPF_ALLOWED_SOCKET_FDS_MAP_NAME);
-        assert_eq!(allow_map.kind, EbpfMapKind::LruHash);
-        assert_eq!(allow_map.key_size, EBPF_ALLOWED_SOCKET_FD_KEY_BYTES);
-        assert_eq!(allow_map.value_size, EBPF_ALLOWED_SOCKET_FD_VALUE_BYTES);
-
-        let process_allow_map = process_map(EBPF_ALLOWED_PROCESS_TGIDS_MAP_NAME);
-        assert_eq!(process_allow_map.kind, EbpfMapKind::LruHash);
-        assert_eq!(
-            process_allow_map.key_size,
-            EBPF_ALLOWED_PROCESS_TGID_KEY_BYTES
+        assert_map_layout(
+            process_map(EBPF_EVENTS_MAP_NAME),
+            EbpfMapKind::Ringbuf,
+            0,
+            0,
+            128 * 1024 * 1024,
         );
-        assert_eq!(
-            process_allow_map.value_size,
-            EBPF_ALLOWED_PROCESS_TGID_VALUE_BYTES
+        assert_map_layout(
+            process_map(EBPF_ALLOWED_SOCKET_FDS_MAP_NAME),
+            EbpfMapKind::LruHash,
+            8,
+            24,
+            8192,
         );
-
-        let epoch_map = process_map(EBPF_FD_TABLE_EPOCHS_MAP_NAME);
-        assert_eq!(epoch_map.kind, EbpfMapKind::Hash);
-        assert_eq!(epoch_map.key_size, EBPF_FD_TABLE_EPOCH_KEY_BYTES);
-        assert_eq!(epoch_map.value_size, EBPF_FD_TABLE_EPOCH_VALUE_BYTES);
-
-        let fd_generation_map = process_map(EBPF_SOCKET_FD_GENERATIONS_MAP_NAME);
-        assert_eq!(fd_generation_map.kind, EbpfMapKind::Hash);
-        assert_eq!(
-            fd_generation_map.key_size,
-            EBPF_SOCKET_FD_GENERATION_KEY_BYTES
+        assert_map_layout(
+            process_map(EBPF_ALLOWED_PROCESS_TGIDS_MAP_NAME),
+            EbpfMapKind::LruHash,
+            4,
+            8,
+            8192,
         );
-        assert_eq!(
-            fd_generation_map.value_size,
-            EBPF_SOCKET_FD_GENERATION_VALUE_BYTES
+        assert_map_layout(
+            process_map(EBPF_FD_TABLE_EPOCHS_MAP_NAME),
+            EbpfMapKind::Hash,
+            4,
+            8,
+            8192,
         );
-
-        let pending_connects = process_map(EBPF_PENDING_CONNECTS_MAP_NAME);
-        assert_eq!(pending_connects.kind, EbpfMapKind::Hash);
-        assert_eq!(
-            pending_connects.value_size,
-            size_of::<EbpfPendingSocketConnectAttempt>() as u32
+        assert_map_layout(
+            process_map(EBPF_SOCKET_FD_GENERATIONS_MAP_NAME),
+            EbpfMapKind::Hash,
+            8,
+            8,
+            8192,
         );
-
-        let pending_accepts = process_map(EBPF_PENDING_ACCEPTS_MAP_NAME);
-        assert_eq!(pending_accepts.kind, EbpfMapKind::Hash);
-        assert_eq!(
-            pending_accepts.value_size,
-            size_of::<EbpfPendingSocketAcceptAttempt>() as u32
+        assert_map_layout(
+            process_map(EBPF_PENDING_CONNECTS_MAP_NAME),
+            EbpfMapKind::Hash,
+            8,
+            56,
+            8192,
         );
-
-        let pending_map = process_map(EBPF_PENDING_WRITES_MAP_NAME);
-        assert_eq!(pending_map.kind, EbpfMapKind::Hash);
-        assert_eq!(
-            pending_map.value_size,
-            size_of::<EbpfPendingSocketWriteSample>() as u32
+        assert_map_layout(
+            process_map(EBPF_PENDING_ACCEPTS_MAP_NAME),
+            EbpfMapKind::Hash,
+            8,
+            24,
+            8192,
         );
-
-        let pending_scratch = process_map(EBPF_PENDING_WRITE_SCRATCH_MAP_NAME);
-        assert_eq!(pending_scratch.kind, EbpfMapKind::PerCpuArray);
-        assert_eq!(
-            pending_scratch.value_size,
-            size_of::<EbpfPendingSocketWriteSample>() as u32
+        assert_map_layout(
+            process_map(EBPF_PENDING_WRITES_MAP_NAME),
+            EbpfMapKind::Hash,
+            8,
+            16408,
+            8192,
         );
-
-        let pending_reads = process_map(EBPF_PENDING_READS_MAP_NAME);
-        assert_eq!(pending_reads.kind, EbpfMapKind::Hash);
-        assert_eq!(
-            pending_reads.value_size,
-            size_of::<EbpfPendingSocketReadAttempt>() as u32
+        assert_map_layout(
+            process_map(EBPF_PENDING_WRITE_SCRATCH_MAP_NAME),
+            EbpfMapKind::PerCpuArray,
+            4,
+            16408,
+            1,
         );
-
-        let read_scratch = process_map(EBPF_PROCESS_READ_EVENT_SCRATCH_MAP_NAME);
-        assert_eq!(read_scratch.kind, EbpfMapKind::PerCpuArray);
-        assert_eq!(
-            read_scratch.value_size,
-            size_of::<EbpfSocketReadSampleRecord>() as u32
+        assert_map_layout(
+            process_map(EBPF_PENDING_READS_MAP_NAME),
+            EbpfMapKind::Hash,
+            8,
+            32,
+            8192,
         );
-
-        let output_losses = process_map(EBPF_PROCESS_OUTPUT_LOSSES_MAP_NAME);
-        assert_eq!(output_losses.kind, EbpfMapKind::PerCpuArray);
-        assert_eq!(output_losses.key_size, EBPF_PROCESS_OUTPUT_LOSS_KEY_BYTES);
-        assert_eq!(output_losses.value_size, size_of::<u64>() as u32);
-        assert_eq!(
-            output_losses.max_entries,
-            EBPF_PROCESS_OUTPUT_LOSSES_MAX_ENTRIES
+        assert_map_layout(
+            process_map(EBPF_PROCESS_EVENT_SCRATCH_MAP_NAME),
+            EbpfMapKind::PerCpuArray,
+            4,
+            16456,
+            1,
         );
-
-        let tracepoint_firings = process_map(EBPF_PROCESS_TRACEPOINT_FIRINGS_MAP_NAME);
-        assert_eq!(tracepoint_firings.kind, EbpfMapKind::PerCpuArray);
-        assert_eq!(
-            tracepoint_firings.key_size,
-            EBPF_PROCESS_TRACEPOINT_FIRING_KEY_BYTES
+        assert_map_layout(
+            process_map(EBPF_PROCESS_READ_EVENT_SCRATCH_MAP_NAME),
+            EbpfMapKind::PerCpuArray,
+            4,
+            16456,
+            1,
         );
-        assert_eq!(tracepoint_firings.value_size, size_of::<u64>() as u32);
-        assert_eq!(
-            tracepoint_firings.max_entries,
-            EBPF_PROCESS_TRACEPOINT_FIRINGS_MAX_ENTRIES
+        assert_map_layout(
+            process_map(EBPF_PROCESS_OUTPUT_LOSSES_MAP_NAME),
+            EbpfMapKind::PerCpuArray,
+            4,
+            8,
+            1,
+        );
+        assert_map_layout(
+            process_map(EBPF_PROCESS_TRACEPOINT_FIRINGS_MAP_NAME),
+            EbpfMapKind::PerCpuArray,
+            4,
+            8,
+            34,
         );
 
         assert_eq!(
@@ -1010,7 +1014,10 @@ mod tests {
 
     #[test]
     fn pending_socket_write_sample_layout_is_stable() {
-        assert_eq!(size_of::<EbpfPendingSocketWriteSample>(), 280);
+        assert_eq!(
+            size_of::<EbpfPendingSocketWriteSample>(),
+            24 + EBPF_SOCKET_WRITE_SAMPLE_BYTES
+        );
         assert_eq!(align_of::<EbpfPendingSocketWriteSample>(), 8);
         assert_eq!(offset_of!(EbpfPendingSocketWriteSample, fd), 0);
         assert_eq!(offset_of!(EbpfPendingSocketWriteSample, original_len), 4);
@@ -1074,6 +1081,19 @@ mod tests {
             .iter()
             .find(|spec| spec.name == name)
             .expect("process map should exist")
+    }
+
+    fn assert_map_layout(
+        spec: EbpfMapSpec,
+        kind: EbpfMapKind,
+        key_size: u32,
+        value_size: u32,
+        max_entries: u32,
+    ) {
+        assert_eq!(spec.kind, kind);
+        assert_eq!(spec.key_size, key_size);
+        assert_eq!(spec.value_size, value_size);
+        assert_eq!(spec.max_entries, max_entries);
     }
 
     fn assert_unique(values: impl IntoIterator<Item = &'static str>) {

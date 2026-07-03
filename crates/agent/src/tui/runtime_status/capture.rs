@@ -16,11 +16,31 @@ use super::CaptureDiagnosticMessage;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CaptureDiagnostics {
     snapshot: CaptureStatusSnapshot,
+    provider_reported: bool,
+    input_activity_reported: bool,
 }
 
 impl CaptureDiagnostics {
     pub(super) fn new(snapshot: CaptureStatusSnapshot) -> Self {
-        Self { snapshot }
+        let provider_reported = snapshot.provider.is_some();
+        let input_activity_reported = snapshot.input_activity.is_some();
+        Self {
+            snapshot,
+            provider_reported,
+            input_activity_reported,
+        }
+    }
+
+    pub(super) fn from_admin_status(
+        snapshot: CaptureStatusSnapshot,
+        provider_reported: bool,
+        input_activity_reported: bool,
+    ) -> Self {
+        Self {
+            snapshot,
+            provider_reported,
+            input_activity_reported,
+        }
     }
 
     pub(super) fn status_message(
@@ -52,6 +72,15 @@ impl CaptureDiagnostics {
                 "Capture using {}; passive fallback occurred ({summary})",
                 self.selected_backend_label()
             )));
+        }
+        if traffic_empty && self.runtime_provider_pending() {
+            return Some(CaptureDiagnosticMessage::Info(format!(
+                "Capture {} is starting; waiting for provider",
+                self.selected_backend_label()
+            )));
+        }
+        if traffic_empty && let Some(message) = self.capture_loss_status_message() {
+            return Some(message);
         }
         traffic_empty.then(|| {
             CaptureDiagnosticMessage::Info(format!(
@@ -119,6 +148,24 @@ impl CaptureDiagnostics {
         if let Some(reason) = &self.snapshot.reason {
             lines.push(format!("reason: {reason}"));
         }
+        if let Some(activity) = &self.snapshot.input_activity {
+            lines.push(format!(
+                "input activity: capture_events={}, output_loss_events={}, lost_events={}",
+                activity.capture_events, activity.output_loss_events, activity.lost_events
+            ));
+            lines.extend(activity.providers.iter().map(|provider| {
+                format!(
+                    "input provider {}: capture_events={}, output_loss_events={}, lost_events={}",
+                    provider.provider.wire_name(),
+                    provider.capture_events,
+                    provider.output_loss_events,
+                    provider.lost_events
+                )
+            }));
+            if let Some(signal) = &activity.last_signal {
+                lines.push(format!("last input signal: {}", signal.kind()));
+            }
+        }
         if !self.snapshot.candidates.is_empty() {
             lines.push("provider candidates:".to_string());
             lines.extend(self.snapshot.candidates.iter().map(|candidate| {
@@ -170,6 +217,28 @@ impl CaptureDiagnostics {
             || self.snapshot.mode == CapturePlanMode::Unavailable
     }
 
+    fn runtime_provider_pending(&self) -> bool {
+        self.using_live_host()
+            && self.snapshot.provider_runtime_mode.is_some()
+            && !self.provider_reported
+            && !self.input_activity_reported
+    }
+
+    fn capture_loss_status_message(&self) -> Option<CaptureDiagnosticMessage> {
+        let activity = self.snapshot.input_activity.as_ref()?;
+        if activity.output_loss_events == 0 && activity.lost_events == 0 {
+            return None;
+        }
+        let provider_summary = input_loss_provider_summary(activity);
+        Some(CaptureDiagnosticMessage::Warning(format!(
+            "Capture {} lost {} input event(s) across {} output-loss signal(s){}; parsed HTTP may be incomplete, switch to Diagnostics/All or use MITM for reliable full payload visibility",
+            self.selected_backend_label(),
+            activity.lost_events,
+            activity.output_loss_events,
+            provider_summary
+        )))
+    }
+
     pub(super) fn using_live_host(&self) -> bool {
         self.snapshot.selected_input_source == Some(CaptureInputSource::LiveHost)
             || (self.snapshot.selected_input_source.is_none()
@@ -178,6 +247,10 @@ impl CaptureDiagnostics {
 
     pub(super) fn using_mitm_plaintext_bridge(&self) -> bool {
         self.snapshot.selected_input_source == Some(CaptureInputSource::MitmPlaintextBridge)
+    }
+
+    pub(super) fn using_libpcap_live_host(&self) -> bool {
+        self.using_live_host() && self.snapshot.selected_backend == Some(CaptureBackend::Libpcap)
     }
 
     pub(super) fn mitm_bridge_passive_context_message(&self) -> Option<CaptureDiagnosticMessage> {
@@ -294,6 +367,28 @@ fn unique_backend_names(backends: Vec<CaptureBackend>) -> Vec<&'static str> {
         }
         names
     })
+}
+
+fn input_loss_provider_summary(
+    activity: &crate::capture_provider::CaptureInputActivityRuntimeSnapshot,
+) -> String {
+    let providers = activity
+        .providers
+        .iter()
+        .filter(|provider| provider.output_loss_events > 0 || provider.lost_events > 0)
+        .map(|provider| {
+            format!(
+                "{} lost {} event(s)",
+                provider.provider.wire_name(),
+                provider.lost_events
+            )
+        })
+        .collect::<Vec<_>>();
+    if providers.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", providers.join(", "))
+    }
 }
 
 fn candidate_failure_detail(candidate: &CaptureCandidateStatusSnapshot) -> Option<String> {

@@ -17,18 +17,24 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use probe_config::default_config_path;
 
 use super::{
-    agent::TuiAgentSupervisor,
     app::{TuiAction, TuiApp, TuiEffect, TuiTab},
     config_edit::{TuiError, load_config, load_or_create_config, save_config},
     hit::HitMap,
+    process_catalog_task::{
+        STARTUP_BACKGROUND_STATUS, apply_process_catalog_load_result,
+        cancel_pending_process_catalog, spawn_process_catalog_load, take_finished_process_catalog,
+    },
     processes::ProcessCatalog,
     render::draw,
-    runtime_actions::request_runtime_actions_reload,
+    runtime_reconcile::{
+        QueuedRuntimeReconcile, apply_runtime_reconcile_result, cancel_pending_runtime_reconcile,
+        mark_saved_runtime_success, reload_runtime_actions, spawn_saved_runtime_reconcile,
+        spawn_startup_runtime_reconcile, take_finished_runtime_reconcile,
+    },
     traffic::{TrafficDetailLoadResult, load_traffic_detail},
 };
 
 const TRAFFIC_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TuiOptions {
     pub(crate) config: Option<PathBuf>,
@@ -40,18 +46,13 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
     let mut app = TuiApp::new(
         config_path,
         loaded.config.clone(),
-        ProcessCatalog::from_proc(),
+        ProcessCatalog::default(),
     );
-    let mut supervisor = match TuiAgentSupervisor::attach_or_spawn(app.config()).await {
-        Ok(supervisor) => {
-            app.attach_agent(supervisor.attachment(app.config()));
-            Some(supervisor)
-        }
-        Err(error) => {
-            app.mark_error(format!("TUI agent unavailable: {error}"));
-            None
-        }
-    };
+    let mut supervisor = None;
+    let mut pending_process_catalog = Some(spawn_process_catalog_load());
+    let mut pending_runtime_reconcile = Some(spawn_startup_runtime_reconcile(app.config().clone()));
+    let mut queued_runtime_reconcile: Option<QueuedRuntimeReconcile> = None;
+    app.mark_info(STARTUP_BACKGROUND_STATUS);
     let result = async {
         let mut terminal = TerminalSession::enter()?;
         let mut last_traffic_refresh = Instant::now()
@@ -61,6 +62,19 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
         let mut pending_traffic_detail: Option<PendingTrafficDetail> = None;
 
         loop {
+            if let Some(result) = take_finished_process_catalog(&mut pending_process_catalog).await
+            {
+                apply_process_catalog_load_result(&mut app, result);
+            }
+            if let Some(result) =
+                take_finished_runtime_reconcile(&mut pending_runtime_reconcile).await
+            {
+                apply_runtime_reconcile_result(&mut supervisor, &mut app, result);
+                if let Some(queued) = queued_runtime_reconcile.take() {
+                    pending_runtime_reconcile =
+                        Some(spawn_saved_runtime_reconcile(&mut supervisor, queued));
+                }
+            }
             if let Some(result) = take_finished_traffic_detail(&mut pending_traffic_detail).await {
                 app.apply_traffic_detail_result(result);
             }
@@ -114,12 +128,31 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
                                 loaded.source = source;
                                 app.mark_saved(saved_status.clone());
                                 if should_reconcile_runtime {
-                                    reconcile_saved_runtime(
-                                        &mut supervisor,
-                                        &mut app,
-                                        &saved_status,
-                                    )
-                                    .await;
+                                    let queued = QueuedRuntimeReconcile {
+                                        config: app.config().clone(),
+                                        config_path: app.config_path().clone(),
+                                        active_socket_path: app
+                                            .active_admin_socket_path()
+                                            .map(PathBuf::from),
+                                        saved_status: saved_status.clone(),
+                                    };
+                                    if pending_runtime_reconcile.is_some() {
+                                        queued_runtime_reconcile = Some(queued);
+                                        mark_saved_runtime_success(
+                                            &mut app,
+                                            &saved_status,
+                                            "runtime apply queued behind the active agent task",
+                                        );
+                                    } else {
+                                        pending_runtime_reconcile = Some(
+                                            spawn_saved_runtime_reconcile(&mut supervisor, queued),
+                                        );
+                                        mark_saved_runtime_success(
+                                            &mut app,
+                                            &saved_status,
+                                            "applying runtime changes in background",
+                                        );
+                                    }
                                 }
                             }
                             Err(error) => app.mark_save_failed(error.to_string()),
@@ -128,7 +161,9 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
                     TuiEffect::ReloadConfig => match load_config(app.config_path()) {
                         Ok(next) => {
                             loaded = next;
-                            app.replace_config(loaded.config.clone(), ProcessCatalog::from_proc());
+                            app.replace_config(loaded.config.clone(), ProcessCatalog::default());
+                            app.mark_info("Reloaded config; refreshing process list in background");
+                            pending_process_catalog = Some(spawn_process_catalog_load());
                         }
                         Err(error) => app.mark_save_failed(error.to_string()),
                     },
@@ -151,6 +186,8 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
         if let Some(pending) = pending_traffic_detail {
             pending.task.abort();
         }
+        cancel_pending_runtime_reconcile(pending_runtime_reconcile).await;
+        cancel_pending_process_catalog(pending_process_catalog).await;
 
         Ok(())
     }
@@ -184,119 +221,6 @@ async fn take_finished_traffic_detail(
             pending.request_id,
             format!("traffic detail task failed: {error}"),
         )),
-    }
-}
-
-async fn reconcile_saved_runtime(
-    supervisor: &mut Option<TuiAgentSupervisor>,
-    app: &mut TuiApp,
-    saved_status: &super::app::StatusMessage,
-) {
-    let config = app.config().clone();
-    match supervisor.take() {
-        Some(running) if running.is_managed() => match running.restart(&config).await {
-            Ok(next) => {
-                app.attach_agent(next.attachment(&config));
-                mark_saved_runtime_success(
-                    app,
-                    saved_status,
-                    format!(
-                        "restarted TUI managed agent; {}",
-                        app.runtime_agent_status()
-                    ),
-                );
-                *supervisor = Some(next);
-            }
-            Err(error) => {
-                detach_saved_runtime_error(
-                    app,
-                    saved_status,
-                    format!("failed to restart TUI managed agent: {error}"),
-                );
-            }
-        },
-        Some(running) => {
-            mark_saved_runtime_warning(
-                app,
-                saved_status,
-                "restart the attached agent to apply capture and MITM runtime resources",
-            );
-            *supervisor = Some(running);
-        }
-        None => match TuiAgentSupervisor::attach_or_spawn(&config).await {
-            Ok(next) => {
-                app.attach_agent(next.attachment(&config));
-                mark_saved_runtime_success(
-                    app,
-                    saved_status,
-                    format!("attached TUI agent; {}", app.runtime_agent_status()),
-                );
-                *supervisor = Some(next);
-            }
-            Err(error) => {
-                mark_saved_runtime_error(
-                    app,
-                    saved_status,
-                    format!("TUI agent is still unavailable: {error}"),
-                );
-            }
-        },
-    }
-}
-
-fn mark_saved_runtime_success(
-    app: &mut TuiApp,
-    saved_status: &super::app::StatusMessage,
-    suffix: impl AsRef<str>,
-) {
-    let text = saved_runtime_status_text(saved_status, suffix);
-    match saved_status.kind {
-        super::app::StatusKind::Warning => app.mark_warning(text),
-        super::app::StatusKind::Error => app.mark_error(text),
-        _ => app.mark_info(text),
-    }
-}
-
-fn mark_saved_runtime_warning(
-    app: &mut TuiApp,
-    saved_status: &super::app::StatusMessage,
-    suffix: impl AsRef<str>,
-) {
-    app.mark_warning(saved_runtime_status_text(saved_status, suffix));
-}
-
-fn mark_saved_runtime_error(
-    app: &mut TuiApp,
-    saved_status: &super::app::StatusMessage,
-    suffix: impl AsRef<str>,
-) {
-    app.mark_error(saved_runtime_status_text(saved_status, suffix));
-}
-
-fn detach_saved_runtime_error(
-    app: &mut TuiApp,
-    saved_status: &super::app::StatusMessage,
-    suffix: impl AsRef<str>,
-) {
-    app.detach_agent(saved_runtime_status_text(saved_status, suffix));
-}
-
-fn saved_runtime_status_text(
-    saved_status: &super::app::StatusMessage,
-    suffix: impl AsRef<str>,
-) -> String {
-    format!("{}; {}", saved_status.text, suffix.as_ref())
-}
-
-async fn reload_runtime_actions(app: &mut TuiApp) {
-    let Some(socket_path) = app.active_admin_socket_path().map(PathBuf::from) else {
-        app.mark_warning("No active agent admin socket is attached to this TUI session");
-        return;
-    };
-    match request_runtime_actions_reload(&socket_path).await {
-        Ok(summary) if summary.has_failures() => app.mark_warning(summary.status_text()),
-        Ok(summary) => app.mark_info(summary.status_text()),
-        Err(error) => app.mark_error(error.to_string()),
     }
 }
 
@@ -420,8 +344,14 @@ fn key_to_action(key: KeyEvent, editing_text: bool, active_tab: TuiTab) -> Optio
         (KeyCode::Char('d'), _) if active_tab == TuiTab::Traffic => {
             Some(TuiAction::OpenTrafficDiagnostics)
         }
+        (KeyCode::Char('v'), _) if active_tab == TuiTab::Traffic => {
+            Some(TuiAction::CycleTrafficViewMode)
+        }
         (KeyCode::Char('h'), _) if active_tab == TuiTab::Traffic => {
             Some(TuiAction::CycleTrafficEventFilter)
+        }
+        (KeyCode::Char('t'), _) if active_tab == TuiTab::Traffic => {
+            Some(TuiAction::FollowTrafficTail)
         }
         (KeyCode::Char('a'), _) if active_tab == TuiTab::Traffic => Some(TuiAction::ObserveAuto),
         (KeyCode::Char('e'), _) if active_tab == TuiTab::Traffic => Some(TuiAction::ObserveEbpf),
@@ -456,8 +386,22 @@ fn text_key_to_action(key: KeyEvent) -> Option<TuiAction> {
 fn mouse_to_action(hit_map: &HitMap, mouse: MouseEvent) -> Option<TuiAction> {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(hit) = hit_map.scrollbar_hit(mouse.column, mouse.row) {
+                return Some(TuiAction::DragScrollbar {
+                    target: hit.target,
+                    offset: hit.offset,
+                    height: hit.height,
+                });
+            }
             hit_map.hit(mouse.column, mouse.row).map(TuiAction::Click)
         }
+        MouseEventKind::Drag(MouseButton::Left) => hit_map
+            .scrollbar_hit(mouse.column, mouse.row)
+            .map(|hit| TuiAction::DragScrollbar {
+                target: hit.target,
+                offset: hit.offset,
+                height: hit.height,
+            }),
         MouseEventKind::Moved => Some(TuiAction::Hover {
             target: hit_map.hit(mouse.column, mouse.row),
             column: mouse.column,
@@ -482,7 +426,7 @@ mod tests {
 
     use super::{
         super::{
-            app::{StatusKind, StatusMessage, TuiAction, TuiApp, TuiTab},
+            app::{TuiAction, TuiApp, TuiTab},
             hit::{HitArea, HitMap, HitTarget, ScrollTarget},
             processes::{ProcessCatalog, ProcessEntry},
             render::draw,
@@ -555,6 +499,14 @@ mod tests {
                 TuiTab::Traffic
             ),
             Some(TuiAction::OpenTrafficDiagnostics)
+        );
+        assert_eq!(
+            key_to_action(
+                KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+                false,
+                TuiTab::Traffic
+            ),
+            Some(TuiAction::FollowTrafficTail)
         );
         assert_eq!(
             key_to_action(
@@ -720,6 +672,33 @@ mod tests {
     }
 
     #[test]
+    fn mouse_drag_on_scrollbar_targets_scrollbar_position() {
+        let hit_map = HitMap::new(vec![HitArea::scrollbar(
+            Rect::new(20, 4, 1, 10),
+            ScrollTarget::TrafficEvents,
+        )]);
+
+        let action = mouse_to_action(
+            &hit_map,
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 20,
+                row: 9,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert_eq!(
+            action,
+            Some(TuiAction::DragScrollbar {
+                target: ScrollTarget::TrafficEvents,
+                offset: 5,
+                height: 10,
+            })
+        );
+    }
+
+    #[test]
     fn traffic_watch_button_scroll_does_not_move_process_picker()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut app = traffic_test_app();
@@ -771,82 +750,6 @@ mod tests {
 
         assert_eq!(resolve_config_path(Some(explicit.clone())), explicit);
         assert_eq!(resolve_config_path(None), default_config_path());
-    }
-
-    #[test]
-    fn saved_runtime_success_preserves_warning_severity() {
-        let mut app = TuiApp::new(
-            PathBuf::from("/tmp/agent.toml"),
-            AgentConfig::default(),
-            ProcessCatalog::default(),
-        );
-        let status = StatusMessage::warning(
-            "Outbound reliable MITM proxy data path configured, but MITM proxy executable is missing",
-        );
-
-        mark_saved_runtime_success(&mut app, &status, "restarted TUI managed agent");
-
-        assert_eq!(app.status().kind, StatusKind::Warning);
-        assert!(
-            app.status()
-                .text
-                .contains("MITM proxy executable is missing")
-        );
-        assert!(app.status().text.contains("restarted TUI managed agent"));
-    }
-
-    #[test]
-    fn saved_runtime_error_preserves_operation_context() {
-        let mut app = TuiApp::new(
-            PathBuf::from("/tmp/agent.toml"),
-            AgentConfig::default(),
-            ProcessCatalog::default(),
-        );
-        let status = StatusMessage::saved(
-            "Saved bidirectional MITM observation for curl; runtime bidirectional MITM expansion is pending",
-        );
-
-        mark_saved_runtime_error(
-            &mut app,
-            &status,
-            "TUI agent is still unavailable: startup failed",
-        );
-
-        assert_eq!(app.status().kind, StatusKind::Error);
-        assert!(app.status().text.contains("bidirectional MITM observation"));
-        assert!(app.status().text.contains("MITM expansion is pending"));
-        assert!(app.status().text.contains("startup failed"));
-    }
-
-    #[test]
-    fn saved_runtime_detach_error_preserves_operation_context() {
-        let mut app = TuiApp::new(
-            PathBuf::from("/tmp/agent.toml"),
-            AgentConfig::default(),
-            ProcessCatalog::default(),
-        );
-        let status = StatusMessage::saved(
-            "Saved bidirectional MITM observation for curl; runtime bidirectional MITM expansion is pending",
-        );
-
-        detach_saved_runtime_error(
-            &mut app,
-            &status,
-            "failed to restart TUI managed agent: restart failed",
-        );
-
-        assert_eq!(app.status().kind, StatusKind::Error);
-        assert!(app.status().text.contains("bidirectional MITM observation"));
-        assert!(app.status().text.contains("MITM expansion is pending"));
-        assert!(
-            app.runtime_agent_status()
-                .contains("bidirectional MITM observation")
-        );
-        assert!(
-            app.runtime_agent_status()
-                .contains("MITM expansion is pending")
-        );
-        assert!(app.status().text.contains("restart failed"));
     }
 
     #[tokio::test]

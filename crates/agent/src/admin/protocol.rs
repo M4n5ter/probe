@@ -7,10 +7,11 @@ use tokio::{io::AsyncReadExt, net::UnixStream};
 use crate::{
     configured_enforcement::{ActiveEnforcementPolicy, LoadedEnforcementPolicySourceSnapshot},
     configured_policy::ConfiguredPolicySource,
+    runtime_reload::config_reload::{ConfigReloadApplySnapshot, ConfigReloadPlanSnapshot},
     status::MetricsSnapshot,
 };
 
-use super::{config_reload::ConfigReloadPlanSnapshot, debug_dump::AdminDebugDump};
+use super::debug_dump::AdminDebugDump;
 
 const ADMIN_REQUEST_MAX_BYTES: usize = 4 * 1024;
 
@@ -43,19 +44,23 @@ macro_rules! admin_requests {
 
 admin_requests! {
     Status => ("status", false),
+    TrafficStatus => ("traffic_status", false),
     Metrics => ("metrics", false),
     PrometheusMetrics => ("prometheus_metrics", false),
     DebugDump => ("debug_dump", false),
     TailEvents {
         after_sequence: u64,
+        latest: bool,
         limit: usize,
         selector: Option<probe_core::Selector>,
+        attribution_mode: super::event_tail::EventTailAttributionMode,
         event_types: Vec<probe_core::EventType>,
     } => ("tail_events", false),
     EventDetail {
         sequence: u64,
     } => ("event_detail", false),
     PlanConfigReload { path: PathBuf } => ("plan_config_reload", false),
+    ApplyConfigReload { path: PathBuf } => ("apply_config_reload", true),
     ReloadRuntimeActions => ("reload_runtime_actions", true),
     ReloadPolicies => ("reload_policies", true),
     ReloadEnforcementPolicy => ("reload_enforcement_policy", true),
@@ -66,6 +71,9 @@ admin_requests! {
 pub(super) enum AdminResponse {
     Status {
         snapshot: Box<crate::status::AgentStatusSnapshot>,
+    },
+    TrafficStatus {
+        projection: Box<crate::status::TrafficStatusProjection>,
     },
     Metrics {
         metrics: Box<MetricsSnapshot>,
@@ -88,6 +96,9 @@ pub(super) enum AdminResponse {
     },
     ConfigReloadPlan {
         plan: Box<ConfigReloadPlanSnapshot>,
+    },
+    ConfigReloadApply {
+        apply: Box<ConfigReloadApplySnapshot>,
     },
     PolicyReload(PolicyReloadSuccess),
     RuntimeActionsReload {

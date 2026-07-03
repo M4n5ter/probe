@@ -34,9 +34,10 @@ fallback_backends = ["ebpf", "libpcap"]
 # object_path = "/opt/traffic-probe/ebpf-process-observation.bpf.o"
 
 [capture.libpcap]
-# Leave interface unset to let libpcap choose a default device. Use "any" or
-# a concrete interface such as "lo" or "eth0" when the deployment needs it.
-# interface = "any"
+# Leave interface unset for Linux host-wide capture through the "any" device.
+# Set a concrete interface such as "lo", "eth0", or "docker0" only when the
+# deployment intentionally narrows the capture scope.
+# interface = "eth0"
 bpf_filter = "tcp"
 snaplen = 65535
 promisc = false

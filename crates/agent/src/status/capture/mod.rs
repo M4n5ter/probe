@@ -27,7 +27,7 @@ pub struct CaptureStatusSnapshot {
     pub open_failures: Vec<CaptureOpenFailureStatusSnapshot>,
     #[serde(default, skip_deserializing)]
     pub provider: Option<CaptureProviderRuntimeDetailsSnapshot>,
-    #[serde(default, skip_deserializing)]
+    #[serde(default)]
     pub input_activity: Option<CaptureInputActivityRuntimeSnapshot>,
 }
 

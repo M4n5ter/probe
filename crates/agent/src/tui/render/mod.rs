@@ -275,6 +275,12 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         spans.extend([
             Span::styled("d", Style::default().fg(Color::Gray)),
             Span::raw(" data path  "),
+            Span::styled("v", Style::default().fg(Color::Gray)),
+            Span::raw(" view  "),
+            Span::styled("h", Style::default().fg(Color::Gray)),
+            Span::raw(" filter  "),
+            Span::styled("t", Style::default().fg(Color::Gray)),
+            Span::raw(" live  "),
             Span::styled("a/e/l/m", Style::default().fg(Color::Gray)),
             Span::raw(" observe  "),
             Span::styled("x", Style::default().fg(Color::Gray)),
@@ -352,7 +358,7 @@ fn render_button(
     frame: &mut Frame<'_>,
     hits: &mut Vec<HitArea>,
     area: Rect,
-    label: &'static str,
+    label: &str,
     target: HitTarget,
     hovered: bool,
 ) {
@@ -389,6 +395,15 @@ fn table_data_row_start(area: Rect) -> u16 {
     area.y.saturating_add(2)
 }
 
+fn table_scroll_track(area: Rect) -> Rect {
+    Rect::new(
+        area.x,
+        table_data_row_start(area),
+        area.width,
+        area.height.saturating_sub(3),
+    )
+}
+
 fn render_vertical_scrollbar(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -396,7 +411,7 @@ fn render_vertical_scrollbar(
     position: usize,
     viewport_len: usize,
 ) {
-    if content_len <= viewport_len || area.height < 3 {
+    if content_len <= viewport_len || area.width == 0 || area.height == 0 {
         return;
     }
     let mut state = ScrollbarState::new(content_len)
@@ -693,6 +708,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut app = test_app();
         app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Traffic)));
+        let data_path_summary = app.traffic_data_path_summary();
         let mut terminal = Terminal::new(TestBackend::new(100, 24))?;
         let mut hit_map = HitMap::default();
 
@@ -702,6 +718,7 @@ mod tests {
 
         let output = terminal.backend().to_string();
         assert!(output.contains("[Data Path]"));
+        assert!(output.contains("[Tail Live]"));
         assert!(output.contains("[Search]"));
         assert!(output.contains("[Watch]"));
         assert!(output.contains("[Auto]"));
@@ -710,8 +727,11 @@ mod tests {
         assert!(!output.contains("[MITM]"));
         assert!(output.contains("Traffic Readiness"));
         assert!(output.contains("Data path source: local config"));
-        assert!(output.contains("data path Capture unavailable"));
-        assert!(output.contains("capture unavailable:"));
+        assert!(
+            data_path_summary.capture.contains("ebpf selected"),
+            "capture readiness should remain a separate summary field: {data_path_summary:?}"
+        );
+        assert!(output.contains("capture ebpf selected"));
         assert!(output.contains("next configure reliable MITM proxy data path"));
         assert!(output.contains("MITM not configured;"));
         assert!(scroll_target_exists(
@@ -746,6 +766,12 @@ mod tests {
         ));
         assert!(hit_exists(
             &hit_map,
+            Some(HitTarget::Control(ControlId::TrafficTailFollow)),
+            100,
+            24
+        ));
+        assert!(hit_exists(
+            &hit_map,
             Some(HitTarget::Control(ControlId::ObserveAuto)),
             100,
             24
@@ -763,6 +789,14 @@ mod tests {
             24
         ));
         Ok(())
+    }
+
+    #[test]
+    fn table_scroll_track_matches_table_data_rows() {
+        let table = Rect::new(10, 20, 80, 15);
+
+        assert_eq!(table_data_row_start(table), 22);
+        assert_eq!(table_scroll_track(table), Rect::new(10, 22, 80, 12));
     }
 
     #[test]

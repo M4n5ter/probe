@@ -26,7 +26,7 @@ pub const EBPF_PROCESS_LIFECYCLE_RECORD_BYTES: usize =
     core::mem::size_of::<EbpfProcessLifecycleRecord>();
 pub const EBPF_SOCKET_WRITE_SAMPLE_RECORD_BYTES: usize =
     core::mem::size_of::<EbpfSocketWriteSampleRecord>();
-pub const EBPF_SOCKET_WRITE_SAMPLE_BYTES: usize = 256;
+pub const EBPF_SOCKET_WRITE_SAMPLE_BYTES: usize = 16 * 1024;
 pub const EBPF_SOCKET_READ_SAMPLE_RECORD_BYTES: usize =
     core::mem::size_of::<EbpfSocketReadSampleRecord>();
 pub const EBPF_SOCKET_READ_SAMPLE_BYTES: usize = EBPF_SOCKET_WRITE_SAMPLE_BYTES;
@@ -1285,9 +1285,15 @@ mod tests {
         assert_eq!(align_of::<EbpfCloseRangeObservation>(), 4);
         assert_eq!(size_of::<EbpfProcessLifecycleRecord>(), 48);
         assert_eq!(align_of::<EbpfProcessLifecycleRecord>(), 4);
-        assert_eq!(size_of::<EbpfSocketWriteSample>(), 280);
+        assert_eq!(
+            size_of::<EbpfSocketWriteSample>(),
+            24 + EBPF_SOCKET_WRITE_SAMPLE_BYTES
+        );
         assert_eq!(align_of::<EbpfSocketWriteSample>(), 8);
-        assert_eq!(size_of::<EbpfSocketReadSample>(), 280);
+        assert_eq!(
+            size_of::<EbpfSocketReadSample>(),
+            24 + EBPF_SOCKET_READ_SAMPLE_BYTES
+        );
         assert_eq!(align_of::<EbpfSocketReadSample>(), 8);
         assert_eq!(size_of::<EbpfAcceptTracepointRecord>(), 96);
         assert_eq!(align_of::<EbpfAcceptTracepointRecord>(), 8);
@@ -1297,9 +1303,15 @@ mod tests {
         assert_eq!(align_of::<EbpfCloseTracepointRecord>(), 8);
         assert_eq!(size_of::<EbpfCloseRangeTracepointRecord>(), 60);
         assert_eq!(align_of::<EbpfCloseRangeTracepointRecord>(), 4);
-        assert_eq!(size_of::<EbpfSocketWriteSampleRecord>(), 328);
+        assert_eq!(
+            size_of::<EbpfSocketWriteSampleRecord>(),
+            48 + size_of::<EbpfSocketWriteSample>()
+        );
         assert_eq!(align_of::<EbpfSocketWriteSampleRecord>(), 8);
-        assert_eq!(size_of::<EbpfSocketReadSampleRecord>(), 328);
+        assert_eq!(
+            size_of::<EbpfSocketReadSampleRecord>(),
+            48 + size_of::<EbpfSocketReadSample>()
+        );
         assert_eq!(align_of::<EbpfSocketReadSampleRecord>(), 8);
         assert_eq!(8 % align_of::<EbpfProcessLifecycleRecord>(), 0);
         assert_eq!(8 % align_of::<EbpfSocketWriteSampleRecord>(), 0);

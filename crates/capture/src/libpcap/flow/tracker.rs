@@ -359,6 +359,41 @@ mod tests {
     }
 
     #[test]
+    fn listener_resolution_prefers_server_side_for_http_request() {
+        let request = DecodedTcpSegment {
+            source: ipv4(10, 0, 0, 1),
+            destination: ipv4(10, 0, 0, 2),
+            source_port: 50_000,
+            destination_port: 80,
+            sequence: 100,
+            flags: default_flags(),
+            payload: b"GET / HTTP/1.1\r\n\r\n",
+        };
+        let mut resolver: Option<Box<dyn ProcessResolver>> =
+            Some(Box::new(ConnectionAndListenerResolver {
+                connection: TcpConnection::new(
+                    TcpEndpoint::new(Ipv4Addr::new(10, 0, 0, 1).into(), 50_000),
+                    TcpEndpoint::new(Ipv4Addr::new(10, 0, 0, 2).into(), 80),
+                ),
+                listener: TcpEndpoint::new(Ipv4Addr::new(10, 0, 0, 2).into(), 80),
+                connection_process: demo_process(7, "client"),
+                listener_process: demo_process(42, "server"),
+            }));
+        let mut tracker = FlowTracker::default();
+
+        let observed = tracker
+            .observe(&request, timestamp(1, 1), &mut resolver)
+            .payload;
+
+        assert_eq!(observed.direction, Direction::Inbound);
+        assert_eq!(observed.flow.local.address, "10.0.0.2");
+        assert_eq!(observed.flow.remote.address, "10.0.0.1");
+        assert_eq!(observed.flow.process.identity.pid, 42);
+        assert_eq!(observed.flow.process.name, "server");
+        assert_eq!(observed.attribution_confidence, 60);
+    }
+
+    #[test]
     fn closed_flow_re_resolves_reused_four_tuple() {
         let first = DecodedTcpSegment {
             source: ipv4(10, 0, 0, 1),
@@ -860,6 +895,35 @@ mod tests {
             Ok((connection == self.connection).then(|| ResolvedProcess {
                 process: self.process.clone(),
                 confidence: self.confidence,
+            }))
+        }
+    }
+
+    struct ConnectionAndListenerResolver {
+        connection: TcpConnection,
+        listener: TcpEndpoint,
+        connection_process: ProcessContext,
+        listener_process: ProcessContext,
+    }
+
+    impl ProcessResolver for ConnectionAndListenerResolver {
+        fn resolve_tcp_process(
+            &mut self,
+            connection: TcpConnection,
+        ) -> Result<Option<ResolvedProcess>, crate::CaptureError> {
+            Ok((connection == self.connection).then(|| ResolvedProcess {
+                process: self.connection_process.clone(),
+                confidence: 60,
+            }))
+        }
+
+        fn resolve_tcp_listener(
+            &mut self,
+            local_endpoint: TcpEndpoint,
+        ) -> Result<Option<ResolvedProcess>, crate::CaptureError> {
+            Ok((local_endpoint == self.listener).then(|| ResolvedProcess {
+                process: self.listener_process.clone(),
+                confidence: 60,
             }))
         }
     }

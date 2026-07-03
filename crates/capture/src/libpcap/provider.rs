@@ -333,9 +333,7 @@ impl CaptureProvider for LibpcapProvider {
 fn resolve_device(interface: Option<&str>) -> Result<Device, CaptureError> {
     match interface {
         Some(interface) => Ok(Device::from(interface)),
-        None => Device::lookup()
-            .map_err(|error| pcap_error("lookup default device", error))?
-            .ok_or_else(|| CaptureError::provider("libpcap", "no default pcap device found")),
+        None => Ok(Device::from("any")),
     }
 }
 
@@ -552,6 +550,22 @@ mod tests {
             half_close.last(),
             Some(CaptureEvent::ConnectionClosed { .. })
         ));
+    }
+
+    #[test]
+    fn automatic_device_uses_linux_any_interface() -> Result<(), Box<dyn std::error::Error>> {
+        let device = resolve_device(None)?;
+
+        assert_eq!(device.name, "any");
+        Ok(())
+    }
+
+    #[test]
+    fn configured_device_keeps_exact_interface_name() -> Result<(), Box<dyn std::error::Error>> {
+        let device = resolve_device(Some("lo"))?;
+
+        assert_eq!(device.name, "lo");
+        Ok(())
     }
 
     fn decoded_payload() -> DecodedTcpSegment<'static> {

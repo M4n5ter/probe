@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
 use pipeline::PipelinePolicySet;
+use probe_config::AgentConfig;
 use runtime::RuntimePlan;
 use tokio::sync::Mutex;
 
 use crate::configured_policy::{
     ConfiguredPolicyContent, ConfiguredPolicyError, ConfiguredPolicySource, LoadedPipelinePolicies,
-    load_configured_pipeline_policies_with_context,
+    PolicySourceLoadContext, load_configured_pipeline_policies_with_context,
 };
 use crate::control_plane_http::policy_source_load_context_from_plan;
 
@@ -73,12 +74,23 @@ pub(crate) async fn reload_policies(
     policy_set: &PipelinePolicySet,
     gate: &PolicyReloadGate,
 ) -> Result<PolicyReloadSummary, ConfiguredPolicyError> {
-    let mut state = gate.inner.lock().await;
-    let loaded = load_configured_pipeline_policies_with_context(
+    reload_policies_from_config(
         &plan.config,
         policy_source_load_context_from_plan(plan),
+        policy_set,
+        gate,
     )
-    .await?;
+    .await
+}
+
+pub(crate) async fn reload_policies_from_config(
+    config: &AgentConfig,
+    load_context: PolicySourceLoadContext,
+    policy_set: &PipelinePolicySet,
+    gate: &PolicyReloadGate,
+) -> Result<PolicyReloadSummary, ConfiguredPolicyError> {
+    let mut state = gate.inner.lock().await;
+    let loaded = load_configured_pipeline_policies_with_context(config, load_context).await?;
     let loaded_count = loaded.policies.len() as u64;
     let policies = loaded.sources;
     let active_set_updated = state
@@ -132,6 +144,7 @@ mod tests {
     use crate::configured_policy::{
         PolicySourceLoadContext, load_configured_pipeline_policies_with_context,
     };
+    use crate::runtime_plan::RuntimePlanHandle;
 
     #[tokio::test]
     async fn admin_reload_policies_swaps_active_pipeline_policy_set()
@@ -159,7 +172,7 @@ mod tests {
         run_policy_request(spool.as_ref(), policy_set.clone(), "/before", 1)?;
         let plan = Arc::new(runtime_plan_from_config(config)?);
         let server = spawn_admin_server(
-            Arc::clone(&plan),
+            RuntimePlanHandle::new(Arc::clone(&plan)),
             Arc::clone(&spool),
             AdminServerConfig::unix_socket(socket_path.clone()),
             AdminRuntimeState {
@@ -212,7 +225,7 @@ mod tests {
         .into_policy_set();
         let plan = Arc::new(runtime_plan_from_config(config)?);
         let server = spawn_admin_server(
-            Arc::clone(&plan),
+            RuntimePlanHandle::new(Arc::clone(&plan)),
             Arc::clone(&spool),
             AdminServerConfig::unix_socket(socket_path.clone()),
             AdminRuntimeState {

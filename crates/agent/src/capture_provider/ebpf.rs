@@ -158,7 +158,7 @@ mod tests {
     }
 
     fn process_selector() -> Selector {
-        named_process_selector("sssa-backend")
+        named_process_selector("fixture-backend")
     }
 
     fn named_process_selector(name: &str) -> Selector {

@@ -80,7 +80,7 @@ pub(super) fn render_traffic_popup(
             .scroll((scroll as u16, 0)),
         modal,
     );
-    super::render_vertical_scrollbar(frame, modal, lines.len(), scroll, inner.height as usize);
+    super::render_vertical_scrollbar(frame, inner, lines.len(), scroll, inner.height as usize);
 
     let close = Rect::new(
         modal.x.saturating_add(modal.width.saturating_sub(10)),
@@ -164,11 +164,18 @@ fn render_traffic_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, hits: 
         Span::styled("filter ", Style::default().fg(Color::Gray)),
         Span::raw(app.traffic_filter_label()),
         Span::raw("   "),
+        Span::styled("view ", Style::default().fg(Color::Gray)),
+        Span::raw(app.traffic().view_mode_label()),
+        Span::raw("   "),
         Span::styled("events ", Style::default().fg(Color::Gray)),
         Span::raw(traffic.event_filter_label()),
         Span::raw("   "),
         Span::styled("tail ", Style::default().fg(Color::Gray)),
-        Span::raw(traffic.rows().len().to_string()),
+        Span::raw(format!(
+            "{} {}",
+            traffic.tail_mode_label(),
+            traffic.rows().len()
+        )),
         Span::raw("   "),
         Span::styled("last export ", Style::default().fg(Color::Gray)),
         Span::raw(traffic.last_export_sequence().to_string()),
@@ -203,9 +210,28 @@ fn render_traffic_action_bar(
         frame,
         hits,
         action_area(area, x, y),
+        app.traffic().view_mode_label(),
+        HitTarget::Control(ControlId::TrafficViewMode),
+        app.is_hovered(HitTarget::Control(ControlId::TrafficViewMode)),
+    )
+    .unwrap_or(x);
+    x = render_action_button(
+        frame,
+        hits,
+        action_area(area, x, y),
         app.traffic().event_filter_label(),
         HitTarget::Control(ControlId::TrafficEventFilter),
         app.is_hovered(HitTarget::Control(ControlId::TrafficEventFilter)),
+    )
+    .unwrap_or(x);
+    let tail_label = format!("Tail {}", app.traffic().tail_mode_label());
+    x = render_action_button(
+        frame,
+        hits,
+        action_area(area, x, y),
+        &tail_label,
+        HitTarget::Control(ControlId::TrafficTailFollow),
+        app.is_hovered(HitTarget::Control(ControlId::TrafficTailFollow)),
     )
     .unwrap_or(x);
     if let Some(index) = app
@@ -250,7 +276,7 @@ fn render_action_button(
     frame: &mut Frame<'_>,
     hits: &mut Vec<HitArea>,
     available: Rect,
-    label: &'static str,
+    label: &str,
     target: HitTarget,
     hovered: bool,
 ) -> Option<u16> {
@@ -314,6 +340,137 @@ fn truncate_to_width(value: &str, max_width: usize) -> String {
 }
 
 fn render_traffic_events(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut TuiApp,
+    hits: &mut Vec<HitArea>,
+) {
+    if app.traffic().showing_http_exchanges() {
+        render_http_exchanges(frame, area, app, hits);
+        return;
+    }
+    render_traffic_event_rows(frame, area, app, hits);
+}
+
+fn render_http_exchanges(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut TuiApp,
+    hits: &mut Vec<HitArea>,
+) {
+    hits.push(HitArea::scroll(area, ScrollTarget::TrafficEvents));
+    let visible_rows = area.height.saturating_sub(3) as usize;
+    app.set_traffic_viewport_rows(visible_rows);
+    let traffic = app.traffic();
+    let start = traffic
+        .http_scroll()
+        .min(traffic.http_exchanges().len().saturating_sub(visible_rows));
+    let end = start
+        .saturating_add(visible_rows)
+        .min(traffic.http_exchanges().len());
+    let rows = traffic.http_exchanges()[start..end]
+        .iter()
+        .enumerate()
+        .map(|(visible_index, exchange)| {
+            let absolute_index = start + visible_index;
+            let marker = if absolute_index == traffic.selected_http_exchange_index() {
+                ">"
+            } else {
+                " "
+            };
+            let row = Row::new([
+                Cell::from(marker),
+                Cell::from(exchange.sequence.to_string()),
+                Cell::from(exchange.process.clone()),
+                Cell::from(exchange.method.clone()),
+                Cell::from(super::truncate(&exchange.target, 40)),
+                Cell::from(exchange.status.clone()),
+                Cell::from(exchange.direction.clone()),
+                Cell::from(exchange.endpoint.clone()),
+                Cell::from(super::truncate(&exchange.summary, TRAFFIC_SUMMARY_WIDTH)),
+            ]);
+            if app.is_hovered(HitTarget::TrafficRow(absolute_index)) {
+                row.style(Style::default().fg(Color::Black).bg(Color::Gray))
+            } else {
+                row
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let row_start = super::table_data_row_start(area);
+    for visible_index in 0..end.saturating_sub(start) {
+        hits.push(HitArea::new(
+            Rect::new(
+                area.x + 1,
+                row_start + visible_index as u16,
+                area.width.saturating_sub(2),
+                1,
+            ),
+            HitTarget::TrafficRow(start + visible_index),
+        ));
+    }
+
+    let mut state = TableState::new().with_selected(
+        (!traffic.http_exchanges().is_empty())
+            .then_some(traffic.selected_http_exchange_index().saturating_sub(start)),
+    );
+    frame.render_stateful_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(2),
+                Constraint::Length(8),
+                Constraint::Length(20),
+                Constraint::Length(8),
+                Constraint::Length(32),
+                Constraint::Length(14),
+                Constraint::Length(5),
+                Constraint::Length(22),
+                Constraint::Min(20),
+            ],
+        )
+        .header(
+            Row::new([
+                "", "Seq", "Process", "Method", "Target", "Status", "Dir", "Remote", "Summary",
+            ])
+            .style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )
+        .highlight_spacing(HighlightSpacing::Always)
+        .row_highlight_style(Style::default().fg(Color::Black).bg(Color::LightBlue))
+        .block(Block::bordered().title("HTTP Exchanges")),
+        area,
+        &mut state,
+    );
+    let scroll_track = super::table_scroll_track(area);
+    super::render_vertical_scrollbar(
+        frame,
+        scroll_track,
+        traffic.http_exchanges().len(),
+        traffic.http_scroll(),
+        visible_rows,
+    );
+    if traffic.http_exchanges().len() > visible_rows
+        && scroll_track.width > 0
+        && scroll_track.height > 0
+    {
+        let hit_width = area.width.min(3);
+        hits.push(HitArea::scrollbar(
+            Rect::new(
+                area.x.saturating_add(area.width.saturating_sub(hit_width)),
+                scroll_track.y,
+                hit_width,
+                scroll_track.height,
+            ),
+            ScrollTarget::TrafficEvents,
+        ));
+    }
+}
+
+fn render_traffic_event_rows(
     frame: &mut Frame<'_>,
     area: Rect,
     app: &mut TuiApp,
@@ -397,17 +554,30 @@ fn render_traffic_events(
         )
         .highlight_spacing(HighlightSpacing::Always)
         .row_highlight_style(Style::default().fg(Color::Black).bg(Color::LightBlue))
-        .block(Block::bordered().title("Traffic")),
+        .block(Block::bordered().title("Traffic Events")),
         area,
         &mut state,
     );
+    let scroll_track = super::table_scroll_track(area);
     super::render_vertical_scrollbar(
         frame,
-        area,
+        scroll_track,
         traffic.rows().len(),
         traffic.scroll(),
         visible_rows,
     );
+    if traffic.rows().len() > visible_rows && scroll_track.width > 0 && scroll_track.height > 0 {
+        let hit_width = area.width.min(3);
+        hits.push(HitArea::scrollbar(
+            Rect::new(
+                area.x.saturating_add(area.width.saturating_sub(hit_width)),
+                scroll_track.y,
+                hit_width,
+                scroll_track.height,
+            ),
+            ScrollTarget::TrafficEvents,
+        ));
+    }
 }
 
 fn render_traffic_detail_preview(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {

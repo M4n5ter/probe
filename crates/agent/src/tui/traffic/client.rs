@@ -6,25 +6,29 @@ use thiserror::Error;
 
 use crate::admin::{
     AdminClientError, AdminRequest, EventDetailSnapshot, EventDetailTooLargeSnapshot,
-    EventTailSnapshot, send_admin_json_request_with_timeout,
+    EventTailAttributionMode, EventTailSnapshot, send_admin_json_request_with_timeout,
 };
 
 const TAIL_TIMEOUT: Duration = Duration::from_secs(1);
 const DETAIL_TIMEOUT: Duration = Duration::from_secs(2);
-const TAIL_LIMIT: usize = 64;
+const TAIL_LIMIT: usize = 256;
 
 pub(super) async fn request_tail_events(
     socket_path: &Path,
     after_sequence: u64,
+    latest: bool,
     selector: Selector,
+    attribution_mode: EventTailAttributionMode,
     event_types: &[EventType],
 ) -> Result<EventTailSnapshot, TrafficClientError> {
     let response = send_admin_json_request_with_timeout(
         socket_path,
         AdminRequest::TailEvents {
             after_sequence,
+            latest,
             limit: TAIL_LIMIT,
             selector: Some(selector),
+            attribution_mode,
             event_types: event_types.to_vec(),
         },
         TAIL_TIMEOUT,

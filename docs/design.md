@@ -49,6 +49,8 @@ libpcap/procfs 等 fallback 路径，并明确标注能力降级。
 - Storage retention 由统一 worker 维护 ingress/export lifecycle，并保留 per-sink cursor 与可退休前缀边界。
 - 在线 capture input activity 与 pipeline metrics 可观测 input poll 活性、capture read、ingress/export 进展、
   policy/enforcement 输出和 provider-level capture loss。
+- 主配置 reload 已覆盖 policy-only 在线应用和 runtime generation 请求；capture/observations 变更会在 capture safe point
+  validate-then-swap 新 capture provider，并更新 agent-wide active `RuntimePlan` handle。
 
 eBPF / procfs 现状：
 
@@ -191,9 +193,10 @@ flowchart LR
 - WebSocket `websocket_message` payload 上限为 16 MiB；超限 message 保留 frame metadata
   并省略 message event；不解压 WebSocket extension payload。
 - 不支持 HTTP/2、HTTP/3/QUIC 的完整解析。
-- 不实现动态远程控制面、长连接下发或运行中主配置热替换；admin config reload planning
-  只校验和规划候选主配置，不替换运行中的 capture/export/TLS/admin owner。policy bundle 和 enforcement manifest
-  只支持当前配置引用 source 的手动 reload 或显式本地 watcher。
+- 不实现动态远程控制面或长连接下发；主配置热重载限定为已有明确 lifecycle owner 的资源。
+  policy-only 主配置变更可在线应用；capture/observations 通过 runtime generation safe point
+  替换 capture provider；export、storage、admin、TLS、transparent interception 和完整 MITM lifecycle
+  不通过该路径隐式切换。
 - 不长期保存全量原始流量。
 
 当前实现状态不在本节展开；第 6 节维护 capability 事实目录，各领域章节维护实现细节与验证路径。
@@ -327,7 +330,11 @@ Operator TUI 能力事实：
   该命令仍受单响应详情预算约束：预算内返回完整事件；超过预算返回 `event_detail_too_large`
   metadata，避免把巨大 retained record 序列化成单条 admin 响应。Traffic detail popup 在 tail row
   为 omission 时通过后台任务使用该命令补齐详情，并在等待、too-large 或失败时保留 tail budget 诊断。
-- Runtime tab 通过 admin Unix socket 调用 `reload_runtime_actions`。该动作只执行 active `RuntimePlan`
+- Runtime tab 保存配置后通过 admin Unix socket 调用 `apply_config_reload`。该动作先复用主配置 reload planning，
+  再应用可在线切换的候选配置段；policy-only 变更在 policy watcher/poller topology 不变且未启用时可在线生效。
+  对 capture、export、TLS、admin、interception、process observation 或 watcher topology 变更，TUI 显示
+  runtime rebuild verdict。
+- Runtime tab 也可以调用 `reload_runtime_actions`。该动作只执行 active `RuntimePlan`
   中可安全在线切换的 runtime owners：policy bundle reload 和 external enforcement manifest reload。
   响应按 action 独立展示成功或失败；它不替换运行中的主 agent config，也不改变 exporter sink cursor。
   Runtime tab 同时提供 admin socket enablement、socket path 和 Prometheus listener enablement 的配置字段。
@@ -530,6 +537,8 @@ managed backend 的 feed openability 在 backend readiness 后、透明规则安
     lookup 做 TCP 连接归因。
   - 已实现：fd lookup 支持 thread pid、TGID fallback、`NStgid` PID namespace alias，以及 hidden TGID 场景下的 unique
     fd/process-hint candidate。
+  - 已实现：listener lookup 支持 exact local endpoint、process net namespace local address 匹配，以及同地址族唯一 wildcard
+    listener fallback；多 wildcard listener 保持未归因，避免把 `0.0.0.0:port` 或 `[::]:port` 误判给错误进程。
   - 已实现：真实 `/proc` 上可对 live socket fd 使用 `pidfd_getfd` + `SO_COOKIE` 获取可选 socket cookie，并要求 duplicated
     fd inode 与原 fd symlink inode 一致。
   - 已实现：tcp6 IPv4-mapped endpoint 会归一化。
@@ -1683,6 +1692,8 @@ TLS decrypt hint auto-binding runtime refresh 不变量：
 - 本地 enforcement manifest watcher 复用独立的 enforcement reload primitive。
 - remote policy bundle poller 和 remote enforcement manifest poller 复用各自的 reload primitive。
 - 候选主配置 planning 由 admin `plan_config_reload` 提供；该命令不替换 active config。
+- 候选主配置在线应用由 admin `apply_config_reload` 提供；范围限定为无 watcher/poller topology 变更的
+  policy-only 主配置变更。
 - push/streaming 控制面下发和通用配置后台 reload worker 未实现。
 
 #### HTTP/1 and WebSocket parser
@@ -2147,13 +2158,14 @@ fallback 使用 Rust `pcap` crate + 系统 libpcap。
 fallback 能力边界：
 
 - 支持明文 HTTP/1.x 捕获和解析。
-- 进程归因通过 procfs/netlink 快照 best effort。
+- 进程归因通过 procfs socket、listener endpoint 和进程 network namespace 快照 best effort。
 - TLS 明文不承诺 uprobe 等同能力；只依赖可用的 keylog/session material 或其它 PlaintextProvider。
 - 所有事件必须标记 degraded/capability source。
 
 当前实现状态：
 
 - `capture::LibpcapProvider` 使用 `pcap` crate 2.4 和系统 libpcap。
+- Linux 上未配置 interface 时默认打开 libpcap `any` 设备，以覆盖 loopback、物理网卡、bridge 和容器可见流量；配置具体 interface 只用于主动收窄观测范围。
 - 支持配置 interface、BPF filter、snaplen、promisc、immediate mode、read timeout 和 buffer size。
 - 已支持 Ethernet、Linux cooked v1/v2、`RAW`、direct `IPV4`/`IPV6` 和 `NULL`/`LOOP` loopback 上的基础 IPv4/TCP 与无扩展头 IPv6/TCP
   segment 解析；IPv4 分片、IPv6 extension header/fragment 和 snaplen 截断包会被跳过，避免把不完整字节伪装成正常 HTTP payload。
@@ -2165,7 +2177,8 @@ fallback 能力边界：
 - `agent` composition root 只在 libpcap provider 能按当前配置打开并安装 filter 时注入 available `Libpcap` descriptor；
   否则注入 unavailable descriptor 并输出原因，`runtime` 只消费 descriptor 做 plan。
 - live `LibpcapProvider` 由 `agent` 注入 procfs TCP process resolver。resolver 通过共享 `TcpConnection`、`/proc/net/tcp`、
-  可读取且可解析时的 `/proc/net/tcp6` 和 fd socket inode best-effort 归因；短 TTL socket snapshot 成功时提高
+  可读取且可解析时的 `/proc/net/tcp6` 和 fd socket inode best-effort 归因；当完整四元组无法稳定匹配时，会按 observed local endpoint
+  解析 TCP listener，并扫描进程 network namespace 下的 TCP table 来处理容器、bridge 和 docker-proxy 场景。短 TTL socket snapshot 成功时提高
   attribution confidence，失败时回退到 synthetic unknown identity。
 - 同一个 procfs resolver 也实现 eBPF socket flow bridge 所需的 TGID+thread PID+fd 反向解析：
   先从 `/proc/<thread_pid>/fd/<fd>` 读取 socket inode，线程 fd 消失时回退到 TGID fd。
@@ -3611,7 +3624,7 @@ WSL2 或受限内核即使支持 sock_diag 查询，也可能无法实际销毁 
 - 配置化 enforcement policy 通过 `enforcement.policy.source` 指向本地 manifest、manifest directory 或 remote manifest document。
 - 目录化拆分（例如 `policies.d`、`exporters.d`、`selectors.d`）是目标形态，尚未实现。
 - 在线 `plan_config_reload` 可读取本地候选 TOML，执行 parse/schema/static runtime validation，并输出
-  `no_change`、`restart_required` 或 `invalid_candidate`。
+  `no_change`、`apply_online`、`restart_required` 或 `invalid_candidate`。
 - 候选主配置 planning 不执行 setup-time active probes；需要内核能力、自测或 readiness probe 的资源在重启或后续
   hot reload owner 中证明。
 - 本地 policy bundle watcher 触发当前配置引用的全量 enabled policy source reload，不重读主配置。
@@ -4607,6 +4620,7 @@ Status snapshot：
 - 已实现 CLI `status --config <path>`。
 - 输出可复用的 JSON snapshot。
 - snapshot 包含 health。
+- snapshot 包含 runtime generation、pending/applying/outcome 和 capture control safe point。
 - snapshot 包含 capture status。
 - 在线 capture status 对 backend-specific runtime facts 使用 `capture.provider`；process eBPF provider 通过该字段暴露
   tracepoint link ownership、tracepoint firing counters、safe active tracepoint liveness、kernel liveness proof status
@@ -4768,13 +4782,15 @@ Admin socket：
 - JSON-lines 协议支持 `{"command":"event_detail","sequence":42}`；响应 kind 为 `event_detail`、
   `event_detail_too_large` 或 `error`。
 - JSON-lines 协议支持 `{"command":"plan_config_reload","path":"/etc/probe/agent.toml"}`。
+- JSON-lines 协议支持 `{"command":"apply_config_reload","path":"/etc/probe/agent.toml"}`。
 - JSON-lines 协议支持 `{"command":"reload_runtime_actions"}`。
 - JSON-lines 协议支持 `{"command":"reload_policies"}`。
 - JSON-lines 协议支持 `{"command":"reload_enforcement_policy"}`。
 - `debug_dump` 复用在线 status snapshot builder，并附带 admin protocol inventory 和 privacy declaration；它包含 runtime
   plan/status 字段和本地路径，但不包含 raw config 文本或 secret material 字节。
 - `agent admin --socket <path> <command>` 是该 JSON-lines 协议的一等 CLI client；`status`、`metrics`、`debug-dump`、
-  `tail-events`、`event-detail --sequence <n>`、`plan-config-reload --config <path>`、`reload-runtime-actions`、`reload-policies` 和
+  `tail-events`、`event-detail --sequence <n>`、`plan-config-reload --config <path>`、
+  `apply-config-reload --config <path>`、`reload-runtime-actions`、`reload-policies` 和
   `reload-enforcement-policy` 输出 JSON，`prometheus-metrics` 输出 text exposition。
 - `agent admin <command>` 不带 `--socket` 时使用 `PROBE_HOME/run/admin.sock`。
 - admin socket parent directory 必须存在；显式服务级路径由部署层预创建。
@@ -4821,18 +4837,37 @@ Config reload planning：
 - 该命令执行配置 parse/schema validation 和 static runtime validation。
 - 该命令不执行 setup-time active probes，例如 socket destroy 自测、MITM TCP readiness probe 或 host rule mutation。
 - parse error 只返回 parser message 和 byte span，不回显 raw config line。
-- 返回 `config_reload_plan`，其中 decision 为 `no_change`、`restart_required` 或 `invalid_candidate`。
+- 返回 `config_reload_plan`，其中 decision 为 `no_change`、`apply_online`、`restart_required`
+  或 `invalid_candidate`。
 - `invalid_candidate` 区分 `read`、`parse` 和 `validate` 阶段。
-- `restart_required` 按 agent identity、capture、storage、export、policy reload、policies、selectors、TLS、enforcement
-  和 admin 拆分 changed sections。
+- changed sections 按 agent identity、capture、observations、storage、export、policy reload、policies、selectors、TLS、
+  enforcement 和 admin 拆分。
+- `apply_online` 表示所有 changed sections 都由在线 runtime owner 管理。主配置在线应用范围限定为
+  policy-only 变更，并要求 `[policy_reload]` watcher 和 poller topology 未启用且未改变。
+- `restart_required` 表示至少一个 changed section 仍由 setup-time service、background topology 或
+  one-shot runtime owner 管理。
+- `observations` 作为独立 section 表示进程观察 profile 变化；这些 profile 会投影到 capture backend 选择、
+  deep observation selector 和进程级 data path ownership，不能被折叠成普通 `[capture]` diff。
 - 每个 changed section 携带 restart reason，说明该 top-level 配置域绑定的运行时 owner。
-- 响应同时列出无需主配置热替换即可使用的 runtime actions：`reload_policies` 和 `reload_enforcement_policy`。
+- 响应同时列出无需进程重启即可使用的 runtime actions：`reload_policies`、`reload_enforcement_policy`
+  和 `request_runtime_generation`。
+- `apply_config_reload` 复用相同 planning contract；当 decision 为 `apply_online` 时执行对应在线动作，
+  所有动作成功后替换 agent-wide active `RuntimePlan` handle。
+- `apply_config_reload` 返回 `config_reload_apply`，其中包含原始 plan、每个 apply action 的 outcome，
+  以及 `active_plan_updated`。
+- 对只涉及 data path generation 的 rebuild verdict，`apply_config_reload` 会向 runtime generation owner 提交
+  `request_runtime_generation` action；action outcome 为 `queued`，表示候选配置已进入运行时请求队列但 active plan
+  尚未替换。
+- live agent 在 capture control safe point 消费 pending generation request。请求进入 `applying` 后会记录
+  `last_outcome`，避免永久 pending。
 - `reload_runtime_actions` 可执行 active `RuntimePlan` 下可安全在线切换的 runtime actions。
-- 该命令不替换 active config。
-- 该命令不启动、停止或重建 capture/export/TLS/admin/interception owner。
+- `reload_runtime_actions` 不替换 active config。
+- `reload_runtime_actions` 不启动、停止或重建 capture/export/TLS/admin/interception owner。
 
 Admin reload：
 
+- `plan_config_reload` 对候选主配置执行 bounded local read、parse、schema validation 和 static runtime validation。
+- `apply_config_reload` 只应用 planning 判定为 `apply_online` 的候选主配置段；任一 action 失败时不替换 active plan。
 - reload commands 只作用于 active `RuntimePlan` 已经拥有可交换 runtime owner 的资源。
 - reload commands 不重读主 TOML，不替换 active config，也不改变 capture/export/TLS/admin/interception 配置。
 - `reload_runtime_actions` 执行当前可在线切换的 runtime actions，并按 action 独立返回 `succeeded` 或 `failed` outcome。
@@ -4841,10 +4876,19 @@ Admin reload：
 
 | Command | Runtime owner | Success response | Failure behavior |
 | --- | --- | --- | --- |
+| `plan_config_reload` | 无 mutation；候选配置 validator | `config_reload_plan` | `invalid_candidate` 描述 read/parse/validate 阶段 |
+| `apply_config_reload` | 候选配置中可在线应用的 runtime owner | `config_reload_apply`，包含 plan、actions、`active_plan_updated` | action 失败时保留旧 active plan；非 online section 返回 restart verdict |
+| `request_runtime_generation` | live agent runtime generation owner | `queued` action outcome，status 中出现 pending generation request | active plan 不提前替换；不覆盖 setup-time service topology |
 | `reload_runtime_actions` | 当前可在线切换的 runtime owner 集合 | 每个 action 的独立 outcome | 返回 `runtime_actions_reload`，失败 action 进入 `failed` outcome |
 | `reload_policies` | active pipeline policy set | `loaded_count`、policy sources、`active_set_updated` | 返回 error，保留旧 active policy set |
 | `reload_enforcement_policy` | active enforcement planner/policy state | source、selector 状态、protective action profile | 返回 error，保留旧 active enforcement policy |
 
+- `apply_config_reload` 只在线应用 policy-only 主配置变更；当 `[policy_reload]` watch/poll topology
+  启用或改变时，policy config 变更需要 runtime rebuild。
+- data path generation request 只由 capture 和 observations 触发；当前 executor 在线替换对应的
+  capture provider generation。
+  selectors、TLS、enforcement、storage、export、admin socket、policy reload topology 或 agent identity
+  变更保持 `restart_required`，直到对应 lifecycle owner 存在。
 - `reload_policies` 只重载当前配置中的 enabled policy bundles。
 - `reload_enforcement_policy` 只重载当前 `RuntimePlan` 中的 enforcement policy source。
 - 透明接管 setup-time host rules 尚无在线 mutation owner 时，enforcement policy reload 会 fail closed。
@@ -4870,11 +4914,47 @@ Enforcement reload watcher：
 
 Full config hot reload：
 
-- 自动切换 active config 尚未实现。
-- 运行中 owner swap 尚未实现。
-- 主配置 watcher 尚未实现。
-- 后续主配置热替换应复用同一 status snapshot 构建器。
-- 后续主配置热替换必须承担运行中 agent 的在线状态查询语义。
+目标模型：
+
+- 主配置热重载以 runtime generation 为单位执行，而不是按单个字段做局部补丁。
+- live agent 是 generation swap 的 owner。admin handler 只负责接收请求、校验候选配置、返回状态和触发运行时动作；
+  不直接重建 capture provider、TLS plaintext、MITM backend、transparent interception 或 exporter owner。
+- active `RuntimePlan` 由 agent-wide handle 拥有；admin、Prometheus、policy watcher/poller 和 enforcement watcher/poller
+  都从该 handle 获取 snapshot。
+- 候选配置必须先完成 bounded local read、parse、schema validation、static runtime validation 和 RuntimePlan projection。
+- generation swap 必须采用 validate-then-swap；候选 generation 构建失败时保留旧 generation。
+- 状态面应暴露 pending、applying、applied 和 failed generation，TUI/status/prometheus 复用同一 snapshot。
+- provider 执行必须周期性回到 control safe point。pipeline run options 支持按 capture event 数和 provider poll 数设定上限；
+  live capture loop 按 poll batch 运行 provider，避免 idle provider 永久占用 blocking capture task。
+- provider 的 `poll_next` 不应无限阻塞。libpcap provider 使用 nonblocking pcap handle；eBPF process observation provider
+  在无事件时返回 `Idle` 或 `Finished`。
+- runtime generation status 已暴露 active generation、pending request、applying request、last outcome 和 capture control safe point。
+- pending request 由 `apply_config_reload` 针对 data path generation rebuild verdict 产生。
+- runtime generation request 由 admin apply 阶段基于已读取、已解析的 typed candidate config 创建；
+  executor 消费 pending request 后执行 artifact hydration、static runtime validation 和 runtime composition build。
+- capture 和 observations 变更会在候选 capture provider 成功打开后替换 live loop provider、更新 capture runtime
+  status、替换 agent-wide active `RuntimePlan` handle，并推进 active runtime generation。
+- selectors、TLS 和 enforcement 仍缺完整 lifecycle owner；这些 section 保持 `restart_required`，
+  不进入 runtime generation queue。
+
+在线可交换边界：
+
+| 资源 | 热重载语义 |
+|---|---|
+| policy bundle | 已有 validate-then-swap owner；支持 admin 手动 reload、本地 watcher 和 remote poller。 |
+| enforcement policy manifest | 已有 validate-then-swap owner；支持 admin 手动 reload、本地 watcher 和 remote poller。 |
+| main TOML policy-only config | `apply_config_reload` 可在无 watcher/poller topology 变更时应用，并更新 active plan。 |
+| capture/observations generation | `apply_config_reload` 提交 `request_runtime_generation`；live agent 在 capture safe point validate-then-swap capture provider 和 active plan。 |
+| selectors/TLS/enforcement generation | 当前缺少对应 lifecycle owner；config reload planning 保持 `restart_required`，不提交 runtime generation request。 |
+| setup-time service topology | 需要对应 lifecycle owner；admin socket、exporter topology 和 storage path 不随 data path generation 隐式切换。 |
+
+运行时约束：
+
+- capture data path、TLS plaintext、MITM bridge 和 transparent interception host rules 属于同一 generation 生命周期。
+- data path generation 包含 capture backend、process observations、selectors、TLS plaintext、MITM bridge 和 transparent interception。
+- setup-time host rules 不能被 planner-only enforcement reload 隐式改变。
+- exporter cursor 和 durable spool path 不能被 capture generation swap 偷换；涉及存储路径或 exporter topology 的配置需要独立 owner。
+- 主配置 watcher 与手动 `apply_config_reload` 应共享同一个 planning/apply contract，不能各自解释 TOML。
 
 能力：
 
@@ -6270,6 +6350,9 @@ TLS material E2E 的 source、初始状态、refresh 边界和证明范围见 TL
 - 命中、未命中和多 bundle 顺序语义在 reload 后仍保持。
 - admin 测试覆盖 `reload_policies` 成功后，后续 pipeline event 使用新 active policy set。
 - admin 测试覆盖新 bundle 无效时保留旧 active set。
+- admin 测试覆盖 `apply_config_reload` 对 policy-only 主配置变更执行在线应用、更新 active plan，并让
+  status 同时反映候选配置 policy count 和新 runtime policy version。
+- admin 测试覆盖 `apply_config_reload` 对 restart-required section 返回 rebuild verdict 且不替换 active plan。
 
 #### Enforcement reload metrics 覆盖
 
@@ -6286,8 +6369,9 @@ TLS material E2E 的 source、初始状态、refresh 边界和证明范围见 TL
 
 #### Admin command 覆盖
 
-- admin protocol inventory 测试覆盖 `tail_events` 和 `event_detail` 的 non-mutating 标记，以及 `reload_runtime_actions`、
-  `reload_policies` 和 `reload_enforcement_policy` 的 mutating 标记。
+- admin protocol inventory 测试覆盖 `tail_events`、`event_detail` 和 `plan_config_reload` 的 non-mutating 标记，
+  以及 `apply_config_reload`、`reload_runtime_actions`、`reload_policies` 和 `reload_enforcement_policy`
+  的 mutating 标记。
 - admin tail event 测试覆盖 typed admin client 经 Unix socket 读取 durable export event tail、selector 过滤、
   `next_after_sequence` 推进和 exporter sink cursor 不被 ack。
 - admin event detail 测试覆盖 typed admin client 经 Unix socket 按 sequence 读取单条 durable export event、

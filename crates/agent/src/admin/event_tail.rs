@@ -1,4 +1,6 @@
-use probe_core::{EventEnvelope, EventType, Selector, SpoolPayloadSchema};
+use probe_core::{
+    CaptureSource, CompiledSelector, EventEnvelope, EventType, Selector, SpoolPayloadSchema,
+};
 use serde::{Deserialize, Serialize};
 use storage::{FjallSpool, StoredEvent};
 use thiserror::Error;
@@ -13,9 +15,19 @@ const SELECTOR_SCAN_MULTIPLIER: usize = 8;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct EventTailRequest {
     pub(super) after_sequence: u64,
+    pub(super) latest: bool,
     pub(super) limit: usize,
     pub(super) selector: Option<Selector>,
+    pub(super) attribution_mode: EventTailAttributionMode,
     pub(super) event_types: Vec<EventType>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum EventTailAttributionMode {
+    #[default]
+    Strict,
+    IncludeUnknownProcess,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,9 +114,10 @@ pub(super) fn read_event_tail(
         .transpose()
         .map_err(EventTailError::Selector)?;
     let event_type_filter = EventTypeFilter::new(&request.event_types);
-    let stored = spool.read_export_batch_after(request.after_sequence, scan_limit)?;
     let last_export_sequence = spool.snapshot()?.last_export_sequence;
-    let mut next_after_sequence = request.after_sequence;
+    let after_sequence = effective_after_sequence(&request, scan_limit, last_export_sequence);
+    let stored = spool.read_export_batch_after(after_sequence, scan_limit)?;
+    let mut next_after_sequence = after_sequence;
     let mut events = Vec::new();
     let mut omissions = Vec::new();
     let mut included_payload_bytes = 0_usize;
@@ -126,9 +139,9 @@ pub(super) fn read_event_tail(
         }
         let record = decode_tail_record(stored_event)?;
         if event_type_filter.matches(&record.event)
-            && selector
-                .as_ref()
-                .is_none_or(|selector| selector.matches_event(&record.event))
+            && selector.as_ref().is_none_or(|selector| {
+                selector_matches_event(selector, &record.event, request.attribution_mode)
+            })
         {
             if included_payload_bytes.saturating_add(payload_bytes)
                 > MAX_TAIL_RESPONSE_PAYLOAD_BYTES
@@ -153,7 +166,7 @@ pub(super) fn read_event_tail(
     }
 
     Ok(EventTailSnapshot {
-        after_sequence: request.after_sequence,
+        after_sequence,
         next_after_sequence,
         last_export_sequence,
         limit,
@@ -167,6 +180,39 @@ pub(super) fn read_event_tail(
         events,
         omissions,
     })
+}
+
+fn selector_matches_event(
+    selector: &CompiledSelector,
+    event: &EventEnvelope,
+    mode: EventTailAttributionMode,
+) -> bool {
+    selector.matches_event(event)
+        || (mode == EventTailAttributionMode::IncludeUnknownProcess
+            && is_libpcap_unknown_process_event(event)
+            && selector.matches_event_with_unknown_process(event))
+}
+
+fn is_libpcap_unknown_process_event(event: &EventEnvelope) -> bool {
+    event.origin().source() == CaptureSource::Libpcap
+        && event.flow().is_some_and(|flow| {
+            flow.attribution_confidence == 0
+                && flow.process.identity.pid == 0
+                && flow.process.identity.exe_path == "unknown"
+                && flow.process.identity.runtime_hint.as_deref() == Some("libpcap_fallback")
+        })
+}
+
+fn effective_after_sequence(
+    request: &EventTailRequest,
+    scan_limit: usize,
+    last_export_sequence: u64,
+) -> u64 {
+    if request.latest {
+        last_export_sequence.saturating_sub(scan_limit as u64)
+    } else {
+        request.after_sequence
+    }
 }
 
 struct EventTypeFilter<'a> {
@@ -328,8 +374,10 @@ mod tests {
             &spool,
             EventTailRequest {
                 after_sequence: 0,
+                latest: false,
                 limit: 16,
                 selector: Some(exe_selector("/usr/bin/nginx")),
+                attribution_mode: EventTailAttributionMode::Strict,
                 event_types: Vec::new(),
             },
         )?;
@@ -352,6 +400,44 @@ mod tests {
     }
 
     #[test]
+    fn relaxed_tail_includes_libpcap_unknown_process_candidates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        ExportEventWriter::new(&spool).append_occurrence(&libpcap_unknown_process_event())?;
+        let selector = exe_selector("/app/backend");
+
+        let strict = read_event_tail(
+            &spool,
+            EventTailRequest {
+                after_sequence: 0,
+                latest: false,
+                limit: 16,
+                selector: Some(selector.clone()),
+                attribution_mode: EventTailAttributionMode::Strict,
+                event_types: vec![EventType::HttpRequestHeaders],
+            },
+        )?;
+        let relaxed = read_event_tail(
+            &spool,
+            EventTailRequest {
+                after_sequence: 0,
+                latest: false,
+                limit: 16,
+                selector: Some(selector),
+                attribution_mode: EventTailAttributionMode::IncludeUnknownProcess,
+                event_types: vec![EventType::HttpRequestHeaders],
+            },
+        )?;
+
+        assert!(strict.events.is_empty());
+        assert_eq!(relaxed.events.len(), 1);
+        assert_eq!(relaxed.events[0].sequence, 1);
+        assert_eq!(spool.export_cursor("webhook")?, 0);
+        Ok(())
+    }
+
+    #[test]
     fn tail_events_filters_by_event_type() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
         let spool = FjallSpool::open(temp.path())?;
@@ -365,8 +451,10 @@ mod tests {
             &spool,
             EventTailRequest {
                 after_sequence: 0,
+                latest: false,
                 limit: 16,
                 selector: None,
+                attribution_mode: EventTailAttributionMode::Strict,
                 event_types: vec![EventType::HttpRequestHeaders],
             },
         )?;
@@ -382,6 +470,38 @@ mod tests {
     }
 
     #[test]
+    fn latest_tail_starts_from_recent_export_window() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        for _ in 0..32 {
+            ExportEventWriter::new(&spool).append_occurrence(&event_with_kind(
+                "/usr/bin/curl",
+                EventKind::ConnectionOpened,
+            ))?;
+        }
+        ExportEventWriter::new(&spool).append_occurrence(&event_for_exe("/usr/bin/curl"))?;
+
+        let tail = read_event_tail(
+            &spool,
+            EventTailRequest {
+                after_sequence: 0,
+                latest: true,
+                limit: 4,
+                selector: None,
+                attribution_mode: EventTailAttributionMode::Strict,
+                event_types: vec![EventType::HttpRequestHeaders],
+            },
+        )?;
+
+        assert_eq!(tail.after_sequence, 1);
+        assert_eq!(tail.next_after_sequence, 33);
+        assert_eq!(tail.last_export_sequence, 33);
+        assert_eq!(tail.events.len(), 1);
+        assert_eq!(tail.events[0].sequence, 33);
+        Ok(())
+    }
+
+    #[test]
     fn tail_events_clamps_zero_limit_to_one() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
         let spool = FjallSpool::open(temp.path())?;
@@ -392,8 +512,10 @@ mod tests {
             &spool,
             EventTailRequest {
                 after_sequence: 0,
+                latest: false,
                 limit: 0,
                 selector: None,
+                attribution_mode: EventTailAttributionMode::Strict,
                 event_types: Vec::new(),
             },
         )?;
@@ -419,8 +541,10 @@ mod tests {
             &spool,
             EventTailRequest {
                 after_sequence: 0,
+                latest: false,
                 limit: 16,
                 selector: None,
+                attribution_mode: EventTailAttributionMode::Strict,
                 event_types: Vec::new(),
             },
         )?;
@@ -454,8 +578,10 @@ mod tests {
             &spool,
             EventTailRequest {
                 after_sequence: 0,
+                latest: false,
                 limit: 16,
                 selector: Some(exe_selector("/usr/bin/curl")),
+                attribution_mode: EventTailAttributionMode::Strict,
                 event_types: Vec::new(),
             },
         )?;
@@ -478,8 +604,10 @@ mod tests {
             &spool,
             EventTailRequest {
                 after_sequence: 0,
+                latest: false,
                 limit: 16,
                 selector: None,
+                attribution_mode: EventTailAttributionMode::Strict,
                 event_types: Vec::new(),
             },
         )?;
@@ -533,6 +661,38 @@ mod tests {
     fn event_for_exe(exe_path: &str) -> EventEnvelope {
         event_with_kind(
             exe_path,
+            EventKind::HttpRequestHeaders(HttpHeaders {
+                direction: Direction::Outbound,
+                stream_sequence: 1,
+                method: Some("GET".to_string()),
+                target: Some("/".to_string()),
+                status: None,
+                reason: None,
+                version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+            }),
+        )
+    }
+
+    fn libpcap_unknown_process_event() -> EventEnvelope {
+        let mut flow = flow_for_exe("unknown");
+        flow.process.identity.pid = 0;
+        flow.process.identity.tgid = 0;
+        flow.process.identity.start_time_ticks = 0;
+        flow.process.identity.boot_id = "libpcap".to_string();
+        flow.process.identity.cmdline_hash = "unknown".to_string();
+        flow.process.identity.runtime_hint = Some("libpcap_fallback".to_string());
+        flow.process.name = "unknown".to_string();
+        flow.process.cmdline.clear();
+        flow.attribution_confidence = 0;
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            flow,
+            CaptureOrigin::from_source(CaptureSource::Libpcap),
+            "test",
             EventKind::HttpRequestHeaders(HttpHeaders {
                 direction: Direction::Outbound,
                 stream_sequence: 1,

@@ -6,7 +6,6 @@ use std::{
     time::Duration,
 };
 
-use runtime::RuntimePlan;
 use storage::FjallSpool;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -16,6 +15,7 @@ use tokio::{
 };
 
 use super::server::{AdminRuntimeState, build_admin_status_snapshot};
+use crate::runtime_plan::RuntimePlanHandle;
 use crate::status::{PROMETHEUS_TEXT_CONTENT_TYPE, render_prometheus_metrics};
 
 const PROMETHEUS_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
@@ -24,7 +24,7 @@ const PROMETHEUS_MAX_REQUEST_BYTES: usize = 8 * 1024;
 
 pub(super) async fn accept_connections(
     listener: TcpListener,
-    plan: Arc<RuntimePlan>,
+    plan: RuntimePlanHandle,
     spool: Arc<FjallSpool>,
     runtime_state: Arc<AdminRuntimeState>,
     stop_requested: Arc<AtomicBool>,
@@ -36,7 +36,7 @@ pub(super) async fn accept_connections(
             result = listener.accept() => {
                 match result {
                     Ok((stream, _)) => {
-                        let plan = Arc::clone(&plan);
+                        let plan = plan.clone();
                         let spool = Arc::clone(&spool);
                         let runtime_state = Arc::clone(&runtime_state);
                         handlers.spawn(async move {
@@ -72,7 +72,7 @@ pub(super) async fn accept_connections(
 
 async fn handle_connection(
     mut stream: TcpStream,
-    plan: Arc<RuntimePlan>,
+    plan: RuntimePlanHandle,
     spool: Arc<FjallSpool>,
     runtime_state: Arc<AdminRuntimeState>,
 ) -> Result<(), std::io::Error> {
@@ -99,6 +99,7 @@ async fn handle_connection(
 
     match request_target(&request) {
         RequestTarget::Metrics => {
+            let plan = plan.snapshot();
             let snapshot =
                 build_admin_status_snapshot(plan.as_ref(), spool.as_ref(), &runtime_state);
             let metrics = render_prometheus_metrics(&snapshot);
@@ -252,7 +253,7 @@ mod tests {
         let spool = Arc::new(FjallSpool::open(&spool_path)?);
         let plan = Arc::new(runtime_plan(spool_path)?);
         let server = spawn_admin_server(
-            Arc::clone(&plan),
+            RuntimePlanHandle::new(Arc::clone(&plan)),
             Arc::clone(&spool),
             AdminServerConfig::unix_socket(socket_path).with_prometheus(PrometheusListenerConfig {
                 listen_addr: "127.0.0.1:0".parse()?,

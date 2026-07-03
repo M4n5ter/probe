@@ -8,7 +8,10 @@ use super::fields::{
     FieldApplyOutcome, FieldId, apply_field, apply_text_field, editable_text_value,
 };
 use super::hit::{HitTarget, ScrollTarget};
-use super::observation_setup::{ProcessObservationMode, upsert_process_observation};
+use super::observation_setup::{
+    ProcessObservationMode, process_observation_exe_paths, remove_process_observation,
+    replace_process_observations_with, upsert_process_observation,
+};
 use super::process_view::ProcessViewState;
 use super::processes::{ProcessCatalog, ProcessEntry, selector_for_exe_path};
 use super::runtime_attachment::RuntimeAttachment;
@@ -93,13 +96,20 @@ pub(crate) enum TuiAction {
     StartProcessSearch,
     ToggleProcessMonitor,
     OpenTrafficDiagnostics,
+    CycleTrafficViewMode,
     CycleTrafficEventFilter,
+    FollowTrafficTail,
     ObserveAuto,
     ObserveEbpf,
     ObserveLibpcap,
     Scroll {
         delta: isize,
         target: Option<ScrollTarget>,
+    },
+    DragScrollbar {
+        target: ScrollTarget,
+        offset: usize,
+        height: usize,
     },
     Hover {
         target: Option<HitTarget>,
@@ -283,6 +293,7 @@ impl TuiApp {
             hovered_target: None,
             hovered_process_argv: None,
         };
+        app.sync_process_monitors_from_config();
         app.refresh_local_runtime_diagnostics();
         app
     }
@@ -327,6 +338,7 @@ impl TuiApp {
 
     pub(crate) fn set_traffic_viewport_rows(&mut self, rows: usize) {
         self.traffic_visible_rows = rows.max(1);
+        self.traffic.set_viewport_rows(self.traffic_visible_rows);
     }
 
     pub(crate) fn processes(&self) -> &ProcessCatalog {
@@ -469,6 +481,11 @@ impl TuiApp {
             TuiAction::MoveUp => self.move_selection(-1),
             TuiAction::MoveDown => self.move_selection(1),
             TuiAction::Scroll { delta, target } => self.scroll_target(delta, target),
+            TuiAction::DragScrollbar {
+                target,
+                offset,
+                height,
+            } => self.drag_scrollbar(target, offset, height),
             TuiAction::NextValue => return self.adjust_selected(1),
             TuiAction::PreviousValue => return self.adjust_selected(-1),
             TuiAction::TextInput(_)
@@ -476,9 +493,11 @@ impl TuiApp {
             | TuiAction::TextSubmit
             | TuiAction::TextCancel => {}
             TuiAction::StartProcessSearch => self.begin_process_search(),
-            TuiAction::ToggleProcessMonitor => self.toggle_selected_process_monitor(),
+            TuiAction::ToggleProcessMonitor => return self.toggle_selected_process_monitor(),
             TuiAction::OpenTrafficDiagnostics => self.open_traffic_diagnostics(),
+            TuiAction::CycleTrafficViewMode => self.cycle_traffic_view_mode(),
             TuiAction::CycleTrafficEventFilter => self.cycle_traffic_event_filter(),
+            TuiAction::FollowTrafficTail => self.follow_traffic_tail(),
             TuiAction::ObserveAuto => {
                 return self.apply_process_observation(ProcessObservationMode::Auto);
             }
@@ -536,8 +555,15 @@ impl TuiApp {
         self.hovered_target = None;
         self.hovered_process_argv = None;
         self.dirty = false;
-        self.process_view.reconcile_monitors(&self.processes);
+        self.sync_process_monitors_from_config();
         self.status = StatusMessage::info("Reloaded config and process list");
+        self.clamp_selection();
+    }
+
+    pub(crate) fn replace_process_catalog(&mut self, processes: ProcessCatalog) {
+        self.processes = processes;
+        self.hovered_process_argv = None;
+        self.sync_process_monitors_from_config();
         self.clamp_selection();
     }
 
@@ -566,8 +592,8 @@ impl TuiApp {
             }
             HitTarget::TextEditSubmit | HitTarget::TextEditCancel => {}
             HitTarget::Process(index) | HitTarget::ProcessArgv(index) => self.select_process(index),
-            HitTarget::ProcessMonitor(index) => self.toggle_process_monitor(index),
-            HitTarget::TrafficProcess(index) => self.watch_process_from_traffic(index),
+            HitTarget::ProcessMonitor(index) => return self.toggle_process_monitor(index),
+            HitTarget::TrafficProcess(index) => return self.watch_process_from_traffic(index),
             HitTarget::TrafficRow(index) => return self.select_traffic_row(index),
             HitTarget::TrafficPopupPanel | HitTarget::TextEditPanel => {}
             HitTarget::TrafficPopupClose => self.close_traffic_popup(),
@@ -621,37 +647,34 @@ impl TuiApp {
         self.active_tab = TuiTab::Processes;
     }
 
-    fn toggle_process_monitor(&mut self, index: usize) {
-        if self.process_view.toggle_monitor(index, &self.processes) {
-            self.traffic = TrafficState::default();
-            self.clear_traffic_popup();
-            self.status = StatusMessage::info(self.traffic_filter_label());
-        } else {
-            self.status = StatusMessage::warning(
-                "Selected process has no readable executable path; traffic filter was not changed",
-            );
+    fn toggle_process_monitor(&mut self, index: usize) -> Option<TuiEffect> {
+        match self.process_view.toggle_monitor(index, &self.processes) {
+            Some(true) => self.observe_process_at_index(
+                index,
+                ProcessObservationMode::Auto,
+                MonitorMode::Keep,
+            ),
+            Some(false) => self.remove_process_observation_at_index(index),
+            None => {
+                self.status = StatusMessage::warning(
+                    "Selected process has no readable executable path; observation was not changed",
+                );
+                None
+            }
         }
     }
 
-    fn toggle_selected_process_monitor(&mut self) {
+    fn toggle_selected_process_monitor(&mut self) -> Option<TuiEffect> {
         let Some(index) = self.process_view.selected_index() else {
             self.status = StatusMessage::warning("No selected process");
-            return;
+            return None;
         };
-        self.toggle_process_monitor(index);
+        self.toggle_process_monitor(index)
     }
 
-    fn watch_process_from_traffic(&mut self, index: usize) {
-        if self.process_view.set_single_monitor(index, &self.processes) {
-            self.traffic = TrafficState::default();
-            self.clear_traffic_popup();
-            self.active_tab = TuiTab::Traffic;
-            self.status = StatusMessage::info(self.traffic_filter_label());
-        } else {
-            self.status = StatusMessage::warning(
-                "Selected process has no readable executable path; traffic filter was not changed",
-            );
-        }
+    fn watch_process_from_traffic(&mut self, index: usize) -> Option<TuiEffect> {
+        self.active_tab = TuiTab::Traffic;
+        self.observe_process_at_index(index, ProcessObservationMode::Auto, MonitorMode::Single)
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -674,9 +697,16 @@ impl TuiApp {
         if target_scrolls_processes(self.active_tab, target) {
             self.move_process(delta);
         } else if target_scrolls_traffic_events(self.active_tab, target) {
-            self.move_traffic(delta);
+            self.scroll_traffic(delta);
         } else {
             self.move_selection(delta);
+        }
+    }
+
+    fn drag_scrollbar(&mut self, target: ScrollTarget, offset: usize, height: usize) {
+        if target_scrolls_traffic_events(self.active_tab, Some(target)) {
+            self.traffic
+                .drag_scrollbar(offset, height, self.traffic_visible_rows);
         }
     }
 
@@ -714,18 +744,32 @@ impl TuiApp {
                 return;
             }
         };
-        self.traffic.refresh(&socket_path, selector).await;
-        let diagnostics_error = match request_traffic_runtime_diagnostics(&socket_path).await {
+        let diagnostics_result = request_traffic_runtime_diagnostics(&socket_path).await;
+        let attribution_mode = diagnostics_result
+            .as_ref()
+            .map(|diagnostics| diagnostics.tail_attribution_mode())
+            .unwrap_or(crate::admin::EventTailAttributionMode::Strict);
+        match &diagnostics_result {
+            Ok(diagnostics) => {
+                self.data_path_diagnostics =
+                    DataPathDiagnosticsView::from_running_agent(diagnostics.clone());
+            }
+            Err(error) => {
+                let message = format!("running agent status unavailable: {error}");
+                self.refresh_local_runtime_diagnostics_with_reason(message);
+            }
+        }
+        self.traffic
+            .refresh(&socket_path, selector, attribution_mode)
+            .await;
+        let diagnostics_error = match diagnostics_result {
             Ok(diagnostics) => {
                 let message = diagnostics.status_message(self.traffic.rows().is_empty());
-                self.data_path_diagnostics =
-                    DataPathDiagnosticsView::from_running_agent(diagnostics);
                 self.traffic.apply_runtime_diagnostic_message(message);
                 None
             }
             Err(error) => {
                 let message = format!("running agent status unavailable: {error}");
-                self.refresh_local_runtime_diagnostics_with_reason(message.clone());
                 Some(message)
             }
         };
@@ -807,6 +851,11 @@ impl TuiApp {
             .move_selection(delta, self.traffic_visible_rows);
     }
 
+    fn scroll_traffic(&mut self, delta: isize) {
+        self.traffic
+            .scroll_viewport(delta.saturating_mul(3), self.traffic_visible_rows);
+    }
+
     fn select_traffic_row(&mut self, index: usize) -> Option<TuiEffect> {
         self.active_tab = TuiTab::Traffic;
         self.traffic.select_row(index, self.traffic_visible_rows);
@@ -818,8 +867,7 @@ impl TuiApp {
             return self.open_traffic_detail();
         }
         if direction > 0 && self.active_tab == TuiTab::Processes {
-            self.toggle_selected_process_monitor();
-            return None;
+            return self.toggle_selected_process_monitor();
         }
         let field = match self.selected_focus_target()? {
             FocusTarget::Field(field) => field,
@@ -858,8 +906,16 @@ impl TuiApp {
                 self.open_traffic_diagnostics();
                 None
             }
+            ControlId::TrafficViewMode => {
+                self.cycle_traffic_view_mode();
+                None
+            }
             ControlId::TrafficEventFilter => {
                 self.cycle_traffic_event_filter();
+                None
+            }
+            ControlId::TrafficTailFollow => {
+                self.follow_traffic_tail();
                 None
             }
             ControlId::ObserveAuto => self.apply_process_observation(ProcessObservationMode::Auto),
@@ -883,6 +939,15 @@ impl TuiApp {
             self.status = StatusMessage::warning("No selected process");
             return None;
         };
+        self.observe_process_at_index(index, mode, MonitorMode::Single)
+    }
+
+    fn observe_process_at_index(
+        &mut self,
+        index: usize,
+        mode: ProcessObservationMode,
+        monitor_mode: MonitorMode,
+    ) -> Option<TuiEffect> {
         let Some(process) = self.processes.entries().get(index) else {
             self.status = StatusMessage::warning("No selected process");
             return None;
@@ -893,10 +958,23 @@ impl TuiApp {
             );
             return None;
         };
+        let Some(exe_path) = process.selector_key() else {
+            self.status = StatusMessage::warning(
+                "Selected process has no readable executable path; observation was not changed",
+            );
+            return None;
+        };
         let process_name = process.name.clone();
-        let observation_id = process_observation_id(process);
-        upsert_process_observation(&mut self.config, observation_id, selector, mode);
-        self.process_view.set_single_monitor(index, &self.processes);
+        match monitor_mode {
+            MonitorMode::Keep => {
+                upsert_process_observation(&mut self.config, &exe_path, selector, mode);
+                self.process_view.select(index, &self.processes);
+            }
+            MonitorMode::Single => {
+                replace_process_observations_with(&mut self.config, &exe_path, selector, mode);
+                self.process_view.set_single_monitor(index, &self.processes);
+            }
+        }
         self.traffic = TrafficState::default();
         self.clear_traffic_popup();
         self.dirty = true;
@@ -904,6 +982,37 @@ impl TuiApp {
         self.clamp_selection();
 
         let saved_status = process_observation_status(mode, &process_name);
+        self.status = saved_status.clone();
+        Some(TuiEffect::save_config_with_status(saved_status))
+    }
+
+    fn remove_process_observation_at_index(&mut self, index: usize) -> Option<TuiEffect> {
+        let Some(process) = self.processes.entries().get(index) else {
+            self.status = StatusMessage::warning("No selected process");
+            return None;
+        };
+        let Some(exe_path) = process.selector_key() else {
+            self.status = StatusMessage::warning(
+                "Selected process has no readable executable path; observation was not changed",
+            );
+            return None;
+        };
+        let process_name = process.name.clone();
+        self.process_view.select(index, &self.processes);
+        if !remove_process_observation(&mut self.config, &exe_path) {
+            self.traffic = TrafficState::default();
+            self.clear_traffic_popup();
+            self.status = StatusMessage::info(self.traffic_filter_label());
+            return None;
+        }
+
+        self.traffic = TrafficState::default();
+        self.clear_traffic_popup();
+        self.dirty = true;
+        self.refresh_local_runtime_diagnostics();
+        self.clamp_selection();
+
+        let saved_status = process_observation_removed_status(&process_name);
         self.status = saved_status.clone();
         Some(TuiEffect::save_config_with_status(saved_status))
     }
@@ -1040,7 +1149,7 @@ impl TuiApp {
     }
 
     fn open_traffic_detail(&mut self) -> Option<TuiEffect> {
-        if self.traffic.selected_row().is_some() {
+        if self.traffic.active_row_count() > 0 {
             self.open_traffic_popup(TrafficPopup::RowDetail);
         }
         self.traffic
@@ -1054,6 +1163,16 @@ impl TuiApp {
 
     fn cycle_traffic_event_filter(&mut self) {
         self.traffic.cycle_event_filter();
+        self.status = StatusMessage::info(self.traffic.status().text.clone());
+    }
+
+    fn cycle_traffic_view_mode(&mut self) {
+        self.traffic.cycle_view_mode();
+        self.status = StatusMessage::info(self.traffic.status().text.clone());
+    }
+
+    fn follow_traffic_tail(&mut self) {
+        self.traffic.jump_to_tail(self.traffic_visible_rows);
         self.status = StatusMessage::info(self.traffic.status().text.clone());
     }
 
@@ -1163,6 +1282,12 @@ impl TuiApp {
         }
     }
 
+    fn sync_process_monitors_from_config(&mut self) {
+        let exe_paths = process_observation_exe_paths(&self.config);
+        self.process_view
+            .replace_monitors(exe_paths, &self.processes);
+    }
+
     fn clamp_selection(&mut self) {
         let targets = self.focus_targets_for_active_tab();
         if self.selected_field_index >= targets.len() {
@@ -1181,18 +1306,21 @@ fn initial_status(processes: &ProcessCatalog) -> StatusMessage {
     }
 }
 
-fn process_observation_id(process: &ProcessEntry) -> String {
-    process
-        .selector_key()
-        .map(|key| format!("exe:{key}"))
-        .unwrap_or_else(|| format!("pid:{}", process.pid))
-}
-
 fn process_observation_status(mode: ProcessObservationMode, process_name: &str) -> StatusMessage {
     StatusMessage::saved(format!(
         "Observing {process_name} inbound and outbound with {} data path",
         mode.label()
     ))
+}
+
+fn process_observation_removed_status(process_name: &str) -> StatusMessage {
+    StatusMessage::saved(format!("Stopped observing {process_name}"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MonitorMode {
+    Keep,
+    Single,
 }
 
 fn fit_lines(mut lines: Vec<String>, max_lines: usize) -> Vec<String> {
@@ -1240,14 +1368,14 @@ mod tests {
 
     use probe_config::{
         AgentConfig, CaptureSelection, ExporterConfig, ExporterTransportConfig,
-        default_export_file_path,
+        ObservationDataPathMode, ProcessObservationConfig, default_export_file_path,
     };
 
     use super::{
         super::{
             controls::{ControlId, FocusTarget},
             copy::MITM_PLAINTEXT_COVERAGE,
-            processes::{ProcessCatalog, ProcessEntry},
+            processes::{ProcessCatalog, ProcessEntry, selector_for_exe_path},
             runtime_attachment::RuntimeAttachment,
             text::INLINE_TEXT_MAX_CHARS,
         },
@@ -1457,6 +1585,34 @@ mod tests {
     }
 
     #[test]
+    fn traffic_process_click_writes_auto_observation() {
+        let mut app = multi_process_app();
+        app.select_tab(TuiTab::Traffic);
+
+        let effect = app.handle_action(TuiAction::Click(HitTarget::TrafficProcess(1)));
+
+        let saved_status = expect_save_status(effect);
+        assert_eq!(saved_status.kind, StatusKind::Saved);
+        assert!(app.dirty());
+        assert_eq!(app.active_tab(), TuiTab::Traffic);
+        assert!(app.process_is_monitored(1));
+        assert_eq!(app.traffic_filter_label(), "1 watched processes");
+        assert_eq!(app.config.observations.len(), 1);
+        assert_eq!(app.config.observations[0].id, "exe:/usr/sbin/nginx");
+        assert_eq!(
+            app.config.observations[0].data_path,
+            ObservationDataPathMode::Auto
+        );
+        assert_eq!(
+            app.config.observations[0].directions,
+            [
+                probe_core::Direction::Inbound,
+                probe_core::Direction::Outbound
+            ]
+        );
+    }
+
+    #[test]
     fn overview_data_path_summary_updates_after_process_observation()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
@@ -1544,11 +1700,14 @@ mod tests {
     fn process_watch_set_builds_multi_process_traffic_selector() {
         let mut app = multi_process_app();
 
-        app.handle_action(TuiAction::Click(HitTarget::ProcessMonitor(0)));
-        app.handle_action(TuiAction::Click(HitTarget::ProcessMonitor(1)));
+        let first_effect = app.handle_action(TuiAction::Click(HitTarget::ProcessMonitor(0)));
+        let second_effect = app.handle_action(TuiAction::Click(HitTarget::ProcessMonitor(1)));
 
+        assert_eq!(expect_save_status(first_effect).kind, StatusKind::Saved);
+        assert_eq!(expect_save_status(second_effect).kind, StatusKind::Saved);
         assert!(app.process_is_monitored(0));
         assert!(app.process_is_monitored(1));
+        assert_eq!(app.config.observations.len(), 2);
         assert_eq!(app.traffic_filter_label(), "2 watched processes");
         let Some(probe_core::Selector::Any { selectors }) = app.traffic_filter_selector() else {
             panic!("multiple watched processes should use any selector");
@@ -1557,10 +1716,114 @@ mod tests {
     }
 
     #[test]
-    fn config_reload_prunes_watched_processes_that_are_no_longer_visible() {
+    fn process_watch_toggle_removes_process_observation() {
+        let mut app = multi_process_app();
+
+        let observe_effect = app.handle_action(TuiAction::Click(HitTarget::ProcessMonitor(1)));
+        let remove_effect = app.handle_action(TuiAction::Click(HitTarget::ProcessMonitor(1)));
+
+        assert_eq!(expect_save_status(observe_effect).kind, StatusKind::Saved);
+        assert_eq!(expect_save_status(remove_effect).kind, StatusKind::Saved);
+        assert!(!app.process_is_monitored(1));
+        assert!(app.config.observations.is_empty());
+        assert_eq!(app.traffic_filter_label(), "focused process: nginx");
+    }
+
+    #[test]
+    fn traffic_single_watch_replaces_other_process_observations() {
         let mut app = multi_process_app();
         app.handle_action(TuiAction::Click(HitTarget::ProcessMonitor(0)));
         app.handle_action(TuiAction::Click(HitTarget::ProcessMonitor(1)));
+
+        let effect = app.handle_action(TuiAction::Click(HitTarget::TrafficProcess(1)));
+
+        assert_eq!(expect_save_status(effect).kind, StatusKind::Saved);
+        assert!(!app.process_is_monitored(0));
+        assert!(app.process_is_monitored(1));
+        assert_eq!(app.config.observations.len(), 1);
+        assert_eq!(app.config.observations[0].id, "exe:/usr/sbin/nginx");
+        assert_eq!(
+            app.config.observations[0].selector,
+            selector_for_exe_path("/usr/sbin/nginx".to_string())
+        );
+    }
+
+    #[test]
+    fn traffic_single_watch_deduplicates_existing_process_observations() {
+        let mut config = AgentConfig::default();
+        config
+            .observations
+            .push(named_process_observation("backend-a", "/usr/sbin/nginx"));
+        config
+            .observations
+            .push(named_process_observation("backend-b", "/usr/sbin/nginx"));
+        config
+            .observations
+            .push(named_process_observation("curl", "/usr/bin/curl"));
+        let mut app = multi_process_app_with_config(config);
+
+        let effect = app.handle_action(TuiAction::Click(HitTarget::TrafficProcess(1)));
+
+        assert_eq!(expect_save_status(effect).kind, StatusKind::Saved);
+        assert!(app.process_is_monitored(1));
+        assert_eq!(app.config.observations.len(), 1);
+        assert_eq!(app.config.observations[0].id, "backend-a");
+        assert_eq!(
+            app.config.observations[0].selector,
+            selector_for_exe_path("/usr/sbin/nginx".to_string())
+        );
+    }
+
+    #[test]
+    fn app_initializes_process_monitors_from_observations() {
+        let mut config = AgentConfig::default();
+        config
+            .observations
+            .push(process_observation("/usr/sbin/nginx"));
+
+        let app = multi_process_app_with_config(config);
+
+        assert!(!app.process_is_monitored(0));
+        assert!(app.process_is_monitored(1));
+        assert_eq!(app.traffic_filter_label(), "1 watched processes");
+    }
+
+    #[test]
+    fn app_initializes_process_monitors_from_named_process_observations() {
+        let mut config = AgentConfig::default();
+        config
+            .observations
+            .push(named_process_observation("backend", "/usr/sbin/nginx"));
+
+        let app = multi_process_app_with_config(config);
+
+        assert!(!app.process_is_monitored(0));
+        assert!(app.process_is_monitored(1));
+        assert_eq!(app.traffic_filter_label(), "1 watched processes");
+    }
+
+    #[test]
+    fn process_watch_toggle_removes_named_process_observation() {
+        let mut config = AgentConfig::default();
+        config
+            .observations
+            .push(named_process_observation("backend", "/usr/sbin/nginx"));
+        let mut app = multi_process_app_with_config(config);
+
+        let effect = app.handle_action(TuiAction::Click(HitTarget::ProcessMonitor(1)));
+
+        assert_eq!(expect_save_status(effect).kind, StatusKind::Saved);
+        assert!(!app.process_is_monitored(1));
+        assert!(app.config.observations.is_empty());
+    }
+
+    #[test]
+    fn config_reload_prunes_watched_processes_that_are_no_longer_visible() {
+        let mut app = multi_process_app();
+        let first_effect = app.handle_action(TuiAction::Click(HitTarget::ProcessMonitor(0)));
+        let second_effect = app.handle_action(TuiAction::Click(HitTarget::ProcessMonitor(1)));
+        assert_eq!(expect_save_status(first_effect).kind, StatusKind::Saved);
+        assert_eq!(expect_save_status(second_effect).kind, StatusKind::Saved);
 
         app.replace_config(
             app.config().clone(),
@@ -1872,6 +2135,22 @@ mod tests {
             uid: 1000,
             gid: 1000,
             cgroup_path: Some(format!("system.slice/{name}.service")),
+        }
+    }
+
+    fn process_observation(exe_path: &str) -> ProcessObservationConfig {
+        named_process_observation(&format!("exe:{exe_path}"), exe_path)
+    }
+
+    fn named_process_observation(id: &str, exe_path: &str) -> ProcessObservationConfig {
+        ProcessObservationConfig {
+            id: id.to_string(),
+            selector: selector_for_exe_path(exe_path.to_string()),
+            data_path: ObservationDataPathMode::Auto,
+            directions: vec![
+                probe_core::Direction::Inbound,
+                probe_core::Direction::Outbound,
+            ],
         }
     }
 

@@ -9,7 +9,6 @@ use std::{
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use pipeline::PipelinePolicySet;
 use probe_config::{AgentConfig, PolicySourceConfig};
-use runtime::RuntimePlan;
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -18,6 +17,8 @@ use crate::reload_watcher::{
     ReloadFuture, ReloadWatchPath, ReloadWatcherError, ReloadWatcherHandle, absolute_path,
     spawn_reload_watcher,
 };
+use crate::runtime_plan::RuntimePlanHandle;
+use crate::runtime_reload::RuntimeReloadGate;
 
 #[derive(Debug, Error)]
 pub(crate) enum PolicyReloadWatcherError {
@@ -50,14 +51,16 @@ impl PolicyReloadWatcherHandle {
 }
 
 pub(crate) fn spawn_watcher(
-    plan: Arc<RuntimePlan>,
+    plan: RuntimePlanHandle,
     policy_set: PipelinePolicySet,
     gate: PolicyReloadGate,
+    config_apply_gate: RuntimeReloadGate,
 ) -> Result<Option<PolicyReloadWatcherHandle>, PolicyReloadWatcherError> {
-    if !plan.config.policy_reload.watch_local_bundles {
+    let initial_plan = plan.snapshot();
+    if !initial_plan.config.policy_reload.watch_local_bundles {
         return Ok(None);
     }
-    let targets = local_policy_bundle_watch_targets(&plan.config);
+    let targets = local_policy_bundle_watch_targets(&initial_plan.config);
     if targets.is_empty() {
         return Ok(None);
     }
@@ -69,7 +72,8 @@ pub(crate) fn spawn_watcher(
             .map(|target| target.bundle_path.clone())
             .collect::<Vec<_>>(),
     );
-    let debounce = Duration::from_millis(plan.config.policy_reload.debounce_ms);
+    let debounce = Duration::from_millis(initial_plan.config.policy_reload.debounce_ms);
+    drop(initial_plan);
     let inner = spawn_reload_watcher(
         "policy reload watcher",
         watch_paths,
@@ -79,6 +83,7 @@ pub(crate) fn spawn_watcher(
             plan,
             policy_set,
             gate,
+            config_apply_gate,
             targets,
         },
         reload_after_quiet_period,
@@ -89,9 +94,10 @@ pub(crate) fn spawn_watcher(
 }
 
 struct WatcherReloadContext {
-    plan: Arc<RuntimePlan>,
+    plan: RuntimePlanHandle,
     policy_set: PipelinePolicySet,
     gate: PolicyReloadGate,
+    config_apply_gate: RuntimeReloadGate,
     targets: Vec<LocalPolicyBundleWatchTarget>,
 }
 
@@ -173,7 +179,9 @@ fn is_non_symlink_directory(path: &Path) -> Result<bool, io::Error> {
 }
 
 async fn reload_after_policy_change(context: &WatcherReloadContext) {
-    match reload_policies(&context.plan, &context.policy_set, &context.gate).await {
+    let _config_apply_guard = context.config_apply_gate.lock().await;
+    let plan = context.plan.snapshot();
+    match reload_policies(&plan, &context.policy_set, &context.gate).await {
         Ok(summary) => {
             info!(
                 loaded_count = summary.loaded_count,
@@ -275,7 +283,9 @@ mod tests {
         AddressPort, Direction, EventEnvelope, EventKind, FlowContext, FlowIdentity,
         ProcessContext, ProcessIdentity, SpoolPayloadSchema, Timestamp, TransportProtocol,
     };
-    use runtime::{CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry};
+    use runtime::{
+        CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry, RuntimePlan,
+    };
     use storage::FjallSpool;
 
     use super::*;
@@ -400,9 +410,10 @@ mod tests {
         );
 
         let watcher = spawn_watcher(
-            Arc::clone(&plan),
+            RuntimePlanHandle::new(Arc::clone(&plan)),
             policy_set.clone(),
             PolicyReloadGate::default(),
+            RuntimeReloadGate::default(),
         )?
         .expect("watcher should start for enabled local bundle");
         write_policy_bundle(&policy_path, "new", "new")?;
@@ -444,9 +455,10 @@ mod tests {
         .into_policy_set();
         let spool = FjallSpool::open(&spool_path)?;
         let watcher = spawn_watcher(
-            Arc::clone(&plan),
+            RuntimePlanHandle::new(Arc::clone(&plan)),
             policy_set.clone(),
             PolicyReloadGate::default(),
+            RuntimeReloadGate::default(),
         )?
         .expect("watcher should start for enabled local bundle");
 
@@ -485,9 +497,10 @@ mod tests {
         let plan = Arc::new(runtime_plan_from_config(config)?);
 
         let Err(error) = spawn_watcher(
-            plan,
+            RuntimePlanHandle::new(plan),
             PipelinePolicySet::default(),
             PolicyReloadGate::default(),
+            RuntimeReloadGate::default(),
         ) else {
             panic!("symlink bundle root must not be watched");
         };
