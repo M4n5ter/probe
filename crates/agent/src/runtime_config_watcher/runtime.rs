@@ -472,6 +472,7 @@ mod tests {
             RuntimeGenerationState::for_config_version(current.config.config_version.clone());
         runtime_generation.request_reload(RuntimeGenerationReloadRequestInput {
             candidate_path: config_path.clone(),
+            base_config: current.config.clone(),
             candidate_config: first_candidate,
             current_config_version: current.config.config_version.clone(),
             candidate_config_version: Some("first".to_string()),
@@ -523,6 +524,7 @@ mod tests {
             RuntimeGenerationState::for_config_version(current.config.config_version.clone());
         let applying = runtime_generation.request_reload(RuntimeGenerationReloadRequestInput {
             candidate_path: config_path.clone(),
+            base_config: current.config.clone(),
             candidate_config: applying_candidate,
             current_config_version: current.config.config_version.clone(),
             candidate_config_version: Some("applying".to_string()),
@@ -544,6 +546,7 @@ mod tests {
             runtime_generation.record_reload_applied(applying.request_id, "applying");
             runtime_generation.request_reload(RuntimeGenerationReloadRequestInput {
                 candidate_path: config_path.clone(),
+                base_config: current.config.clone(),
                 candidate_config: stale_candidate,
                 current_config_version: current.config.config_version.clone(),
                 candidate_config_version: Some("stale".to_string()),

@@ -16,6 +16,7 @@ pub(crate) struct RuntimeGenerationState {
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeGenerationReloadRequestInput {
     pub candidate_path: PathBuf,
+    pub base_config: AgentConfig,
     pub candidate_config: AgentConfig,
     pub current_config_version: String,
     pub candidate_config_version: Option<String>,
@@ -25,6 +26,7 @@ pub(crate) struct RuntimeGenerationReloadRequestInput {
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeGenerationReloadRequest {
     pub snapshot: RuntimeGenerationReloadRequestSnapshot,
+    pub base_config: AgentConfig,
     pub candidate_config: AgentConfig,
 }
 
@@ -166,6 +168,7 @@ impl RuntimeGenerationState {
         };
         control.pending_reload = Some(RuntimeGenerationReloadRequest {
             snapshot: snapshot.clone(),
+            base_config: request.base_config,
             candidate_config: request.candidate_config,
         });
         Ok(snapshot)
@@ -434,6 +437,7 @@ mod tests {
         };
         RuntimeGenerationReloadRequestInput {
             candidate_path: PathBuf::from(path),
+            base_config: AgentConfig::default(),
             candidate_config,
             current_config_version: "local".to_string(),
             candidate_config_version: Some(candidate_version.to_string()),

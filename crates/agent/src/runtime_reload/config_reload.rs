@@ -334,7 +334,8 @@ pub(crate) async fn apply_config_reload(
     } = loaded;
     match &plan.decision {
         ConfigReloadDecision::QueueRuntimeGeneration { .. } => {
-            let runtime_generation_request = runtime_generation_reload_request(&plan, &candidate);
+            let runtime_generation_request =
+                runtime_generation_reload_request(&plan, &current_plan.config, &candidate);
             return ConfigReloadApplyOutcome {
                 snapshot: ConfigReloadApplySnapshot {
                     plan,
@@ -680,9 +681,9 @@ fn config_reload_decision(changed_sections: &[ConfigReloadSectionChange]) -> Con
         ConfigReloadDecision::ApplyOnline {
             reason: "changed sections are owned by runtime reload gates".to_string(),
         }
-    } else if changed_sections_can_use_runtime_generation(changed_sections) {
+    } else if runtime_generation_handoff_sections(changed_sections).is_some() {
         ConfigReloadDecision::QueueRuntimeGeneration {
-            reason: "changed sections are owned by capture provider generation swaps".to_string(),
+            reason: "changed sections are owned by the runtime generation handoff".to_string(),
         }
     } else {
         ConfigReloadDecision::RestartRequired {
@@ -692,17 +693,20 @@ fn config_reload_decision(changed_sections: &[ConfigReloadSectionChange]) -> Con
 }
 
 fn changed_sections_can_apply_online(changed_sections: &[ConfigReloadSectionChange]) -> bool {
-    let Some((first, rest)) = changed_sections.split_first() else {
+    if changed_sections.is_empty() {
         return false;
-    };
-    let Some(first_owner) = online_reload_owner(first) else {
-        return false;
-    };
-    if first_owner == ConfigReloadOnlineOwner::ActionGated {
-        return rest.is_empty();
     }
-    rest.iter()
-        .all(|change| online_reload_owner(change) == Some(ConfigReloadOnlineOwner::PlanOnly))
+    let mut action_gated_count = 0;
+    for change in changed_sections {
+        match online_reload_owner(change) {
+            Some(ConfigReloadOnlineOwner::PlanOnly) => {}
+            Some(ConfigReloadOnlineOwner::ActionGated) => {
+                action_gated_count += 1;
+            }
+            None => return false,
+        }
+    }
+    action_gated_count <= 1
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -715,7 +719,11 @@ fn online_reload_owner(change: &ConfigReloadSectionChange) -> Option<ConfigReloa
     if change.reload_mode != ConfigReloadSectionReloadMode::ApplyOnline {
         return None;
     }
-    match change.section {
+    online_section_owner(change.section)
+}
+
+fn online_section_owner(section: ConfigReloadSection) -> Option<ConfigReloadOnlineOwner> {
+    match section {
         ConfigReloadSection::Export | ConfigReloadSection::Storage => {
             Some(ConfigReloadOnlineOwner::PlanOnly)
         }
@@ -726,13 +734,25 @@ fn online_reload_owner(change: &ConfigReloadSectionChange) -> Option<ConfigReloa
     }
 }
 
-fn changed_sections_can_use_runtime_generation(
+fn runtime_generation_handoff_sections(
     changed_sections: &[ConfigReloadSectionChange],
-) -> bool {
-    !changed_sections.is_empty()
-        && changed_sections
-            .iter()
-            .all(section_can_use_runtime_generation)
+) -> Option<Vec<ConfigReloadSection>> {
+    if changed_sections.is_empty() {
+        return None;
+    }
+    let mut has_generation_section = false;
+    let mut sections = Vec::with_capacity(changed_sections.len());
+    for change in changed_sections {
+        if section_can_use_runtime_generation(change) {
+            has_generation_section = true;
+            sections.push(change.section);
+        } else if online_reload_owner(change) == Some(ConfigReloadOnlineOwner::PlanOnly) {
+            sections.push(change.section);
+        } else {
+            return None;
+        }
+    }
+    has_generation_section.then_some(sections)
 }
 
 fn agent_identity_can_use_runtime_generation(
@@ -875,6 +895,7 @@ fn reloadable_runtime_actions() -> Vec<ConfigReloadRuntimeAction> {
 
 pub(crate) fn runtime_generation_reload_request(
     plan: &ConfigReloadPlanSnapshot,
+    current: &AgentConfig,
     candidate: &AgentConfig,
 ) -> Option<RuntimeGenerationReloadRequestInput> {
     if !matches!(
@@ -883,24 +904,35 @@ pub(crate) fn runtime_generation_reload_request(
     ) {
         return None;
     }
-    let changed_sections = plan
-        .changed_sections
-        .iter()
-        .filter(|change| section_can_use_runtime_generation(change))
-        .map(|change| section_name(change.section).to_string())
+    let changed_sections = runtime_generation_handoff_sections(&plan.changed_sections)?
+        .into_iter()
+        .map(|section| section_name(section).to_string())
         .collect::<Vec<_>>();
-    (!changed_sections.is_empty()
-        && plan
-            .changed_sections
-            .iter()
-            .all(section_can_use_runtime_generation))
-    .then(|| RuntimeGenerationReloadRequestInput {
+    Some(RuntimeGenerationReloadRequestInput {
         candidate_path: plan.candidate_path.clone(),
+        base_config: current.clone(),
         candidate_config: candidate.clone(),
         current_config_version: plan.current_config_version.clone(),
         candidate_config_version: plan.candidate_config_version.clone(),
         changed_sections,
     })
+}
+
+pub(crate) fn runtime_generation_plan_only_conflicts(
+    base: &AgentConfig,
+    active: &AgentConfig,
+    candidate: &AgentConfig,
+) -> Vec<String> {
+    CONFIG_RELOAD_SECTIONS
+        .into_iter()
+        .map(|spec| spec.section)
+        .filter(|section| online_section_owner(*section) == Some(ConfigReloadOnlineOwner::PlanOnly))
+        .filter(|section| {
+            section_changed(*section, base, active) && section_changed(*section, active, candidate)
+        })
+        .map(section_name)
+        .map(str::to_string)
+        .collect()
 }
 
 fn section_can_use_runtime_generation(change: &ConfigReloadSectionChange) -> bool {
@@ -1018,9 +1050,9 @@ mod tests {
     }
 
     #[test]
-    fn config_reload_plan_reports_restart_sections_for_valid_candidate()
+    fn config_reload_plan_queues_generation_with_plan_only_export_changes()
     -> Result<(), Box<dyn std::error::Error>> {
-        let temp = test_dir("config-reload-restart")?;
+        let temp = test_dir("config-reload-generation-with-export")?;
         let current_config = base_config(temp.join("spool"));
         let current = runtime_plan(current_config)?;
         let mut candidate = base_config(temp.join("spool"));
@@ -1039,7 +1071,10 @@ mod tests {
         let plan = plan_config_reload(&current.config, &candidate_path);
 
         assert!(
-            matches!(plan.decision, ConfigReloadDecision::RestartRequired { .. }),
+            matches!(
+                plan.decision,
+                ConfigReloadDecision::QueueRuntimeGeneration { .. }
+            ),
             "{:?}",
             plan.decision
         );
@@ -1075,6 +1110,12 @@ mod tests {
                     ConfigReloadSectionReloadMode::ApplyOnline,
                 ),
             ]
+        );
+        let request = runtime_generation_reload_request(&plan, &current.config, &candidate)
+            .expect("generation handoff should carry plan-only export changes");
+        assert_eq!(
+            request.changed_sections,
+            ["agent_identity", "capture", "export"]
         );
         fs::remove_dir_all(temp)?;
         Ok(())
@@ -1145,7 +1186,7 @@ mod tests {
             "{:?}",
             plan.decision
         );
-        let request = runtime_generation_reload_request(&plan, &candidate)
+        let request = runtime_generation_reload_request(&plan, &current.config, &candidate)
             .expect("capture-only rebuild should be eligible for generation queue");
 
         assert_eq!(
@@ -1293,7 +1334,7 @@ mod tests {
     }
 
     #[test]
-    fn config_reload_plan_keeps_action_gated_and_plan_only_online_changes_restart_required()
+    fn config_reload_plan_can_apply_action_gated_and_plan_only_online_changes()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("config-reload-online-action-plan-mixed")?;
         let current = runtime_plan(base_config(temp.join("spool")))?;
@@ -1320,7 +1361,7 @@ mod tests {
         let plan = plan_config_reload(&current.config, &candidate_path);
 
         assert!(
-            matches!(plan.decision, ConfigReloadDecision::RestartRequired { .. }),
+            matches!(plan.decision, ConfigReloadDecision::ApplyOnline { .. }),
             "{:?}",
             plan.decision
         );
@@ -1601,6 +1642,7 @@ mod tests {
             RuntimeGenerationState::for_config_version(current.config.config_version.clone());
         runtime_generation.request_reload(RuntimeGenerationReloadRequestInput {
             candidate_path: candidate_path.clone(),
+            base_config: current.config.clone(),
             candidate_config: candidate.clone(),
             current_config_version: current.config.config_version.clone(),
             candidate_config_version: Some(candidate.config_version.clone()),
@@ -1652,6 +1694,7 @@ mod tests {
             RuntimeGenerationState::for_config_version(current.config.config_version.clone());
         let first = runtime_generation.request_reload(RuntimeGenerationReloadRequestInput {
             candidate_path: candidate_path.clone(),
+            base_config: current.config.clone(),
             candidate_config: first_candidate,
             current_config_version: current.config.config_version.clone(),
             candidate_config_version: Some("first".to_string()),
@@ -1687,6 +1730,72 @@ mod tests {
         assert_eq!(
             plan_handle.snapshot().config.config_version,
             current.config.config_version
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn complete_config_reload_apply_queues_generation_with_plan_only_sections()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-generation-plus-plan-only")?;
+        let current = runtime_plan(base_config(temp.join("spool")))?;
+        let mut candidate = current.config.clone();
+        candidate.capture.fallback_backends = vec![LiveCaptureBackend::Libpcap];
+        candidate.storage.retention = StorageRetentionConfig {
+            ingress: IngressJournalRetentionConfig {
+                max_age_ms: None,
+                max_records: Some(100_000),
+                sweep_interval_ms: 5_000,
+                prune_batch_limit: 128,
+            },
+            ..StorageRetentionConfig::default()
+        };
+        candidate.exporters.push(ExporterConfig {
+            id: "file".to_string(),
+            transport: ExporterTransportConfig::File {
+                path: temp.join("events.jsonl"),
+            },
+            ..ExporterConfig::default()
+        });
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+        let plan_handle = RuntimePlanHandle::new(Arc::new(current.clone()));
+        let runtime_generation =
+            RuntimeGenerationState::for_config_version(current.config.config_version.clone());
+
+        let outcome = apply_config_reload(
+            &current,
+            &PipelinePolicySet::default(),
+            &PolicyReloadGate::default(),
+            None,
+            &EnforcementReloadGate::default(),
+            &candidate_path,
+        )
+        .await;
+        let snapshot =
+            complete_config_reload_apply(outcome, &plan_handle, Some(&runtime_generation));
+
+        assert!(!snapshot.active_plan_updated);
+        assert!(matches!(
+            snapshot.actions.as_slice(),
+            [ConfigReloadApplyAction::RequestRuntimeGeneration(
+                ConfigReloadRuntimeGenerationActionOutcome::Queued { request_id: 1, .. },
+            )]
+        ));
+        let pending = runtime_generation
+            .snapshot()
+            .pending
+            .expect("candidate should remain pending until a capture safe point");
+        assert_eq!(pending.changed_sections, ["capture", "storage", "export"]);
+        assert_eq!(pending.candidate_config_version.as_deref(), Some("local"));
+        assert!(
+            plan_handle.snapshot().config.exporters.is_empty(),
+            "runtime plan should not change before the generation safe point"
+        );
+        assert_eq!(
+            plan_handle.snapshot().config.storage.retention,
+            current.config.storage.retention
         );
         fs::remove_dir_all(temp)?;
         Ok(())
@@ -1729,7 +1838,7 @@ mod tests {
                 ),
             ]
         );
-        let request = runtime_generation_reload_request(&plan, &candidate)
+        let request = runtime_generation_reload_request(&plan, &current.config, &candidate)
             .expect("config version and capture rebuild should queue together");
         assert_eq!(request.changed_sections, ["agent_identity", "capture"]);
         assert_eq!(
@@ -1775,7 +1884,7 @@ mod tests {
                 ConfigReloadSectionReloadMode::RuntimeGeneration,
             )]
         );
-        let request = runtime_generation_reload_request(&plan, &candidate)
+        let request = runtime_generation_reload_request(&plan, &current.config, &candidate)
             .expect("TLS decrypt hints should rebuild the capture generation");
         assert_eq!(request.changed_sections, ["tls"]);
         fs::remove_dir_all(temp)?;
@@ -1813,13 +1922,13 @@ mod tests {
                 ConfigReloadSectionReloadMode::ProcessRestart,
             )]
         );
-        assert!(runtime_generation_reload_request(&plan, &candidate).is_none());
+        assert!(runtime_generation_reload_request(&plan, &current.config, &candidate).is_none());
         fs::remove_dir_all(temp)?;
         Ok(())
     }
 
     #[test]
-    fn config_reload_plan_keeps_mixed_online_and_generation_owner_changes_restart_required()
+    fn config_reload_plan_keeps_action_gated_online_and_generation_owner_changes_restart_required()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("config-reload-online-then-generation")?;
         let current = runtime_plan(base_config(temp.join("spool")))?;
@@ -1858,7 +1967,7 @@ mod tests {
                 ),
             ]
         );
-        assert!(runtime_generation_reload_request(&plan, &candidate).is_none());
+        assert!(runtime_generation_reload_request(&plan, &current.config, &candidate).is_none());
         fs::remove_dir_all(temp)?;
         Ok(())
     }
@@ -1875,7 +1984,7 @@ mod tests {
 
         let plan = plan_config_reload(&current.config, &candidate_path);
 
-        assert!(runtime_generation_reload_request(&plan, &candidate).is_none());
+        assert!(runtime_generation_reload_request(&plan, &current.config, &candidate).is_none());
         fs::remove_dir_all(temp)?;
         Ok(())
     }
@@ -1993,7 +2102,7 @@ mod tests {
     }
 
     #[test]
-    fn config_reload_plan_keeps_mixed_online_owner_changes_restart_required()
+    fn config_reload_plan_keeps_multiple_action_gated_online_owner_changes_restart_required()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("config-reload-mixed-online-owners")?;
         let current = runtime_plan(base_config(temp.join("spool")))?;

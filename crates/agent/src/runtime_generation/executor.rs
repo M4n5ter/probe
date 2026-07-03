@@ -14,7 +14,7 @@ use crate::{
         RuntimeReloadGate,
         config_reload::{
             ConfigReloadDecision, ConfigReloadPlanSnapshot, plan_config_reload_for_candidate,
-            runtime_generation_reload_request,
+            runtime_generation_plan_only_conflicts, runtime_generation_reload_request,
         },
     },
     tls_plaintext::{TlsDecryptHintRuntimeState, TlsPlaintextRuntimeState},
@@ -76,11 +76,14 @@ impl RuntimeGenerationExecutor {
             &request.snapshot.candidate_path,
             &request.candidate_config,
         );
-        if !reload_plan_allows_runtime_generation(&reload_plan, &request.candidate_config) {
-            self.runtime_generation.record_reload_failed(
-                request.snapshot.request_id,
-                "candidate no longer contains only supported runtime generation changes against the active plan",
-            );
+        if let Err(message) = reload_plan_allows_runtime_generation(
+            &reload_plan,
+            &request.base_config,
+            &active_plan.config,
+            &request.candidate_config,
+        ) {
+            self.runtime_generation
+                .record_reload_failed(request.snapshot.request_id, message);
             return RuntimeGenerationProcessResult::Failed;
         }
         match build_runtime_generation_candidate(request.candidate_config) {
@@ -93,11 +96,14 @@ impl RuntimeGenerationExecutor {
                     &request.snapshot.candidate_path,
                     &candidate.plan.config,
                 );
-                if !reload_plan_allows_runtime_generation(&reload_plan, &candidate.plan.config) {
-                    self.runtime_generation.record_reload_failed(
-                        request.snapshot.request_id,
-                        "candidate no longer contains only supported runtime generation changes against the active plan",
-                    );
+                if let Err(message) = reload_plan_allows_runtime_generation(
+                    &reload_plan,
+                    &request.base_config,
+                    &active_plan.config,
+                    &candidate.plan.config,
+                ) {
+                    self.runtime_generation
+                        .record_reload_failed(request.snapshot.request_id, message);
                     return RuntimeGenerationProcessResult::Failed;
                 }
                 match self.build_capture_provider(&candidate.plan) {
@@ -183,12 +189,31 @@ impl RuntimeGenerationExecutor {
 
 fn reload_plan_allows_runtime_generation(
     reload_plan: &ConfigReloadPlanSnapshot,
+    base_config: &AgentConfig,
+    active_config: &AgentConfig,
     candidate_config: &AgentConfig,
-) -> bool {
-    matches!(
+) -> Result<(), String> {
+    if !(matches!(
         reload_plan.decision,
         ConfigReloadDecision::QueueRuntimeGeneration { .. }
-    ) && runtime_generation_reload_request(reload_plan, candidate_config).is_some()
+    ) && runtime_generation_reload_request(reload_plan, active_config, candidate_config)
+        .is_some())
+    {
+        return Err(
+            "candidate no longer contains only supported runtime generation changes against the active plan"
+                .to_string(),
+        );
+    }
+    let conflicts =
+        runtime_generation_plan_only_conflicts(base_config, active_config, candidate_config);
+    if conflicts.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "candidate would overwrite newer online plan changes in {}",
+            conflicts.join(", ")
+        ))
+    }
 }
 
 struct RuntimeGenerationCandidate {
@@ -218,8 +243,9 @@ mod tests {
     use std::{path::PathBuf, sync::Arc};
 
     use probe_config::{
-        CaptureBackend, CaptureSelection, PolicyConfig, PolicySourceConfig, TlsMaterialConfig,
-        TlsMaterialKind,
+        CaptureBackend, CaptureSelection, ExporterConfig, ExporterTransportConfig,
+        IngressJournalRetentionConfig, PolicyConfig, PolicySourceConfig, StorageRetentionConfig,
+        TlsMaterialConfig, TlsMaterialKind,
     };
 
     use super::*;
@@ -237,6 +263,7 @@ mod tests {
         let request = runtime_generation
             .request_reload(RuntimeGenerationReloadRequestInput {
                 candidate_path: PathBuf::from("/tmp/probe-stale-runtime-generation.toml"),
+                base_config: AgentConfig::default(),
                 candidate_config: candidate,
                 current_config_version: "local".to_string(),
                 candidate_config_version: None,
@@ -278,6 +305,7 @@ mod tests {
         let runtime_generation = RuntimeGenerationState::for_config_version("local");
         let request = runtime_generation.request_reload(RuntimeGenerationReloadRequestInput {
             candidate_path,
+            base_config: AgentConfig::default(),
             candidate_config: candidate.clone(),
             current_config_version: "local".to_string(),
             candidate_config_version: Some(candidate.config_version.clone()),
@@ -318,6 +346,60 @@ mod tests {
     }
 
     #[test]
+    fn runtime_generation_reload_carries_plan_only_sections_at_safe_point()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let feed_path = temp.path().join("events.jsonl");
+        std::fs::write(&feed_path, "")?;
+        let export_path = temp.path().join("export.jsonl");
+        let mut candidate = AgentConfig::default();
+        candidate.capture.selection = CaptureSelection::CaptureEventFeed;
+        candidate.capture.capture_event_feed.path = Some(feed_path);
+        candidate.capture.capture_event_feed.follow = Some(false);
+        candidate.storage.retention = StorageRetentionConfig {
+            ingress: IngressJournalRetentionConfig {
+                max_age_ms: None,
+                max_records: Some(100_000),
+                sweep_interval_ms: 5_000,
+                prune_batch_limit: 128,
+            },
+            ..StorageRetentionConfig::default()
+        };
+        candidate.exporters.push(ExporterConfig {
+            id: "file".to_string(),
+            transport: ExporterTransportConfig::File { path: export_path },
+            ..ExporterConfig::default()
+        });
+        let runtime_generation = RuntimeGenerationState::for_config_version("local");
+        runtime_generation.request_reload(RuntimeGenerationReloadRequestInput {
+            candidate_path: temp.path().join("candidate.toml"),
+            base_config: AgentConfig::default(),
+            candidate_config: candidate.clone(),
+            current_config_version: "local".to_string(),
+            candidate_config_version: Some(candidate.config_version.clone()),
+            changed_sections: vec![
+                "capture".to_string(),
+                "storage".to_string(),
+                "export".to_string(),
+            ],
+        })?;
+        let mut runtime = RuntimeGenerationReloadTestRuntime::new(AgentConfig::default())?;
+
+        runtime.process_reload(&runtime_generation);
+
+        let active = runtime.plan_handle.snapshot();
+        assert_eq!(
+            active.capture.selected_backend,
+            Some(CaptureBackend::CaptureEventFeed)
+        );
+        assert_eq!(active.storage.retention.ingress.max_records, Some(100_000));
+        assert_eq!(active.config.exporters, candidate.exporters);
+        assert_eq!(active.export.sinks[0].id(), "file");
+        assert_eq!(runtime.provider.name(), "capture_event_feed_jsonl");
+        Ok(())
+    }
+
+    #[test]
     fn runtime_generation_reload_returns_applied_config_version_for_live_handoff()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
@@ -333,6 +415,7 @@ mod tests {
         let runtime_generation = RuntimeGenerationState::for_config_version("local");
         runtime_generation.request_reload(RuntimeGenerationReloadRequestInput {
             candidate_path: temp.path().join("candidate.toml"),
+            base_config: AgentConfig::default(),
             candidate_config: candidate,
             current_config_version: "local".to_string(),
             candidate_config_version: Some("candidate".to_string()),
@@ -374,6 +457,7 @@ mod tests {
         let runtime_generation = RuntimeGenerationState::for_config_version("local");
         runtime_generation.request_reload(RuntimeGenerationReloadRequestInput {
             candidate_path: temp.path().join("candidate.toml"),
+            base_config: AgentConfig::default(),
             candidate_config: candidate,
             current_config_version: "local".to_string(),
             candidate_config_version: Some("local".to_string()),
@@ -410,6 +494,7 @@ mod tests {
         let runtime_generation = RuntimeGenerationState::for_config_version("local");
         runtime_generation.request_reload(RuntimeGenerationReloadRequestInput {
             candidate_path: temp.path().join("candidate.toml"),
+            base_config: AgentConfig::default(),
             candidate_config: candidate,
             current_config_version: "local".to_string(),
             candidate_config_version: Some("local".to_string()),
@@ -502,6 +587,7 @@ mod tests {
         let runtime_generation = RuntimeGenerationState::for_config_version("local");
         let request = runtime_generation.request_reload(RuntimeGenerationReloadRequestInput {
             candidate_path: temp.path().join("candidate.toml"),
+            base_config: AgentConfig::default(),
             candidate_config: candidate.clone(),
             current_config_version: "local".to_string(),
             candidate_config_version: Some(candidate.config_version.clone()),
@@ -534,6 +620,57 @@ mod tests {
     }
 
     #[test]
+    fn runtime_generation_reload_rejects_stale_plan_only_overwrite()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let feed_path = temp.path().join("events.jsonl");
+        std::fs::write(&feed_path, "")?;
+        let mut candidate = AgentConfig::default();
+        candidate.capture.selection = CaptureSelection::CaptureEventFeed;
+        candidate.capture.capture_event_feed.path = Some(feed_path);
+        candidate.capture.capture_event_feed.follow = Some(false);
+        let runtime_generation = RuntimeGenerationState::for_config_version("local");
+        let request = runtime_generation.request_reload(RuntimeGenerationReloadRequestInput {
+            candidate_path: temp.path().join("candidate.toml"),
+            base_config: AgentConfig::default(),
+            candidate_config: candidate.clone(),
+            current_config_version: "local".to_string(),
+            candidate_config_version: Some(candidate.config_version.clone()),
+            changed_sections: vec!["capture".to_string()],
+        })?;
+        let mut runtime = RuntimeGenerationReloadTestRuntime::new(AgentConfig::default())?;
+        let mut newer_config = AgentConfig::default();
+        newer_config.exporters.push(ExporterConfig {
+            id: "file".to_string(),
+            transport: ExporterTransportConfig::File {
+                path: temp.path().join("export.jsonl"),
+            },
+            ..ExporterConfig::default()
+        });
+        runtime
+            .plan_handle
+            .replace(build_runtime_composition(newer_config)?.into_plan());
+
+        runtime.process_reload(&runtime_generation);
+
+        let snapshot = runtime_generation.snapshot();
+        assert_eq!(snapshot.active.generation, 1);
+        let outcome = serde_json::to_value(snapshot.last_outcome)
+            .expect("runtime generation outcome should serialize");
+        assert_eq!(outcome["request_id"], request.request_id);
+        assert_eq!(outcome["result"]["result"], "failed");
+        assert!(
+            outcome["result"]["message"]
+                .as_str()
+                .is_some_and(|message| message
+                    .contains("candidate would overwrite newer online plan changes in export"))
+        );
+        assert_eq!(runtime.plan_handle.snapshot().config.exporters.len(), 1);
+        assert_eq!(runtime.provider.name(), "finished");
+        Ok(())
+    }
+
+    #[test]
     fn runtime_generation_reload_rejects_unsupported_sections_after_candidate_validation()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
@@ -543,6 +680,7 @@ mod tests {
         let runtime_generation = RuntimeGenerationState::for_config_version("local");
         let request = runtime_generation.request_reload(RuntimeGenerationReloadRequestInput {
             candidate_path,
+            base_config: AgentConfig::default(),
             candidate_config: candidate.clone(),
             current_config_version: "local".to_string(),
             candidate_config_version: Some(candidate.config_version.clone()),

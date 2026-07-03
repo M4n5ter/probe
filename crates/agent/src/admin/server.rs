@@ -807,7 +807,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_plan_config_reload_reports_restart_required_sections()
+    async fn admin_plan_config_reload_reports_generation_handoff_sections()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("admin-config-reload-plan")?;
         let socket_path = temp.join("admin.sock");
@@ -847,7 +847,7 @@ mod tests {
         assert_eq!(response["kind"], json!("config_reload_plan"));
         assert_eq!(
             response["plan"]["decision"]["kind"],
-            json!("restart_required")
+            json!("queue_runtime_generation")
         );
         assert_eq!(
             response["plan"]["candidate_config_version"],
