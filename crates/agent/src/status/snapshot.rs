@@ -55,6 +55,15 @@ pub struct TrafficStatusProjection {
     pub tls: TlsStatusSnapshot,
 }
 
+#[derive(Clone, Default)]
+pub struct TrafficRuntimeStatusInput {
+    pub capture: Option<crate::capture_provider::CaptureProviderRuntimeSnapshot>,
+    pub capture_input: Option<crate::capture_provider::CaptureInputActivityRuntimeSnapshot>,
+    pub l7_mitm: Option<L7MitmRuntimeSnapshot>,
+    pub runtime_generation: Option<RuntimeGenerationSnapshot>,
+    pub transparent_proxy: Option<TransparentProxyRuntimeSnapshot>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HealthSnapshot {
     pub mode: RuntimeMode,
@@ -109,30 +118,14 @@ pub fn build_traffic_status_projection(plan: &RuntimePlan) -> TrafficStatusProje
 
 pub fn build_traffic_status_projection_with_runtime(
     plan: &RuntimePlan,
-    runtime: RuntimeStatusInput,
+    runtime: TrafficRuntimeStatusInput,
 ) -> TrafficStatusProjection {
-    let capabilities = capabilities_with_runtime(
-        plan,
-        runtime.capture.as_ref(),
-        runtime.tls_plaintext.as_ref(),
-    );
+    let capabilities = capabilities_with_runtime(plan, runtime.capture.as_ref(), None);
     let capture = capture_status(plan, runtime.capture.clone(), runtime.capture_input);
     let transparent_proxy = runtime.transparent_proxy;
     let l7_mitm = runtime.l7_mitm;
-    let enforcement = match runtime.enforcement {
-        EnforcementRuntimeStatusInput::OfflineInspect => {
-            enforcement_status_with_transparent_proxy(plan, l7_mitm, transparent_proxy)
-        }
-        EnforcementRuntimeStatusInput::Runtime { active_policy } => {
-            enforcement_status_with_active_policy(plan, &active_policy, l7_mitm, transparent_proxy)
-        }
-    };
-    let tls = tls_status(
-        plan,
-        &capabilities,
-        runtime.tls_plaintext,
-        runtime.tls_decrypt_hints,
-    );
+    let enforcement = enforcement_status_with_transparent_proxy(plan, l7_mitm, transparent_proxy);
+    let tls = tls_status(plan, &capabilities, None, None);
     TrafficStatusProjection {
         runtime_generation: runtime.runtime_generation,
         capture,
@@ -393,6 +386,37 @@ mod tests {
             json!(256)
         );
         assert_eq!(snapshot.metrics.export.total_lag, Some(2));
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_status_projection_omits_tls_runtime_details()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = runtime_plan_from_config(
+            config_with_storage_path(PathBuf::from("/tmp/traffic-probe-spool")),
+            Vec::new(),
+        )?;
+
+        let projection = build_traffic_status_projection_with_runtime(
+            &plan,
+            TrafficRuntimeStatusInput::default(),
+        );
+        let value = serde_json::to_value(&projection)?;
+        let bytes = serde_json::to_vec(&projection)?;
+
+        assert_eq!(
+            value["tls"]["plaintext"]["instrumentation"]["runtime"],
+            json!(null)
+        );
+        assert_eq!(
+            value["tls"]["plaintext"]["decrypt_hints"]["runtime"],
+            json!(null)
+        );
+        assert!(
+            bytes.len() < 64 * 1024,
+            "traffic status projection should stay lightweight, got {} bytes",
+            bytes.len()
+        );
         Ok(())
     }
 

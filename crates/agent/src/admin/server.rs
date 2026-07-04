@@ -41,9 +41,9 @@ use crate::runtime_reload::{
 };
 use crate::status::{
     AgentStatusSnapshot, EnforcementRuntimeStatusInput, PROMETHEUS_TEXT_CONTENT_TYPE,
-    RuntimeStatusInput, TrafficStatusProjection, build_status_snapshot_with_runtime,
-    build_traffic_status_projection_with_runtime, collect_running_spool_status,
-    render_prometheus_metrics,
+    RuntimeStatusInput, TrafficRuntimeStatusInput, TrafficStatusProjection,
+    build_status_snapshot_with_runtime, build_traffic_status_projection_with_runtime,
+    collect_running_spool_status, render_prometheus_metrics,
 };
 use crate::tls_plaintext::{TlsDecryptHintRuntimeState, TlsPlaintextRuntimeState};
 use crate::transparent_interception::TransparentProxyRuntimeHandle;
@@ -451,7 +451,7 @@ fn build_admin_traffic_status_projection(
     plan: &RuntimePlan,
     runtime_state: &AdminRuntimeState,
 ) -> TrafficStatusProjection {
-    build_traffic_status_projection_with_runtime(plan, runtime_status_input(runtime_state))
+    build_traffic_status_projection_with_runtime(plan, traffic_runtime_status_input(runtime_state))
 }
 
 fn tail_attribution_mode(
@@ -503,12 +503,7 @@ fn runtime_status_input(runtime_state: &AdminRuntimeState) -> RuntimeStatusInput
     RuntimeStatusInput {
         capture: runtime_state.capture.snapshot(),
         capture_input: runtime_state.capture.input_activity_snapshot(),
-        enforcement: runtime_state.enforcement.as_ref().map_or(
-            EnforcementRuntimeStatusInput::OfflineInspect,
-            |state| EnforcementRuntimeStatusInput::Runtime {
-                active_policy: Box::new(state.active_policy()),
-            },
-        ),
+        enforcement: enforcement_runtime_status_input(runtime_state),
         export_worker: Some(runtime_state.export_worker.snapshot()),
         policy: Some(runtime_state.policy_set.runtime_snapshot()),
         pipeline: runtime_state
@@ -536,6 +531,36 @@ fn runtime_status_input(runtime_state: &AdminRuntimeState) -> RuntimeStatusInput
             .as_ref()
             .map(TransparentProxyRuntimeHandle::snapshot),
     }
+}
+
+fn traffic_runtime_status_input(runtime_state: &AdminRuntimeState) -> TrafficRuntimeStatusInput {
+    TrafficRuntimeStatusInput {
+        capture: runtime_state.capture.snapshot(),
+        capture_input: runtime_state.capture.input_activity_snapshot(),
+        l7_mitm: runtime_state
+            .l7_mitm
+            .as_ref()
+            .map(L7MitmRuntimeHandle::snapshot),
+        runtime_generation: runtime_state
+            .runtime_generation
+            .as_ref()
+            .map(RuntimeGenerationState::snapshot),
+        transparent_proxy: runtime_state
+            .transparent_proxy
+            .as_ref()
+            .map(TransparentProxyRuntimeHandle::snapshot),
+    }
+}
+
+fn enforcement_runtime_status_input(
+    runtime_state: &AdminRuntimeState,
+) -> EnforcementRuntimeStatusInput {
+    runtime_state.enforcement.as_ref().map_or(
+        EnforcementRuntimeStatusInput::OfflineInspect,
+        |state| EnforcementRuntimeStatusInput::Runtime {
+            active_policy: Box::new(state.active_policy()),
+        },
+    )
 }
 
 #[cfg(test)]
@@ -581,7 +606,11 @@ mod tests {
     use super::*;
     use crate::{
         configured_enforcement::LoadedEnforcementPolicySource,
-        runtime_generation::RuntimeGenerationState, runtime_plan::RuntimePlanHandle,
+        runtime_generation::RuntimeGenerationState,
+        runtime_plan::RuntimePlanHandle,
+        tls_plaintext::{
+            TlsDecryptHintRuntimeState, TlsPlaintextRuntimeSnapshot, TlsPlaintextRuntimeState,
+        },
     };
 
     #[tokio::test]
@@ -654,6 +683,55 @@ mod tests {
 
         assert_eq!(response["kind"], json!("pong"));
         assert_eq!(client_response["kind"], json!("pong"));
+        server.stop().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_traffic_status_omits_high_cardinality_tls_runtime()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-traffic-status-lightweight")?;
+        let socket_path = temp.join("admin.sock");
+        let spool_path = temp.join("spool");
+        let spool = Arc::new(FjallSpool::open(&spool_path)?);
+        let plan = Arc::new(runtime_plan(spool_path)?);
+        let tls_plaintext = TlsPlaintextRuntimeState::for_plan(plan.as_ref());
+        tls_plaintext.restore_snapshot(TlsPlaintextRuntimeSnapshot::disabled(
+            "x".repeat(20 * 1024 * 1024),
+        ));
+        let runtime_state = AdminRuntimeState {
+            tls_decrypt_hints: Some(TlsDecryptHintRuntimeState::for_plan(plan.as_ref())),
+            tls_plaintext: Some(tls_plaintext),
+            ..AdminRuntimeState::default()
+        };
+        let server = spawn_admin_server(
+            RuntimePlanHandle::new(Arc::clone(&plan)),
+            Arc::clone(&spool),
+            AdminServerConfig::unix_socket(socket_path.clone()),
+            runtime_state,
+        )?;
+
+        let response = crate::admin::send_admin_json_request(
+            &socket_path,
+            crate::admin::AdminRequest::TrafficStatus,
+        )
+        .await?;
+        let bytes = serde_json::to_vec(&response)?;
+
+        assert_eq!(response["kind"], json!("traffic_status"));
+        assert_eq!(
+            response["projection"]["tls"]["plaintext"]["instrumentation"]["runtime"],
+            json!(null)
+        );
+        assert_eq!(
+            response["projection"]["tls"]["plaintext"]["decrypt_hints"]["runtime"],
+            json!(null)
+        );
+        assert!(
+            bytes.len() < 64 * 1024,
+            "traffic_status should stay lightweight, got {} bytes",
+            bytes.len()
+        );
         server.stop().await;
         Ok(())
     }

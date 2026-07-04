@@ -20,8 +20,9 @@ pub(crate) use metrics::MetricsSnapshot;
 pub(crate) use prometheus::{PROMETHEUS_TEXT_CONTENT_TYPE, render_prometheus_metrics};
 pub(crate) use snapshot::{
     AgentStatusSnapshot, EnforcementRuntimeStatusInput, RuntimeStatusInput,
-    TrafficStatusProjection, build_status_snapshot, build_status_snapshot_with_runtime,
-    build_traffic_status_projection, build_traffic_status_projection_with_runtime,
+    TrafficRuntimeStatusInput, TrafficStatusProjection, build_status_snapshot,
+    build_status_snapshot_with_runtime, build_traffic_status_projection,
+    build_traffic_status_projection_with_runtime,
 };
 pub(crate) use spool::{collect_running_spool_status, collect_spool_status};
 pub(crate) use tls::TlsStatusSnapshot;
