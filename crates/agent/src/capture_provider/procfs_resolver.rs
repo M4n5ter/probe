@@ -6,6 +6,11 @@ use capture::{
 use probe_core::{CapabilityKind, ProcessContext, RuntimeMode, TcpConnection, TcpEndpoint};
 use runtime::RuntimePlan;
 
+// This is intentionally below direct procfs and hinted-fd attribution confidence, but above
+// synthetic unknown-process attribution. It is only used for libpcap passive observation when the
+// attributed listener owners agree and some matching listener sockets remain unattributed.
+const LIBPCAP_UNATTRIBUTED_LISTENER_CONFIDENCE_CAP: u8 = 35;
+
 pub(super) fn procfs_tcp_process_resolver_for_plan(
     plan: &RuntimePlan,
 ) -> Option<Box<dyn ProcessResolver>> {
@@ -50,7 +55,7 @@ impl ProcessResolver for ProcfsTcpProcessResolver {
     ) -> Result<Option<ResolvedProcess>, CaptureError> {
         self.resolver
             .resolve_tcp_listeners_by_local_endpoint(local_endpoint)
-            .map(unique_listener_owner_process)
+            .map(libpcap_best_effort_unique_attributed_listener_owner)
             .map_err(|error| CaptureError::provider("procfs_socket_attribution", error.to_string()))
     }
 
@@ -59,10 +64,10 @@ impl ProcessResolver for ProcfsTcpProcessResolver {
     }
 }
 
-fn unique_listener_owner_process(lookup: TcpListenerProcessLookup) -> Option<ResolvedProcess> {
-    if !lookup.unattributed_listeners.is_empty() {
-        return None;
-    }
+fn libpcap_best_effort_unique_attributed_listener_owner(
+    lookup: TcpListenerProcessLookup,
+) -> Option<ResolvedProcess> {
+    let has_unattributed_listeners = !lookup.unattributed_listeners.is_empty();
 
     let mut listeners = lookup.listeners.into_iter();
     let first = listeners.next()?;
@@ -72,6 +77,9 @@ fn unique_listener_owner_process(lookup: TcpListenerProcessLookup) -> Option<Res
             return None;
         }
         confidence = confidence.min(listener.owner.confidence);
+    }
+    if has_unattributed_listeners {
+        confidence = confidence.min(LIBPCAP_UNATTRIBUTED_LISTENER_CONFIDENCE_CAP);
     }
     Some(ResolvedProcess {
         process: first.owner.process,
@@ -133,7 +141,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unique_listener_owner_accepts_multiple_observed_listeners_for_same_owner() {
+    fn libpcap_listener_owner_accepts_multiple_observed_listeners_for_same_owner() {
         let owner = process(321, "backend");
         let lookup = TcpListenerProcessLookup {
             listeners: vec![
@@ -143,7 +151,8 @@ mod tests {
             unattributed_listeners: Vec::new(),
         };
 
-        let resolved = unique_listener_owner_process(lookup).expect("owner should be unique");
+        let resolved = libpcap_best_effort_unique_attributed_listener_owner(lookup)
+            .expect("owner should be unique");
 
         assert_eq!(resolved.process.identity.pid, 321);
         assert_eq!(resolved.process.name, "backend");
@@ -151,7 +160,7 @@ mod tests {
     }
 
     #[test]
-    fn unique_listener_owner_rejects_ambiguous_owners() {
+    fn libpcap_listener_owner_rejects_ambiguous_owners() {
         let lookup = TcpListenerProcessLookup {
             listeners: vec![
                 listener(123, "first-proxy", process(321, "first-backend"), 60, 8081),
@@ -166,11 +175,11 @@ mod tests {
             unattributed_listeners: Vec::new(),
         };
 
-        assert!(unique_listener_owner_process(lookup).is_none());
+        assert!(libpcap_best_effort_unique_attributed_listener_owner(lookup).is_none());
     }
 
     #[test]
-    fn unique_listener_owner_rejects_unknown_listener_inodes() {
+    fn libpcap_listener_owner_degrades_when_unknown_listener_inodes_are_present() {
         let owner = process(321, "backend");
         let lookup = TcpListenerProcessLookup {
             listeners: vec![
@@ -183,7 +192,28 @@ mod tests {
             }],
         };
 
-        assert!(unique_listener_owner_process(lookup).is_none());
+        let resolved = libpcap_best_effort_unique_attributed_listener_owner(lookup)
+            .expect("unique owner should resolve");
+
+        assert_eq!(resolved.process.identity.pid, 321);
+        assert_eq!(resolved.process.name, "backend");
+        assert_eq!(
+            resolved.confidence,
+            LIBPCAP_UNATTRIBUTED_LISTENER_CONFIDENCE_CAP
+        );
+    }
+
+    #[test]
+    fn libpcap_listener_owner_rejects_only_unknown_listener_inodes() {
+        let lookup = TcpListenerProcessLookup {
+            listeners: Vec::new(),
+            unattributed_listeners: vec![TcpUnattributedListener {
+                socket_inode: 999,
+                local: TcpEndpoint::new(Ipv4Addr::UNSPECIFIED.into(), 8081),
+            }],
+        };
+
+        assert!(libpcap_best_effort_unique_attributed_listener_owner(lookup).is_none());
     }
 
     fn listener(
