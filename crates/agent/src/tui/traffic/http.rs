@@ -274,16 +274,13 @@ impl HttpExchangeBuilder {
     }
 
     fn body_direction_is_response(&self, direction: Direction) -> bool {
-        self.response
+        if let Some(headers) = &self.response.headers {
+            return headers.direction == direction;
+        }
+        self.request
             .headers
             .as_ref()
-            .is_some_and(|headers| headers.direction == direction)
-            || (self.request.headers.is_none()
-                && self
-                    .response
-                    .headers
-                    .as_ref()
-                    .is_some_and(|headers| headers.direction == direction))
+            .is_some_and(|headers| headers.direction != direction)
     }
 
     fn into_row(mut self) -> HttpExchangeRow {
@@ -593,6 +590,52 @@ mod tests {
             details
                 .iter()
                 .any(|line| line == "  Incomplete reason: end of stream was not observed")
+        );
+    }
+
+    #[test]
+    fn response_body_without_response_headers_uses_opposite_request_direction() {
+        let rows = vec![
+            TrafficRow::from_event(
+                1,
+                event(EventKind::HttpRequestHeaders(HttpHeaders {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    method: Some("GET".to_string()),
+                    target: Some("/windowed".to_string()),
+                    status: None,
+                    reason: None,
+                    version: "HTTP/1.1".to_string(),
+                    headers: Vec::new(),
+                })),
+            ),
+            TrafficRow::from_event(
+                2,
+                event(EventKind::HttpBodyChunk(BodyChunk {
+                    direction: Direction::Inbound,
+                    stream_sequence: 1,
+                    offset: 0,
+                    data: b"ok".to_vec().into(),
+                    end_stream: true,
+                })),
+            ),
+        ];
+
+        let exchanges = build_http_exchange_rows(&rows);
+        let [exchange] = exchanges.as_slice() else {
+            panic!("expected one exchange");
+        };
+
+        assert_eq!(
+            exchange.summary,
+            "GET /windowed -> pending (req 0 B, resp 2 B)"
+        );
+        let details = exchange.detail_lines();
+        assert!(details.iter().any(|line| line == "  Body payload: ok"));
+        assert!(
+            details
+                .iter()
+                .any(|line| line == "  Headers: not observed in current window")
         );
     }
 
