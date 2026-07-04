@@ -1,5 +1,4 @@
 use std::{
-    fmt,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -28,11 +27,6 @@ pub(crate) struct RuntimeGenerationReloadRequest {
     pub snapshot: RuntimeGenerationReloadRequestSnapshot,
     pub base_config: AgentConfig,
     pub candidate_config: AgentConfig,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RuntimeGenerationReloadQueueError {
-    applying_request_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -142,28 +136,14 @@ impl RuntimeGenerationState {
         control.pending_reload.is_some() || control.snapshot.applying.is_some()
     }
 
-    pub(crate) fn has_applying_reload(&self) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .snapshot
-            .applying
-            .is_some()
-    }
-
     pub(crate) fn request_reload(
         &self,
         request: RuntimeGenerationReloadRequestInput,
-    ) -> Result<RuntimeGenerationReloadRequestSnapshot, RuntimeGenerationReloadQueueError> {
+    ) -> RuntimeGenerationReloadRequestSnapshot {
         let mut control = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(applying) = &control.snapshot.applying {
-            return Err(RuntimeGenerationReloadQueueError {
-                applying_request_id: applying.request.request_id,
-            });
-        }
         let request_id = control.next_request_id;
         control.next_request_id = control.next_request_id.saturating_add(1);
         let snapshot = RuntimeGenerationReloadRequestSnapshot {
@@ -179,7 +159,7 @@ impl RuntimeGenerationState {
             base_config: request.base_config,
             candidate_config: request.candidate_config,
         });
-        Ok(snapshot)
+        snapshot
     }
 
     pub(crate) fn begin_pending_reload(&self) -> Option<RuntimeGenerationReloadRequest> {
@@ -187,6 +167,9 @@ impl RuntimeGenerationState {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if control.snapshot.applying.is_some() {
+            return None;
+        }
         let request = control.pending_reload.take()?;
         control.snapshot.applying = Some(RuntimeGenerationReloadApplyingSnapshot {
             request: request.snapshot.clone(),
@@ -205,6 +188,9 @@ impl RuntimeGenerationState {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !current_applying_request_matches(&control, request_id) {
+            return;
+        }
         let config_version = config_version.into();
         control.snapshot.active.generation = control.snapshot.active.generation.saturating_add(1);
         control.snapshot.active.config_version = config_version.clone();
@@ -225,6 +211,9 @@ impl RuntimeGenerationState {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !current_applying_request_matches(&control, request_id) {
+            return;
+        }
         control.snapshot.applying = None;
         control.snapshot.last_outcome = Some(RuntimeGenerationReloadOutcomeSnapshot {
             request_id,
@@ -249,18 +238,6 @@ impl RuntimeGenerationState {
     }
 }
 
-impl fmt::Display for RuntimeGenerationReloadQueueError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "runtime generation reload is busy: applying request {}",
-            self.applying_request_id
-        )
-    }
-}
-
-impl std::error::Error for RuntimeGenerationReloadQueueError {}
-
 impl Default for RuntimeGenerationState {
     fn default() -> Self {
         Self {
@@ -276,6 +253,14 @@ fn snapshot_from_control(control: &RuntimeGenerationControl) -> RuntimeGeneratio
         .as_ref()
         .map(|request| request.snapshot.clone());
     snapshot
+}
+
+fn current_applying_request_matches(control: &RuntimeGenerationControl, request_id: u64) -> bool {
+    control
+        .snapshot
+        .applying
+        .as_ref()
+        .is_some_and(|applying| applying.request.request_id == request_id)
 }
 
 fn current_unix_time_ns() -> u64 {
@@ -326,9 +311,7 @@ mod tests {
         let state = RuntimeGenerationState::for_config_version("local");
         assert!(!state.has_pending_or_applying_reload());
 
-        state
-            .request_reload(reload_request("candidate.toml", "candidate"))
-            .expect("request should queue");
+        state.request_reload(reload_request("candidate.toml", "candidate"));
         assert!(state.has_pending_or_applying_reload());
 
         let applying = state
@@ -348,12 +331,8 @@ mod tests {
     fn runtime_generation_replaces_pending_reload_with_latest_request() {
         let state = RuntimeGenerationState::for_config_version("local");
 
-        let first = state
-            .request_reload(reload_request("candidate-a.toml", "candidate-a"))
-            .expect("first request should queue");
-        let second = state
-            .request_reload(reload_request("candidate-b.toml", "candidate-b"))
-            .expect("second request should replace pending request");
+        let first = state.request_reload(reload_request("candidate-a.toml", "candidate-a"));
+        let second = state.request_reload(reload_request("candidate-b.toml", "candidate-b"));
 
         let snapshot = state.snapshot();
         assert_eq!(first.request_id, 1);
@@ -370,9 +349,7 @@ mod tests {
     #[test]
     fn runtime_generation_moves_pending_request_to_applying() {
         let state = RuntimeGenerationState::for_config_version("local");
-        let queued = state
-            .request_reload(reload_request("candidate.toml", "candidate"))
-            .expect("request should queue");
+        let queued = state.request_reload(reload_request("candidate.toml", "candidate"));
 
         let applying = state
             .begin_pending_reload()
@@ -388,29 +365,66 @@ mod tests {
     }
 
     #[test]
-    fn runtime_generation_rejects_reload_while_request_is_applying() {
+    fn runtime_generation_keeps_latest_pending_reload_while_request_is_applying() {
         let state = RuntimeGenerationState::for_config_version("local");
-        state
-            .request_reload(reload_request("candidate-a.toml", "candidate-a"))
-            .expect("first request should queue");
-        state.begin_pending_reload();
+        let first = state.request_reload(reload_request("candidate-a.toml", "candidate-a"));
+        let applying = state
+            .begin_pending_reload()
+            .expect("first request should begin applying");
 
         let second = state.request_reload(reload_request("candidate-b.toml", "candidate-b"));
 
-        assert!(matches!(
-            second,
-            Err(RuntimeGenerationReloadQueueError {
-                applying_request_id: 1,
-            })
-        ));
+        let snapshot = state.snapshot();
+        assert_eq!(applying.snapshot, first);
+        assert_eq!(
+            snapshot.applying.as_ref().map(|value| &value.request),
+            Some(&first)
+        );
+        assert_eq!(snapshot.pending, Some(second.clone()));
+        assert!(state.begin_pending_reload().is_none());
+        assert_eq!(state.snapshot().pending, Some(second.clone()));
+
+        state.record_reload_applied(
+            first.request_id,
+            "candidate-a",
+            RuntimeGenerationHandoffOutcomeSnapshot::Drained,
+        );
+        let next = state
+            .begin_pending_reload()
+            .expect("latest pending request should begin after applying request completes");
+        assert_eq!(next.snapshot, second);
+    }
+
+    #[test]
+    fn runtime_generation_ignores_completion_for_non_applying_request() {
+        let state = RuntimeGenerationState::for_config_version("local");
+        let first = state.request_reload(reload_request("candidate-a.toml", "candidate-a"));
+        state
+            .begin_pending_reload()
+            .expect("first request should begin applying");
+        let second = state.request_reload(reload_request("candidate-b.toml", "candidate-b"));
+
+        state.record_reload_applied(
+            second.request_id,
+            "candidate-b",
+            RuntimeGenerationHandoffOutcomeSnapshot::Drained,
+        );
+        state.record_reload_failed(second.request_id, "candidate-b failed");
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.active.config_version, "local");
+        assert_eq!(
+            snapshot.applying.as_ref().map(|value| &value.request),
+            Some(&first)
+        );
+        assert_eq!(snapshot.pending, Some(second));
+        assert_eq!(snapshot.last_outcome, None);
     }
 
     #[test]
     fn runtime_generation_records_failed_reload_outcome() {
         let state = RuntimeGenerationState::for_config_version("local");
-        let queued = state
-            .request_reload(reload_request("candidate.toml", "candidate"))
-            .expect("request should queue");
+        let queued = state.request_reload(reload_request("candidate.toml", "candidate"));
         state.begin_pending_reload();
 
         state.record_reload_failed(queued.request_id, "candidate is not usable");
@@ -428,9 +442,7 @@ mod tests {
     #[test]
     fn runtime_generation_records_applied_reload_outcome() {
         let state = RuntimeGenerationState::for_config_version("local");
-        let queued = state
-            .request_reload(reload_request("candidate.toml", "candidate"))
-            .expect("request should queue");
+        let queued = state.request_reload(reload_request("candidate.toml", "candidate"));
         state.begin_pending_reload();
 
         state.record_reload_applied(

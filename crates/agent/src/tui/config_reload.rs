@@ -141,7 +141,7 @@ pub(crate) enum ConfigReloadApplyDisposition {
     NeedsRestart,
     Rejected,
     OnlineApplyFailed,
-    RuntimeGenerationQueueFailed,
+    RuntimeGenerationRequestFailed,
     Failed,
 }
 
@@ -159,7 +159,7 @@ impl ConfigReloadApplySummary {
             .any(ConfigReloadApplyActionSummary::failed)
         {
             if self.has_failed_runtime_generation_request() {
-                return ConfigReloadApplyDisposition::RuntimeGenerationQueueFailed;
+                return ConfigReloadApplyDisposition::RuntimeGenerationRequestFailed;
             }
             if self.plan.can_apply_online() {
                 return ConfigReloadApplyDisposition::OnlineApplyFailed;
@@ -195,7 +195,7 @@ impl ConfigReloadApplySummary {
         if !failed.is_empty() {
             let prefix = match self.disposition() {
                 ConfigReloadApplyDisposition::OnlineApplyFailed => "runtime online apply failed",
-                ConfigReloadApplyDisposition::RuntimeGenerationQueueFailed => {
+                ConfigReloadApplyDisposition::RuntimeGenerationRequestFailed => {
                     "runtime generation reload request failed"
                 }
                 _ => "runtime config reload failed",
@@ -334,9 +334,6 @@ impl ConfigReloadApplyActionOutcomeSummary {
         match snapshot {
             ConfigReloadRuntimeGenerationActionOutcome::Queued { detail, request_id } => {
                 Self::QueuedGeneration { detail, request_id }
-            }
-            ConfigReloadRuntimeGenerationActionOutcome::Busy { message } => {
-                Self::Failed { message }
             }
             ConfigReloadRuntimeGenerationActionOutcome::Failed { message } => {
                 Self::Failed { message }
@@ -686,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn config_reload_apply_summary_reports_runtime_generation_queue_failure() {
+    fn config_reload_apply_summary_reports_runtime_generation_request_failure() {
         let response = json!({
             "kind": "config_reload_apply",
             "apply": {
@@ -704,8 +701,8 @@ mod tests {
                     {
                         "action": "request_runtime_generation",
                         "outcome": {
-                            "result": "busy",
-                            "message": "runtime generation reload is busy: applying request 1"
+                            "result": "failed",
+                            "message": "runtime generation owner is unavailable"
                         }
                     }
                 ]
@@ -713,15 +710,15 @@ mod tests {
         });
 
         let summary = parse_config_reload_apply_response(&response)
-            .expect("queue failure response should parse");
+            .expect("request failure response should parse");
 
         assert_eq!(
             summary.disposition(),
-            ConfigReloadApplyDisposition::RuntimeGenerationQueueFailed
+            ConfigReloadApplyDisposition::RuntimeGenerationRequestFailed
         );
         assert_eq!(
             summary.status_text(),
-            "runtime generation reload request failed: request_runtime_generation: runtime generation reload is busy: applying request 1"
+            "runtime generation reload request failed: request_runtime_generation: runtime generation owner is unavailable"
         );
     }
 

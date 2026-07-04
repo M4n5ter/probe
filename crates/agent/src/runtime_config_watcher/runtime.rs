@@ -9,8 +9,6 @@ use pipeline::PipelinePolicySet;
 use thiserror::Error;
 use tracing::{info, warn};
 
-const RUNTIME_GENERATION_BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(250);
-
 use crate::{
     configured_enforcement::EnforcementRuntimeState,
     enforcement_reload::EnforcementReloadGate,
@@ -201,13 +199,8 @@ async fn reload_after_config_change(
     context: &RuntimeConfigWatcherContext,
     config_path: &Path,
 ) -> ConfigReloadApplySnapshot {
-    let mut snapshot = apply_config_reload_once(context, config_path).await;
+    let snapshot = apply_config_reload_once(context, config_path).await;
     log_config_reload_apply_outcome(config_path, &snapshot);
-    while runtime_generation_queue_busy(&snapshot) {
-        wait_until_runtime_generation_idle(&context.runtime_generation).await;
-        snapshot = apply_config_reload_once(context, config_path).await;
-        log_config_reload_apply_outcome(config_path, &snapshot);
-    }
     snapshot
 }
 
@@ -228,12 +221,6 @@ async fn apply_config_reload_once(
         config_path,
     )
     .await
-}
-
-async fn wait_until_runtime_generation_idle(runtime_generation: &RuntimeGenerationState) {
-    while runtime_generation.has_applying_reload() {
-        tokio::time::sleep(RUNTIME_GENERATION_BUSY_RETRY_INTERVAL).await;
-    }
 }
 
 fn log_config_reload_apply_outcome(config_path: &Path, snapshot: &ConfigReloadApplySnapshot) {
@@ -266,17 +253,6 @@ fn reload_outcome_needs_operator_attention(snapshot: &ConfigReloadApplySnapshot)
         .any(config_reload_apply_action_failed)
 }
 
-fn runtime_generation_queue_busy(snapshot: &ConfigReloadApplySnapshot) -> bool {
-    snapshot.actions.iter().any(|action| {
-        matches!(
-            action,
-            ConfigReloadApplyAction::RequestRuntimeGeneration(
-                ConfigReloadRuntimeGenerationActionOutcome::Busy { .. },
-            )
-        )
-    })
-}
-
 fn config_reload_apply_action_failed(action: &ConfigReloadApplyAction) -> bool {
     matches!(
         action,
@@ -285,8 +261,7 @@ fn config_reload_apply_action_failed(action: &ConfigReloadApplyAction) -> bool {
                 ConfigReloadApplyActionOutcome::Failed { .. },
             )
             | ConfigReloadApplyAction::RequestRuntimeGeneration(
-                ConfigReloadRuntimeGenerationActionOutcome::Busy { .. }
-                    | ConfigReloadRuntimeGenerationActionOutcome::Failed { .. },
+                ConfigReloadRuntimeGenerationActionOutcome::Failed { .. },
             )
     )
 }
@@ -431,31 +406,6 @@ mod tests {
         assert!(!event_requests_reload(&event, &config_path));
     }
 
-    #[test]
-    fn runtime_generation_busy_action_requests_retry() {
-        let snapshot = ConfigReloadApplySnapshot {
-            plan: crate::runtime_reload::config_reload::ConfigReloadPlanSnapshot {
-                candidate_path: PathBuf::from("/tmp/probe/agent.toml"),
-                current_config_version: "current".to_string(),
-                candidate_config_version: Some("next".to_string()),
-                decision: ConfigReloadDecision::QueueRuntimeGeneration {
-                    reason: "test".to_string(),
-                },
-                changed_sections: Vec::new(),
-                reloadable_runtime_actions: Vec::new(),
-            },
-            actions: vec![ConfigReloadApplyAction::RequestRuntimeGeneration(
-                ConfigReloadRuntimeGenerationActionOutcome::Busy {
-                    message: "runtime generation reload is busy: applying request 1".to_string(),
-                },
-            )],
-            active_plan_updated: false,
-        };
-
-        assert!(runtime_generation_queue_busy(&snapshot));
-        assert!(reload_outcome_needs_operator_attention(&snapshot));
-    }
-
     #[tokio::test]
     async fn config_change_replaces_pending_generation_with_latest_file()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -477,7 +427,7 @@ mod tests {
             current_config_version: current.config.config_version.clone(),
             candidate_config_version: Some("first".to_string()),
             changed_sections: vec!["agent_identity".to_string(), "capture".to_string()],
-        })?;
+        });
         let context = RuntimeConfigWatcherContext {
             plan: RuntimePlanHandle::new(Arc::new(current)),
             policy_set: PipelinePolicySet::default(),
@@ -507,7 +457,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_change_retry_after_applying_replaces_intervening_pending_generation()
+    async fn config_change_while_applying_replaces_intervening_pending_generation()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
         let current = runtime_plan(base_config(temp.path().join("spool")))?;
@@ -529,8 +479,17 @@ mod tests {
             current_config_version: current.config.config_version.clone(),
             candidate_config_version: Some("applying".to_string()),
             changed_sections: vec!["agent_identity".to_string(), "capture".to_string()],
-        })?;
+        });
         runtime_generation.begin_pending_reload();
+        let stale_request =
+            runtime_generation.request_reload(RuntimeGenerationReloadRequestInput {
+                candidate_path: config_path.clone(),
+                base_config: current.config.clone(),
+                candidate_config: stale_candidate,
+                current_config_version: current.config.config_version.clone(),
+                candidate_config_version: Some("stale".to_string()),
+                changed_sections: vec!["agent_identity".to_string(), "capture".to_string()],
+            });
         let context = RuntimeConfigWatcherContext {
             plan: RuntimePlanHandle::new(Arc::new(current.clone())),
             policy_set: PipelinePolicySet::default(),
@@ -541,27 +500,7 @@ mod tests {
             runtime_generation: runtime_generation.clone(),
         };
 
-        let insert_stale_pending_after_applying = async {
-            tokio::time::sleep(RUNTIME_GENERATION_BUSY_RETRY_INTERVAL / 2).await;
-            runtime_generation.record_reload_applied(
-                applying.request_id,
-                "applying",
-                crate::runtime_generation::RuntimeGenerationHandoffOutcomeSnapshot::Drained,
-            );
-            runtime_generation.request_reload(RuntimeGenerationReloadRequestInput {
-                candidate_path: config_path.clone(),
-                base_config: current.config.clone(),
-                candidate_config: stale_candidate,
-                current_config_version: current.config.config_version.clone(),
-                candidate_config_version: Some("stale".to_string()),
-                changed_sections: vec!["agent_identity".to_string(), "capture".to_string()],
-            })
-        };
-        let (snapshot, stale_request) = tokio::join!(
-            reload_after_config_change(&context, &config_path),
-            insert_stale_pending_after_applying,
-        );
-        let stale_request = stale_request?;
+        let snapshot = reload_after_config_change(&context, &config_path).await;
 
         assert!(matches!(
             snapshot.actions.as_slice(),
@@ -573,6 +512,7 @@ mod tests {
             .snapshot()
             .pending
             .expect("latest candidate should replace stale pending generation");
+        assert_eq!(applying.request_id, 1);
         assert_eq!(stale_request.request_id, 2);
         assert_eq!(pending.request_id, 3);
         assert_eq!(pending.candidate_config_version.as_deref(), Some("latest"));

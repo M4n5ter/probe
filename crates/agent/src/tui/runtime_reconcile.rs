@@ -371,7 +371,7 @@ fn runtime_apply_status_kind(disposition: &ConfigReloadApplyDisposition) -> Stat
     match disposition {
         ConfigReloadApplyDisposition::Rejected
         | ConfigReloadApplyDisposition::OnlineApplyFailed
-        | ConfigReloadApplyDisposition::RuntimeGenerationQueueFailed
+        | ConfigReloadApplyDisposition::RuntimeGenerationRequestFailed
         | ConfigReloadApplyDisposition::Failed => StatusKind::Error,
         ConfigReloadApplyDisposition::NeedsRestart => StatusKind::Warning,
         ConfigReloadApplyDisposition::NoChange
@@ -383,7 +383,7 @@ fn runtime_apply_status_kind(disposition: &ConfigReloadApplyDisposition) -> Stat
 fn runtime_apply_follow_up(disposition: &ConfigReloadApplyDisposition) -> RuntimeApplyFollowUp {
     match disposition {
         ConfigReloadApplyDisposition::NeedsRestart
-        | ConfigReloadApplyDisposition::RuntimeGenerationQueueFailed
+        | ConfigReloadApplyDisposition::RuntimeGenerationRequestFailed
         | ConfigReloadApplyDisposition::Failed => RuntimeApplyFollowUp::RestartToApply,
         ConfigReloadApplyDisposition::NoChange
         | ConfigReloadApplyDisposition::AppliedOnline

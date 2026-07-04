@@ -281,8 +281,8 @@ mod tests {
                     {
                         "action": "request_runtime_generation",
                         "outcome": {
-                            "result": "busy",
-                            "message": "runtime generation reload is busy: applying request 1"
+                            "result": "failed",
+                            "message": "runtime generation owner is unavailable"
                         }
                     }
                 ]
@@ -292,7 +292,7 @@ mod tests {
         assert_eq!(
             admin_action_error_message(&response).as_deref(),
             Some(
-                "config reload action failed: request_runtime_generation: runtime generation reload is busy: applying request 1"
+                "config reload action failed: request_runtime_generation: runtime generation owner is unavailable"
             )
         );
     }

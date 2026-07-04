@@ -178,7 +178,6 @@ pub(crate) enum ConfigReloadApplyActionOutcome {
 #[serde(rename_all = "snake_case", tag = "result")]
 pub(crate) enum ConfigReloadRuntimeGenerationActionOutcome {
     Queued { detail: String, request_id: u64 },
-    Busy { message: String },
     Failed { message: String },
 }
 
@@ -194,11 +193,10 @@ pub(crate) fn complete_config_reload_apply(
             outcome.snapshot.active_plan_updated = true;
         }
         ConfigReloadApplyCompletion::RequestRuntimeGeneration(request) => {
-            outcome.snapshot.actions.push(
-                match runtime_generation
-                    .map(|runtime_generation| runtime_generation.request_reload(*request))
-                {
-                    Some(Ok(request)) => ConfigReloadApplyAction::RequestRuntimeGeneration(
+            outcome.snapshot.actions.push(match runtime_generation {
+                Some(runtime_generation) => {
+                    let request = runtime_generation.request_reload(*request);
+                    ConfigReloadApplyAction::RequestRuntimeGeneration(
                         ConfigReloadRuntimeGenerationActionOutcome::Queued {
                             request_id: request.request_id,
                             detail: format!(
@@ -210,19 +208,14 @@ pub(crate) fn complete_config_reload_apply(
                                     .unwrap_or("<unknown config_version>")
                             ),
                         },
-                    ),
-                    Some(Err(error)) => ConfigReloadApplyAction::RequestRuntimeGeneration(
-                        ConfigReloadRuntimeGenerationActionOutcome::Busy {
-                            message: error.to_string(),
-                        },
-                    ),
-                    None => ConfigReloadApplyAction::RequestRuntimeGeneration(
-                        ConfigReloadRuntimeGenerationActionOutcome::Failed {
-                            message: "runtime generation owner is unavailable".to_string(),
-                        },
-                    ),
-                },
-            );
+                    )
+                }
+                None => ConfigReloadApplyAction::RequestRuntimeGeneration(
+                    ConfigReloadRuntimeGenerationActionOutcome::Failed {
+                        message: "runtime generation owner is unavailable".to_string(),
+                    },
+                ),
+            });
         }
     }
     outcome.snapshot
@@ -1778,25 +1771,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_config_reload_apply_reports_busy_generation_while_applying_without_replacing_plan()
+    async fn complete_config_reload_apply_queues_generation_while_another_generation_is_applying()
     -> Result<(), Box<dyn std::error::Error>> {
-        let temp = test_dir("config-reload-busy-generation")?;
+        let temp = test_dir("config-reload-applying-generation")?;
         let current = runtime_plan(base_config(temp.join("spool")))?;
-        let mut candidate = current.config.clone();
-        candidate.capture.fallback_backends = vec![LiveCaptureBackend::Libpcap];
+        let mut applying_candidate = current.config.clone();
+        applying_candidate.config_version = "applying".to_string();
+        applying_candidate.capture.fallback_backends = vec![LiveCaptureBackend::Libpcap];
+        let mut latest_candidate = applying_candidate.clone();
+        latest_candidate.config_version = "latest".to_string();
         let candidate_path = temp.join("agent.toml");
-        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+        fs::write(&candidate_path, toml::to_string(&latest_candidate)?)?;
         let plan_handle = RuntimePlanHandle::new(Arc::new(current.clone()));
         let runtime_generation =
             RuntimeGenerationState::for_config_version(current.config.config_version.clone());
         runtime_generation.request_reload(RuntimeGenerationReloadRequestInput {
             candidate_path: candidate_path.clone(),
             base_config: current.config.clone(),
-            candidate_config: candidate.clone(),
+            candidate_config: applying_candidate,
             current_config_version: current.config.config_version.clone(),
-            candidate_config_version: Some(candidate.config_version.clone()),
-            changed_sections: vec!["capture".to_string()],
-        })?;
+            candidate_config_version: Some("applying".to_string()),
+            changed_sections: vec!["agent_identity".to_string(), "capture".to_string()],
+        });
         runtime_generation.begin_pending_reload();
 
         let outcome = apply_config_reload(
@@ -1815,9 +1811,15 @@ mod tests {
         assert!(matches!(
             snapshot.actions.as_slice(),
             [ConfigReloadApplyAction::RequestRuntimeGeneration(
-                ConfigReloadRuntimeGenerationActionOutcome::Busy { .. },
+                ConfigReloadRuntimeGenerationActionOutcome::Queued { request_id: 2, .. },
             )]
         ));
+        let pending = runtime_generation
+            .snapshot()
+            .pending
+            .expect("latest candidate should wait for the applying generation to finish");
+        assert_eq!(pending.request_id, 2);
+        assert_eq!(pending.candidate_config_version.as_deref(), Some("latest"));
         assert_eq!(
             plan_handle.snapshot().config.capture.fallback_backends,
             current.config.capture.fallback_backends
@@ -1848,7 +1850,7 @@ mod tests {
             current_config_version: current.config.config_version.clone(),
             candidate_config_version: Some("first".to_string()),
             changed_sections: vec!["agent_identity".to_string(), "capture".to_string()],
-        })?;
+        });
 
         let outcome = apply_config_reload(
             &current,

@@ -263,16 +263,14 @@ mod tests {
     fn runtime_generation_reload_rejects_candidate_that_no_longer_matches_supported_diff() {
         let runtime_generation = RuntimeGenerationState::for_config_version("local");
         let candidate = AgentConfig::default();
-        let request = runtime_generation
-            .request_reload(RuntimeGenerationReloadRequestInput {
-                candidate_path: PathBuf::from("/tmp/probe-stale-runtime-generation.toml"),
-                base_config: AgentConfig::default(),
-                candidate_config: candidate,
-                current_config_version: "local".to_string(),
-                candidate_config_version: None,
-                changed_sections: vec!["capture".to_string()],
-            })
-            .expect("runtime generation request should queue");
+        let request = runtime_generation.request_reload(RuntimeGenerationReloadRequestInput {
+            candidate_path: PathBuf::from("/tmp/probe-stale-runtime-generation.toml"),
+            base_config: AgentConfig::default(),
+            candidate_config: candidate,
+            current_config_version: "local".to_string(),
+            candidate_config_version: None,
+            changed_sections: vec!["capture".to_string()],
+        });
 
         let mut runtime = RuntimeGenerationReloadTestRuntime::new(AgentConfig::default())
             .expect("runtime generation test runtime should build");
@@ -313,7 +311,7 @@ mod tests {
             current_config_version: "local".to_string(),
             candidate_config_version: Some(candidate.config_version.clone()),
             changed_sections: vec!["capture".to_string()],
-        })?;
+        });
         let mut runtime = RuntimeGenerationReloadTestRuntime::new(AgentConfig::default())?;
 
         runtime.process_reload(&runtime_generation);
@@ -380,7 +378,7 @@ mod tests {
             current_config_version: "local".to_string(),
             candidate_config_version: Some(candidate.config_version.clone()),
             changed_sections: vec!["capture".to_string(), "selectors".to_string()],
-        })?;
+        });
         let mut runtime = RuntimeGenerationReloadTestRuntime::new(AgentConfig::default())?;
 
         runtime.process_reload(&runtime_generation);
@@ -434,7 +432,7 @@ mod tests {
                 "storage".to_string(),
                 "export".to_string(),
             ],
-        })?;
+        });
         let mut runtime = RuntimeGenerationReloadTestRuntime::new(AgentConfig::default())?;
 
         runtime.process_reload(&runtime_generation);
@@ -472,7 +470,7 @@ mod tests {
             current_config_version: "local".to_string(),
             candidate_config_version: Some("candidate".to_string()),
             changed_sections: vec!["agent_identity".to_string(), "capture".to_string()],
-        })?;
+        });
         let mut runtime = RuntimeGenerationReloadTestRuntime::new(AgentConfig::default())?;
 
         let mut handoff_config_version = None;
@@ -522,7 +520,7 @@ mod tests {
             current_config_version: "local".to_string(),
             candidate_config_version: Some("local".to_string()),
             changed_sections: vec!["capture".to_string(), "tls".to_string()],
-        })?;
+        });
         let mut runtime = RuntimeGenerationReloadTestRuntime::new(AgentConfig::default())?;
 
         runtime.process_reload(&runtime_generation);
@@ -559,7 +557,7 @@ mod tests {
             current_config_version: "local".to_string(),
             candidate_config_version: Some("local".to_string()),
             changed_sections: vec!["capture".to_string(), "tls".to_string()],
-        })?;
+        });
         let mut runtime = RuntimeGenerationReloadTestRuntime::new(AgentConfig::default())?;
         let before = runtime.tls_decrypt_hint_runtime.snapshot();
 
@@ -652,7 +650,7 @@ mod tests {
             current_config_version: "local".to_string(),
             candidate_config_version: Some(candidate.config_version.clone()),
             changed_sections: vec!["capture".to_string()],
-        })?;
+        });
         let mut runtime = RuntimeGenerationReloadTestRuntime::new(AgentConfig::default())?;
         let mut newer_config = AgentConfig::default();
         newer_config.policies.push(PolicyConfig {
@@ -697,7 +695,7 @@ mod tests {
             current_config_version: "local".to_string(),
             candidate_config_version: Some(candidate.config_version.clone()),
             changed_sections: vec!["capture".to_string()],
-        })?;
+        });
         let mut runtime = RuntimeGenerationReloadTestRuntime::new(AgentConfig::default())?;
         let mut newer_config = AgentConfig::default();
         newer_config.exporters.push(ExporterConfig {
@@ -745,7 +743,7 @@ mod tests {
             current_config_version: "local".to_string(),
             candidate_config_version: Some(candidate.config_version.clone()),
             changed_sections: vec!["tls".to_string()],
-        })?;
+        });
         let mut runtime = RuntimeGenerationReloadTestRuntime::new(AgentConfig::default())?;
 
         runtime.process_reload(&runtime_generation);
