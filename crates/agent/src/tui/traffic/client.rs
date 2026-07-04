@@ -34,13 +34,17 @@ pub(super) async fn request_tail_events(
         .await;
         match result {
             Ok(snapshot) => return Ok(snapshot),
-            Err(error)
-                if matches!(
-                    error,
-                    TrafficClientError::AdminClient(AdminClientError::ResponseTooLarge { .. })
-                ) && let Some(next_limit) = next_tail_retry_limit(limit) =>
-            {
-                limit = next_limit;
+            Err(TrafficClientError::AdminClient(AdminClientError::ResponseTooLarge {
+                limit: response_limit_bytes,
+            })) => {
+                if let Some(next_limit) = next_tail_retry_limit(limit) {
+                    limit = next_limit;
+                    continue;
+                }
+                return Err(TrafficClientError::TailResponseTooLarge {
+                    event_limit: limit,
+                    response_limit_bytes,
+                });
             }
             Err(error) => return Err(error),
         }
@@ -169,6 +173,13 @@ pub(super) enum TrafficClientError {
         payload_bytes: usize,
         max_payload_bytes: usize,
     },
+    #[error(
+        "admin tail_events response exceeds {response_limit_bytes} bytes even with limit {event_limit}"
+    )]
+    TailResponseTooLarge {
+        event_limit: usize,
+        response_limit_bytes: usize,
+    },
     #[error("admin {command} failed: {message}")]
     AdminCommandFailed {
         command: &'static str,
@@ -220,6 +231,38 @@ mod tests {
         let tail = request_tail_events(&socket_path, 0, false, Selector::default(), &[]).await?;
 
         assert_eq!(tail.limit, TAIL_LIMIT / TAIL_RETRY_DIVISOR);
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tail_events_reports_final_response_budget_after_retry_floor()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp = tempdir()?;
+        let socket_path = temp.path().join("admin.sock");
+        let listener = UnixListener::bind(&socket_path)?;
+        let server = tokio::spawn(async move {
+            for expected_limit in [256, 64, 16, 4, 1] {
+                let mut stream = accept_request(&listener).await?;
+                let request = read_request(&mut stream).await?;
+                assert_eq!(request["limit"], json!(expected_limit));
+                stream.write_all(&vec![b'a'; 16 * 1024 * 1024 + 1]).await?;
+                stream.shutdown().await?;
+            }
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+
+        let error = request_tail_events(&socket_path, 0, false, Selector::default(), &[])
+            .await
+            .expect_err("tail_events should report final response budget");
+
+        assert!(matches!(
+            error,
+            TrafficClientError::TailResponseTooLarge {
+                event_limit: 1,
+                response_limit_bytes: 16_777_216
+            }
+        ));
         server.await??;
         Ok(())
     }

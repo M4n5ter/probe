@@ -1553,6 +1553,12 @@ fn traffic_refresh_error_message(error: &TrafficClientError) -> String {
                 path.display()
             )
         }
+        TrafficClientError::TailResponseTooLarge {
+            event_limit,
+            response_limit_bytes,
+        } => format!(
+            "tail_events refresh exceeded {response_limit_bytes} bytes after reducing the list batch to {event_limit}"
+        ),
         _ => error.to_string(),
     }
 }
@@ -1782,6 +1788,19 @@ mod tests {
         assert_eq!(traffic.status().kind, TrafficStatusKind::Warning);
         assert_eq!(traffic.rows().len(), 4);
         assert_eq!(traffic.http_exchanges().len(), 1);
+    }
+
+    #[test]
+    fn tail_response_too_large_error_keeps_operator_context() {
+        let message = traffic_refresh_error_message(&TrafficClientError::TailResponseTooLarge {
+            event_limit: 1,
+            response_limit_bytes: 16_777_216,
+        });
+
+        assert_eq!(
+            message,
+            "tail_events refresh exceeded 16777216 bytes after reducing the list batch to 1"
+        );
     }
 
     #[test]
