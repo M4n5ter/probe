@@ -314,7 +314,6 @@ async fn handle_admin_request(
             }
         }
         AdminRequest::TrafficStatus => {
-            let _config_apply_guard = runtime_state.config_apply_gate.lock().await;
             let plan = plan_handle.snapshot();
             let projection = build_admin_traffic_status_projection(plan.as_ref(), runtime_state);
             AdminResponse::TrafficStatus {
@@ -353,11 +352,8 @@ async fn handle_admin_request(
             selector,
             event_types,
         } => {
-            let attribution_mode = {
-                let _config_apply_guard = runtime_state.config_apply_gate.lock().await;
-                let plan = plan_handle.snapshot();
-                tail_attribution_mode(plan.as_ref(), runtime_state)
-            };
+            let plan = plan_handle.snapshot();
+            let attribution_mode = tail_attribution_mode(plan.as_ref(), runtime_state);
             match read_event_tail(
                 spool,
                 EventTailRequest {
@@ -569,7 +565,7 @@ mod tests {
         collections::BTreeMap,
         os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use capture::ReplayProvider;
@@ -732,6 +728,69 @@ mod tests {
             "traffic_status should stay lightweight, got {} bytes",
             bytes.len()
         );
+        server.stop().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_traffic_status_does_not_wait_for_config_apply_gate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_admin_request_does_not_wait_for_config_apply_gate(
+            "admin-traffic-status-while-applying",
+            crate::admin::AdminRequest::TrafficStatus,
+            "traffic_status",
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_tail_events_does_not_wait_for_config_apply_gate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_admin_request_does_not_wait_for_config_apply_gate(
+            "admin-tail-events-while-applying",
+            crate::admin::AdminRequest::TailEvents {
+                after_sequence: 0,
+                latest: false,
+                limit: 10,
+                selector: None,
+                event_types: Vec::new(),
+            },
+            "event_tail",
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn assert_admin_request_does_not_wait_for_config_apply_gate(
+        name: &str,
+        request: crate::admin::AdminRequest,
+        expected_kind: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir(name)?;
+        let socket_path = temp.join("admin.sock");
+        let spool_path = temp.join("spool");
+        let spool = Arc::new(FjallSpool::open(&spool_path)?);
+        let plan = Arc::new(runtime_plan(spool_path)?);
+        let runtime_state = AdminRuntimeState::default();
+        let gate = runtime_state.config_apply_gate.clone();
+        let guard = gate.lock().await;
+        let server = spawn_admin_server(
+            RuntimePlanHandle::new(Arc::clone(&plan)),
+            Arc::clone(&spool),
+            AdminServerConfig::unix_socket(socket_path.clone()),
+            runtime_state,
+        )?;
+
+        let response = crate::admin::send_admin_json_request_with_timeout(
+            &socket_path,
+            request,
+            Duration::from_millis(500),
+        )
+        .await?;
+
+        assert_eq!(response["kind"], json!(expected_kind));
+        drop(guard);
         server.stop().await;
         Ok(())
     }
