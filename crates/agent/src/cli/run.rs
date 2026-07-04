@@ -582,6 +582,33 @@ mod tests {
     }
 
     #[test]
+    fn admin_tail_events_cli_parses_scan_limit_override() {
+        let cli = Cli::try_parse_from([
+            "traffic-probe",
+            "admin",
+            "tail-events",
+            "--limit",
+            "10",
+            "--scan-limit",
+            "100",
+        ])
+        .expect("tail-events should accept an explicit scan limit");
+
+        let Command::Admin { command, .. } = cli.command else {
+            panic!("expected admin command");
+        };
+        let AdminCliCommand::TailEvents {
+            limit, scan_limit, ..
+        } = command
+        else {
+            panic!("expected tail-events command");
+        };
+
+        assert_eq!(limit, 10);
+        assert_eq!(scan_limit, Some(100));
+    }
+
+    #[test]
     fn internal_product_proxy_dispatch_reuses_mitm_proxy_cli_parser()
     -> Result<(), Box<dyn std::error::Error>> {
         let agent_args = [

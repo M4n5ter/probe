@@ -3060,33 +3060,43 @@ mod tests {
                 reason: "test capture loss".to_string(),
             }),
         );
-        EventTailSnapshot {
-            events: vec![EventTailRecord {
+        tail_snapshot(
+            sequence.saturating_sub(1),
+            sequence,
+            1,
+            vec![EventTailRecord {
                 sequence,
                 stored_at_unix_ns: sequence,
                 event: EventTailEvent::from_envelope(&event),
             }],
-            scanned: 1,
-            next_after_sequence: sequence,
-            ..empty_tail_snapshot(sequence.saturating_sub(1))
-        }
+        )
     }
 
     fn empty_tail_snapshot(after_sequence: u64) -> EventTailSnapshot {
+        tail_snapshot(after_sequence, after_sequence, 0, Vec::new())
+    }
+
+    fn tail_snapshot(
+        after_sequence: u64,
+        next_after_sequence: u64,
+        scanned: usize,
+        events: Vec<EventTailRecord>,
+    ) -> EventTailSnapshot {
         EventTailSnapshot {
             after_sequence,
-            next_after_sequence: after_sequence,
-            last_export_sequence: after_sequence,
+            next_after_sequence,
+            last_export_sequence: next_after_sequence,
             attribution_mode: EventTailAttributionMode::Strict,
             limit: 256,
-            scanned: 0,
+            scan_limit: 256,
+            scanned,
             budget: EventTailBudgetSnapshot {
                 max_event_payload_bytes: 1024,
                 max_record_bytes: 1024,
                 included_record_bytes: 0,
                 truncated: false,
             },
-            events: Vec::new(),
+            events,
             omissions: Vec::new(),
         }
     }

@@ -10,4 +10,5 @@ pub(crate) use model::{
     EventTailBudgetSnapshot, EventTailEvent, EventTailKind, EventTailOmission, EventTailRecord,
     EventTailSnapshot,
 };
+pub(crate) use read::default_tail_scan_limit;
 pub(super) use read::{EventTailRequest, read_event_detail, read_event_tail};

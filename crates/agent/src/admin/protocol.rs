@@ -89,6 +89,7 @@ admin_requests! {
         after_sequence: u64,
         latest: bool,
         limit: usize,
+        scan_limit: Option<usize>,
         selector: Option<probe_core::Selector>,
         event_types: Vec<probe_core::EventType>,
     } => ("tail_events", false, AdminResponseBudget::Default),
@@ -350,6 +351,7 @@ mod tests {
                 after_sequence: 0,
                 latest: false,
                 limit: 1,
+                scan_limit: Some(1),
                 selector: None,
                 event_types: Vec::new(),
             },
@@ -401,5 +403,30 @@ mod tests {
         assert_eq!(request.response_budget(), expected_budget);
         let value = serde_json::to_value(request).expect("serialize admin request");
         assert_eq!(value.get("command").and_then(Value::as_str), Some(expected));
+    }
+
+    #[test]
+    fn tail_events_scan_limit_is_an_optional_wire_override() {
+        let request = serde_json::from_value::<AdminRequest>(serde_json::json!({
+            "command": "tail_events",
+            "after_sequence": 0,
+            "latest": false,
+            "limit": 16,
+            "selector": null,
+            "event_types": []
+        }))
+        .expect("tail_events should accept the default scan policy");
+
+        assert_eq!(
+            request,
+            AdminRequest::TailEvents {
+                after_sequence: 0,
+                latest: false,
+                limit: 16,
+                scan_limit: None,
+                selector: None,
+                event_types: Vec::new(),
+            }
+        );
     }
 }

@@ -24,6 +24,8 @@ pub(super) enum AdminCliCommand {
         #[arg(long, default_value_t = 50)]
         limit: usize,
         #[arg(long)]
+        scan_limit: Option<usize>,
+        #[arg(long)]
         process_exe_glob: Option<String>,
         #[arg(long)]
         http: bool,
@@ -84,6 +86,7 @@ fn admin_request(command: AdminCliCommand) -> AdminRequest {
             after_sequence,
             latest,
             limit,
+            scan_limit,
             process_exe_glob,
             http,
             event_types,
@@ -91,6 +94,7 @@ fn admin_request(command: AdminCliCommand) -> AdminRequest {
             after_sequence,
             latest,
             limit,
+            scan_limit,
             selector: process_exe_glob.map(process_exe_selector),
             event_types: tail_event_types(http, event_types),
         },
@@ -188,6 +192,7 @@ mod tests {
                 after_sequence: 7,
                 latest: false,
                 limit: 10,
+                scan_limit: Some(100),
                 process_exe_glob: Some("/usr/bin/curl".to_string()),
                 http: true,
                 event_types: vec![EventType::Gap, EventType::HttpRequestHeaders],
@@ -196,6 +201,7 @@ mod tests {
                 after_sequence: 7,
                 latest: false,
                 limit: 10,
+                scan_limit: Some(100),
                 selector: Some(process_exe_selector("/usr/bin/curl".to_string())),
                 event_types: vec![
                     EventType::Gap,
@@ -204,6 +210,25 @@ mod tests {
                     EventType::HttpResponseHeaders,
                     EventType::SseEvent,
                 ],
+            }
+        );
+        assert_eq!(
+            admin_request(AdminCliCommand::TailEvents {
+                after_sequence: 7,
+                latest: true,
+                limit: 10,
+                scan_limit: None,
+                process_exe_glob: None,
+                http: false,
+                event_types: Vec::new(),
+            }),
+            AdminRequest::TailEvents {
+                after_sequence: 7,
+                latest: true,
+                limit: 10,
+                scan_limit: None,
+                selector: None,
+                event_types: Vec::new(),
             }
         );
         assert_eq!(

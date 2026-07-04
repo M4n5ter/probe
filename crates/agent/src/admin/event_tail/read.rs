@@ -16,29 +16,65 @@ use super::{
 };
 
 const MAX_TAIL_LIMIT: usize = 1_024;
-const MAX_TAIL_LIVE_SCAN: usize = 16_384;
-const MAX_TAIL_LATEST_SCAN: usize = 65_536;
 const MAX_TAIL_EVENT_PAYLOAD_BYTES: usize = MAX_EVENT_DETAIL_PAYLOAD_BYTES;
 const MAX_TAIL_RECORD_BYTES: usize = 4 * 1024 * 1024;
 const MAX_EVENT_DETAIL_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
-const LIVE_SELECTOR_SCAN_MULTIPLIER: usize = 16;
-const LATEST_SELECTOR_SCAN_MULTIPLIER: usize = 64;
+
+const TAIL_SCAN_LIMIT_POLICY: TailScanLimitPolicy = TailScanLimitPolicy {
+    live_default: 16_384,
+    live_max: 16_384,
+    latest_default: 65_536,
+    latest_max: 65_536,
+};
+
+#[derive(Debug, Clone, Copy)]
+struct TailScanLimitPolicy {
+    live_default: usize,
+    live_max: usize,
+    latest_default: usize,
+    latest_max: usize,
+}
+
+impl TailScanLimitPolicy {
+    fn default_for(self, latest: bool) -> usize {
+        if latest {
+            self.latest_default
+        } else {
+            self.live_default
+        }
+    }
+
+    fn max_for(self, latest: bool) -> usize {
+        if latest {
+            self.latest_max
+        } else {
+            self.live_max
+        }
+    }
+}
+
+pub(crate) fn default_tail_scan_limit(latest: bool) -> usize {
+    TAIL_SCAN_LIMIT_POLICY.default_for(latest)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::admin) struct EventTailRequest {
     pub(in crate::admin) after_sequence: u64,
     pub(in crate::admin) latest: bool,
     pub(in crate::admin) limit: usize,
+    pub(in crate::admin) scan_limit: usize,
     pub(in crate::admin) selector: Option<Selector>,
     pub(in crate::admin) attribution_mode: EventTailAttributionMode,
     pub(in crate::admin) event_types: Vec<EventType>,
 }
+
 pub(in crate::admin) fn read_event_tail(
     spool: &FjallSpool,
     request: EventTailRequest,
 ) -> Result<EventTailSnapshot, EventTailError> {
     let limit = normalize_limit(request.limit);
     let filtered = request.selector.is_some() || !request.event_types.is_empty();
-    let scan_limit = scan_limit(limit, filtered, request.latest);
+    let scan_limit = normalize_scan_limit(request.scan_limit, limit, filtered, request.latest);
     let selector = request
         .selector
         .as_ref()
@@ -87,6 +123,7 @@ pub(in crate::admin) fn read_event_tail(
         last_export_sequence,
         attribution_mode: request.attribution_mode,
         limit,
+        scan_limit,
         scanned: tail.scanned,
         budget: EventTailBudgetSnapshot {
             max_event_payload_bytes: MAX_TAIL_EVENT_PAYLOAD_BYTES,
@@ -291,16 +328,12 @@ fn normalize_limit(limit: usize) -> usize {
     limit.clamp(1, MAX_TAIL_LIMIT)
 }
 
-fn scan_limit(limit: usize, filtered: bool, latest: bool) -> usize {
+fn normalize_scan_limit(scan_limit: usize, limit: usize, filtered: bool, latest: bool) -> usize {
     if !filtered {
         return limit;
     }
-    let (multiplier, max_scan) = if latest {
-        (LATEST_SELECTOR_SCAN_MULTIPLIER, MAX_TAIL_LATEST_SCAN)
-    } else {
-        (LIVE_SELECTOR_SCAN_MULTIPLIER, MAX_TAIL_LIVE_SCAN)
-    };
-    limit.saturating_mul(multiplier).clamp(limit, max_scan)
+    let max_scan = TAIL_SCAN_LIMIT_POLICY.max_for(latest);
+    scan_limit.clamp(limit, max_scan)
 }
 
 fn omission_for(stored: &StoredEvent, reason: EventTailOmissionReason) -> EventTailOmission {
@@ -327,6 +360,18 @@ mod tests {
     use super::super::model::EventTailKind;
     use super::*;
 
+    fn tail_request() -> EventTailRequest {
+        EventTailRequest {
+            after_sequence: 0,
+            latest: false,
+            limit: 16,
+            scan_limit: 16,
+            selector: None,
+            attribution_mode: EventTailAttributionMode::Strict,
+            event_types: Vec::new(),
+        }
+    }
+
     #[test]
     fn tail_events_filters_by_process_selector_without_advancing_export_cursor()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -338,12 +383,8 @@ mod tests {
         let tail = read_event_tail(
             &spool,
             EventTailRequest {
-                after_sequence: 0,
-                latest: false,
-                limit: 16,
                 selector: Some(exe_selector("/usr/bin/nginx")),
-                attribution_mode: EventTailAttributionMode::Strict,
-                event_types: Vec::new(),
+                ..tail_request()
             },
         )?;
 
@@ -376,23 +417,18 @@ mod tests {
         let strict = read_event_tail(
             &spool,
             EventTailRequest {
-                after_sequence: 0,
-                latest: false,
-                limit: 16,
                 selector: Some(selector.clone()),
-                attribution_mode: EventTailAttributionMode::Strict,
                 event_types: vec![EventType::HttpRequestHeaders],
+                ..tail_request()
             },
         )?;
         let relaxed = read_event_tail(
             &spool,
             EventTailRequest {
-                after_sequence: 0,
-                latest: false,
-                limit: 16,
                 selector: Some(selector),
                 attribution_mode: EventTailAttributionMode::IncludeUnknownProcess,
                 event_types: vec![EventType::HttpRequestHeaders],
+                ..tail_request()
             },
         )?;
 
@@ -416,12 +452,8 @@ mod tests {
         let tail = read_event_tail(
             &spool,
             EventTailRequest {
-                after_sequence: 0,
-                latest: false,
-                limit: 16,
-                selector: None,
-                attribution_mode: EventTailAttributionMode::Strict,
                 event_types: vec![EventType::HttpRequestHeaders],
+                ..tail_request()
             },
         )?;
 
@@ -431,6 +463,69 @@ mod tests {
         assert_eq!(
             tail.events[0].event.kind.event_type(),
             EventType::HttpRequestHeaders
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn filtered_tail_scan_limit_can_exceed_response_limit() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        ExportEventWriter::new(&spool).append_occurrence(&event_with_kind(
+            "/usr/bin/curl",
+            EventKind::ConnectionOpened,
+        ))?;
+        ExportEventWriter::new(&spool).append_occurrence(&event_for_exe("/usr/bin/curl"))?;
+
+        let tail = read_event_tail(
+            &spool,
+            EventTailRequest {
+                limit: 1,
+                scan_limit: 2,
+                event_types: vec![EventType::HttpRequestHeaders],
+                ..tail_request()
+            },
+        )?;
+
+        assert_eq!(tail.limit, 1);
+        assert_eq!(tail.scan_limit, 2);
+        assert_eq!(tail.scanned, 2);
+        assert_eq!(tail.next_after_sequence, 2);
+        assert_eq!(tail.events.len(), 1);
+        assert_eq!(tail.events[0].sequence, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn unfiltered_latest_tail_keeps_latest_window_tied_to_response_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        for _ in 0..3 {
+            ExportEventWriter::new(&spool).append_occurrence(&event_for_exe("/usr/bin/curl"))?;
+        }
+
+        let tail = read_event_tail(
+            &spool,
+            EventTailRequest {
+                latest: true,
+                limit: 1,
+                scan_limit: 3,
+                ..tail_request()
+            },
+        )?;
+
+        assert_eq!(tail.limit, 1);
+        assert_eq!(tail.scan_limit, 1);
+        assert_eq!(tail.after_sequence, 2);
+        assert_eq!(tail.scanned, 1);
+        assert_eq!(
+            tail.events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![3]
         );
         Ok(())
     }
@@ -457,12 +552,9 @@ mod tests {
         let tail = read_event_tail(
             &spool,
             EventTailRequest {
-                after_sequence: 0,
-                latest: false,
                 limit: MAX_TAIL_LIMIT,
-                selector: None,
-                attribution_mode: EventTailAttributionMode::Strict,
-                event_types: Vec::new(),
+                scan_limit: MAX_TAIL_LIMIT,
+                ..tail_request()
             },
         )?;
 
@@ -501,16 +593,16 @@ mod tests {
         let tail = read_event_tail(
             &spool,
             EventTailRequest {
-                after_sequence: 0,
                 latest: true,
                 limit: 4,
-                selector: None,
-                attribution_mode: EventTailAttributionMode::Strict,
+                scan_limit: 256,
                 event_types: vec![EventType::HttpRequestHeaders],
+                ..tail_request()
             },
         )?;
 
         assert_eq!(tail.after_sequence, 44);
+        assert_eq!(tail.scan_limit, 256);
         assert_eq!(tail.next_after_sequence, 300);
         assert_eq!(tail.last_export_sequence, 300);
         assert_eq!(tail.scanned, 256);
@@ -531,12 +623,11 @@ mod tests {
         let tail = read_event_tail(
             &spool,
             EventTailRequest {
-                after_sequence: 0,
                 latest: true,
                 limit: 4,
-                selector: None,
-                attribution_mode: EventTailAttributionMode::Strict,
+                scan_limit: 256,
                 event_types: vec![EventType::HttpRequestHeaders],
+                ..tail_request()
             },
         )?;
 
@@ -572,12 +663,11 @@ mod tests {
         let tail = read_event_tail(
             &spool,
             EventTailRequest {
-                after_sequence: 0,
                 latest: true,
                 limit: 4,
-                selector: None,
-                attribution_mode: EventTailAttributionMode::Strict,
+                scan_limit: 256,
                 event_types: vec![EventType::HttpRequestHeaders],
+                ..tail_request()
             },
         )?;
 
@@ -604,12 +694,9 @@ mod tests {
         let tail = read_event_tail(
             &spool,
             EventTailRequest {
-                after_sequence: 0,
-                latest: false,
                 limit: 0,
-                selector: None,
-                attribution_mode: EventTailAttributionMode::Strict,
-                event_types: Vec::new(),
+                scan_limit: 0,
+                ..tail_request()
             },
         )?;
 
@@ -630,17 +717,7 @@ mod tests {
             oversized,
         ))?;
 
-        let tail = read_event_tail(
-            &spool,
-            EventTailRequest {
-                after_sequence: 0,
-                latest: false,
-                limit: 16,
-                selector: None,
-                attribution_mode: EventTailAttributionMode::Strict,
-                event_types: Vec::new(),
-            },
-        )?;
+        let tail = read_event_tail(&spool, tail_request())?;
 
         assert_eq!(tail.next_after_sequence, 1);
         assert!(tail.events.is_empty());
@@ -670,12 +747,8 @@ mod tests {
         let tail = read_event_tail(
             &spool,
             EventTailRequest {
-                after_sequence: 0,
-                latest: false,
-                limit: 16,
                 selector: Some(exe_selector("/usr/bin/curl")),
-                attribution_mode: EventTailAttributionMode::Strict,
-                event_types: Vec::new(),
+                ..tail_request()
             },
         )?;
 
@@ -693,17 +766,7 @@ mod tests {
         let event = large_body_event_for_exe("/usr/bin/curl", 512 * 1024);
         ExportEventWriter::new(&spool).append_occurrence(&event)?;
 
-        let tail = read_event_tail(
-            &spool,
-            EventTailRequest {
-                after_sequence: 0,
-                latest: false,
-                limit: 16,
-                selector: None,
-                attribution_mode: EventTailAttributionMode::Strict,
-                event_types: Vec::new(),
-            },
-        )?;
+        let tail = read_event_tail(&spool, tail_request())?;
         assert_eq!(tail.events.len(), 1);
         assert!(tail.omissions.is_empty());
         assert!(

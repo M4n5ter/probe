@@ -22,7 +22,10 @@ use pipeline::{PipelinePolicySet, PipelineRuntimeMetrics};
 
 use super::{
     debug_dump::AdminDebugDump,
-    event_tail::{EventTailAttributionMode, EventTailRequest, read_event_detail, read_event_tail},
+    event_tail::{
+        EventTailAttributionMode, EventTailRequest, default_tail_scan_limit, read_event_detail,
+        read_event_tail,
+    },
     protocol::{AdminRequest, AdminResponse, read_admin_request},
     reload::{RuntimeReloadAction, reload_action_response, reload_runtime_actions_response},
     socket::{AdminError, AdminServerConfig, bind_admin_socket, bind_prometheus_listener},
@@ -349,6 +352,7 @@ async fn handle_admin_request(
             after_sequence,
             latest,
             limit,
+            scan_limit,
             selector,
             event_types,
         } => {
@@ -360,6 +364,7 @@ async fn handle_admin_request(
                     after_sequence,
                     latest,
                     limit,
+                    scan_limit: scan_limit.unwrap_or_else(|| default_tail_scan_limit(latest)),
                     selector,
                     attribution_mode,
                     event_types,
@@ -754,6 +759,7 @@ mod tests {
                 after_sequence: 0,
                 latest: false,
                 limit: 10,
+                scan_limit: Some(10),
                 selector: None,
                 event_types: Vec::new(),
             },
@@ -819,6 +825,7 @@ mod tests {
                 after_sequence: 0,
                 latest: false,
                 limit: 10,
+                scan_limit: None,
                 selector: Some(Selector::term(
                     ProcessSelector::default(),
                     TrafficSelector {
@@ -833,6 +840,10 @@ mod tests {
         .await?;
 
         assert_eq!(response["kind"], json!("event_tail"));
+        assert_eq!(
+            response["tail"]["scan_limit"],
+            json!(default_tail_scan_limit(false))
+        );
         assert_eq!(response["tail"]["scanned"], json!(2));
         assert_eq!(response["tail"]["next_after_sequence"], json!(2));
         let events = response["tail"]["events"]
@@ -893,6 +904,7 @@ mod tests {
                 after_sequence: 0,
                 latest: false,
                 limit: 10,
+                scan_limit: Some(10),
                 selector: Some(Selector::term(
                     ProcessSelector {
                         exe_path_globs: vec!["/app/backend".to_string()],
@@ -982,6 +994,7 @@ mod tests {
                 after_sequence: 0,
                 latest: false,
                 limit: 10,
+                scan_limit: Some(10),
                 selector: Some(Selector::term(
                     ProcessSelector::default(),
                     TrafficSelector {
@@ -1046,6 +1059,7 @@ mod tests {
                 after_sequence: 0,
                 latest: false,
                 limit: 10,
+                scan_limit: Some(10),
                 selector: Some(Selector::term(
                     ProcessSelector::default(),
                     TrafficSelector {

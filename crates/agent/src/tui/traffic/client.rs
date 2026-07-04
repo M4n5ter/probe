@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use crate::admin::{
     AdminClientError, AdminRequest, EventDetailSnapshot, EventDetailTooLargeSnapshot,
-    EventTailSnapshot, send_admin_json_request_with_timeout,
+    EventTailSnapshot, default_tail_scan_limit, send_admin_json_request_with_timeout,
 };
 
 const TAIL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -23,6 +23,7 @@ pub(super) async fn request_tail_events(
     event_types: &[EventType],
 ) -> Result<EventTailSnapshot, TrafficClientError> {
     let mut limit = tail_limit(latest);
+    let scan_limit = default_tail_scan_limit(latest);
     loop {
         let result = request_tail_events_with_limit(
             socket_path,
@@ -31,6 +32,7 @@ pub(super) async fn request_tail_events(
             selector.clone(),
             event_types,
             limit,
+            scan_limit,
         )
         .await;
         match result {
@@ -68,6 +70,7 @@ async fn request_tail_events_with_limit(
     selector: Selector,
     event_types: &[EventType],
     limit: usize,
+    scan_limit: usize,
 ) -> Result<EventTailSnapshot, TrafficClientError> {
     let response = send_admin_json_request_with_timeout(
         socket_path,
@@ -75,6 +78,7 @@ async fn request_tail_events_with_limit(
             after_sequence,
             latest,
             limit,
+            scan_limit: Some(scan_limit),
             selector: Some(selector),
             event_types: event_types.to_vec(),
         },
@@ -228,6 +232,10 @@ mod tests {
             let mut first = accept_request(&listener).await?;
             let first_request = read_request(&mut first).await?;
             assert_eq!(first_request["limit"], json!(LIVE_TAIL_LIMIT));
+            assert_eq!(
+                first_request["scan_limit"],
+                json!(default_tail_scan_limit(false))
+            );
             first.write_all(&vec![b'a'; 16 * 1024 * 1024 + 1]).await?;
             first.shutdown().await?;
 
@@ -237,13 +245,23 @@ mod tests {
                 second_request["limit"],
                 json!(LIVE_TAIL_LIMIT / TAIL_RETRY_DIVISOR)
             );
-            write_tail_response(&mut second, LIVE_TAIL_LIMIT / TAIL_RETRY_DIVISOR).await?;
+            assert_eq!(
+                second_request["scan_limit"],
+                json!(default_tail_scan_limit(false))
+            );
+            write_tail_response(
+                &mut second,
+                LIVE_TAIL_LIMIT / TAIL_RETRY_DIVISOR,
+                default_tail_scan_limit(false),
+            )
+            .await?;
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
 
         let tail = request_tail_events(&socket_path, 0, false, Selector::default(), &[]).await?;
 
         assert_eq!(tail.limit, LIVE_TAIL_LIMIT / TAIL_RETRY_DIVISOR);
+        assert_eq!(tail.scan_limit, default_tail_scan_limit(false));
         server.await??;
         Ok(())
     }
@@ -259,13 +277,20 @@ mod tests {
             let request = read_request(&mut stream).await?;
             assert_eq!(request["latest"], json!(true));
             assert_eq!(request["limit"], json!(INITIAL_TAIL_LIMIT));
-            write_tail_response(&mut stream, INITIAL_TAIL_LIMIT).await?;
+            assert_eq!(request["scan_limit"], json!(default_tail_scan_limit(true)));
+            write_tail_response(
+                &mut stream,
+                INITIAL_TAIL_LIMIT,
+                default_tail_scan_limit(true),
+            )
+            .await?;
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
 
         let tail = request_tail_events(&socket_path, 0, true, Selector::default(), &[]).await?;
 
         assert_eq!(tail.limit, INITIAL_TAIL_LIMIT);
+        assert_eq!(tail.scan_limit, default_tail_scan_limit(true));
         server.await??;
         Ok(())
     }
@@ -282,7 +307,8 @@ mod tests {
             assert_eq!(request["latest"], json!(true));
             assert_eq!(request["event_types"], json!(["http_request_headers"]));
             assert_eq!(request["limit"], json!(1_024));
-            write_tail_response(&mut stream, 1_024).await?;
+            assert_eq!(request["scan_limit"], json!(default_tail_scan_limit(true)));
+            write_tail_response(&mut stream, 1_024, default_tail_scan_limit(true)).await?;
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
 
@@ -296,6 +322,7 @@ mod tests {
         .await?;
 
         assert_eq!(tail.limit, 1_024);
+        assert_eq!(tail.scan_limit, default_tail_scan_limit(true));
         server.await??;
         Ok(())
     }
@@ -311,6 +338,7 @@ mod tests {
                 let mut stream = accept_request(&listener).await?;
                 let request = read_request(&mut stream).await?;
                 assert_eq!(request["limit"], json!(expected_limit));
+                assert_eq!(request["scan_limit"], json!(default_tail_scan_limit(false)));
                 stream.write_all(&vec![b'a'; 16 * 1024 * 1024 + 1]).await?;
                 stream.shutdown().await?;
             }
@@ -348,6 +376,7 @@ mod tests {
     async fn write_tail_response(
         stream: &mut UnixStream,
         limit: usize,
+        scan_limit: usize,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let response = json!({
             "kind": "event_tail",
@@ -357,6 +386,7 @@ mod tests {
                 "last_export_sequence": 0,
                 "attribution_mode": "strict",
                 "limit": limit,
+                "scan_limit": scan_limit,
                 "scanned": 0,
                 "budget": {
                     "max_event_payload_bytes": TAIL_FIXTURE_MAX_EVENT_PAYLOAD_BYTES,

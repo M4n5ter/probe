@@ -23,6 +23,7 @@ pub(crate) struct EventTailSnapshot {
     pub last_export_sequence: u64,
     pub attribution_mode: EventTailAttributionMode,
     pub limit: usize,
+    pub scan_limit: usize,
     pub scanned: usize,
     pub budget: EventTailBudgetSnapshot,
     pub events: Vec<EventTailRecord>,

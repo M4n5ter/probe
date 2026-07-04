@@ -388,6 +388,7 @@ impl TrafficState {
             last_export_sequence: 1,
             attribution_mode: EventTailAttributionMode::Strict,
             limit: 1,
+            scan_limit: 1,
             scanned: 1,
             budget: crate::admin::EventTailBudgetSnapshot {
                 max_event_payload_bytes: 512,
@@ -2734,37 +2735,33 @@ mod tests {
     }
 
     fn tail_snapshot_with_response_budget_omission_at(sequence: u64) -> EventTailSnapshot {
-        EventTailSnapshot {
-            after_sequence: 0,
-            next_after_sequence: sequence,
-            last_export_sequence: sequence,
-            attribution_mode: EventTailAttributionMode::Strict,
-            limit: 64,
-            scanned: sequence as usize,
-            budget: tail_budget(256, 128, true),
-            events: Vec::new(),
-            omissions: vec![EventTailOmission {
+        tail_snapshot(
+            0,
+            sequence,
+            64,
+            sequence as usize,
+            tail_budget(256, 128, true),
+            Vec::new(),
+            vec![EventTailOmission {
                 sequence,
                 stored_at_unix_ns: sequence * 100,
                 payload_schema: SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON.to_string(),
                 payload_bytes: 4096,
                 reason: EventTailOmissionReason::ResponseBudgetExceeded,
             }],
-        }
+        )
     }
 
     fn empty_tail_snapshot(scanned: usize) -> EventTailSnapshot {
-        EventTailSnapshot {
-            after_sequence: 0,
-            next_after_sequence: scanned as u64,
-            last_export_sequence: scanned as u64,
-            attribution_mode: EventTailAttributionMode::Strict,
-            limit: 64,
+        tail_snapshot(
+            0,
+            scanned as u64,
+            64,
             scanned,
-            budget: tail_budget(4096, 0, false),
-            events: Vec::new(),
-            omissions: Vec::new(),
-        }
+            tail_budget(4096, 0, false),
+            Vec::new(),
+            Vec::new(),
+        )
     }
 
     fn tail_snapshot_with_gap_events(range: std::ops::RangeInclusive<u64>) -> EventTailSnapshot {
@@ -2773,17 +2770,15 @@ mod tests {
         let events = range
             .map(|sequence| tail_record(sequence, sequence * 100, gap_event(sequence)))
             .collect::<Vec<_>>();
-        EventTailSnapshot {
+        tail_snapshot(
             after_sequence,
-            next_after_sequence: last_export_sequence,
             last_export_sequence,
-            attribution_mode: EventTailAttributionMode::Strict,
-            limit: events.len(),
-            scanned: events.len(),
-            budget: tail_budget(4096, 0, false),
+            events.len(),
+            events.len(),
+            tail_budget(4096, 0, false),
             events,
-            omissions: Vec::new(),
-        }
+            Vec::new(),
+        )
     }
 
     fn tail_snapshot_with_body_events(range: std::ops::RangeInclusive<u64>) -> EventTailSnapshot {
@@ -2798,17 +2793,15 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        EventTailSnapshot {
+        tail_snapshot(
             after_sequence,
-            next_after_sequence: last_export_sequence,
             last_export_sequence,
-            attribution_mode: EventTailAttributionMode::Strict,
-            limit: events.len(),
-            scanned: events.len(),
-            budget: tail_budget(4096, 0, false),
+            events.len(),
+            events.len(),
+            tail_budget(4096, 0, false),
             events,
-            omissions: Vec::new(),
-        }
+            Vec::new(),
+        )
     }
 
     fn tail_snapshot_with_http_exchange() -> EventTailSnapshot {
@@ -2818,17 +2811,15 @@ mod tests {
             tail_record(3, 300, response_event(200, "OK")),
             tail_record(4, 400, response_body_event(b"ok")),
         ];
-        EventTailSnapshot {
-            after_sequence: 0,
-            next_after_sequence: 4,
-            last_export_sequence: 4,
-            attribution_mode: EventTailAttributionMode::Strict,
-            limit: events.len(),
-            scanned: events.len(),
-            budget: tail_budget(4096, 0, false),
+        tail_snapshot(
+            0,
+            4,
+            events.len(),
+            events.len(),
+            tail_budget(4096, 0, false),
             events,
-            omissions: Vec::new(),
-        }
+            Vec::new(),
+        )
     }
 
     fn tail_snapshot_with_websocket_session() -> EventTailSnapshot {
@@ -2836,17 +2827,15 @@ mod tests {
             tail_record(1, 100, websocket_handoff_event("/ws")),
             tail_record(2, 200, websocket_message_event(b"hello")),
         ];
-        EventTailSnapshot {
-            after_sequence: 0,
-            next_after_sequence: 2,
-            last_export_sequence: 2,
-            attribution_mode: EventTailAttributionMode::Strict,
-            limit: events.len(),
-            scanned: events.len(),
-            budget: tail_budget(4096, 0, false),
+        tail_snapshot(
+            0,
+            2,
+            events.len(),
+            events.len(),
+            tail_budget(4096, 0, false),
             events,
-            omissions: Vec::new(),
-        }
+            Vec::new(),
+        )
     }
 
     fn tail_snapshot_with_websocket_handoffs(range: RangeInclusive<u64>) -> EventTailSnapshot {
@@ -2861,17 +2850,15 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        EventTailSnapshot {
+        tail_snapshot(
             after_sequence,
             next_after_sequence,
-            last_export_sequence: next_after_sequence,
-            attribution_mode: EventTailAttributionMode::Strict,
-            limit: events.len(),
-            scanned: events.len(),
-            budget: tail_budget(4096, 0, false),
+            events.len(),
+            events.len(),
+            tail_budget(4096, 0, false),
             events,
-            omissions: Vec::new(),
-        }
+            Vec::new(),
+        )
     }
 
     fn tail_snapshot_with_mixed_projection_events() -> EventTailSnapshot {
@@ -2906,16 +2893,37 @@ mod tests {
             .into_iter()
             .map(|(sequence, event)| tail_record(sequence, sequence, event))
             .collect::<Vec<_>>();
+        tail_snapshot(
+            0,
+            next_after_sequence,
+            events.len(),
+            events.len(),
+            tail_budget(4096, 0, false),
+            events,
+            Vec::new(),
+        )
+    }
+
+    fn tail_snapshot(
+        after_sequence: u64,
+        next_after_sequence: u64,
+        limit: usize,
+        scanned: usize,
+        budget: EventTailBudgetSnapshot,
+        events: Vec<EventTailRecord>,
+        omissions: Vec<EventTailOmission>,
+    ) -> EventTailSnapshot {
         EventTailSnapshot {
-            after_sequence: 0,
+            after_sequence,
             next_after_sequence,
             last_export_sequence: next_after_sequence,
             attribution_mode: EventTailAttributionMode::Strict,
-            limit: events.len(),
-            scanned: events.len(),
-            budget: tail_budget(4096, 0, false),
+            limit,
+            scan_limit: limit,
+            scanned,
+            budget,
             events,
-            omissions: Vec::new(),
+            omissions,
         }
     }
 
