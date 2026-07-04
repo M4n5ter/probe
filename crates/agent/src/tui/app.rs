@@ -21,8 +21,9 @@ use super::runtime_status::{
 };
 use super::text::terminal_safe_inline_text;
 use super::traffic::{
-    TrafficDetailLoadRequest, TrafficDetailLoadResult, TrafficRefreshRequest, TrafficRefreshResult,
-    TrafficState, load_traffic_refresh, traffic_selector_key,
+    TrafficDetailLoadRequest, TrafficDetailLoadResult, TrafficEventFilter, TrafficRefreshRequest,
+    TrafficRefreshResult, TrafficState, TrafficViewMode, load_traffic_refresh,
+    traffic_selector_key,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +103,8 @@ pub(crate) enum TuiAction {
     OpenTrafficDiagnostics,
     CycleTrafficViewMode,
     CycleTrafficEventFilter,
+    SetTrafficViewMode(TrafficViewMode),
+    SetTrafficEventFilter(TrafficEventFilter),
     FollowTrafficTail,
     ObserveAuto,
     ObserveEbpf,
@@ -581,6 +584,10 @@ impl TuiApp {
             TuiAction::OpenTrafficDiagnostics => self.open_traffic_diagnostics(),
             TuiAction::CycleTrafficViewMode => self.cycle_traffic_view_mode(),
             TuiAction::CycleTrafficEventFilter => self.cycle_traffic_event_filter(),
+            TuiAction::SetTrafficViewMode(view_mode) => self.set_traffic_view_mode(view_mode),
+            TuiAction::SetTrafficEventFilter(event_filter) => {
+                self.set_traffic_event_filter(event_filter);
+            }
             TuiAction::FollowTrafficTail => self.follow_traffic_tail(),
             TuiAction::ObserveAuto => {
                 return self.apply_process_observation(ProcessObservationMode::Auto);
@@ -1138,12 +1145,12 @@ impl TuiApp {
                 self.open_traffic_diagnostics();
                 None
             }
-            ControlId::TrafficViewMode => {
-                self.cycle_traffic_view_mode();
+            ControlId::TrafficView(view_mode) => {
+                self.set_traffic_view_mode(view_mode);
                 None
             }
-            ControlId::TrafficEventFilter => {
-                self.cycle_traffic_event_filter();
+            ControlId::TrafficFilter(event_filter) => {
+                self.set_traffic_event_filter(event_filter);
                 None
             }
             ControlId::TrafficTailFollow => {
@@ -1426,8 +1433,18 @@ impl TuiApp {
         self.status = StatusMessage::info(self.traffic.status().text.clone());
     }
 
+    fn set_traffic_event_filter(&mut self, event_filter: TrafficEventFilter) {
+        self.traffic.set_event_filter(event_filter);
+        self.status = StatusMessage::info(self.traffic.status().text.clone());
+    }
+
     fn cycle_traffic_view_mode(&mut self) {
         self.traffic.cycle_view_mode();
+        self.status = StatusMessage::info(self.traffic.status().text.clone());
+    }
+
+    fn set_traffic_view_mode(&mut self, view_mode: TrafficViewMode) {
+        self.traffic.set_view_mode(view_mode);
         self.status = StatusMessage::info(self.traffic.status().text.clone());
     }
 
@@ -1924,6 +1941,84 @@ mod tests {
                 probe_core::Direction::Outbound
             ]
         );
+    }
+
+    #[test]
+    fn traffic_direct_view_and_filter_controls_update_state() {
+        let mut app = test_app();
+        app.select_tab(TuiTab::Traffic);
+
+        app.handle_action(TuiAction::Click(HitTarget::Control(
+            ControlId::TrafficView(TrafficViewMode::WebSocket),
+        )));
+        assert!(
+            app.traffic()
+                .requested_view_mode_is(TrafficViewMode::WebSocket)
+        );
+
+        app.handle_action(TuiAction::Click(HitTarget::Control(
+            ControlId::TrafficView(TrafficViewMode::Events),
+        )));
+        assert!(
+            app.traffic()
+                .requested_view_mode_is(TrafficViewMode::Events)
+        );
+
+        app.handle_action(TuiAction::Click(HitTarget::Control(
+            ControlId::TrafficFilter(TrafficEventFilter::Http),
+        )));
+        assert!(app.traffic().event_filter_is(TrafficEventFilter::Http));
+        assert!(app.traffic().requested_view_mode_is(TrafficViewMode::Http));
+
+        app.handle_action(TuiAction::Click(HitTarget::Control(
+            ControlId::TrafficFilter(TrafficEventFilter::All),
+        )));
+        assert!(app.traffic().event_filter_is(TrafficEventFilter::All));
+        assert!(
+            app.traffic()
+                .requested_view_mode_is(TrafficViewMode::Events)
+        );
+    }
+
+    #[test]
+    fn traffic_direct_view_and_filter_keyboard_actions_update_state() {
+        let mut app = test_app();
+        app.select_tab(TuiTab::Traffic);
+
+        app.handle_action(TuiAction::SetTrafficViewMode(TrafficViewMode::WebSocket));
+        assert!(
+            app.traffic()
+                .requested_view_mode_is(TrafficViewMode::WebSocket)
+        );
+
+        app.handle_action(TuiAction::SetTrafficEventFilter(
+            TrafficEventFilter::Diagnostics,
+        ));
+        assert!(
+            app.traffic()
+                .event_filter_is(TrafficEventFilter::Diagnostics)
+        );
+        assert!(
+            app.traffic()
+                .requested_view_mode_is(TrafficViewMode::Events)
+        );
+    }
+
+    #[test]
+    fn traffic_arrow_keys_keep_browsing_traffic_rows() {
+        let mut app = test_app();
+        app.select_tab(TuiTab::Traffic);
+        app.attach_agent(RuntimeAttachment::existing(PathBuf::from(
+            "/tmp/admin.sock",
+        )));
+        append_traffic_capture_loss(&mut app, 10);
+        append_traffic_capture_loss(&mut app, 11);
+        assert_eq!(app.traffic().rows().len(), 2);
+        assert_eq!(app.traffic().selected_index(), 1);
+
+        app.handle_action(TuiAction::MoveUp);
+
+        assert_eq!(app.traffic().selected_index(), 0);
     }
 
     #[test]
@@ -2910,6 +3005,20 @@ mod tests {
             }
         }))
         .expect("runtime generation diagnostics should parse")
+    }
+
+    fn append_traffic_capture_loss(app: &mut TuiApp, sequence: u64) {
+        let request = app
+            .begin_traffic_refresh()
+            .expect("attached test app should produce a traffic selector");
+        app.apply_traffic_refresh_result(TrafficRefreshLoadResult {
+            identity: request.identity.clone(),
+            diagnostics: Ok(runtime_generation_diagnostics(1, "local", None)),
+            traffic: TrafficRefreshResult::from_request_for_test(
+                &request.traffic,
+                tail_snapshot_with_capture_loss(sequence),
+            ),
+        });
     }
 
     fn tail_snapshot_with_capture_loss(sequence: u64) -> EventTailSnapshot {

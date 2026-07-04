@@ -3,14 +3,15 @@ use probe_config::AgentConfig;
 use super::{
     app::TuiTab,
     fields::{FieldId, field_value, fields_for_tab},
+    traffic::{TrafficEventFilter, TrafficViewMode},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ControlId {
     ReloadRuntimeActions,
     OpenTrafficDiagnostics,
-    TrafficViewMode,
-    TrafficEventFilter,
+    TrafficView(TrafficViewMode),
+    TrafficFilter(TrafficEventFilter),
     TrafficTailFollow,
     ObserveAuto,
     ObserveEbpf,
@@ -19,13 +20,34 @@ pub(crate) enum ControlId {
     ClearProcessSearch,
 }
 
+pub(crate) const TRAFFIC_VIEW_CONTROLS: [ControlId; 3] = [
+    ControlId::TrafficView(TrafficViewMode::Http),
+    ControlId::TrafficView(TrafficViewMode::WebSocket),
+    ControlId::TrafficView(TrafficViewMode::Events),
+];
+
+pub(crate) const TRAFFIC_FILTER_CONTROLS: [ControlId; 6] = [
+    ControlId::TrafficFilter(TrafficEventFilter::Application),
+    ControlId::TrafficFilter(TrafficEventFilter::Http),
+    ControlId::TrafficFilter(TrafficEventFilter::WebSocket),
+    ControlId::TrafficFilter(TrafficEventFilter::Security),
+    ControlId::TrafficFilter(TrafficEventFilter::Diagnostics),
+    ControlId::TrafficFilter(TrafficEventFilter::All),
+];
+
+pub(crate) const TRAFFIC_OBSERVE_CONTROLS: [ControlId; 3] = [
+    ControlId::ObserveAuto,
+    ControlId::ObserveEbpf,
+    ControlId::ObserveLibpcap,
+];
+
 impl ControlId {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::ReloadRuntimeActions => "Reload runtime actions",
             Self::OpenTrafficDiagnostics => "Show data path",
-            Self::TrafficViewMode => "Toggle traffic view",
-            Self::TrafficEventFilter => "Cycle traffic event filter",
+            Self::TrafficView(mode) => mode.control_label(),
+            Self::TrafficFilter(filter) => filter.control_label(),
             Self::TrafficTailFollow => "Follow latest traffic events",
             Self::ObserveAuto => "Observe selected process with auto data path",
             Self::ObserveEbpf => "Observe selected process with eBPF",
@@ -39,8 +61,8 @@ impl ControlId {
         match self {
             Self::ReloadRuntimeActions => "run action",
             Self::OpenTrafficDiagnostics => "open diagnostics",
-            Self::TrafficViewMode => "toggle view",
-            Self::TrafficEventFilter => "cycle filter",
+            Self::TrafficView(_) => "select view",
+            Self::TrafficFilter(_) => "select filter",
             Self::TrafficTailFollow => "jump to live",
             Self::ObserveAuto | Self::ObserveEbpf | Self::ObserveLibpcap => "observe process",
             Self::SearchProcesses => "search",
@@ -51,8 +73,8 @@ impl ControlId {
     pub(crate) fn traffic_action_label(self) -> &'static str {
         match self {
             Self::OpenTrafficDiagnostics => "Data Path",
-            Self::TrafficViewMode => "View",
-            Self::TrafficEventFilter => "Events",
+            Self::TrafficView(mode) => mode.short_label(),
+            Self::TrafficFilter(filter) => filter.short_label(),
             Self::TrafficTailFollow => "Live",
             Self::ObserveAuto => "Auto",
             Self::ObserveEbpf => "eBPF",
@@ -65,12 +87,8 @@ impl ControlId {
         match self {
             Self::ReloadRuntimeActions => "uses active TUI runtime".to_string(),
             Self::OpenTrafficDiagnostics => "capture and MITM runtime diagnostics".to_string(),
-            Self::TrafficViewMode => {
-                "HTTP exchanges, WebSocket sessions, or raw traffic events".to_string()
-            }
-            Self::TrafficEventFilter => {
-                "parsed protocol, security, diagnostics, or all events".to_string()
-            }
+            Self::TrafficView(mode) => mode.description().to_string(),
+            Self::TrafficFilter(filter) => filter.description().to_string(),
             Self::TrafficTailFollow => {
                 "jump to the newest traffic event and resume live follow".to_string()
             }
@@ -121,14 +139,37 @@ pub(crate) fn focus_targets_for_tab(tab: TuiTab, config: &AgentConfig) -> Vec<Fo
         .collect()
 }
 
+pub(crate) fn traffic_digit_control(digit: char) -> Option<ControlId> {
+    let value = digit.to_digit(10)? as usize;
+    match value {
+        1..=3 => TRAFFIC_VIEW_CONTROLS.get(value - 1).copied(),
+        4..=9 => TRAFFIC_FILTER_CONTROLS.get(value - 4).copied(),
+        _ => None,
+    }
+}
+
 fn controls_for_tab(tab: TuiTab) -> Vec<ControlId> {
     match tab {
         TuiTab::Runtime => vec![ControlId::ReloadRuntimeActions],
-        TuiTab::Enforcement => vec![
-            ControlId::ObserveAuto,
-            ControlId::ObserveEbpf,
-            ControlId::ObserveLibpcap,
-        ],
+        TuiTab::Enforcement => TRAFFIC_OBSERVE_CONTROLS.to_vec(),
         _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn traffic_digit_controls_follow_canonical_action_order() {
+        for (index, control) in TRAFFIC_VIEW_CONTROLS.into_iter().enumerate() {
+            let digit = char::from_digit((index + 1) as u32, 10).expect("valid digit");
+            assert_eq!(traffic_digit_control(digit), Some(control));
+        }
+        for (index, control) in TRAFFIC_FILTER_CONTROLS.into_iter().enumerate() {
+            let digit = char::from_digit((index + 4) as u32, 10).expect("valid digit");
+            assert_eq!(traffic_digit_control(digit), Some(control));
+        }
+        assert_eq!(traffic_digit_control('0'), None);
     }
 }

@@ -11,7 +11,9 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::tui::{
     app::{ProcessArgvHover, TuiApp},
-    controls::ControlId,
+    controls::{
+        ControlId, TRAFFIC_FILTER_CONTROLS, TRAFFIC_OBSERVE_CONTROLS, TRAFFIC_VIEW_CONTROLS,
+    },
     hit::{HitArea, HitTarget, ScrollTarget},
     traffic::TrafficStatusKind,
 };
@@ -29,7 +31,7 @@ pub(super) fn render_traffic(
     hits: &mut Vec<HitArea>,
 ) {
     let [status_area, workspace] =
-        Layout::vertical([Constraint::Length(4), Constraint::Min(4)]).areas(area);
+        Layout::vertical([Constraint::Length(5), Constraint::Min(4)]).areas(area);
     let (process_area, right_area) = if workspace.width >= 100 {
         let [process_area, right_area] =
             Layout::horizontal([Constraint::Length(38), Constraint::Min(52)]).areas(workspace);
@@ -210,49 +212,54 @@ fn render_traffic_action_bar(
     app: &TuiApp,
     hits: &mut Vec<HitArea>,
 ) {
-    if area.height < 2 {
+    let Some(mut cursor) = ActionBarCursor::new(area) else {
         return;
-    }
-    let mut x = area.x;
-    let y = area.y + 1;
-    x = render_action_button(
+    };
+    cursor.render_button(
         frame,
         hits,
-        action_area(area, x, y),
         ControlId::OpenTrafficDiagnostics.traffic_action_label(),
         HitTarget::Control(ControlId::OpenTrafficDiagnostics),
         app.is_hovered(HitTarget::Control(ControlId::OpenTrafficDiagnostics)),
-    )
-    .unwrap_or(x);
-    let traffic_view_label = app.traffic().view_mode_label();
-    x = render_action_button(
-        frame,
-        hits,
-        action_area(area, x, y),
-        &traffic_view_label,
-        HitTarget::Control(ControlId::TrafficViewMode),
-        app.is_hovered(HitTarget::Control(ControlId::TrafficViewMode)),
-    )
-    .unwrap_or(x);
-    x = render_action_button(
-        frame,
-        hits,
-        action_area(area, x, y),
-        app.traffic().event_filter_label(),
-        HitTarget::Control(ControlId::TrafficEventFilter),
-        app.is_hovered(HitTarget::Control(ControlId::TrafficEventFilter)),
-    )
-    .unwrap_or(x);
+        false,
+    );
+    for control in TRAFFIC_VIEW_CONTROLS {
+        let ControlId::TrafficView(mode) = control else {
+            continue;
+        };
+        let target = HitTarget::Control(control);
+        cursor.render_button(
+            frame,
+            hits,
+            control.traffic_action_label(),
+            target,
+            app.is_hovered(target),
+            app.traffic().active_view_mode_is(mode),
+        );
+    }
+    for control in TRAFFIC_FILTER_CONTROLS {
+        let ControlId::TrafficFilter(filter) = control else {
+            continue;
+        };
+        let target = HitTarget::Control(control);
+        cursor.render_button(
+            frame,
+            hits,
+            control.traffic_action_label(),
+            target,
+            app.is_hovered(target),
+            app.traffic().event_filter_is(filter),
+        );
+    }
     let tail_label = format!("Tail {}", app.traffic().tail_mode_label());
-    x = render_action_button(
+    cursor.render_button(
         frame,
         hits,
-        action_area(area, x, y),
         &tail_label,
         HitTarget::Control(ControlId::TrafficTailFollow),
         app.is_hovered(HitTarget::Control(ControlId::TrafficTailFollow)),
-    )
-    .unwrap_or(x);
+        false,
+    );
     if let Some(index) = app
         .selected_process_index()
         .filter(|index| app.processes().entries().get(*index).is_some())
@@ -263,68 +270,106 @@ fn render_traffic_action_bar(
         } else {
             "Watch"
         };
-        x = render_action_button(
+        cursor.render_button(
             frame,
             hits,
-            action_area(area, x, y),
             label,
             target,
             app.is_hovered(target),
-        )
-        .unwrap_or(x);
+            app.process_is_monitored(index),
+        );
     }
-    for control in [
-        ControlId::ObserveAuto,
-        ControlId::ObserveEbpf,
-        ControlId::ObserveLibpcap,
-    ] {
-        x = render_action_button(
+    for control in TRAFFIC_OBSERVE_CONTROLS {
+        cursor.render_button(
             frame,
             hits,
-            action_area(area, x, y),
             control.traffic_action_label(),
             HitTarget::Control(control),
             app.is_hovered(HitTarget::Control(control)),
-        )
-        .unwrap_or(x);
+            false,
+        );
     }
-    let _ = x;
 }
 
-fn render_action_button(
-    frame: &mut Frame<'_>,
-    hits: &mut Vec<HitArea>,
-    available: Rect,
-    label: &str,
-    target: HitTarget,
-    hovered: bool,
-) -> Option<u16> {
-    let width = label.len() as u16 + 2;
-    if width > available.width {
-        return None;
-    }
-    let area = Rect::new(available.x, available.y, width, 1);
-    super::render_button(frame, hits, area, label, target, hovered);
-    Some(available.x.saturating_add(width + 1))
+struct ActionBarCursor {
+    left: u16,
+    right: u16,
+    x: u16,
+    y: u16,
+    last_y: u16,
 }
 
-fn action_area(area: Rect, x: u16, y: u16) -> Rect {
-    let right = area.x.saturating_add(area.width);
-    Rect::new(x, y, right.saturating_sub(x), 1)
+impl ActionBarCursor {
+    fn new(area: Rect) -> Option<Self> {
+        if area.width == 0 || area.height < 4 {
+            return None;
+        }
+        let first_y = area.y.saturating_add(1);
+        let last_y = area.y.saturating_add(area.height.saturating_sub(3));
+        Some(Self {
+            left: area.x,
+            right: area.x.saturating_add(area.width),
+            x: area.x,
+            y: first_y,
+            last_y,
+        })
+    }
+
+    fn render_button(
+        &mut self,
+        frame: &mut Frame<'_>,
+        hits: &mut Vec<HitArea>,
+        label: impl Into<String>,
+        target: HitTarget,
+        hovered: bool,
+        active: bool,
+    ) -> bool {
+        let label = label.into();
+        let width = label.len() as u16 + 2;
+        if width > self.right.saturating_sub(self.left) {
+            return false;
+        }
+        if width > self.right.saturating_sub(self.x) && !self.wrap() {
+            return false;
+        }
+        let area = Rect::new(self.x, self.y, width, 1);
+        super::render_button_with_state(frame, hits, area, &label, target, hovered, active);
+        self.x = self.x.saturating_add(width.saturating_add(1));
+        true
+    }
+
+    fn wrap(&mut self) -> bool {
+        if self.y >= self.last_y {
+            return false;
+        }
+        self.x = self.left;
+        self.y = self.y.saturating_add(1);
+        true
+    }
 }
 
 fn render_traffic_data_path_summary(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    if area.height < 4 {
+    if area.height < 3 {
         return;
     }
     let [first_line, second_line] = traffic_data_path_summary(app);
     frame.render_widget(
         Paragraph::new(first_line),
-        Rect::new(area.x, area.y + 2, area.width, 1),
+        Rect::new(
+            area.x,
+            area.y + area.height.saturating_sub(2),
+            area.width,
+            1,
+        ),
     );
     frame.render_widget(
         Paragraph::new(second_line),
-        Rect::new(area.x, area.y + 3, area.width, 1),
+        Rect::new(
+            area.x,
+            area.y + area.height.saturating_sub(1),
+            area.width,
+            1,
+        ),
     );
 }
 

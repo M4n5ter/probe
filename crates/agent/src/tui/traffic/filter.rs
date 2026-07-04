@@ -3,7 +3,7 @@ use probe_core::EventType;
 use crate::event_type_groups;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum TrafficEventFilter {
+pub(crate) enum TrafficEventFilter {
     Application,
     Http,
     WebSocket,
@@ -13,7 +13,7 @@ pub(super) enum TrafficEventFilter {
 }
 
 impl TrafficEventFilter {
-    pub(super) fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Application => "Parsed",
             Self::Http => "HTTP",
@@ -21,6 +21,39 @@ impl TrafficEventFilter {
             Self::Security => "Security",
             Self::Diagnostics => "Diagnostics",
             Self::All => "All",
+        }
+    }
+
+    pub(crate) fn short_label(self) -> &'static str {
+        match self {
+            Self::Application => "Parsed",
+            Self::Http => "HTTP",
+            Self::WebSocket => "WS",
+            Self::Security => "Sec",
+            Self::Diagnostics => "Diag",
+            Self::All => "All",
+        }
+    }
+
+    pub(crate) fn control_label(self) -> &'static str {
+        match self {
+            Self::Application => "Show parsed application events",
+            Self::Http => "Show HTTP events",
+            Self::WebSocket => "Show WebSocket events",
+            Self::Security => "Show security events",
+            Self::Diagnostics => "Show diagnostic events",
+            Self::All => "Show all traffic events",
+        }
+    }
+
+    pub(crate) fn description(self) -> &'static str {
+        match self {
+            Self::Application => "parsed protocol events",
+            Self::Http => "HTTP request, response, and body events",
+            Self::WebSocket => "WebSocket handoff, frame, and message events",
+            Self::Security => "policy and enforcement events",
+            Self::Diagnostics => "capture diagnostics and losses",
+            Self::All => "all stored traffic events",
         }
     }
 

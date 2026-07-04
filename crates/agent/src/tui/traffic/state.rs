@@ -617,6 +617,19 @@ impl TrafficState {
         self.event_filter.label()
     }
 
+    #[cfg(test)]
+    pub(crate) fn requested_view_mode_is(&self, mode: TrafficViewMode) -> bool {
+        self.view_mode == mode
+    }
+
+    pub(crate) fn active_view_mode_is(&self, mode: TrafficViewMode) -> bool {
+        self.active_view().active == mode
+    }
+
+    pub(crate) fn event_filter_is(&self, filter: TrafficEventFilter) -> bool {
+        self.event_filter == filter
+    }
+
     pub(crate) fn diagnostic_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         if let Some(diagnostics) = &self.empty_filter_diagnostics {
@@ -741,7 +754,19 @@ impl TrafficState {
     }
 
     pub(crate) fn cycle_event_filter(&mut self) {
-        self.event_filter = self.event_filter.next();
+        self.set_event_filter(self.event_filter.next());
+    }
+
+    pub(crate) fn set_event_filter(&mut self, event_filter: TrafficEventFilter) {
+        if self.event_filter == event_filter {
+            self.status = TrafficStatus::idle(format!(
+                "Traffic event filter is already {}; showing {} view",
+                self.event_filter.label(),
+                self.view_mode.label()
+            ));
+            return;
+        }
+        self.event_filter = event_filter;
         self.view_mode = preferred_view_for_event_filter(self.event_filter);
         self.reset_tail();
         self.status = TrafficStatus::idle(format!(
@@ -752,7 +777,18 @@ impl TrafficState {
     }
 
     pub(crate) fn cycle_view_mode(&mut self) {
-        self.view_mode = self.view_mode.next();
+        self.set_view_mode(self.view_mode.next());
+    }
+
+    pub(crate) fn set_view_mode(&mut self, view_mode: TrafficViewMode) {
+        if self.view_mode == view_mode {
+            self.status = TrafficStatus::idle(format!(
+                "Traffic view is already {}",
+                self.view_mode_label()
+            ));
+            return;
+        }
+        self.view_mode = view_mode;
         if self.follow_tail {
             self.sync_tail_viewports(self.viewport_rows);
         } else {
@@ -1148,11 +1184,35 @@ impl TrafficViewMode {
         [Self::Http, Self::WebSocket, Self::Events]
     }
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Http => "HTTP",
             Self::WebSocket => "WebSocket",
             Self::Events => "Events",
+        }
+    }
+
+    pub(crate) fn short_label(self) -> &'static str {
+        match self {
+            Self::Http => "HTTP",
+            Self::WebSocket => "WS",
+            Self::Events => "Events",
+        }
+    }
+
+    pub(crate) fn control_label(self) -> &'static str {
+        match self {
+            Self::Http => "Show HTTP exchanges",
+            Self::WebSocket => "Show WebSocket sessions",
+            Self::Events => "Show raw traffic events",
+        }
+    }
+
+    pub(crate) fn description(self) -> &'static str {
+        match self {
+            Self::Http => "HTTP exchanges",
+            Self::WebSocket => "WebSocket sessions",
+            Self::Events => "raw traffic events",
         }
     }
 

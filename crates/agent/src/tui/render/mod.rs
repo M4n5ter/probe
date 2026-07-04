@@ -276,9 +276,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             Span::styled("d", Style::default().fg(Color::Gray)),
             Span::raw(" data path  "),
             Span::styled("v", Style::default().fg(Color::Gray)),
-            Span::raw(" view  "),
+            Span::raw(" cycle view  "),
             Span::styled("h", Style::default().fg(Color::Gray)),
-            Span::raw(" filter  "),
+            Span::raw(" cycle filter  "),
+            Span::styled("1-3", Style::default().fg(Color::Gray)),
+            Span::raw(" views  "),
+            Span::styled("4-9", Style::default().fg(Color::Gray)),
+            Span::raw(" filters  "),
             Span::styled("t", Style::default().fg(Color::Gray)),
             Span::raw(" live  "),
             Span::styled("a/e/l", Style::default().fg(Color::Gray)),
@@ -360,19 +364,33 @@ fn render_button(
     target: HitTarget,
     hovered: bool,
 ) {
+    render_button_with_state(frame, hits, area, label, target, hovered, false);
+}
+
+fn render_button_with_state(
+    frame: &mut Frame<'_>,
+    hits: &mut Vec<HitArea>,
+    area: Rect,
+    label: &str,
+    target: HitTarget,
+    hovered: bool,
+    active: bool,
+) {
     hits.push(HitArea::new(area, target));
-    let style = if hovered {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::LightYellow)
-            .add_modifier(Modifier::BOLD)
-    };
+    let style = button_style(hovered, active);
     frame.render_widget(Paragraph::new(format!("[{label}]")).style(style), area);
+}
+
+fn button_style(hovered: bool, active: bool) -> Style {
+    let background = match (hovered, active) {
+        (true, _) => Color::Cyan,
+        (false, true) => Color::LightBlue,
+        (false, false) => Color::LightYellow,
+    };
+    Style::default()
+        .fg(Color::Black)
+        .bg(background)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn action_cell(label: &'static str, hovered: bool) -> Cell<'static> {
@@ -465,7 +483,7 @@ mod tests {
     use super::{
         super::{
             app::{TuiAction, TuiApp},
-            controls::ControlId,
+            controls::{ControlId, TRAFFIC_FILTER_CONTROLS, TRAFFIC_VIEW_CONTROLS},
             fields::FieldId,
             hit::ScrollTarget,
             processes::{ProcessCatalog, ProcessEntry},
@@ -743,6 +761,13 @@ mod tests {
 
         let output = terminal.backend().to_string();
         assert!(output.contains("[Data Path]"));
+        assert!(output.contains("[HTTP]"));
+        assert!(output.contains("[WS]"));
+        assert!(output.contains("[Events]"));
+        assert!(output.contains("[Parsed]"));
+        assert!(output.contains("[All]"));
+        assert!(output.contains("[Sec]"));
+        assert!(output.contains("[Diag]"));
         assert!(output.contains("[Tail Live]"));
         assert!(output.contains("[Search]"));
         assert!(output.contains("[Watch]"));
@@ -791,6 +816,17 @@ mod tests {
             100,
             24
         ));
+        for control in TRAFFIC_VIEW_CONTROLS
+            .into_iter()
+            .chain(TRAFFIC_FILTER_CONTROLS)
+        {
+            assert!(hit_exists(
+                &hit_map,
+                Some(HitTarget::Control(control)),
+                100,
+                24
+            ));
+        }
         assert!(hit_exists(
             &hit_map,
             Some(HitTarget::Control(ControlId::TrafficTailFollow)),

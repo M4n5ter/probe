@@ -24,6 +24,7 @@ use super::{
     },
     config_edit::{TuiError, load_config, load_or_create_config},
     config_save_task::{ConfigSaveCompletion, ConfigSaveState, SavedConfigRuntimeReconcile},
+    controls::{ControlId, traffic_digit_control},
     hit::HitMap,
     process_catalog_task::{
         STARTUP_BACKGROUND_STATUS, apply_process_catalog_load_result,
@@ -591,6 +592,9 @@ fn key_to_action(key: KeyEvent, editing_text: bool, active_tab: TuiTab) -> Optio
         (KeyCode::Char('h'), _) if active_tab == TuiTab::Traffic => {
             Some(TuiAction::CycleTrafficEventFilter)
         }
+        (KeyCode::Char(digit), _) if active_tab == TuiTab::Traffic && digit.is_ascii_digit() => {
+            traffic_digit_action(digit)
+        }
         (KeyCode::Char('t'), _) if active_tab == TuiTab::Traffic => {
             Some(TuiAction::FollowTrafficTail)
         }
@@ -604,6 +608,16 @@ fn key_to_action(key: KeyEvent, editing_text: bool, active_tab: TuiTab) -> Optio
         (KeyCode::Left, _) => Some(TuiAction::PreviousValue),
         (KeyCode::Right, _) | (KeyCode::Enter, _) | (KeyCode::Char(' '), _) => {
             Some(TuiAction::NextValue)
+        }
+        _ => None,
+    }
+}
+
+fn traffic_digit_action(digit: char) -> Option<TuiAction> {
+    match traffic_digit_control(digit)? {
+        ControlId::TrafficView(view_mode) => Some(TuiAction::SetTrafficViewMode(view_mode)),
+        ControlId::TrafficFilter(event_filter) => {
+            Some(TuiAction::SetTrafficEventFilter(event_filter))
         }
         _ => None,
     }
@@ -674,6 +688,7 @@ mod tests {
             runtime_reconcile::{
                 completed_runtime_reconcile_for_test, completed_startup_runtime_reconcile_for_test,
             },
+            traffic::{TrafficEventFilter, TrafficViewMode},
         },
         *,
     };
@@ -751,6 +766,55 @@ mod tests {
                 TuiTab::Traffic
             ),
             Some(TuiAction::FollowTrafficTail)
+        );
+        for (digit, action) in [
+            ('1', TuiAction::SetTrafficViewMode(TrafficViewMode::Http)),
+            (
+                '2',
+                TuiAction::SetTrafficViewMode(TrafficViewMode::WebSocket),
+            ),
+            ('3', TuiAction::SetTrafficViewMode(TrafficViewMode::Events)),
+            (
+                '4',
+                TuiAction::SetTrafficEventFilter(TrafficEventFilter::Application),
+            ),
+            (
+                '5',
+                TuiAction::SetTrafficEventFilter(TrafficEventFilter::Http),
+            ),
+            (
+                '6',
+                TuiAction::SetTrafficEventFilter(TrafficEventFilter::WebSocket),
+            ),
+            (
+                '7',
+                TuiAction::SetTrafficEventFilter(TrafficEventFilter::Security),
+            ),
+            (
+                '8',
+                TuiAction::SetTrafficEventFilter(TrafficEventFilter::Diagnostics),
+            ),
+            (
+                '9',
+                TuiAction::SetTrafficEventFilter(TrafficEventFilter::All),
+            ),
+        ] {
+            assert_eq!(
+                key_to_action(
+                    KeyEvent::new(KeyCode::Char(digit), KeyModifiers::NONE),
+                    false,
+                    TuiTab::Traffic
+                ),
+                Some(action)
+            );
+        }
+        assert_eq!(
+            key_to_action(
+                KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+                false,
+                TuiTab::Overview
+            ),
+            None
         );
         assert_eq!(
             key_to_action(
