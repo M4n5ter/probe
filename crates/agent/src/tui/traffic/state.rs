@@ -1848,7 +1848,7 @@ mod tests {
             traffic
                 .detail_preview_lines(9)
                 .iter()
-                .any(|line| line == "Request body: 5 bytes")
+                .any(|line| line == "Request body: 5 bytes (not loaded)")
         );
         assert!(
             traffic

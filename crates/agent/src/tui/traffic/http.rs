@@ -76,9 +76,9 @@ impl HttpExchangeRow {
             format!("Remote: {}", self.endpoint),
             format!("Request: {} {}", self.method, self.target),
             format!("Response: {}", self.status),
-            format!("Request body: {} bytes", self.request.body_len()),
-            format!("Response body: {} bytes", self.response.body_len()),
-            "Headers and payloads: detail view".to_string(),
+            format!("Request body: {}", self.request.body_preview()),
+            format!("Response body: {}", self.response.body_preview()),
+            "Detail: headers and payloads".to_string(),
         ];
         fit_preview_lines(lines, max_lines)
     }
@@ -141,6 +141,72 @@ impl HttpMessage {
         self.body.iter().map(|chunk| chunk.data_len).sum()
     }
 
+    fn body_preview(&self) -> String {
+        let bytes = self.body_len();
+        let status = self.body_payload_status();
+        format!("{} bytes ({})", bytes, status.preview_label())
+    }
+
+    fn body_payload_status(&self) -> BodyPayloadStatus {
+        if self.body.is_empty() {
+            return BodyPayloadStatus::None;
+        }
+        let missing_chunks = self
+            .body
+            .iter()
+            .filter(|chunk| chunk.data.is_none())
+            .count();
+        if missing_chunks == self.body.len() {
+            return BodyPayloadStatus::NotLoaded { missing_chunks };
+        }
+        if missing_chunks > 0 {
+            return BodyPayloadStatus::Partial { missing_chunks };
+        }
+        match BodyPayloadScan::scan(&self.body, false)
+            .expect("non-empty loaded body chunks must classify")
+            .coverage
+        {
+            BodyPayloadCoverage::Complete => BodyPayloadStatus::Loaded,
+            BodyPayloadCoverage::Incomplete { .. } => BodyPayloadStatus::Incomplete,
+        }
+    }
+
+    fn body_payload_state(&self) -> BodyPayloadState {
+        match self.body_payload_status() {
+            BodyPayloadStatus::None => BodyPayloadState::None,
+            BodyPayloadStatus::NotLoaded { missing_chunks } => {
+                BodyPayloadState::NotLoaded { missing_chunks }
+            }
+            BodyPayloadStatus::Partial { missing_chunks } => {
+                let loaded = sorted_body_chunks(&self.body)
+                    .into_iter()
+                    .filter_map(|chunk| chunk.data.as_ref())
+                    .flat_map(|data| data.iter().copied())
+                    .collect::<Vec<_>>();
+                BodyPayloadState::Partial {
+                    loaded,
+                    missing_chunks,
+                }
+            }
+            BodyPayloadStatus::Loaded | BodyPayloadStatus::Incomplete => {
+                match BodyPayloadDetail::from_chunks(&self.body)
+                    .expect("non-empty loaded body chunks must classify")
+                {
+                    BodyPayloadDetail::Complete { bytes } => BodyPayloadState::Loaded { bytes },
+                    BodyPayloadDetail::Incomplete {
+                        start_offset,
+                        observed_bytes,
+                        reason,
+                    } => BodyPayloadState::Incomplete {
+                        start_offset,
+                        observed_bytes,
+                        reason,
+                    },
+                }
+            }
+        }
+    }
+
     fn detail_lines(&self, label: &str) -> Vec<String> {
         let mut lines = Vec::new();
         lines.push(format!("{label} headers"));
@@ -176,10 +242,9 @@ impl HttpMessage {
         }
         lines.push(format!("{label} body"));
         lines.push(format!("  Body bytes: {}", self.body_len()));
-        if self.body.is_empty() {
-            lines.push("  Body payload: -".to_string());
-        } else if self.body.iter().any(|chunk| chunk.data.is_none()) {
-            lines.extend(self.partial_body_payload_lines());
+        let state = self.body_payload_state();
+        lines.extend(state.detail_lines());
+        if state.has_chunks() {
             lines.push(format!("  Body chunks: {}", self.body.len()));
             for chunk in sorted_body_chunks(&self.body) {
                 match &chunk.data {
@@ -195,47 +260,8 @@ impl HttpMessage {
                     )),
                 }
             }
-        } else {
-            lines.extend(self.body_payload_lines());
-            lines.push(format!("  Body chunks: {}", self.body.len()));
-            for chunk in sorted_body_chunks(&self.body) {
-                let data = chunk
-                    .data
-                    .as_ref()
-                    .expect("body payload was checked before rendering chunks");
-                lines.push(format!(
-                    "  Body chunk offset={} end_stream={}: {}",
-                    chunk.offset,
-                    chunk.end_stream,
-                    bytes_detail(data)
-                ));
-            }
         }
         lines
-    }
-
-    fn partial_body_payload_lines(&self) -> Vec<String> {
-        let loaded = sorted_body_chunks(&self.body)
-            .into_iter()
-            .filter_map(|chunk| chunk.data.as_ref())
-            .flat_map(|data| data.iter().copied())
-            .collect::<Vec<_>>();
-        let missing_chunks = self
-            .body
-            .iter()
-            .filter(|chunk| chunk.data.is_none())
-            .count();
-        if loaded.is_empty() {
-            return vec![
-                "  Body payload: not loaded in tail response".to_string(),
-                format!("  Missing body chunks: {missing_chunks}"),
-            ];
-        }
-        vec![
-            "  Body payload: partially loaded".to_string(),
-            format!("  Observed loaded body bytes: {}", bytes_detail(&loaded)),
-            format!("  Missing body chunks: {missing_chunks}"),
-        ]
     }
 
     fn detail_fetch_sequences(&self) -> Vec<u64> {
@@ -245,34 +271,89 @@ impl HttpMessage {
             .map(|chunk| chunk.sequence)
             .collect()
     }
+}
 
-    fn body_payload_lines(&self) -> Vec<String> {
-        let Some(payload) = BodyPayloadDetail::from_chunks(&self.body) else {
-            return vec!["  Body payload: -".to_string()];
-        };
-        match payload {
-            BodyPayloadDetail::Complete { bytes } => {
-                vec![format!("  Body payload: {}", bytes_detail(&bytes))]
-            }
-            BodyPayloadDetail::Incomplete {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BodyPayloadStatus {
+    None,
+    NotLoaded { missing_chunks: usize },
+    Partial { missing_chunks: usize },
+    Loaded,
+    Incomplete,
+}
+
+impl BodyPayloadStatus {
+    fn preview_label(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::NotLoaded { .. } => "not loaded",
+            Self::Partial { .. } => "partial",
+            Self::Loaded => "loaded",
+            Self::Incomplete => "incomplete",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BodyPayloadState {
+    None,
+    NotLoaded {
+        missing_chunks: usize,
+    },
+    Partial {
+        loaded: Vec<u8>,
+        missing_chunks: usize,
+    },
+    Loaded {
+        bytes: Vec<u8>,
+    },
+    Incomplete {
+        start_offset: u64,
+        observed_bytes: Vec<u8>,
+        reason: &'static str,
+    },
+}
+
+impl BodyPayloadState {
+    fn detail_lines(&self) -> Vec<String> {
+        match self {
+            Self::None => vec!["  Body payload: -".to_string()],
+            Self::NotLoaded { missing_chunks } => vec![
+                "  Body payload: not loaded in tail response".to_string(),
+                format!("  Missing body chunks: {missing_chunks}"),
+            ],
+            Self::Partial {
+                loaded,
+                missing_chunks,
+            } => vec![
+                "  Body payload: partially loaded".to_string(),
+                format!("  Observed loaded body bytes: {}", bytes_detail(loaded)),
+                format!("  Missing body chunks: {missing_chunks}"),
+            ],
+            Self::Loaded { bytes } => vec![format!("  Body payload: {}", bytes_detail(bytes))],
+            Self::Incomplete {
                 start_offset,
                 observed_bytes,
                 reason,
             } => {
-                let label = if start_offset == 0 {
+                let label = if *start_offset == 0 {
                     "  Body payload".to_string()
                 } else {
                     format!("  Body payload from offset {start_offset}")
                 };
                 vec![
                     format!("{label}: incomplete"),
-                    format!("  Observed body bytes: {}", bytes_detail(&observed_bytes)),
+                    format!("  Observed body bytes: {}", bytes_detail(observed_bytes)),
                     format!("  Incomplete reason: {reason}"),
                     "  Body payload is incomplete; chunk offsets below show the observed ranges"
                         .to_string(),
                 ]
             }
         }
+    }
+
+    fn has_chunks(&self) -> bool {
+        !matches!(self, Self::None)
     }
 }
 
@@ -286,24 +367,18 @@ struct BodyChunk {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum BodyPayloadDetail {
-    Complete {
-        bytes: Vec<u8>,
-    },
-    Incomplete {
-        start_offset: u64,
-        observed_bytes: Vec<u8>,
-        reason: &'static str,
-    },
+struct BodyPayloadScan {
+    coverage: BodyPayloadCoverage,
+    observed_bytes: Vec<u8>,
 }
 
-impl BodyPayloadDetail {
-    fn from_chunks(chunks: &[BodyChunk]) -> Option<Self> {
+impl BodyPayloadScan {
+    fn scan(chunks: &[BodyChunk], collect_bytes: bool) -> Option<Self> {
         let chunks = sorted_body_chunks(chunks);
         let first = chunks.first()?;
         let start_offset = first.offset;
         let mut next_offset = start_offset;
-        let mut bytes = Vec::new();
+        let mut observed_bytes = Vec::new();
         let mut has_gap = false;
         let mut has_end_stream = false;
         for chunk in chunks {
@@ -320,24 +395,73 @@ impl BodyPayloadDetail {
                 continue;
             }
             let new_bytes = &data[overlap..];
-            bytes.extend_from_slice(new_bytes);
+            if collect_bytes {
+                observed_bytes.extend_from_slice(new_bytes);
+            }
             next_offset = next_offset.saturating_add(new_bytes.len() as u64);
         }
-        if start_offset == 0 && !has_gap && has_end_stream {
-            return Some(Self::Complete { bytes });
-        }
-        let reason = if start_offset != 0 {
-            "body starts after offset 0"
-        } else if has_gap {
-            "missing bytes between observed chunks"
+        let coverage = if start_offset == 0 && !has_gap && has_end_stream {
+            BodyPayloadCoverage::Complete
         } else {
-            "end of stream was not observed"
+            BodyPayloadCoverage::Incomplete {
+                start_offset,
+                reason: incomplete_body_reason(start_offset, has_gap),
+            }
         };
-        Some(Self::Incomplete {
-            start_offset,
-            observed_bytes: bytes,
-            reason,
+        Some(Self {
+            coverage,
+            observed_bytes,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyPayloadCoverage {
+    Complete,
+    Incomplete {
+        start_offset: u64,
+        reason: &'static str,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BodyPayloadDetail {
+    Complete {
+        bytes: Vec<u8>,
+    },
+    Incomplete {
+        start_offset: u64,
+        observed_bytes: Vec<u8>,
+        reason: &'static str,
+    },
+}
+
+impl BodyPayloadDetail {
+    fn from_chunks(chunks: &[BodyChunk]) -> Option<Self> {
+        let scan = BodyPayloadScan::scan(chunks, true)?;
+        match scan.coverage {
+            BodyPayloadCoverage::Complete => Some(Self::Complete {
+                bytes: scan.observed_bytes,
+            }),
+            BodyPayloadCoverage::Incomplete {
+                start_offset,
+                reason,
+            } => Some(Self::Incomplete {
+                start_offset,
+                observed_bytes: scan.observed_bytes,
+                reason,
+            }),
+        }
+    }
+}
+
+fn incomplete_body_reason(start_offset: u64, has_gap: bool) -> &'static str {
+    if start_offset != 0 {
+        "body starts after offset 0"
+    } else if has_gap {
+        "missing bytes between observed chunks"
+    } else {
+        "end of stream was not observed"
     }
 }
 
@@ -625,6 +749,27 @@ mod tests {
                 .iter()
                 .any(|line| line == "  Body chunk offset=0 end_stream=true: ok")
         );
+    }
+
+    #[test]
+    fn preview_summarizes_body_payload_state() {
+        let cases = [
+            BodyPreviewCase::loaded("Request body: 5 bytes (loaded)"),
+            BodyPreviewCase::none("Request body: 0 bytes (none)"),
+            BodyPreviewCase::not_loaded("Request body: 5 bytes (not loaded)"),
+            BodyPreviewCase::partial("Request body: 10 bytes (partial)"),
+            BodyPreviewCase::incomplete("Request body: 5 bytes (incomplete)"),
+        ];
+
+        for case in cases {
+            let expected = case.expected;
+            let preview = single_exchange_preview(case.rows());
+
+            assert!(
+                preview.iter().any(|line| line == expected),
+                "missing {expected} in {preview:?}"
+            );
+        }
     }
 
     #[test]
@@ -1229,6 +1374,109 @@ mod tests {
             positions.windows(2).all(|window| window[0] < window[1]),
             "sections should appear in request/response order: {positions:?}"
         );
+    }
+
+    struct BodyPreviewCase {
+        rows: Vec<TrafficRow>,
+        expected: &'static str,
+    }
+
+    impl BodyPreviewCase {
+        fn loaded(expected: &'static str) -> Self {
+            Self {
+                rows: request_rows(vec![body_row(2, 0, b"hello", true)]),
+                expected,
+            }
+        }
+
+        fn none(expected: &'static str) -> Self {
+            Self {
+                rows: request_rows(Vec::new()),
+                expected,
+            }
+        }
+
+        fn not_loaded(expected: &'static str) -> Self {
+            Self {
+                rows: request_rows(vec![tail_body_row(2, 0, b"hello", true)]),
+                expected,
+            }
+        }
+
+        fn partial(expected: &'static str) -> Self {
+            Self {
+                rows: request_rows(vec![
+                    body_row(2, 0, b"hello", false),
+                    tail_body_row(3, 5, b"world", true),
+                ]),
+                expected,
+            }
+        }
+
+        fn incomplete(expected: &'static str) -> Self {
+            Self {
+                rows: request_rows(vec![body_row(2, 5, b"world", true)]),
+                expected,
+            }
+        }
+
+        fn rows(self) -> Vec<TrafficRow> {
+            self.rows
+        }
+    }
+
+    fn single_exchange_preview(rows: Vec<TrafficRow>) -> Vec<String> {
+        let exchanges = build_http_exchange_rows(&rows);
+        let [exchange] = exchanges.as_slice() else {
+            panic!("expected one exchange: {exchanges:?}");
+        };
+        exchange.preview_lines(16)
+    }
+
+    fn request_rows(mut body_rows: Vec<TrafficRow>) -> Vec<TrafficRow> {
+        let mut rows = vec![TrafficRow::from_event(
+            1,
+            event(EventKind::HttpRequestHeaders(HttpHeaders {
+                direction: Direction::Outbound,
+                stream_sequence: 1,
+                method: Some("POST".to_string()),
+                target: Some("/api/tasks".to_string()),
+                status: None,
+                reason: None,
+                version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+            })),
+        )];
+        rows.append(&mut body_rows);
+        rows
+    }
+
+    fn body_row(sequence: u64, offset: u64, data: &'static [u8], end_stream: bool) -> TrafficRow {
+        TrafficRow::from_event(sequence, body_event(offset, data, end_stream))
+    }
+
+    fn tail_body_row(
+        sequence: u64,
+        offset: u64,
+        data: &'static [u8],
+        end_stream: bool,
+    ) -> TrafficRow {
+        let event = body_event(offset, data, end_stream);
+        TrafficRow::from_record(EventTailRecord {
+            sequence,
+            stored_at_unix_ns: sequence,
+            event: EventTailEvent::from_envelope(&event),
+        })
+    }
+
+    fn body_event(offset: u64, data: &'static [u8], end_stream: bool) -> EventEnvelope {
+        event(EventKind::HttpBodyChunk(BodyChunk {
+            direction: Direction::Outbound,
+            stream_sequence: 1,
+            offset,
+            data: data.to_vec().into(),
+            end_stream,
+        }))
     }
 
     fn event(kind: EventKind) -> EventEnvelope {
