@@ -16,8 +16,8 @@ use super::process_view::ProcessViewState;
 use super::processes::{ProcessCatalog, ProcessEntry, selector_for_exe_path};
 use super::runtime_attachment::RuntimeAttachment;
 use super::runtime_status::{
-    TrafficRuntimeDiagnostics, local_traffic_runtime_diagnostics,
-    request_traffic_runtime_diagnostics,
+    ActiveRuntimeGeneration, RuntimeGenerationReloadObservation, TrafficRuntimeDiagnostics,
+    local_traffic_runtime_diagnostics, request_traffic_runtime_diagnostics,
 };
 use super::text::terminal_safe_inline_text;
 use super::traffic::{
@@ -134,7 +134,7 @@ pub(crate) enum TuiEffect {
     LoadTrafficDetail { sequence: u64 },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TrafficRefreshIdentity {
     runtime_epoch: u64,
     socket_path: PathBuf,
@@ -147,6 +147,12 @@ enum TrafficFilterSelector {
     NoProcessCatalogEntries,
     NoSelectedProcess,
     UnavailableSelectedProcess,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeGenerationRefreshGate {
+    ApplyTraffic,
+    HoldTraffic { message: String },
 }
 
 #[derive(Debug)]
@@ -297,6 +303,8 @@ pub(crate) struct TuiApp {
     traffic_popup_viewport_rows: usize,
     runtime_attachment: RuntimeAttachment,
     runtime_epoch: u64,
+    runtime_generation_identity: Option<ActiveRuntimeGeneration>,
+    runtime_generation_reload_pending: Option<u64>,
     data_path_diagnostics: DataPathDiagnosticsView,
     dirty: bool,
     should_quit: bool,
@@ -335,6 +343,8 @@ impl TuiApp {
             traffic_popup_viewport_rows: 1,
             runtime_attachment: RuntimeAttachment::default(),
             runtime_epoch: 0,
+            runtime_generation_identity: None,
+            runtime_generation_reload_pending: None,
             data_path_diagnostics: DataPathDiagnosticsView::unavailable(
                 "local config diagnostics have not been evaluated yet",
             ),
@@ -515,8 +525,9 @@ impl TuiApp {
     pub(crate) fn attach_agent(&mut self, attachment: RuntimeAttachment) {
         let status = attachment.status_text();
         self.runtime_attachment = attachment;
-        self.bump_runtime_epoch();
-        self.invalidate_traffic_detail_requests();
+        self.runtime_generation_identity = None;
+        self.runtime_generation_reload_pending = None;
+        self.invalidate_runtime_reads();
         self.refresh_local_runtime_diagnostics();
         self.status = StatusMessage::info(status);
     }
@@ -524,10 +535,21 @@ impl TuiApp {
     pub(crate) fn detach_agent(&mut self, message: impl Into<String>) {
         let status = StatusMessage::error(message);
         self.runtime_attachment = RuntimeAttachment::lost(status.text.clone());
-        self.bump_runtime_epoch();
-        self.invalidate_traffic_detail_requests();
+        self.runtime_generation_identity = None;
+        self.runtime_generation_reload_pending = None;
+        self.invalidate_runtime_reads();
         self.status = status;
         self.refresh_local_runtime_diagnostics();
+    }
+
+    pub(crate) fn note_runtime_config_reloaded(&mut self) {
+        self.invalidate_runtime_reads();
+        self.refresh_local_runtime_diagnostics();
+    }
+
+    pub(crate) fn note_runtime_generation_queued(&mut self, request_id: u64) {
+        self.runtime_generation_reload_pending = Some(request_id);
+        self.invalidate_runtime_reads();
     }
 
     pub(crate) fn handle_action(&mut self, action: TuiAction) -> Option<TuiEffect> {
@@ -829,12 +851,26 @@ impl TuiApp {
         }
         match &result.diagnostics {
             Ok(diagnostics) => {
+                let gate = self.runtime_generation_refresh_gate(diagnostics);
                 self.data_path_diagnostics =
                     DataPathDiagnosticsView::from_running_agent(diagnostics.clone());
+                if let RuntimeGenerationRefreshGate::HoldTraffic { message } = gate {
+                    self.traffic.mark_refresh_waiting(message);
+                    self.status = StatusMessage::info(self.traffic.status().text.clone());
+                    return;
+                }
             }
             Err(error) => {
                 let message = format!("running agent status unavailable: {error}");
-                self.refresh_local_runtime_diagnostics_with_reason(message);
+                self.refresh_local_runtime_diagnostics_with_reason(message.clone());
+                if self.runtime_generation_reload_pending.is_some() {
+                    let message = format!(
+                        "Runtime generation reload is pending; cannot verify active generation: {error}"
+                    );
+                    self.traffic.mark_refresh_paused(message.clone());
+                    self.status = StatusMessage::warning(message);
+                    return;
+                }
             }
         }
         let traffic_applied = self.traffic.apply_refresh_result(result.traffic);
@@ -887,11 +923,91 @@ impl TuiApp {
             )
     }
 
+    fn runtime_generation_refresh_gate(
+        &mut self,
+        diagnostics: &TrafficRuntimeDiagnostics,
+    ) -> RuntimeGenerationRefreshGate {
+        let active = diagnostics.active_runtime_generation();
+        if let (Some(previous), Some(next)) = (&self.runtime_generation_identity, &active)
+            && previous != next
+        {
+            let next = next.clone();
+            self.runtime_generation_identity = Some(next.clone());
+            self.runtime_generation_reload_pending = None;
+            self.invalidate_runtime_reads();
+            return RuntimeGenerationRefreshGate::HoldTraffic {
+                message: format!(
+                    "Runtime generation changed to {}; waiting for next traffic refresh",
+                    next.label()
+                ),
+            };
+        }
+        if self.runtime_generation_identity.is_none() {
+            self.runtime_generation_identity = active.clone();
+        }
+        if let Some(request_id) = self.runtime_generation_reload_pending {
+            match diagnostics.runtime_generation_reload_observation(request_id) {
+                RuntimeGenerationReloadObservation::InProgress => {
+                    return RuntimeGenerationRefreshGate::HoldTraffic {
+                        message: diagnostics.running_status_text(self.traffic.rows().is_empty()),
+                    };
+                }
+                RuntimeGenerationReloadObservation::Applied => {
+                    self.runtime_generation_reload_pending = None;
+                    self.invalidate_runtime_reads();
+                    return RuntimeGenerationRefreshGate::HoldTraffic {
+                        message: format!(
+                            "Runtime generation request {request_id} applied; waiting for next traffic refresh"
+                        ),
+                    };
+                }
+                RuntimeGenerationReloadObservation::Failed => {
+                    self.runtime_generation_reload_pending = None;
+                }
+                RuntimeGenerationReloadObservation::SupersededInProgress { request_id } => {
+                    self.runtime_generation_reload_pending = Some(request_id);
+                    return RuntimeGenerationRefreshGate::HoldTraffic {
+                        message: diagnostics.running_status_text(self.traffic.rows().is_empty()),
+                    };
+                }
+                RuntimeGenerationReloadObservation::SupersededApplied { request_id } => {
+                    self.runtime_generation_reload_pending = None;
+                    self.invalidate_runtime_reads();
+                    return RuntimeGenerationRefreshGate::HoldTraffic {
+                        message: format!(
+                            "Runtime generation reload request was superseded by applied request {request_id}; waiting for next traffic refresh"
+                        ),
+                    };
+                }
+                RuntimeGenerationReloadObservation::SupersededFailed { .. } => {
+                    self.runtime_generation_reload_pending = None;
+                }
+                RuntimeGenerationReloadObservation::NotObserved => {
+                    return RuntimeGenerationRefreshGate::HoldTraffic {
+                        message: format!(
+                            "Runtime generation reload request {request_id} is pending; waiting for runtime generation status"
+                        ),
+                    };
+                }
+            }
+        } else if diagnostics.runtime_generation_reload_in_progress() {
+            return RuntimeGenerationRefreshGate::HoldTraffic {
+                message: diagnostics.running_status_text(self.traffic.rows().is_empty()),
+            };
+        }
+        RuntimeGenerationRefreshGate::ApplyTraffic
+    }
+
     fn bump_runtime_epoch(&mut self) {
         self.runtime_epoch = self
             .runtime_epoch
             .checked_add(1)
             .expect("runtime epoch overflow");
+    }
+
+    fn invalidate_runtime_reads(&mut self) {
+        self.bump_runtime_epoch();
+        self.invalidate_traffic_detail_requests();
     }
 
     pub(crate) fn begin_traffic_detail_load(
@@ -1556,6 +1672,13 @@ fn target_scrolls_traffic_events(active_tab: TuiTab, target: Option<ScrollTarget
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+
+    use serde_json::json;
+
+    use crate::admin::{
+        EventTailAttributionMode, EventTailBudgetSnapshot, EventTailEvent, EventTailRecord,
+        EventTailSnapshot,
+    };
 
     use probe_config::{
         AgentConfig, CaptureSelection, ExporterConfig, ExporterTransportConfig,
@@ -2248,6 +2371,240 @@ mod tests {
     }
 
     #[test]
+    fn pending_traffic_refresh_is_stale_after_same_socket_runtime_config_reload() {
+        let socket_path = PathBuf::from("/tmp/admin.sock");
+        let mut app = test_app();
+        app.attach_agent(RuntimeAttachment::existing(socket_path));
+
+        let request = app
+            .begin_traffic_refresh()
+            .expect("selected process should produce a traffic selector");
+        assert!(app.is_current_traffic_refresh_identity(&request.identity));
+
+        app.note_runtime_config_reloaded();
+
+        assert!(!app.is_current_traffic_refresh_identity(&request.identity));
+    }
+
+    #[test]
+    fn pending_traffic_refresh_is_stale_after_runtime_generation_is_queued() {
+        let mut app = test_app();
+        app.attach_agent(RuntimeAttachment::existing(PathBuf::from(
+            "/tmp/admin.sock",
+        )));
+        let request = app
+            .begin_traffic_refresh()
+            .expect("selected process should produce a traffic selector");
+        assert!(app.is_current_traffic_refresh_identity(&request.identity));
+
+        app.note_runtime_generation_queued(7);
+
+        assert!(!app.is_current_traffic_refresh_identity(&request.identity));
+    }
+
+    #[test]
+    fn traffic_refresh_holds_tail_while_runtime_generation_is_pending() {
+        let mut app = test_app();
+        app.attach_agent(RuntimeAttachment::existing(PathBuf::from(
+            "/tmp/admin.sock",
+        )));
+        app.note_runtime_generation_queued(7);
+        let request = app
+            .begin_traffic_refresh()
+            .expect("selected process should produce a traffic selector");
+
+        app.apply_traffic_refresh_result(TrafficRefreshLoadResult {
+            identity: request.identity.clone(),
+            diagnostics: Ok(runtime_generation_diagnostics_with_pending(
+                1,
+                "current",
+                7,
+                "candidate",
+            )),
+            traffic: TrafficRefreshResult::from_request_for_test(
+                &request.traffic,
+                tail_snapshot_with_capture_loss(10),
+            ),
+        });
+
+        assert!(app.traffic().rows().is_empty());
+        assert!(app.status().text.contains("Runtime generation request 7"));
+        assert!(app.status().text.contains("queued for candidate"));
+    }
+
+    #[test]
+    fn traffic_refresh_holds_tail_until_queued_runtime_generation_is_observed() {
+        let mut app = test_app();
+        app.attach_agent(RuntimeAttachment::existing(PathBuf::from(
+            "/tmp/admin.sock",
+        )));
+        app.note_runtime_generation_queued(7);
+        let request = app
+            .begin_traffic_refresh()
+            .expect("selected process should produce a traffic selector");
+
+        app.apply_traffic_refresh_result(TrafficRefreshLoadResult {
+            identity: request.identity.clone(),
+            diagnostics: Ok(stable_runtime_generation_diagnostics(1, "current")),
+            traffic: TrafficRefreshResult::from_request_for_test(
+                &request.traffic,
+                tail_snapshot_with_capture_loss(12),
+            ),
+        });
+
+        assert!(app.traffic().rows().is_empty());
+        assert!(
+            app.status()
+                .text
+                .contains("Runtime generation reload request 7 is pending")
+        );
+    }
+
+    #[test]
+    fn traffic_refresh_follows_superseding_runtime_generation_request() {
+        let mut app = test_app();
+        app.attach_agent(RuntimeAttachment::existing(PathBuf::from(
+            "/tmp/admin.sock",
+        )));
+        app.note_runtime_generation_queued(7);
+        let superseding = app
+            .begin_traffic_refresh()
+            .expect("selected process should produce a traffic selector");
+        app.apply_traffic_refresh_result(TrafficRefreshLoadResult {
+            identity: superseding.identity.clone(),
+            diagnostics: Ok(runtime_generation_diagnostics_with_pending(
+                1,
+                "current",
+                8,
+                "candidate-b",
+            )),
+            traffic: TrafficRefreshResult::from_request_for_test(
+                &superseding.traffic,
+                tail_snapshot_with_capture_loss(13),
+            ),
+        });
+        assert!(app.traffic().rows().is_empty());
+        assert!(app.status().text.contains("Runtime generation request 8"));
+
+        let after_failure = app
+            .begin_traffic_refresh()
+            .expect("selected process should produce a traffic selector");
+        app.apply_traffic_refresh_result(TrafficRefreshLoadResult {
+            identity: after_failure.identity.clone(),
+            diagnostics: Ok(runtime_generation_diagnostics_with_failed_outcome(
+                1, "current", 8,
+            )),
+            traffic: TrafficRefreshResult::from_request_for_test(
+                &after_failure.traffic,
+                tail_snapshot_with_capture_loss(14),
+            ),
+        });
+
+        assert_eq!(app.traffic().rows().len(), 1);
+        assert!(app.status().text.contains("request 8 failed"));
+    }
+
+    #[test]
+    fn traffic_refresh_holds_tail_when_tracked_generation_is_superseded_by_applied_outcome() {
+        let mut app = test_app();
+        app.attach_agent(RuntimeAttachment::existing(PathBuf::from(
+            "/tmp/admin.sock",
+        )));
+        app.note_runtime_generation_queued(7);
+        let request = app
+            .begin_traffic_refresh()
+            .expect("selected process should produce a traffic selector");
+        assert!(app.is_current_traffic_refresh_identity(&request.identity));
+
+        app.apply_traffic_refresh_result(TrafficRefreshLoadResult {
+            identity: request.identity.clone(),
+            diagnostics: Ok(runtime_generation_diagnostics_with_applied_outcome(
+                2,
+                "candidate-b",
+                8,
+            )),
+            traffic: TrafficRefreshResult::from_request_for_test(
+                &request.traffic,
+                tail_snapshot_with_capture_loss(15),
+            ),
+        });
+
+        assert!(app.traffic().rows().is_empty());
+        assert!(!app.is_current_traffic_refresh_identity(&request.identity));
+        assert!(
+            app.status()
+                .text
+                .contains("superseded by applied request 8")
+        );
+    }
+
+    #[test]
+    fn traffic_refresh_applies_tail_when_tracked_generation_is_superseded_by_failed_outcome() {
+        let mut app = test_app();
+        app.attach_agent(RuntimeAttachment::existing(PathBuf::from(
+            "/tmp/admin.sock",
+        )));
+        app.note_runtime_generation_queued(7);
+        let request = app
+            .begin_traffic_refresh()
+            .expect("selected process should produce a traffic selector");
+
+        app.apply_traffic_refresh_result(TrafficRefreshLoadResult {
+            identity: request.identity.clone(),
+            diagnostics: Ok(runtime_generation_diagnostics_with_failed_outcome(
+                1, "current", 8,
+            )),
+            traffic: TrafficRefreshResult::from_request_for_test(
+                &request.traffic,
+                tail_snapshot_with_capture_loss(16),
+            ),
+        });
+
+        assert_eq!(app.traffic().rows().len(), 1);
+        assert!(app.status().text.contains("request 8 failed"));
+    }
+
+    #[test]
+    fn traffic_refresh_holds_tail_and_expires_identity_when_runtime_generation_changes() {
+        let mut app = test_app();
+        app.attach_agent(RuntimeAttachment::existing(PathBuf::from(
+            "/tmp/admin.sock",
+        )));
+        let first = app
+            .begin_traffic_refresh()
+            .expect("selected process should produce a traffic selector");
+        app.apply_traffic_refresh_result(TrafficRefreshLoadResult {
+            identity: first.identity.clone(),
+            diagnostics: Ok(stable_runtime_generation_diagnostics(1, "current")),
+            traffic: TrafficRefreshResult::from_request_for_test(
+                &first.traffic,
+                empty_tail_snapshot(0),
+            ),
+        });
+        let second = app
+            .begin_traffic_refresh()
+            .expect("selected process should produce a traffic selector");
+        assert!(app.is_current_traffic_refresh_identity(&second.identity));
+
+        app.apply_traffic_refresh_result(TrafficRefreshLoadResult {
+            identity: second.identity.clone(),
+            diagnostics: Ok(stable_runtime_generation_diagnostics(2, "candidate")),
+            traffic: TrafficRefreshResult::from_request_for_test(
+                &second.traffic,
+                tail_snapshot_with_capture_loss(11),
+            ),
+        });
+
+        assert!(app.traffic().rows().is_empty());
+        assert!(!app.is_current_traffic_refresh_identity(&second.identity));
+        assert!(
+            app.status()
+                .text
+                .contains("Runtime generation changed to generation 2 (candidate)")
+        );
+    }
+
+    #[test]
     fn capture_backend_cycles_through_live_and_feed_backends() {
         let mut app = TuiApp::new(
             PathBuf::from("/tmp/agent.toml"),
@@ -2432,6 +2789,171 @@ mod tests {
             app.status().text,
             "No readable process entries are available; keeping the current traffic view unchanged"
         );
+    }
+
+    fn stable_runtime_generation_diagnostics(
+        generation: u64,
+        config_version: &str,
+    ) -> TrafficRuntimeDiagnostics {
+        runtime_generation_diagnostics(generation, config_version, None)
+    }
+
+    fn runtime_generation_diagnostics_with_pending(
+        generation: u64,
+        config_version: &str,
+        request_id: u64,
+        candidate_config_version: &str,
+    ) -> TrafficRuntimeDiagnostics {
+        runtime_generation_diagnostics(
+            generation,
+            config_version,
+            Some(json!({
+                "request_id": request_id,
+                "candidate_path": "/tmp/agent.toml",
+                "current_config_version": config_version,
+                "candidate_config_version": candidate_config_version,
+                "changed_sections": ["capture", "observations"],
+                "requested_unix_ns": 10
+            })),
+        )
+    }
+
+    fn runtime_generation_diagnostics_with_failed_outcome(
+        generation: u64,
+        config_version: &str,
+        request_id: u64,
+    ) -> TrafficRuntimeDiagnostics {
+        runtime_generation_diagnostics_with_last_outcome(
+            generation,
+            config_version,
+            Some(json!({
+                "request_id": request_id,
+                "completed_unix_ns": 30,
+                "result": {
+                    "result": "failed",
+                    "message": "candidate capture provider failed to open"
+                }
+            })),
+        )
+    }
+
+    fn runtime_generation_diagnostics_with_applied_outcome(
+        generation: u64,
+        config_version: &str,
+        request_id: u64,
+    ) -> TrafficRuntimeDiagnostics {
+        runtime_generation_diagnostics_with_last_outcome(
+            generation,
+            config_version,
+            Some(json!({
+                "request_id": request_id,
+                "completed_unix_ns": 30,
+                "result": {
+                    "result": "applied",
+                    "generation": generation,
+                    "config_version": config_version,
+                    "handoff": {
+                        "status": "drained"
+                    }
+                }
+            })),
+        )
+    }
+
+    fn runtime_generation_diagnostics(
+        generation: u64,
+        config_version: &str,
+        pending: Option<serde_json::Value>,
+    ) -> TrafficRuntimeDiagnostics {
+        runtime_generation_diagnostics_with_state(generation, config_version, pending, None)
+    }
+
+    fn runtime_generation_diagnostics_with_last_outcome(
+        generation: u64,
+        config_version: &str,
+        last_outcome: Option<serde_json::Value>,
+    ) -> TrafficRuntimeDiagnostics {
+        runtime_generation_diagnostics_with_state(generation, config_version, None, last_outcome)
+    }
+
+    fn runtime_generation_diagnostics_with_state(
+        generation: u64,
+        config_version: &str,
+        pending: Option<serde_json::Value>,
+        last_outcome: Option<serde_json::Value>,
+    ) -> TrafficRuntimeDiagnostics {
+        TrafficRuntimeDiagnostics::from_admin_response_for_test(json!({
+            "kind": "traffic_status",
+            "projection": {
+                "runtime_generation": {
+                    "active": {
+                        "generation": generation,
+                        "config_version": config_version
+                    },
+                    "pending": pending,
+                    "applying": null,
+                    "last_outcome": last_outcome,
+                    "capture_control": {
+                        "safe_points": 3,
+                        "last_safe_point_unix_ns": 20
+                    }
+                },
+                "capture": {
+                    "selection": "auto",
+                    "selected_backend": "ebpf",
+                    "selected_input_source": "live_host",
+                    "mode": "live",
+                    "reason": null,
+                    "candidates": [],
+                    "open_failures": []
+                }
+            }
+        }))
+        .expect("runtime generation diagnostics should parse")
+    }
+
+    fn tail_snapshot_with_capture_loss(sequence: u64) -> EventTailSnapshot {
+        let event = probe_core::EventEnvelope::from_provider(
+            probe_core::Timestamp {
+                monotonic_ns: sequence,
+                wall_time_unix_ns: i64::try_from(sequence).expect("test sequence fits i64"),
+            },
+            probe_core::CaptureOrigin::from_source(probe_core::CaptureSource::Replay),
+            "test",
+            probe_core::EventKind::CaptureLoss(probe_core::CaptureLoss {
+                lost_events: 1,
+                reason: "test capture loss".to_string(),
+            }),
+        );
+        EventTailSnapshot {
+            events: vec![EventTailRecord {
+                sequence,
+                stored_at_unix_ns: sequence,
+                event: EventTailEvent::from_envelope(&event),
+            }],
+            scanned: 1,
+            next_after_sequence: sequence,
+            ..empty_tail_snapshot(sequence.saturating_sub(1))
+        }
+    }
+
+    fn empty_tail_snapshot(after_sequence: u64) -> EventTailSnapshot {
+        EventTailSnapshot {
+            after_sequence,
+            next_after_sequence: after_sequence,
+            last_export_sequence: after_sequence,
+            attribution_mode: EventTailAttributionMode::Strict,
+            limit: 256,
+            scanned: 0,
+            budget: EventTailBudgetSnapshot {
+                max_event_payload_bytes: 1024,
+                max_record_bytes: 1024,
+                included_record_bytes: 0,
+                truncated: false,
+            },
+            events: Vec::new(),
+            omissions: Vec::new(),
+        }
     }
 
     fn test_app() -> TuiApp {

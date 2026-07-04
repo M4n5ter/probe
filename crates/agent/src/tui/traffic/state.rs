@@ -137,6 +137,23 @@ pub(crate) async fn load_traffic_refresh(request: TrafficRefreshRequest) -> Traf
     }
 }
 
+#[cfg(test)]
+impl TrafficRefreshResult {
+    pub(crate) fn from_request_for_test(
+        request: &TrafficRefreshRequest,
+        tail: EventTailSnapshot,
+    ) -> Self {
+        Self {
+            selector_key: request.selector_key.clone(),
+            event_filter: request.event_filter,
+            result: Ok(TrafficRefreshSnapshot {
+                tail,
+                empty_filter_diagnostics: None,
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrafficState {
     after_sequence: u64,
@@ -722,6 +739,10 @@ impl TrafficState {
 
     pub(crate) fn mark_refresh_paused(&mut self, message: impl Into<String>) {
         self.status = TrafficStatus::warning(message);
+    }
+
+    pub(crate) fn mark_refresh_waiting(&mut self, message: impl Into<String>) {
+        self.status = TrafficStatus::idle(message);
     }
 
     pub(crate) fn cycle_event_filter(&mut self) {

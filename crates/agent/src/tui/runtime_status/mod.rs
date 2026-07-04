@@ -67,6 +67,29 @@ pub(crate) struct TrafficRuntimeDiagnostics {
     mitm: Option<MitmDiagnostics>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveRuntimeGeneration {
+    pub(crate) generation: u64,
+    pub(crate) config_version: String,
+}
+
+impl ActiveRuntimeGeneration {
+    pub(crate) fn label(&self) -> String {
+        format!("generation {} ({})", self.generation, self.config_version)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeGenerationReloadObservation {
+    NotObserved,
+    InProgress,
+    Applied,
+    Failed,
+    SupersededInProgress { request_id: u64 },
+    SupersededApplied { request_id: u64 },
+    SupersededFailed { request_id: u64 },
+}
+
 impl TrafficRuntimeDiagnostics {
     #[cfg(test)]
     pub(crate) fn from_capture_snapshot(capture: CaptureStatusSnapshot) -> Self {
@@ -111,6 +134,13 @@ impl TrafficRuntimeDiagnostics {
             capture: CaptureDiagnostics::new(capture),
             mitm: MitmDiagnostics::from_enforcement(enforcement, Some(&tls_materials)),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_admin_response_for_test(
+        response: Value,
+    ) -> Result<Self, RuntimeStatusClientError> {
+        parse_traffic_runtime_diagnostics_response(&response)
     }
 
     pub(crate) fn status_message(&self, traffic_empty: bool) -> Option<CaptureDiagnosticMessage> {
@@ -177,6 +207,80 @@ impl TrafficRuntimeDiagnostics {
 
     pub(crate) fn capture_overview_line(&self) -> String {
         self.capture.overview_line()
+    }
+
+    pub(crate) fn active_runtime_generation(&self) -> Option<ActiveRuntimeGeneration> {
+        self.runtime_generation
+            .as_ref()
+            .map(|snapshot| ActiveRuntimeGeneration {
+                generation: snapshot.active.generation,
+                config_version: snapshot.active.config_version.clone(),
+            })
+    }
+
+    pub(crate) fn runtime_generation_reload_in_progress(&self) -> bool {
+        self.runtime_generation
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.pending.is_some() || snapshot.applying.is_some())
+    }
+
+    pub(crate) fn runtime_generation_reload_observation(
+        &self,
+        request_id: u64,
+    ) -> RuntimeGenerationReloadObservation {
+        let Some(snapshot) = &self.runtime_generation else {
+            return RuntimeGenerationReloadObservation::NotObserved;
+        };
+        if snapshot
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.request_id == request_id)
+            || snapshot
+                .applying
+                .as_ref()
+                .is_some_and(|applying| applying.request.request_id == request_id)
+        {
+            return RuntimeGenerationReloadObservation::InProgress;
+        }
+        if let Some(newer_request_id) = snapshot
+            .pending
+            .as_ref()
+            .map(|pending| pending.request_id)
+            .or_else(|| {
+                snapshot
+                    .applying
+                    .as_ref()
+                    .map(|applying| applying.request.request_id)
+            })
+            .filter(|newer_request_id| *newer_request_id > request_id)
+        {
+            return RuntimeGenerationReloadObservation::SupersededInProgress {
+                request_id: newer_request_id,
+            };
+        }
+        match &snapshot.last_outcome {
+            Some(outcome) if outcome.request_id == request_id => match &outcome.result {
+                RuntimeGenerationReloadResultSnapshot::Applied { .. } => {
+                    RuntimeGenerationReloadObservation::Applied
+                }
+                RuntimeGenerationReloadResultSnapshot::Failed { .. } => {
+                    RuntimeGenerationReloadObservation::Failed
+                }
+            },
+            Some(outcome) if outcome.request_id > request_id => match &outcome.result {
+                RuntimeGenerationReloadResultSnapshot::Applied { .. } => {
+                    RuntimeGenerationReloadObservation::SupersededApplied {
+                        request_id: outcome.request_id,
+                    }
+                }
+                RuntimeGenerationReloadResultSnapshot::Failed { .. } => {
+                    RuntimeGenerationReloadObservation::SupersededFailed {
+                        request_id: outcome.request_id,
+                    }
+                }
+            },
+            _ => RuntimeGenerationReloadObservation::NotObserved,
+        }
     }
 
     pub(crate) fn mitm_overview_line(&self) -> String {

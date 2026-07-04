@@ -70,14 +70,27 @@ enum RuntimeReconcileCompletion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeApplyPlanNote {
     text: String,
-    follow_up: RuntimeApplyFollowUp,
     status_kind: StatusKind,
+    effect: RuntimeApplyEffect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RuntimeApplyFollowUp {
+enum RuntimeApplyEffect {
     KeepRunning,
+    KeepRunningAfterReload,
+    KeepRunningDuringGeneration { request_id: u64 },
     RestartToApply,
+}
+
+impl RuntimeApplyEffect {
+    fn keeps_running(self) -> bool {
+        matches!(
+            self,
+            Self::KeepRunning
+                | Self::KeepRunningAfterReload
+                | Self::KeepRunningDuringGeneration { .. }
+        )
+    }
 }
 
 pub(super) fn spawn_startup_runtime_reconcile(config: AgentConfig) -> PendingRuntimeReconcile {
@@ -138,7 +151,7 @@ async fn saved_runtime_reconcile(
     )
     .await;
     if let (Some(_running), Some(note)) = (&supervisor, &plan_note)
-        && note.follow_up == RuntimeApplyFollowUp::KeepRunning
+        && note.effect.keeps_running()
     {
         let running = supervisor.expect("supervisor was checked");
         return RuntimeReconcileResult {
@@ -212,8 +225,8 @@ async fn runtime_apply_plan_note(
             Ok(path) => path,
             Err(error) => {
                 return Some(RuntimeApplyPlanNote {
-                    follow_up: RuntimeApplyFollowUp::RestartToApply,
                     status_kind: StatusKind::Warning,
+                    effect: RuntimeApplyEffect::RestartToApply,
                     text: format!("runtime config apply unavailable: {error}"),
                 });
             }
@@ -225,14 +238,14 @@ async fn runtime_apply_plan_note(
             Ok(summary) => {
                 let disposition = summary.disposition();
                 RuntimeApplyPlanNote {
-                    follow_up: runtime_apply_follow_up(&disposition),
                     status_kind: runtime_apply_status_kind(&disposition),
+                    effect: runtime_apply_effect(&disposition),
                     text: summary.status_text(),
                 }
             }
             Err(error) => RuntimeApplyPlanNote {
-                follow_up: RuntimeApplyFollowUp::RestartToApply,
                 status_kind: StatusKind::Warning,
+                effect: RuntimeApplyEffect::RestartToApply,
                 text: format!("runtime config apply unavailable: {error}"),
             },
         },
@@ -311,6 +324,13 @@ pub(super) fn apply_runtime_reconcile_result(
             saved_status,
             plan_note,
         } => {
+            match plan_note.effect {
+                RuntimeApplyEffect::KeepRunningAfterReload => app.note_runtime_config_reloaded(),
+                RuntimeApplyEffect::KeepRunningDuringGeneration { request_id } => {
+                    app.note_runtime_generation_queued(request_id);
+                }
+                RuntimeApplyEffect::KeepRunning | RuntimeApplyEffect::RestartToApply => {}
+            }
             mark_saved_runtime_with_kind(app, &saved_status, plan_note.text, plan_note.status_kind);
         }
         RuntimeReconcileCompletion::SavedRestarted {
@@ -380,16 +400,20 @@ fn runtime_apply_status_kind(disposition: &ConfigReloadApplyDisposition) -> Stat
     }
 }
 
-fn runtime_apply_follow_up(disposition: &ConfigReloadApplyDisposition) -> RuntimeApplyFollowUp {
+fn runtime_apply_effect(disposition: &ConfigReloadApplyDisposition) -> RuntimeApplyEffect {
     match disposition {
         ConfigReloadApplyDisposition::NeedsRestart
         | ConfigReloadApplyDisposition::RuntimeGenerationRequestFailed
-        | ConfigReloadApplyDisposition::Failed => RuntimeApplyFollowUp::RestartToApply,
+        | ConfigReloadApplyDisposition::Failed => RuntimeApplyEffect::RestartToApply,
+        ConfigReloadApplyDisposition::AppliedOnline => RuntimeApplyEffect::KeepRunningAfterReload,
+        ConfigReloadApplyDisposition::QueuedGeneration { request_id } => {
+            RuntimeApplyEffect::KeepRunningDuringGeneration {
+                request_id: *request_id,
+            }
+        }
         ConfigReloadApplyDisposition::NoChange
-        | ConfigReloadApplyDisposition::AppliedOnline
-        | ConfigReloadApplyDisposition::QueuedGeneration { .. }
         | ConfigReloadApplyDisposition::Rejected
-        | ConfigReloadApplyDisposition::OnlineApplyFailed => RuntimeApplyFollowUp::KeepRunning,
+        | ConfigReloadApplyDisposition::OnlineApplyFailed => RuntimeApplyEffect::KeepRunning,
     }
 }
 
@@ -589,8 +613,8 @@ mod tests {
                 saved_status,
                 plan_note: Some(RuntimeApplyPlanNote {
                     text: "runtime rebuild required for observations".to_string(),
-                    follow_up: RuntimeApplyFollowUp::RestartToApply,
                     status_kind: StatusKind::Warning,
+                    effect: RuntimeApplyEffect::RestartToApply,
                 }),
             },
         };
@@ -621,8 +645,8 @@ mod tests {
                 saved_status: StatusMessage::saved("Saved config"),
                 plan_note: RuntimeApplyPlanNote {
                     text: "running agent already matches saved config".to_string(),
-                    follow_up: RuntimeApplyFollowUp::KeepRunning,
                     status_kind: StatusKind::Info,
+                    effect: RuntimeApplyEffect::KeepRunning,
                 },
             },
         };
@@ -641,13 +665,48 @@ mod tests {
     }
 
     #[test]
+    fn saved_runtime_reconcile_keeps_running_agent_after_online_apply() {
+        let mut app = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::default(),
+        );
+        app.attach_agent(RuntimeAttachment::existing(PathBuf::from(
+            "/tmp/admin.sock",
+        )));
+        let result = RuntimeReconcileResult {
+            supervisor: None,
+            completion: RuntimeReconcileCompletion::SavedRuntimeKept {
+                saved_status: StatusMessage::saved("Saved export config"),
+                plan_note: RuntimeApplyPlanNote {
+                    text: "runtime applied saved config online: export worker reconciled"
+                        .to_string(),
+                    status_kind: StatusKind::Info,
+                    effect: RuntimeApplyEffect::KeepRunningAfterReload,
+                },
+            },
+        };
+        let mut supervisor = None;
+
+        apply_runtime_reconcile_result(&mut supervisor, &mut app, result);
+
+        assert!(app.status().text.contains("Saved export config"));
+        assert!(
+            app.status()
+                .text
+                .contains("runtime applied saved config online")
+        );
+    }
+
+    #[test]
     fn queued_runtime_generation_maps_to_non_restart_info_disposition() {
         let disposition = ConfigReloadApplyDisposition::QueuedGeneration { request_id: 7 };
 
         assert_eq!(
-            runtime_apply_follow_up(&disposition),
-            RuntimeApplyFollowUp::KeepRunning
+            runtime_apply_effect(&disposition),
+            RuntimeApplyEffect::KeepRunningDuringGeneration { request_id: 7 }
         );
+        assert!(runtime_apply_effect(&disposition).keeps_running());
         assert_eq!(runtime_apply_status_kind(&disposition), StatusKind::Info);
     }
 
