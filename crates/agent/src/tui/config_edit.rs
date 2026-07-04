@@ -54,6 +54,8 @@ pub(crate) enum TuiError {
     },
     #[error("terminal error: {0}")]
     Terminal(#[from] std::io::Error),
+    #[error("{task} task failed: {message}")]
+    TaskFailed { task: &'static str, message: String },
     #[error("failed to {action}: {source}")]
     AgentSupervisor {
         action: &'static str,

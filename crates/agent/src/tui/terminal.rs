@@ -14,7 +14,7 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 
-use probe_config::default_config_path;
+use probe_config::{AgentConfig, default_config_path};
 
 use super::{
     agent::TuiAgentSupervisor,
@@ -22,7 +22,12 @@ use super::{
         StatusMessage, TrafficRefreshLoadResult, TuiAction, TuiApp, TuiEffect, TuiTab,
         load_traffic_refresh_with_diagnostics,
     },
-    config_edit::{TuiError, load_config, load_or_create_config, save_config},
+    config_edit::{TuiError, load_config, load_or_create_config},
+    config_save_task::{
+        ConfigSaveCompletion, PendingConfigSave, apply_config_save_completion,
+        reject_reload_during_config_save, start_config_save, take_finished_config_save,
+        wait_for_config_save,
+    },
     hit::HitMap,
     process_catalog_task::{
         STARTUP_BACKGROUND_STATUS, apply_process_catalog_load_result,
@@ -34,7 +39,7 @@ use super::{
         PendingRuntimeReconcile, QueuedRuntimeReconcile, apply_runtime_reconcile_result,
         cancel_pending_runtime_reconcile, mark_saved_runtime_success, reload_runtime_actions,
         spawn_saved_runtime_reconcile, spawn_startup_runtime_reconcile,
-        take_finished_runtime_reconcile,
+        take_finished_runtime_reconcile, wait_for_runtime_reconcile,
     },
     traffic::{TrafficDetailLoadResult, load_traffic_detail},
 };
@@ -64,10 +69,21 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
             .checked_sub(TRAFFIC_REFRESH_INTERVAL)
             .unwrap_or_else(Instant::now);
         let mut last_agent_poll = Instant::now();
+        let mut pending_config_save: Option<PendingConfigSave> = None;
         let mut pending_traffic_detail: Option<PendingTrafficDetail> = None;
         let mut pending_traffic_refresh: Option<PendingTrafficRefresh> = None;
 
         loop {
+            if let Some(completion) = take_finished_config_save(&mut pending_config_save).await {
+                apply_config_save_and_queue_runtime(
+                    &mut loaded.source,
+                    &mut supervisor,
+                    &mut pending_runtime_reconcile,
+                    &mut queued_runtime_reconcile,
+                    &mut app,
+                    completion,
+                );
+            }
             if let Some(result) = take_finished_process_catalog(&mut pending_process_catalog).await
             {
                 apply_process_catalog_load_result(&mut app, result);
@@ -130,6 +146,16 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
             }
             let hit_map = terminal.draw(&mut app)?;
             if app.should_quit() {
+                finish_before_quit(
+                    &mut terminal,
+                    &mut loaded.source,
+                    &mut supervisor,
+                    &mut pending_config_save,
+                    &mut pending_runtime_reconcile,
+                    &mut queued_runtime_reconcile,
+                    &mut app,
+                )
+                .await?;
                 break;
             }
             if !event::poll(Duration::from_millis(250))? {
@@ -147,39 +173,40 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
                 match effect {
                     TuiEffect::SaveConfig { saved_status } => {
                         let should_reconcile_runtime = app.dirty() || supervisor.as_ref().is_none();
-                        match save_config(app.config_path(), &loaded.source, app.config()) {
-                            Ok(source) => {
-                                loaded.source = source;
-                                app.mark_saved(saved_status.clone());
-                                if should_reconcile_runtime {
-                                    queue_runtime_reconcile(
-                                        &mut supervisor,
-                                        &mut pending_runtime_reconcile,
-                                        &mut queued_runtime_reconcile,
-                                        &mut app,
-                                        saved_status,
-                                    );
-                                }
+                        start_config_save(
+                            &mut pending_config_save,
+                            &loaded.source,
+                            &mut app,
+                            saved_status,
+                            should_reconcile_runtime,
+                        );
+                    }
+                    TuiEffect::ReloadConfig => {
+                        if reject_reload_during_config_save(&pending_config_save, &mut app) {
+                            continue;
+                        }
+                        match load_config(app.config_path()) {
+                            Ok(next) => {
+                                loaded = next;
+                                app.replace_config(
+                                    loaded.config.clone(),
+                                    ProcessCatalog::default(),
+                                );
+                                app.mark_info(
+                                    "Reloaded config; refreshing process list in background",
+                                );
+                                pending_process_catalog = Some(spawn_process_catalog_load());
+                                queue_runtime_reconcile(
+                                    &mut supervisor,
+                                    &mut pending_runtime_reconcile,
+                                    &mut queued_runtime_reconcile,
+                                    &mut app,
+                                    StatusMessage::info("Reloaded config"),
+                                );
                             }
                             Err(error) => app.mark_save_failed(error.to_string()),
                         }
                     }
-                    TuiEffect::ReloadConfig => match load_config(app.config_path()) {
-                        Ok(next) => {
-                            loaded = next;
-                            app.replace_config(loaded.config.clone(), ProcessCatalog::default());
-                            app.mark_info("Reloaded config; refreshing process list in background");
-                            pending_process_catalog = Some(spawn_process_catalog_load());
-                            queue_runtime_reconcile(
-                                &mut supervisor,
-                                &mut pending_runtime_reconcile,
-                                &mut queued_runtime_reconcile,
-                                &mut app,
-                                StatusMessage::info("Reloaded config"),
-                            );
-                        }
-                        Err(error) => app.mark_save_failed(error.to_string()),
-                    },
                     TuiEffect::ReloadRuntimeActions => reload_runtime_actions(&mut app).await,
                     TuiEffect::LoadTrafficDetail { sequence } => {
                         start_traffic_detail_load(&mut app, &mut pending_traffic_detail, sequence)
@@ -233,6 +260,102 @@ struct PendingTrafficRefresh {
     task: tokio::task::JoinHandle<TrafficRefreshLoadResult>,
 }
 
+fn apply_config_save_and_queue_runtime(
+    loaded_source: &mut String,
+    supervisor: &mut Option<TuiAgentSupervisor>,
+    pending_runtime_reconcile: &mut Option<PendingRuntimeReconcile>,
+    queued_runtime_reconcile: &mut Option<QueuedRuntimeReconcile>,
+    app: &mut TuiApp,
+    completion: ConfigSaveCompletion,
+) {
+    if let Some(reconcile) = apply_config_save_completion(loaded_source, app, completion) {
+        queue_runtime_reconcile_for_config(
+            supervisor,
+            pending_runtime_reconcile,
+            queued_runtime_reconcile,
+            app,
+            reconcile.config,
+            reconcile.config_path,
+            reconcile.status,
+        );
+    }
+}
+
+async fn finish_before_quit(
+    terminal: &mut TerminalSession,
+    loaded_source: &mut String,
+    supervisor: &mut Option<TuiAgentSupervisor>,
+    pending_config_save: &mut Option<PendingConfigSave>,
+    pending_runtime_reconcile: &mut Option<PendingRuntimeReconcile>,
+    queued_runtime_reconcile: &mut Option<QueuedRuntimeReconcile>,
+    app: &mut TuiApp,
+) -> Result<(), TuiError> {
+    if pending_config_save.is_some() {
+        app.mark_info("Waiting for config save to finish before quit");
+        let _ = terminal.draw(app)?;
+        if let Some(completion) = wait_for_config_save(pending_config_save).await {
+            apply_config_save_and_queue_runtime(
+                loaded_source,
+                supervisor,
+                pending_runtime_reconcile,
+                queued_runtime_reconcile,
+                app,
+                completion,
+            );
+        }
+    }
+    if runtime_reconcile_needs_finish_before_quit(
+        pending_runtime_reconcile,
+        queued_runtime_reconcile,
+    ) {
+        app.mark_info("Waiting for runtime task to finish before quit");
+        let _ = terminal.draw(app)?;
+        drain_runtime_reconcile_before_quit(
+            supervisor,
+            app,
+            pending_runtime_reconcile,
+            queued_runtime_reconcile,
+        )
+        .await;
+    }
+    Ok(())
+}
+
+fn runtime_reconcile_needs_finish_before_quit(
+    pending_runtime_reconcile: &Option<PendingRuntimeReconcile>,
+    queued_runtime_reconcile: &Option<QueuedRuntimeReconcile>,
+) -> bool {
+    queued_runtime_reconcile.is_some()
+        || pending_runtime_reconcile
+            .as_ref()
+            .is_some_and(PendingRuntimeReconcile::must_finish_before_quit)
+}
+
+async fn drain_runtime_reconcile_before_quit(
+    supervisor: &mut Option<TuiAgentSupervisor>,
+    app: &mut TuiApp,
+    pending_runtime_reconcile: &mut Option<PendingRuntimeReconcile>,
+    queued_runtime_reconcile: &mut Option<QueuedRuntimeReconcile>,
+) {
+    loop {
+        if pending_runtime_reconcile.is_none() {
+            let Some(queued) = queued_runtime_reconcile.take() else {
+                break;
+            };
+            *pending_runtime_reconcile =
+                Some(spawn_queued_runtime_reconcile(supervisor, app, queued));
+        }
+        let Some(result) = wait_for_runtime_reconcile(pending_runtime_reconcile).await else {
+            break;
+        };
+        apply_runtime_reconcile_result(supervisor, app, result);
+        if let Some(queued) = queued_runtime_reconcile.take() {
+            *pending_runtime_reconcile =
+                Some(spawn_queued_runtime_reconcile(supervisor, app, queued));
+        }
+    }
+}
+
 fn queue_runtime_reconcile(
     supervisor: &mut Option<TuiAgentSupervisor>,
     pending_runtime_reconcile: &mut Option<PendingRuntimeReconcile>,
@@ -240,7 +363,27 @@ fn queue_runtime_reconcile(
     app: &mut TuiApp,
     status: StatusMessage,
 ) {
-    let queued = runtime_reconcile_request(app, status.clone());
+    queue_runtime_reconcile_for_config(
+        supervisor,
+        pending_runtime_reconcile,
+        queued_runtime_reconcile,
+        app,
+        app.config().clone(),
+        app.config_path().clone(),
+        status,
+    );
+}
+
+fn queue_runtime_reconcile_for_config(
+    supervisor: &mut Option<TuiAgentSupervisor>,
+    pending_runtime_reconcile: &mut Option<PendingRuntimeReconcile>,
+    queued_runtime_reconcile: &mut Option<QueuedRuntimeReconcile>,
+    app: &mut TuiApp,
+    config: AgentConfig,
+    config_path: PathBuf,
+    status: StatusMessage,
+) {
+    let queued = runtime_reconcile_request(config, config_path, status.clone());
     if pending_runtime_reconcile.is_some() {
         *queued_runtime_reconcile = Some(queued);
         mark_saved_runtime_success(
@@ -254,10 +397,14 @@ fn queue_runtime_reconcile(
     mark_saved_runtime_success(app, &status, "applying runtime changes in background");
 }
 
-fn runtime_reconcile_request(app: &TuiApp, status: StatusMessage) -> QueuedRuntimeReconcile {
+fn runtime_reconcile_request(
+    config: AgentConfig,
+    config_path: PathBuf,
+    status: StatusMessage,
+) -> QueuedRuntimeReconcile {
     QueuedRuntimeReconcile {
-        config: app.config().clone(),
-        config_path: app.config_path().clone(),
+        config,
+        config_path,
         saved_status: status,
     }
 }
@@ -510,6 +657,9 @@ mod tests {
             hit::{HitArea, HitMap, HitTarget, ScrollTarget},
             processes::{ProcessCatalog, ProcessEntry},
             render::draw,
+            runtime_reconcile::{
+                completed_runtime_reconcile_for_test, completed_startup_runtime_reconcile_for_test,
+            },
         },
         *,
     };
@@ -855,6 +1005,45 @@ mod tests {
 
         assert_eq!(result.sequence, 7);
         assert!(pending.is_none());
+    }
+
+    #[tokio::test]
+    async fn quit_drain_consumes_pending_runtime_reconcile() {
+        let mut supervisor = None;
+        let mut app = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::default(),
+        );
+        let mut pending_runtime_reconcile = Some(completed_runtime_reconcile_for_test(
+            "runtime task finished",
+        ));
+        let mut queued_runtime_reconcile = None;
+
+        drain_runtime_reconcile_before_quit(
+            &mut supervisor,
+            &mut app,
+            &mut pending_runtime_reconcile,
+            &mut queued_runtime_reconcile,
+        )
+        .await;
+
+        assert!(pending_runtime_reconcile.is_none());
+        assert!(queued_runtime_reconcile.is_none());
+        assert!(app.status().text.contains("runtime task finished"));
+    }
+
+    #[tokio::test]
+    async fn startup_runtime_reconcile_does_not_block_quit_without_saved_runtime_work() {
+        let pending_runtime_reconcile = Some(completed_startup_runtime_reconcile_for_test(
+            "startup still running",
+        ));
+        let queued_runtime_reconcile = None;
+
+        assert!(!runtime_reconcile_needs_finish_before_quit(
+            &pending_runtime_reconcile,
+            &queued_runtime_reconcile
+        ));
     }
 
     fn first_hit_coordinate(

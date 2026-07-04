@@ -3,6 +3,7 @@ mod app;
 mod config_edit;
 mod config_reload;
 mod config_render;
+mod config_save_task;
 mod controls;
 mod copy;
 mod data_path;

@@ -18,10 +18,16 @@ pub(super) struct QueuedRuntimeReconcile {
 
 pub(super) struct PendingRuntimeReconcile {
     task: tokio::task::JoinHandle<RuntimeReconcileResult>,
-    failure_context: RuntimeReconcileFailureContext,
+    origin: RuntimeReconcileOrigin,
 }
 
-enum RuntimeReconcileFailureContext {
+impl PendingRuntimeReconcile {
+    pub(super) fn must_finish_before_quit(&self) -> bool {
+        matches!(self.origin, RuntimeReconcileOrigin::Saved(_))
+    }
+}
+
+enum RuntimeReconcileOrigin {
     Startup,
     Saved(StatusMessage),
 }
@@ -96,7 +102,7 @@ impl RuntimeApplyEffect {
 pub(super) fn spawn_startup_runtime_reconcile(config: AgentConfig) -> PendingRuntimeReconcile {
     PendingRuntimeReconcile {
         task: tokio::spawn(async move { startup_runtime_reconcile(config).await }),
-        failure_context: RuntimeReconcileFailureContext::Startup,
+        origin: RuntimeReconcileOrigin::Startup,
     }
 }
 
@@ -123,13 +129,13 @@ pub(super) fn spawn_saved_runtime_reconcile(
     queued: QueuedRuntimeReconcile,
     active_socket_path: Option<PathBuf>,
 ) -> PendingRuntimeReconcile {
-    let failure_context = RuntimeReconcileFailureContext::Saved(queued.saved_status.clone());
+    let origin = RuntimeReconcileOrigin::Saved(queued.saved_status.clone());
     let running = supervisor.take();
     PendingRuntimeReconcile {
         task: tokio::spawn(async move {
             saved_runtime_reconcile(running, queued, active_socket_path).await
         }),
-        failure_context,
+        origin,
     }
 }
 
@@ -266,7 +272,20 @@ pub(super) async fn take_finished_runtime_reconcile(
         Ok(result) => result,
         Err(error) => RuntimeReconcileResult {
             supervisor: None,
-            completion: pending.failure_context.task_failed(error),
+            completion: pending.origin.task_failed(error),
+        },
+    })
+}
+
+pub(super) async fn wait_for_runtime_reconcile(
+    pending: &mut Option<PendingRuntimeReconcile>,
+) -> Option<RuntimeReconcileResult> {
+    let pending = pending.take()?;
+    Some(match pending.task.await {
+        Ok(result) => result,
+        Err(error) => RuntimeReconcileResult {
+            supervisor: None,
+            completion: pending.origin.task_failed(error),
         },
     })
 }
@@ -279,7 +298,42 @@ pub(super) async fn cancel_pending_runtime_reconcile(pending: Option<PendingRunt
     let _ = pending.task.await;
 }
 
-impl RuntimeReconcileFailureContext {
+#[cfg(test)]
+pub(super) fn completed_runtime_reconcile_for_test(
+    message: &'static str,
+) -> PendingRuntimeReconcile {
+    completed_runtime_reconcile_for_test_with_context(
+        message,
+        RuntimeReconcileOrigin::Saved(StatusMessage::saved("Saved config")),
+    )
+}
+
+#[cfg(test)]
+pub(super) fn completed_startup_runtime_reconcile_for_test(
+    message: &'static str,
+) -> PendingRuntimeReconcile {
+    completed_runtime_reconcile_for_test_with_context(message, RuntimeReconcileOrigin::Startup)
+}
+
+#[cfg(test)]
+fn completed_runtime_reconcile_for_test_with_context(
+    message: &'static str,
+    origin: RuntimeReconcileOrigin,
+) -> PendingRuntimeReconcile {
+    PendingRuntimeReconcile {
+        task: tokio::spawn(async move {
+            RuntimeReconcileResult {
+                supervisor: None,
+                completion: RuntimeReconcileCompletion::StartupUnavailable {
+                    message: message.to_string(),
+                },
+            }
+        }),
+        origin,
+    }
+}
+
+impl RuntimeReconcileOrigin {
     fn task_failed(self, error: tokio::task::JoinError) -> RuntimeReconcileCompletion {
         let message = format!("TUI runtime task failed: {error}");
         match self {
@@ -717,7 +771,7 @@ mod tests {
         task.abort();
         let mut pending = Some(PendingRuntimeReconcile {
             task,
-            failure_context: RuntimeReconcileFailureContext::Saved(saved_status),
+            origin: RuntimeReconcileOrigin::Saved(saved_status),
         });
         for _ in 0..10 {
             if pending
