@@ -248,11 +248,12 @@ admin surface tail 已解析的 export event。它优先使用选中进程的 ex
 selector；如果选中进程没有可读 executable path，流量过滤会 fail closed，不会退回展示无关的全机流量。
 TUI 的事件表只保留展示摘要，不保留进程 raw argv。bounded tail row 需要完整 payload
 详情时，详情弹窗会通过 admin surface 在后台加载仍被保留的事件。
-Traffic 可以按 HTTP exchange、WebSocket session 或 raw event 三种视图查看。
-HTTP 视图会把 request headers、request body chunks、response headers 和 response body chunks
-组织成同一条 exchange。WebSocket 视图会把 Upgrade handoff、frame metadata 和有界 message
-payload 组织成同一条 session。raw event 视图用于查看 SSE event、connection lifecycle、
-parser gap 或 capture provider diagnostics。
+Traffic 可以按 HTTP exchange、WebSocket session 或 raw event 三种视图查看。live traffic
+按最新优先展示，让新请求保持在表格顶部，旧行仍可通过滚动查看。HTTP 视图会把 request headers、
+request body chunks、response headers 和 response body chunks 组织成同一条 exchange，并在详情弹窗中保留
+完整 observed payload detail。WebSocket 视图会把 Upgrade handoff、frame metadata 和有界 message
+payload 组织成同一条 session。raw event 视图用于查看 SSE event、connection lifecycle、parser gap 或
+capture provider diagnostics。
 同一 Traffic tab 也提供 `Watch`、`Out MITM` 和 `In MITM` 操作，选中进程后即可配置
 passive traffic scope 或 product-proxy MITM，不需要切换到单独的配置页面。出站 MITM
 quick action 默认使用 80 和 443 端口，让普通明文 HTTP 和 TLS 解密后 HTTP 进入同一条

@@ -1,11 +1,11 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{cmp::Reverse, collections::BTreeMap, path::PathBuf};
 
 use probe_core::Selector;
 
 use super::{
     client::{TrafficClientError, request_event_detail, request_tail_events},
     filter::TrafficEventFilter,
-    http::{HttpExchangeRow, build_http_exchange_rows},
+    http::{HttpExchangeIdentity, HttpExchangeRow, build_http_exchange_rows},
     rows::TrafficRow,
     websocket::{WebSocketSessionIdentity, WebSocketSessionRow, build_websocket_session_rows},
 };
@@ -174,6 +174,15 @@ impl TrafficViewport {
         self.scroll
     }
 
+    fn anchor_scroll(&mut self, len: usize, index: usize, visible_rows: usize) {
+        if len == 0 {
+            self.reset();
+            return;
+        }
+        self.scroll = index.min(Self::max_scroll(len, visible_rows));
+        self.clamp_selection_to_viewport(len, visible_rows);
+    }
+
     fn reset(&mut self) {
         *self = Self::default();
     }
@@ -183,14 +192,18 @@ impl TrafficViewport {
         self.scroll = self.scroll.min(len.saturating_sub(1));
     }
 
-    fn subtract_dropped_rows(&mut self, drop_count: usize) {
-        self.selected_index = self.selected_index.saturating_sub(drop_count);
-        self.scroll = self.scroll.saturating_sub(drop_count);
+    fn select_tail(&mut self, _len: usize, _visible_rows: usize) {
+        self.selected_index = 0;
+        self.scroll = 0;
     }
 
-    fn select_tail(&mut self, len: usize, visible_rows: usize) {
-        self.selected_index = len.saturating_sub(1);
-        self.scroll = Self::max_scroll(len, visible_rows);
+    fn keep_tail_viewport(&mut self, len: usize, visible_rows: usize) {
+        if len == 0 {
+            self.reset();
+            return;
+        }
+        self.scroll = 0;
+        self.clamp_selection_to_viewport(len, visible_rows);
     }
 
     fn move_selection(&mut self, len: usize, delta: isize, visible_rows: usize) -> Option<bool> {
@@ -200,7 +213,7 @@ impl TrafficViewport {
         let raw = self.selected_index as isize + delta;
         self.selected_index = raw.clamp(0, len.saturating_sub(1) as isize) as usize;
         self.keep_selected_visible(visible_rows);
-        Some(self.selected_index == len.saturating_sub(1))
+        Some(self.selection_is_at_tail())
     }
 
     fn select_row(&mut self, len: usize, index: usize, visible_rows: usize) -> Option<bool> {
@@ -209,7 +222,7 @@ impl TrafficViewport {
         }
         self.selected_index = index;
         self.keep_selected_visible(visible_rows);
-        Some(self.selected_index == len.saturating_sub(1))
+        Some(self.selection_is_at_tail())
     }
 
     fn scroll_viewport(&mut self, len: usize, delta: isize, visible_rows: usize) -> Option<bool> {
@@ -219,7 +232,7 @@ impl TrafficViewport {
         let max_scroll = Self::max_scroll(len, visible_rows);
         self.scroll = scroll_position(self.scroll, delta, max_scroll);
         self.clamp_selection_to_viewport(len, visible_rows);
-        Some(self.is_at_tail(len, visible_rows))
+        Some(self.viewport_is_at_tail())
     }
 
     fn drag_scrollbar(
@@ -235,13 +248,13 @@ impl TrafficViewport {
         let max_scroll = Self::max_scroll(len, visible_rows);
         if max_scroll == 0 {
             self.scroll = 0;
-            self.selected_index = len.saturating_sub(1);
+            self.selected_index = 0;
             return Some(true);
         }
         let track = height.saturating_sub(1).max(1);
         self.scroll = offset.min(track).saturating_mul(max_scroll) / track;
         self.clamp_selection_to_viewport(len, visible_rows);
-        Some(self.is_at_tail(len, visible_rows))
+        Some(self.viewport_is_at_tail())
     }
 
     fn keep_selected_visible(&mut self, visible_rows: usize) {
@@ -272,8 +285,12 @@ impl TrafficViewport {
         self.selected_index = self.selected_index.min(max_index);
     }
 
-    fn is_at_tail(self, len: usize, visible_rows: usize) -> bool {
-        self.scroll >= Self::max_scroll(len, visible_rows)
+    fn selection_is_at_tail(self) -> bool {
+        self.selected_index == 0
+    }
+
+    fn viewport_is_at_tail(self) -> bool {
+        self.scroll == 0
     }
 
     fn max_scroll(len: usize, visible_rows: usize) -> usize {
@@ -285,6 +302,12 @@ impl TrafficViewport {
 struct TrafficProjection {
     mode: TrafficViewMode,
     len: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpSelection {
+    identity: HttpExchangeIdentity,
+    order_sequence: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -449,7 +472,10 @@ impl TrafficState {
     pub(crate) fn set_viewport_rows(&mut self, rows: usize) {
         self.viewport_rows = rows.max(1);
         if self.follow_tail {
-            self.select_tail(self.viewport_rows);
+            let projection = self.active_projection();
+            let visible_rows = self.viewport_rows;
+            self.viewport_mut(projection.mode)
+                .keep_tail_viewport(projection.len, visible_rows);
         } else {
             self.clamp_viewports_to_visible_rows();
         }
@@ -664,9 +690,6 @@ impl TrafficState {
                 .scroll_viewport(projection.len, delta, visible_rows);
         if let Some(follow_tail) = follow_tail {
             self.follow_tail = follow_tail;
-            if self.follow_tail {
-                self.select_tail(visible_rows);
-            }
         }
     }
 
@@ -680,9 +703,6 @@ impl TrafficState {
         );
         if let Some(follow_tail) = follow_tail {
             self.follow_tail = follow_tail;
-            if self.follow_tail {
-                self.select_tail(visible_rows);
-            }
         }
     }
 
@@ -725,22 +745,32 @@ impl TrafficState {
         self.last_export_sequence = snapshot.last_export_sequence;
         self.attribution_mode = snapshot.attribution_mode;
         let received = snapshot.events.len();
-        let selected_http_sequence = (!self.follow_tail)
+        let has_new_rows = !snapshot.events.is_empty() || !snapshot.omissions.is_empty();
+        let selected_event_sequence = (!self.follow_tail)
             .then(|| {
-                self.http_exchanges
-                    .get(self.http_view.selected_index())
-                    .map(HttpExchangeRow::order_sequence)
+                self.rows
+                    .get(self.event_view.selected_index())
+                    .map(|row| row.sequence)
             })
             .flatten();
-        let selected_websocket = (!self.follow_tail)
+        let event_anchor_sequence = (!self.follow_tail)
             .then(|| {
-                self.websocket_sessions
-                    .get(self.websocket_view.selected_index())
-                    .map(|row| WebSocketSelection {
-                        identity: row.identity(),
-                        order_sequence: row.order_sequence(),
-                    })
+                self.rows
+                    .get(self.event_view.scroll())
+                    .map(|row| row.sequence)
             })
+            .flatten();
+        let selected_http = (!self.follow_tail)
+            .then(|| self.http_selection_at(self.http_view.selected_index()))
+            .flatten();
+        let http_anchor = (!self.follow_tail)
+            .then(|| self.http_selection_at(self.http_view.scroll()))
+            .flatten();
+        let selected_websocket = (!self.follow_tail)
+            .then(|| self.websocket_selection_at(self.websocket_view.selected_index()))
+            .flatten();
+        let websocket_anchor = (!self.follow_tail)
+            .then(|| self.websocket_selection_at(self.websocket_view.scroll()))
             .flatten();
         let status = traffic_status_for_snapshot(
             received,
@@ -749,17 +779,19 @@ impl TrafficState {
             self.attribution_mode,
         );
         self.rows.extend(traffic_rows_for_snapshot(snapshot));
+        self.rows.sort_by_key(|row| Reverse(row.sequence));
+        self.rows.dedup_by_key(|row| row.sequence);
         self.rebuild_protocol_views();
         if self.rows.len() > MAX_ROWS {
-            let drop_count = self.rows.len() - MAX_ROWS;
-            self.rows.drain(0..drop_count);
+            self.rows.truncate(MAX_ROWS);
             self.rebuild_protocol_views();
-            self.event_view.subtract_dropped_rows(drop_count);
         }
-        if self.follow_tail && received > 0 {
+        if self.follow_tail && has_new_rows {
             self.select_tail(self.viewport_rows);
         } else if !self.follow_tail {
-            self.restore_protocol_selections(selected_http_sequence, selected_websocket);
+            self.restore_viewport_anchors(event_anchor_sequence, http_anchor, websocket_anchor);
+            self.restore_event_selection(selected_event_sequence);
+            self.restore_protocol_selections(selected_http, selected_websocket);
         } else {
             self.clamp_selection();
         }
@@ -829,40 +861,108 @@ impl TrafficState {
             .clamp_to_len(self.websocket_sessions.len());
     }
 
-    fn restore_protocol_selections(
+    fn http_selection_at(&self, index: usize) -> Option<HttpSelection> {
+        self.http_exchanges.get(index).map(|row| HttpSelection {
+            identity: row.identity(),
+            order_sequence: row.order_sequence(),
+        })
+    }
+
+    fn websocket_selection_at(&self, index: usize) -> Option<WebSocketSelection> {
+        self.websocket_sessions
+            .get(index)
+            .map(|row| WebSocketSelection {
+                identity: row.identity(),
+                order_sequence: row.order_sequence(),
+            })
+    }
+
+    fn restore_viewport_anchors(
         &mut self,
-        http_sequence: Option<u64>,
+        event_sequence: Option<u64>,
+        http_selection: Option<HttpSelection>,
         websocket_selection: Option<WebSocketSelection>,
     ) {
-        let http_index = http_sequence.and_then(|sequence| {
-            nearest_sequence_index(
-                &self.http_exchanges,
-                sequence,
-                HttpExchangeRow::order_sequence,
-            )
-        });
+        if let Some(index) = event_sequence
+            .and_then(|sequence| nearest_sequence_index(&self.rows, sequence, |row| row.sequence))
+        {
+            self.event_view
+                .anchor_scroll(self.rows.len(), index, self.viewport_rows);
+        }
+
+        if let Some(index) =
+            http_selection.and_then(|selection| self.http_index_for_selection(&selection))
+        {
+            self.http_view
+                .anchor_scroll(self.http_exchanges.len(), index, self.viewport_rows);
+        }
+
+        if let Some(index) =
+            websocket_selection.and_then(|selection| self.websocket_index_for_selection(&selection))
+        {
+            self.websocket_view.anchor_scroll(
+                self.websocket_sessions.len(),
+                index,
+                self.viewport_rows,
+            );
+        }
+    }
+
+    fn restore_protocol_selections(
+        &mut self,
+        http_selection: Option<HttpSelection>,
+        websocket_selection: Option<WebSocketSelection>,
+    ) {
+        let http_index =
+            http_selection.and_then(|selection| self.http_index_for_selection(&selection));
         if let Some(index) = http_index {
             let len = self.http_exchanges.len();
             self.http_view.select_row(len, index, self.viewport_rows);
         }
 
-        let websocket_index = websocket_selection.and_then(|selection| {
-            self.websocket_sessions
-                .iter()
-                .position(|row| row.matches_identity(&selection.identity))
-                .or_else(|| {
-                    nearest_sequence_index(
-                        &self.websocket_sessions,
-                        selection.order_sequence,
-                        WebSocketSessionRow::order_sequence,
-                    )
-                })
-        });
+        let websocket_index = websocket_selection
+            .and_then(|selection| self.websocket_index_for_selection(&selection));
         if let Some(index) = websocket_index {
             let len = self.websocket_sessions.len();
             self.websocket_view
                 .select_row(len, index, self.viewport_rows);
         }
+    }
+
+    fn http_index_for_selection(&self, selection: &HttpSelection) -> Option<usize> {
+        self.http_exchanges
+            .iter()
+            .position(|row| row.matches_identity(&selection.identity))
+            .or_else(|| {
+                nearest_sequence_index(
+                    &self.http_exchanges,
+                    selection.order_sequence,
+                    HttpExchangeRow::order_sequence,
+                )
+            })
+    }
+
+    fn websocket_index_for_selection(&self, selection: &WebSocketSelection) -> Option<usize> {
+        self.websocket_sessions
+            .iter()
+            .position(|row| row.matches_identity(&selection.identity))
+            .or_else(|| {
+                nearest_sequence_index(
+                    &self.websocket_sessions,
+                    selection.order_sequence,
+                    WebSocketSessionRow::order_sequence,
+                )
+            })
+    }
+
+    fn restore_event_selection(&mut self, event_sequence: Option<u64>) {
+        let Some(index) = event_sequence
+            .and_then(|sequence| nearest_sequence_index(&self.rows, sequence, |row| row.sequence))
+        else {
+            return;
+        };
+        let len = self.rows.len();
+        self.event_view.select_row(len, index, self.viewport_rows);
     }
 
     fn active_view(&self) -> TrafficActiveView {
@@ -1153,7 +1253,7 @@ fn traffic_rows_for_snapshot(snapshot: EventTailSnapshot) -> Vec<TrafficRow> {
                 .map(|omission| TrafficRow::from_omission(omission, scanned, budget.clone())),
         )
         .collect::<Vec<_>>();
-    rows.sort_by_key(|row| row.sequence);
+    rows.sort_by_key(|row| Reverse(row.sequence));
     rows
 }
 
@@ -1166,8 +1266,9 @@ fn nearest_sequence_index<T>(
         return None;
     }
     rows.iter()
-        .position(|row| row_sequence(row) >= sequence)
-        .or_else(|| Some(rows.len() - 1))
+        .enumerate()
+        .min_by_key(|(_, row)| row_sequence(row).abs_diff(sequence))
+        .map(|(index, _)| index)
 }
 
 fn omission_summary(omissions: &[EventTailOmission]) -> Option<String> {
@@ -1563,17 +1664,18 @@ mod tests {
         traffic.set_viewport_rows(10);
         traffic.apply_snapshot(tail_snapshot_with_websocket_handoffs(1..=MAX_ROWS as u64));
 
-        traffic.select_row(5, 10);
+        let old_session_index = MAX_ROWS - 6;
+        traffic.select_row(old_session_index, 10);
         assert!(!traffic.following_tail());
-        assert_eq!(traffic.websocket_sessions()[5].sequence, 6);
+        assert_eq!(traffic.websocket_sessions()[old_session_index].sequence, 6);
 
         traffic.apply_snapshot(tail_snapshot_with_websocket_handoffs(
             (MAX_ROWS as u64 + 1)..=(MAX_ROWS as u64 + 10),
         ));
 
-        assert_eq!(traffic.selected_websocket_session_index(), 0);
-        assert_eq!(traffic.websocket_sessions()[0].sequence, 11);
-        assert_eq!(traffic.websocket_sessions()[0].target, "/ws/11");
+        let selected = traffic.selected_websocket_session_index();
+        assert_eq!(traffic.websocket_sessions()[selected].sequence, 11);
+        assert_eq!(traffic.websocket_sessions()[selected].target, "/ws/11");
     }
 
     #[test]
@@ -1586,8 +1688,8 @@ mod tests {
             (25, websocket_handoff_event_with_flow("flow-d", 25, "/d")),
         ]));
 
-        assert_eq!(traffic.websocket_sessions()[0].target, "/b");
-        traffic.select_row(0, 10);
+        assert_eq!(traffic.websocket_sessions()[1].target, "/b");
+        traffic.select_row(1, 10);
         assert!(!traffic.following_tail());
 
         traffic.apply_snapshot(tail_snapshot_from_records(vec![
@@ -1600,6 +1702,147 @@ mod tests {
     }
 
     #[test]
+    fn paused_http_view_preserves_top_visible_exchange_when_newer_rows_arrive() {
+        let mut traffic = TrafficState::default();
+        traffic.set_viewport_rows(3);
+        traffic.apply_snapshot(tail_snapshot_from_records(
+            (1..=6)
+                .map(|sequence| {
+                    (
+                        sequence,
+                        request_event_with_flow(
+                            &format!("http-flow-{sequence}"),
+                            sequence,
+                            "GET",
+                            &format!("/http/{sequence}"),
+                        ),
+                    )
+                })
+                .collect(),
+        ));
+
+        traffic.scroll_viewport(2, 3);
+        assert_eq!(
+            traffic.http_exchanges()[traffic.http_scroll()].target,
+            "/http/4"
+        );
+        assert!(!traffic.following_tail());
+
+        traffic.apply_snapshot(tail_snapshot_from_records(
+            (7..=8)
+                .map(|sequence| {
+                    (
+                        sequence,
+                        request_event_with_flow(
+                            &format!("http-flow-{sequence}"),
+                            sequence,
+                            "GET",
+                            &format!("/http/{sequence}"),
+                        ),
+                    )
+                })
+                .collect(),
+        ));
+
+        assert_eq!(
+            traffic.http_exchanges()[traffic.http_scroll()].target,
+            "/http/4"
+        );
+        assert_eq!(traffic.http_scroll(), 4);
+        assert!(!traffic.following_tail());
+    }
+
+    #[test]
+    fn paused_websocket_view_preserves_top_visible_session_when_newer_rows_arrive() {
+        let mut traffic = TrafficState::default();
+        traffic.cycle_view_mode();
+        traffic.set_viewport_rows(3);
+        traffic.apply_snapshot(tail_snapshot_from_records(
+            (1..=6)
+                .map(|sequence| {
+                    (
+                        sequence,
+                        websocket_handoff_event_with_flow(
+                            &format!("websocket-flow-{sequence}"),
+                            sequence,
+                            &format!("/ws/{sequence}"),
+                        ),
+                    )
+                })
+                .collect(),
+        ));
+
+        traffic.scroll_viewport(2, 3);
+        assert_eq!(
+            traffic.websocket_sessions()[traffic.websocket_scroll()].target,
+            "/ws/4"
+        );
+        assert!(!traffic.following_tail());
+
+        traffic.apply_snapshot(tail_snapshot_from_records(
+            (7..=8)
+                .map(|sequence| {
+                    (
+                        sequence,
+                        websocket_handoff_event_with_flow(
+                            &format!("websocket-flow-{sequence}"),
+                            sequence,
+                            &format!("/ws/{sequence}"),
+                        ),
+                    )
+                })
+                .collect(),
+        ));
+
+        assert_eq!(
+            traffic.websocket_sessions()[traffic.websocket_scroll()].target,
+            "/ws/4"
+        );
+        assert_eq!(traffic.websocket_scroll(), 4);
+        assert!(!traffic.following_tail());
+    }
+
+    #[test]
+    fn paused_http_selection_restores_same_surviving_exchange_after_window_truncates_first_event() {
+        let mut traffic = TrafficState::default();
+        traffic.set_viewport_rows(10);
+        traffic.apply_snapshot(tail_snapshot_from_records(vec![
+            (1, request_event_with_flow("flow-long", 1, "GET", "/long")),
+            (20, response_event_with_flow("flow-long", 20, 200, "OK")),
+            (
+                30,
+                request_event_with_flow("flow-other", 30, "GET", "/other"),
+            ),
+        ]));
+
+        assert_eq!(traffic.http_exchanges()[1].target, "/long");
+        traffic.select_row(1, 10);
+        assert!(!traffic.following_tail());
+
+        let long_late_sequence = MAX_ROWS as u64 + 40;
+        let other_late_sequence = MAX_ROWS as u64 + 10;
+        let records = (31..=(MAX_ROWS as u64 + 50))
+            .map(|sequence| {
+                let event = if sequence == long_late_sequence {
+                    response_event_with_flow("flow-long", sequence, 204, "No Content")
+                } else if sequence == other_late_sequence {
+                    response_event_with_flow("flow-other", sequence, 202, "Accepted")
+                } else {
+                    gap_event(sequence)
+                };
+                (sequence, event)
+            })
+            .collect::<Vec<_>>();
+        traffic.apply_snapshot(tail_snapshot_from_records(records));
+
+        let selected = traffic.selected_http_exchange_index();
+        assert_eq!(
+            traffic.http_exchanges()[selected].order_sequence(),
+            long_late_sequence
+        );
+    }
+
+    #[test]
     fn traffic_tail_follows_new_events_by_default() {
         let mut traffic = traffic_in_events_view();
         traffic.set_viewport_rows(5);
@@ -1607,41 +1850,99 @@ mod tests {
         traffic.apply_snapshot(tail_snapshot_with_body_events(1..=10));
 
         assert_eq!(traffic.rows().len(), 10);
-        assert_eq!(traffic.selected_index(), 9);
-        assert_eq!(traffic.scroll(), 5);
+        assert_eq!(traffic.rows()[0].sequence, 10);
+        assert_eq!(traffic.selected_index(), 0);
+        assert_eq!(traffic.scroll(), 0);
         assert!(traffic.following_tail());
 
         traffic.apply_snapshot(tail_snapshot_with_body_events(11..=12));
 
         assert_eq!(traffic.rows().len(), 12);
-        assert_eq!(traffic.selected_index(), 11);
-        assert_eq!(traffic.scroll(), 7);
+        assert_eq!(traffic.rows()[0].sequence, 12);
+        assert_eq!(traffic.selected_index(), 0);
+        assert_eq!(traffic.scroll(), 0);
         assert!(traffic.following_tail());
     }
 
     #[test]
-    fn traffic_scroll_pauses_tail_follow_until_user_returns_to_bottom() {
+    fn traffic_scroll_pauses_tail_follow_until_user_returns_to_latest_viewport() {
         let mut traffic = traffic_in_events_view();
         traffic.set_viewport_rows(5);
         traffic.apply_snapshot(tail_snapshot_with_body_events(1..=10));
 
-        traffic.scroll_viewport(-3, 5);
+        traffic.scroll_viewport(3, 5);
 
-        assert_eq!(traffic.scroll(), 2);
-        assert_eq!(traffic.selected_index(), 6);
+        assert_eq!(traffic.scroll(), 3);
+        assert_eq!(traffic.selected_index(), 3);
+        assert_eq!(traffic.rows()[traffic.selected_index()].sequence, 7);
+        assert_eq!(traffic.rows()[traffic.scroll()].sequence, 7);
         assert!(!traffic.following_tail());
 
         traffic.apply_snapshot(tail_snapshot_with_body_events(11..=12));
 
-        assert_eq!(traffic.selected_index(), 6);
-        assert_eq!(traffic.scroll(), 2);
+        assert_eq!(traffic.rows()[traffic.selected_index()].sequence, 7);
+        assert_eq!(traffic.rows()[traffic.scroll()].sequence, 7);
+        assert_eq!(traffic.scroll(), 5);
         assert!(!traffic.following_tail());
 
-        traffic.drag_scrollbar(9, 10, 5);
+        traffic.scroll_viewport(-5, 5);
 
-        assert_eq!(traffic.selected_index(), 11);
-        assert_eq!(traffic.scroll(), 7);
+        assert_eq!(traffic.selected_index(), 4);
+        assert_eq!(traffic.scroll(), 0);
         assert!(traffic.following_tail());
+
+        traffic.set_viewport_rows(5);
+
+        assert_eq!(traffic.selected_index(), 4);
+        assert_eq!(traffic.scroll(), 0);
+        assert!(traffic.following_tail());
+
+        traffic.apply_snapshot(tail_snapshot_with_body_events(13..=14));
+
+        assert_eq!(traffic.rows()[0].sequence, 14);
+        assert_eq!(traffic.selected_index(), 0);
+        assert_eq!(traffic.scroll(), 0);
+        assert!(traffic.following_tail());
+    }
+
+    #[test]
+    fn traffic_scrollbar_drag_to_latest_viewport_resumes_tail_follow() {
+        let mut traffic = traffic_in_events_view();
+        traffic.set_viewport_rows(5);
+        traffic.apply_snapshot(tail_snapshot_with_body_events(1..=10));
+
+        traffic.scroll_viewport(3, 5);
+        traffic.apply_snapshot(tail_snapshot_with_body_events(11..=12));
+        assert_eq!(traffic.rows()[traffic.selected_index()].sequence, 7);
+        assert_eq!(traffic.rows()[traffic.scroll()].sequence, 7);
+        assert_eq!(traffic.scroll(), 5);
+        assert!(!traffic.following_tail());
+
+        traffic.drag_scrollbar(0, 10, 5);
+
+        assert_eq!(traffic.selected_index(), 4);
+        assert_eq!(traffic.scroll(), 0);
+        assert!(traffic.following_tail());
+    }
+
+    #[test]
+    fn live_tail_selects_new_omission_rows_after_viewport_returns_to_latest() {
+        let mut traffic = traffic_in_events_view();
+        traffic.set_viewport_rows(5);
+        traffic.apply_snapshot(tail_snapshot_with_body_events(1..=10));
+
+        traffic.scroll_viewport(3, 5);
+        traffic.apply_snapshot(tail_snapshot_with_body_events(11..=12));
+        traffic.scroll_viewport(-5, 5);
+        assert!(traffic.following_tail());
+        assert_eq!(traffic.selected_index(), 4);
+
+        traffic.apply_snapshot(tail_snapshot_with_response_budget_omission_at(13));
+
+        assert_eq!(traffic.selected_index(), 0);
+        let row = traffic.selected_row().expect("omission row is selected");
+        assert_eq!(row.sequence, 13);
+        assert_eq!(row.event_type, "tail omission");
     }
 
     #[test]
@@ -1650,7 +1951,7 @@ mod tests {
         traffic.set_viewport_rows(5);
         traffic.apply_snapshot(tail_snapshot_with_body_events(1..=10));
 
-        traffic.scroll_viewport(-3, 5);
+        traffic.scroll_viewport(3, 5);
         traffic.apply_snapshot(tail_snapshot_with_body_events(11..=12));
         assert_eq!(traffic.tail_mode_label(), "Paused");
         assert!(!traffic.following_tail());
@@ -1658,8 +1959,8 @@ mod tests {
         traffic.jump_to_tail(5);
 
         assert_eq!(traffic.tail_mode_label(), "Live");
-        assert_eq!(traffic.selected_index(), 11);
-        assert_eq!(traffic.scroll(), 7);
+        assert_eq!(traffic.selected_index(), 0);
+        assert_eq!(traffic.scroll(), 0);
         assert!(traffic.following_tail());
     }
 
@@ -1909,18 +2210,22 @@ mod tests {
     }
 
     fn tail_snapshot_with_response_budget_omission() -> EventTailSnapshot {
+        tail_snapshot_with_response_budget_omission_at(2)
+    }
+
+    fn tail_snapshot_with_response_budget_omission_at(sequence: u64) -> EventTailSnapshot {
         EventTailSnapshot {
             after_sequence: 0,
-            next_after_sequence: 2,
-            last_export_sequence: 2,
+            next_after_sequence: sequence,
+            last_export_sequence: sequence,
             attribution_mode: EventTailAttributionMode::Strict,
             limit: 64,
-            scanned: 2,
+            scanned: sequence as usize,
             budget: tail_budget(256, 128, true),
             events: Vec::new(),
             omissions: vec![EventTailOmission {
-                sequence: 2,
-                stored_at_unix_ns: 200,
+                sequence,
+                stored_at_unix_ns: sequence * 100,
                 payload_schema: SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON.to_string(),
                 payload_bytes: 4096,
                 reason: EventTailOmissionReason::ResponseBudgetExceeded,
@@ -2101,12 +2406,24 @@ mod tests {
     }
 
     fn request_event(method: &str, target: &str) -> EventEnvelope {
+        let flow_id = test_flow().id.0;
+        request_event_with_flow(&flow_id, 1, method, target)
+    }
+
+    fn request_event_with_flow(
+        flow_id: &str,
+        sequence: u64,
+        method: &str,
+        target: &str,
+    ) -> EventEnvelope {
+        let mut flow = test_flow();
+        flow.id = FlowIdentity(flow_id.to_string());
         EventEnvelope::from_flow(
             Timestamp {
-                monotonic_ns: 1,
-                wall_time_unix_ns: 1,
+                monotonic_ns: sequence,
+                wall_time_unix_ns: sequence as i64,
             },
-            test_flow(),
+            flow,
             CaptureOrigin::from_source(CaptureSource::Replay),
             "test",
             EventKind::HttpRequestHeaders(probe_core::HttpHeaders {
@@ -2227,12 +2544,24 @@ mod tests {
     }
 
     fn response_event(status: u16, reason: &str) -> EventEnvelope {
+        let flow_id = test_flow().id.0;
+        response_event_with_flow(&flow_id, 1, status, reason)
+    }
+
+    fn response_event_with_flow(
+        flow_id: &str,
+        sequence: u64,
+        status: u16,
+        reason: &str,
+    ) -> EventEnvelope {
+        let mut flow = test_flow();
+        flow.id = FlowIdentity(flow_id.to_string());
         EventEnvelope::from_flow(
             Timestamp {
-                monotonic_ns: 1,
-                wall_time_unix_ns: 1,
+                monotonic_ns: sequence,
+                wall_time_unix_ns: sequence as i64,
             },
-            test_flow(),
+            flow,
             CaptureOrigin::from_source(CaptureSource::Replay),
             "test",
             EventKind::HttpResponseHeaders(probe_core::HttpHeaders {

@@ -286,11 +286,13 @@ for the event table and does not retain raw process argv. When a bounded tail
 row needs full payload detail, the detail popup loads the retained event through
 the admin surface in the background.
 Traffic can be viewed as HTTP exchanges, WebSocket sessions, or raw events.
-The HTTP view groups request headers, request body chunks, response headers, and
-response body chunks into one exchange row. The WebSocket view groups Upgrade
-handoff, frame metadata, and bounded message payload into one session row. Raw
-events stay available for SSE events, connection lifecycle, parser gaps, and
-capture-provider diagnostics.
+Live traffic is presented newest-first so fresh requests remain visible at the
+top while older rows remain reachable by scrolling. The HTTP view groups request
+headers, request body chunks, response headers, and response body chunks into one
+exchange row and keeps the full observed payload detail in the detail popup. The
+WebSocket view groups Upgrade handoff, frame metadata, and bounded message
+payload into one session row. Raw events stay available for SSE events,
+connection lifecycle, parser gaps, and capture-provider diagnostics.
 The same tab also exposes `Watch`, `Out MITM`, and `In MITM` actions so a
 selected process can be scoped for passive traffic or product-proxy MITM without
 switching to a separate configuration screen. The outbound MITM quick action

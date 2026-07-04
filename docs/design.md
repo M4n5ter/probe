@@ -338,6 +338,9 @@ Operator TUI 能力事实：
   过滤，并返回 `next_after_sequence`；该响应 cursor 不会 ack 任何 exporter sink cursor。
   响应同时受单事件 payload budget 和总响应 payload budget 约束；超限事件通过 omission metadata 表达，不在响应中展开。
   当请求带 selector 且某条超限事件无法解码验证 selector 时，该事件不返回 omission metadata，只推进扫描 cursor。
+- Traffic tab 的 live tail 采用最新优先排序；HTTP exchange、WebSocket session 和 raw event 三个视图共享该排序语义。
+  HTTP/WebSocket 聚合按 event sequence 构建，再按最新 activity 展示，因此 body/header 归类不受 UI 排序影响。
+  HTTP detail popup 保留 request/response headers、完整 observed payload detail、chunk offset 和 incomplete reason。
 - `event_detail` 是 non-mutating admin command。它按 export sequence 读取仍被 retention 保留的一条
   `EventEnvelope`，不推进 exporter sink cursor，也不受 `tail_events` 列表响应 budget 约束。
   该命令仍受单响应详情预算约束：预算内返回完整事件；超过预算返回 `event_detail_too_large`
