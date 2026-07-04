@@ -8,7 +8,7 @@ use std::{
 
 use capture::{CaptureError, CapturePoll, CaptureProvider};
 use parsers::Http1ParserFactory;
-use pipeline::{CapturePipeline, PipelineRunOptions};
+use pipeline::{CapturePipeline, PipelineHandoffDrainOutcome, PipelineRunOptions};
 use probe_core::CapabilityState;
 use tempfile::tempdir;
 
@@ -138,7 +138,7 @@ fn drain_provider_before_handoff_journals_drain_events_until_idle()
     let summary =
         pipeline.drain_provider_before_handoff(&mut provider, PipelineRunOptions::max_polls(8))?;
 
-    assert!(summary.drained);
+    assert_eq!(summary.outcome, PipelineHandoffDrainOutcome::Drained);
     assert_eq!(summary.pipeline.capture_events_read, 1);
     assert_eq!(summary.pipeline.ingress_records_journaled, 1);
     assert_eq!(summary.pipeline.ingress_records_processed, 1);
@@ -150,7 +150,28 @@ fn drain_provider_before_handoff_journals_drain_events_until_idle()
 }
 
 #[test]
-fn drain_provider_before_handoff_reports_not_drained_when_poll_budget_is_exhausted()
+fn drain_provider_before_handoff_reports_progress_before_budget_is_exhausted()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let spool = storage::FjallSpool::open(temp.path())?;
+    let mut parser_factory = Http1ParserFactory::default();
+    let mut provider = HandoffDrainProvider::new(vec![CapturePoll::Progress]);
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
+
+    let summary =
+        pipeline.drain_provider_before_handoff(&mut provider, PipelineRunOptions::max_polls(8))?;
+
+    assert_eq!(summary.outcome, PipelineHandoffDrainOutcome::Progress);
+    assert_eq!(summary.pipeline.capture_events_read, 0);
+    assert_eq!(provider.polls, 0);
+    assert_eq!(provider.handoff_polls, 1);
+    assert!(spool.read_ingress_batch_after(0, 10)?.is_empty());
+    assert!(spool.read_export_batch("sink", 10)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn drain_provider_before_handoff_reports_budget_exhausted_when_poll_budget_runs_out()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempdir()?;
     let spool = storage::FjallSpool::open(temp.path())?;
@@ -170,7 +191,10 @@ fn drain_provider_before_handoff_reports_not_drained_when_poll_budget_is_exhaust
     let summary =
         pipeline.drain_provider_before_handoff(&mut provider, PipelineRunOptions::max_polls(1))?;
 
-    assert!(!summary.drained);
+    assert_eq!(
+        summary.outcome,
+        PipelineHandoffDrainOutcome::BudgetExhausted
+    );
     assert_eq!(summary.pipeline.capture_events_read, 1);
     assert_eq!(summary.pipeline.ingress_records_journaled, 1);
     assert_eq!(provider.polls, 0);
@@ -200,7 +224,10 @@ fn drain_provider_before_handoff_respects_max_events() -> Result<(), Box<dyn std
     let summary =
         pipeline.drain_provider_before_handoff(&mut provider, PipelineRunOptions::max_events(1))?;
 
-    assert!(!summary.drained);
+    assert_eq!(
+        summary.outcome,
+        PipelineHandoffDrainOutcome::BudgetExhausted
+    );
     assert_eq!(summary.pipeline.capture_events_read, 1);
     assert_eq!(summary.pipeline.ingress_records_journaled, 1);
     assert_eq!(provider.polls, 0);

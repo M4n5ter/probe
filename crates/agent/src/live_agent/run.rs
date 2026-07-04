@@ -52,10 +52,13 @@ use crate::{
     },
 };
 
+use super::handoff::{
+    RUNTIME_GENERATION_HANDOFF_DRAIN_POLLS, RuntimeGenerationHandoffDecision,
+    RuntimeGenerationHandoffDrain,
+};
+
 const INGRESS_RECOVERY_BATCH_SIZE: usize = 1_024;
 const LIVE_CAPTURE_BATCH_POLLS: u64 = 8;
-const LIVE_CAPTURE_HANDOFF_DRAIN_POLLS: u64 = 1_024;
-const LIVE_CAPTURE_HANDOFF_MAX_DRAIN_BATCHES: u32 = 8;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RunOptions {
     pub max_events: Option<u64>,
@@ -469,12 +472,12 @@ impl BlockingCaptureRun {
                     let drain_summary =
                         pipeline.drain_provider_before_handoff(provider.as_mut(), drain_options)?;
                     let provider_finished = drain_summary.pipeline.capture_provider_finished;
-                    let handoff_drained = drain_summary.drained;
+                    let handoff_outcome = drain_summary.outcome;
                     summary.merge(drain_summary.pipeline);
                     if provider_finished || shutdown::requested(&shutdown_requested) {
                         break;
                     }
-                    let handoff = match handoff_drain.observe(handoff_drained) {
+                    let handoff = match handoff_drain.observe(handoff_outcome) {
                         RuntimeGenerationHandoffDecision::WaitForDrain => continue,
                         RuntimeGenerationHandoffDecision::Proceed(handoff) => handoff,
                     };
@@ -482,7 +485,7 @@ impl BlockingCaptureRun {
                         handoff
                     {
                         eprintln!(
-                            "runtime generation handoff forced after {after_batches} non-drained capture drain batch(es)"
+                            "runtime generation handoff forced after {after_batches} capture drain handoff attempt(s)"
                         );
                     }
                     runtime_generation.record_capture_safe_point();
@@ -529,41 +532,6 @@ impl BlockingCaptureRun {
     }
 }
 
-#[derive(Debug, Default)]
-struct RuntimeGenerationHandoffDrain {
-    not_drained_batches: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RuntimeGenerationHandoffDecision {
-    WaitForDrain,
-    Proceed(RuntimeGenerationHandoffOutcomeSnapshot),
-}
-
-impl RuntimeGenerationHandoffDrain {
-    fn observe(&mut self, drained: bool) -> RuntimeGenerationHandoffDecision {
-        if drained {
-            self.reset();
-            return RuntimeGenerationHandoffDecision::Proceed(
-                RuntimeGenerationHandoffOutcomeSnapshot::Drained,
-            );
-        }
-        self.not_drained_batches = self.not_drained_batches.saturating_add(1);
-        if self.not_drained_batches < LIVE_CAPTURE_HANDOFF_MAX_DRAIN_BATCHES {
-            return RuntimeGenerationHandoffDecision::WaitForDrain;
-        }
-        let after_batches = self.not_drained_batches;
-        self.reset();
-        RuntimeGenerationHandoffDecision::Proceed(RuntimeGenerationHandoffOutcomeSnapshot::Forced {
-            after_batches,
-        })
-    }
-
-    fn reset(&mut self) {
-        self.not_drained_batches = 0;
-    }
-}
-
 fn live_capture_run_options(
     max_events: Option<u64>,
     events_read: u64,
@@ -586,7 +554,7 @@ fn live_capture_handoff_drain_options(
         max_events,
         events_read,
         shutdown_requested,
-        LIVE_CAPTURE_HANDOFF_DRAIN_POLLS,
+        RUNTIME_GENERATION_HANDOFF_DRAIN_POLLS,
     )
 }
 
@@ -791,47 +759,9 @@ mod tests {
             .expect("remaining events should produce a handoff drain batch");
 
         assert_eq!(options.max_events, Some(2));
-        assert_eq!(options.max_polls, Some(LIVE_CAPTURE_HANDOFF_DRAIN_POLLS));
-    }
-
-    #[test]
-    fn runtime_generation_handoff_decision_waits_until_bounded_budget_is_exhausted() {
-        let mut handoff = RuntimeGenerationHandoffDrain::default();
-
-        for _ in 1..LIVE_CAPTURE_HANDOFF_MAX_DRAIN_BATCHES {
-            assert_eq!(
-                handoff.observe(false),
-                RuntimeGenerationHandoffDecision::WaitForDrain
-            );
-        }
-
         assert_eq!(
-            handoff.observe(false),
-            RuntimeGenerationHandoffDecision::Proceed(
-                RuntimeGenerationHandoffOutcomeSnapshot::Forced {
-                    after_batches: LIVE_CAPTURE_HANDOFF_MAX_DRAIN_BATCHES
-                }
-            )
-        );
-    }
-
-    #[test]
-    fn runtime_generation_handoff_decision_resets_after_successful_drain() {
-        let mut handoff = RuntimeGenerationHandoffDrain::default();
-        assert_eq!(
-            handoff.observe(false),
-            RuntimeGenerationHandoffDecision::WaitForDrain
-        );
-
-        assert_eq!(
-            handoff.observe(true),
-            RuntimeGenerationHandoffDecision::Proceed(
-                RuntimeGenerationHandoffOutcomeSnapshot::Drained
-            )
-        );
-        assert_eq!(
-            handoff.observe(false),
-            RuntimeGenerationHandoffDecision::WaitForDrain
+            options.max_polls,
+            Some(RUNTIME_GENERATION_HANDOFF_DRAIN_POLLS)
         );
     }
 

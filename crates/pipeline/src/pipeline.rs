@@ -71,10 +71,17 @@ pub struct PipelineSummary {
     pub export_events_written: u64,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineHandoffDrainSummary {
     pub pipeline: PipelineSummary,
-    pub drained: bool,
+    pub outcome: PipelineHandoffDrainOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineHandoffDrainOutcome {
+    Drained,
+    Progress,
+    BudgetExhausted,
 }
 
 impl PipelineSummary {
@@ -457,27 +464,27 @@ where
                 CapturePoll::Progress => {
                     return Ok(PipelineHandoffDrainSummary {
                         pipeline: summary,
-                        drained: false,
+                        outcome: PipelineHandoffDrainOutcome::Progress,
                     });
                 }
                 CapturePoll::Idle => {
                     return Ok(PipelineHandoffDrainSummary {
                         pipeline: summary,
-                        drained: true,
+                        outcome: PipelineHandoffDrainOutcome::Drained,
                     });
                 }
                 CapturePoll::Finished => {
                     summary.capture_provider_finished = true;
                     return Ok(PipelineHandoffDrainSummary {
                         pipeline: summary,
-                        drained: true,
+                        outcome: PipelineHandoffDrainOutcome::Drained,
                     });
                 }
             }
         }
         Ok(PipelineHandoffDrainSummary {
             pipeline: summary,
-            drained: false,
+            outcome: PipelineHandoffDrainOutcome::BudgetExhausted,
         })
     }
 
