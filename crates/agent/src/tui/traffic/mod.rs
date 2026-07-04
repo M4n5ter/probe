@@ -1,4 +1,6 @@
 mod client;
+mod event_display;
+mod event_ref;
 mod filter;
 mod http;
 mod rows;

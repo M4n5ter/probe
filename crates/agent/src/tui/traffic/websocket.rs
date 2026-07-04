@@ -1,11 +1,9 @@
 use std::collections::BTreeMap;
 
-use probe_core::{
-    Direction, EventEnvelope, EventKind, WebSocketHandoff, WebSocketMessageOpcode, WebSocketOpcode,
-};
+use probe_core::{Direction, WebSocketHandoff, WebSocketMessageOpcode, WebSocketOpcode};
 
-use super::rows::TrafficRow;
 use super::text::{bytes_detail, direction_label, fit_preview_lines, hex_or_dash};
+use super::{event_ref::TrafficEventRef, rows::TrafficRow};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WebSocketSessionRow {
@@ -80,6 +78,14 @@ impl WebSocketSessionRow {
         fit_preview_lines(lines, max_lines)
     }
 
+    pub(crate) fn detail_fetch_sequences(&self) -> Vec<u64> {
+        self.message_events
+            .iter()
+            .filter(|message| message.payload.is_none())
+            .map(|message| message.sequence)
+            .collect()
+    }
+
     fn handoff_detail_lines(&self) -> Vec<String> {
         let mut lines = vec!["Handoff".to_string()];
         match &self.handoff {
@@ -127,7 +133,14 @@ impl WebSocketSessionRow {
                 message.final_frame_sequence,
                 direction_label(message.direction)
             ));
-            lines.push(format!("    Payload: {}", bytes_detail(&message.payload)));
+            lines.push(format!(
+                "    Payload: {}",
+                message
+                    .payload
+                    .as_deref()
+                    .map(bytes_detail)
+                    .unwrap_or_else(|| "open raw event detail".to_string())
+            ));
             lines.push(format!(
                 "    Fingerprint: {}",
                 hex_or_dash(&message.payload_fingerprint)
@@ -177,13 +190,14 @@ struct WebSocketFrameEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WebSocketMessageEvent {
+    sequence: u64,
     direction: Direction,
     message_sequence: u64,
     first_frame_sequence: u64,
     final_frame_sequence: u64,
     opcode: WebSocketMessageOpcode,
     payload_len: u64,
-    payload: Vec<u8>,
+    payload: Option<Vec<u8>>,
     payload_fingerprint: Vec<u8>,
 }
 
@@ -217,36 +231,34 @@ impl WebSocketSessionBuilder {
         }
     }
 
-    fn observe(&mut self, row: &TrafficRow, event: &EventEnvelope) {
+    fn observe(&mut self, row: &TrafficRow, event: TrafficEventRef<'_>) {
         self.first_sequence = self.first_sequence.min(row.sequence);
         self.latest_sequence = self.latest_sequence.max(row.sequence);
         self.raw_sequences.push(row.sequence);
-        match event.kind() {
-            EventKind::WebSocketHandoff(handoff) => self.handoff = Some(handoff.clone()),
-            EventKind::WebSocketFrame(frame) => {
-                self.frame_events.push(WebSocketFrameEvent {
-                    direction: frame.direction,
-                    frame_sequence: frame.frame_sequence,
-                    fin: frame.fin,
-                    opcode: frame.opcode,
-                    payload_len: frame.payload_len,
-                    masked: frame.masked,
-                    payload_fingerprint: frame.payload_fingerprint.clone(),
-                });
-            }
-            EventKind::WebSocketMessage(message) => {
-                self.message_events.push(WebSocketMessageEvent {
-                    direction: message.direction,
-                    message_sequence: message.message_sequence,
-                    first_frame_sequence: message.first_frame_sequence,
-                    final_frame_sequence: message.final_frame_sequence,
-                    opcode: message.opcode,
-                    payload_len: message.payload_len,
-                    payload: message.payload.to_vec(),
-                    payload_fingerprint: message.payload_fingerprint.clone(),
-                });
-            }
-            _ => {}
+        if let Some(handoff) = event.websocket_handoff() {
+            self.handoff = Some(handoff.clone());
+        } else if let Some(frame) = event.websocket_frame() {
+            self.frame_events.push(WebSocketFrameEvent {
+                direction: frame.direction,
+                frame_sequence: frame.frame_sequence,
+                fin: frame.fin,
+                opcode: frame.opcode,
+                payload_len: frame.payload_len,
+                masked: frame.masked,
+                payload_fingerprint: frame.payload_fingerprint.clone(),
+            });
+        } else if let Some(message) = event.websocket_message() {
+            self.message_events.push(WebSocketMessageEvent {
+                sequence: row.sequence,
+                direction: message.direction,
+                message_sequence: message.message_sequence,
+                first_frame_sequence: message.first_frame_sequence,
+                final_frame_sequence: message.final_frame_sequence,
+                opcode: message.opcode,
+                payload_len: message.payload_len,
+                payload: message.payload.map(<[u8]>::to_vec),
+                payload_fingerprint: message.payload_fingerprint.to_vec(),
+            });
         }
     }
 
@@ -310,7 +322,7 @@ pub(super) fn build_websocket_session_rows(rows: &[TrafficRow]) -> Vec<WebSocket
     let mut ordered_rows = rows.iter().collect::<Vec<_>>();
     ordered_rows.sort_by_key(|row| row.sequence);
     for row in ordered_rows {
-        let Some(event) = row.event() else {
+        let Some(event) = row.event_ref() else {
             continue;
         };
         let Some(key) = websocket_session_key(event) else {
@@ -329,14 +341,17 @@ pub(super) fn build_websocket_session_rows(rows: &[TrafficRow]) -> Vec<WebSocket
     rows
 }
 
-fn websocket_session_key(event: &EventEnvelope) -> Option<WebSocketSessionIdentity> {
+fn websocket_session_key(event: TrafficEventRef<'_>) -> Option<WebSocketSessionIdentity> {
     let flow_id = event.flow()?.id.0.clone();
-    let stream_sequence = match event.kind() {
-        EventKind::WebSocketHandoff(handoff) => handoff.stream_sequence,
-        EventKind::WebSocketFrame(frame) => frame.stream_sequence,
-        EventKind::WebSocketMessage(message) => message.stream_sequence,
-        _ => return None,
-    };
+    let stream_sequence = event
+        .websocket_handoff()
+        .map(|handoff| handoff.stream_sequence)
+        .or_else(|| event.websocket_frame().map(|frame| frame.stream_sequence))
+        .or_else(|| {
+            event
+                .websocket_message()
+                .map(|message| message.stream_sequence)
+        })?;
     Some(WebSocketSessionIdentity {
         flow_id,
         stream_sequence,
@@ -365,8 +380,9 @@ fn frame_opcode_label(opcode: WebSocketOpcode) -> String {
 #[cfg(test)]
 mod tests {
     use probe_core::{
-        AddressPort, CaptureOrigin, CaptureSource, FlowContext, FlowIdentity, ProcessContext,
-        ProcessIdentity, Timestamp, TransportProtocol, WebSocketFrame, WebSocketMessage,
+        AddressPort, CaptureOrigin, CaptureSource, EventEnvelope, EventKind, FlowContext,
+        FlowIdentity, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
+        WebSocketFrame, WebSocketMessage,
     };
 
     use super::*;

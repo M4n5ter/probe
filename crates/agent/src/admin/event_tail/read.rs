@@ -1,107 +1,31 @@
-use probe_core::{
-    CaptureSource, CompiledSelector, EventEnvelope, EventType, Selector, SpoolPayloadSchema,
-};
-use serde::{Deserialize, Serialize};
+use probe_core::{CaptureSource, CompiledSelector, Direction, EventType, FlowContext, Selector};
 use storage::{FjallSpool, StoredEvent};
-use thiserror::Error;
+
+use super::{
+    decode::{decode_stored_event, decode_tail_record},
+    error::EventTailError,
+    model::{
+        EventDetailSnapshot, EventTailAttributionMode, EventTailBudgetSnapshot, EventTailEvent,
+        EventTailOmission, EventTailOmissionReason, EventTailRecord, EventTailSnapshot,
+    },
+};
 
 const MAX_TAIL_LIMIT: usize = 256;
 const MAX_TAIL_SCAN: usize = 2_048;
-const MAX_TAIL_EVENT_PAYLOAD_BYTES: usize = 512 * 1024;
+const MAX_TAIL_EVENT_PAYLOAD_BYTES: usize = MAX_EVENT_DETAIL_PAYLOAD_BYTES;
 const MAX_TAIL_RECORD_BYTES: usize = 2 * 1024 * 1024;
 const MAX_EVENT_DETAIL_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const SELECTOR_SCAN_MULTIPLIER: usize = 8;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct EventTailRequest {
-    pub(super) after_sequence: u64,
-    pub(super) latest: bool,
-    pub(super) limit: usize,
-    pub(super) selector: Option<Selector>,
-    pub(super) attribution_mode: EventTailAttributionMode,
-    pub(super) event_types: Vec<EventType>,
+pub(in crate::admin) struct EventTailRequest {
+    pub(in crate::admin) after_sequence: u64,
+    pub(in crate::admin) latest: bool,
+    pub(in crate::admin) limit: usize,
+    pub(in crate::admin) selector: Option<Selector>,
+    pub(in crate::admin) attribution_mode: EventTailAttributionMode,
+    pub(in crate::admin) event_types: Vec<EventType>,
 }
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum EventTailAttributionMode {
-    #[default]
-    Strict,
-    IncludeUnknownProcess,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct EventTailSnapshot {
-    pub after_sequence: u64,
-    pub next_after_sequence: u64,
-    pub last_export_sequence: u64,
-    pub attribution_mode: EventTailAttributionMode,
-    pub limit: usize,
-    pub scanned: usize,
-    pub budget: EventTailBudgetSnapshot,
-    pub events: Vec<EventTailRecord>,
-    pub omissions: Vec<EventTailOmission>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct EventTailRecord {
-    pub sequence: u64,
-    pub stored_at_unix_ns: u64,
-    pub event: EventEnvelope,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct EventDetailSnapshot {
-    pub sequence: u64,
-    pub stored_at_unix_ns: u64,
-    pub payload_schema: String,
-    pub payload_bytes: usize,
-    pub event: EventEnvelope,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct EventDetailTooLargeSnapshot {
-    pub sequence: u64,
-    pub stored_at_unix_ns: u64,
-    pub payload_schema: String,
-    pub payload_bytes: usize,
-    pub max_payload_bytes: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct EventTailBudgetSnapshot {
-    pub max_event_payload_bytes: usize,
-    pub max_record_bytes: usize,
-    pub included_record_bytes: usize,
-    pub truncated: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct EventTailOmission {
-    pub sequence: u64,
-    pub stored_at_unix_ns: u64,
-    pub payload_schema: String,
-    pub payload_bytes: usize,
-    pub reason: EventTailOmissionReason,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum EventTailOmissionReason {
-    EventTooLarge,
-    ResponseBudgetExceeded,
-}
-
-impl EventTailOmissionReason {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::EventTooLarge => "event too large",
-            Self::ResponseBudgetExceeded => "response budget exceeded",
-        }
-    }
-}
-
-pub(super) fn read_event_tail(
+pub(in crate::admin) fn read_event_tail(
     spool: &FjallSpool,
     request: EventTailRequest,
 ) -> Result<EventTailSnapshot, EventTailError> {
@@ -189,18 +113,33 @@ fn tail_record_budget_bytes(record: &EventTailRecord) -> Result<usize, EventTail
 
 fn selector_matches_event(
     selector: &CompiledSelector,
-    event: &EventEnvelope,
+    event: &EventTailEvent,
     mode: EventTailAttributionMode,
 ) -> bool {
-    selector.matches_event(event)
+    let Some(flow) = event.flow.as_ref() else {
+        return false;
+    };
+    let direction = event.kind.direction();
+    selector_matches_tail_flow(selector, flow, direction)
         || (mode == EventTailAttributionMode::IncludeUnknownProcess
             && is_libpcap_unknown_process_event(event)
-            && selector.matches_event_with_unknown_process(event))
+            && selector.matches_flow_with_unknown_process(flow, direction))
 }
 
-fn is_libpcap_unknown_process_event(event: &EventEnvelope) -> bool {
-    event.origin().source() == CaptureSource::Libpcap
-        && event.flow().is_some_and(|flow| {
+fn selector_matches_tail_flow(
+    selector: &CompiledSelector,
+    flow: &FlowContext,
+    direction: Option<Direction>,
+) -> bool {
+    direction.map_or_else(
+        || selector.matches_flow_without_direction(flow),
+        |direction| selector.matches_flow(flow, direction),
+    )
+}
+
+fn is_libpcap_unknown_process_event(event: &EventTailEvent) -> bool {
+    event.origin.source() == CaptureSource::Libpcap
+        && event.flow.as_ref().is_some_and(|flow| {
             flow.attribution_confidence == 0
                 && flow.process.identity.pid == 0
                 && flow.process.identity.exe_path == "unknown"
@@ -229,12 +168,12 @@ impl<'a> EventTypeFilter<'a> {
         Self { event_types }
     }
 
-    fn matches(&self, event: &EventEnvelope) -> bool {
-        self.event_types.is_empty() || self.event_types.contains(&event.kind().event_type())
+    fn matches(&self, event: &EventTailEvent) -> bool {
+        self.event_types.is_empty() || self.event_types.contains(&event.kind.event_type())
     }
 }
 
-pub(super) fn read_event_detail(
+pub(in crate::admin) fn read_event_detail(
     spool: &FjallSpool,
     sequence: u64,
 ) -> Result<EventDetailSnapshot, EventTailError> {
@@ -252,7 +191,7 @@ pub(super) fn read_event_detail(
             max_payload_bytes: MAX_EVENT_DETAIL_PAYLOAD_BYTES,
         });
     }
-    let record = decode_tail_record(stored)?;
+    let record = decode_stored_event(stored)?;
     Ok(EventDetailSnapshot {
         sequence: record.sequence,
         stored_at_unix_ns: record.stored_at_unix_ns,
@@ -276,23 +215,6 @@ fn scan_limit(limit: usize, filtered: bool) -> usize {
     }
 }
 
-fn decode_tail_record(stored: StoredEvent) -> Result<EventTailRecord, EventTailError> {
-    let schema = stored.payload.schema();
-    if schema != &SpoolPayloadSchema::EventEnvelopeSubjectOriginJson {
-        return Err(EventTailError::UnexpectedSchema {
-            sequence: stored.sequence,
-            expected: SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON,
-            actual: schema.to_string(),
-        });
-    }
-    let event = serde_json::from_slice(stored.payload.bytes())?;
-    Ok(EventTailRecord {
-        sequence: stored.sequence,
-        stored_at_unix_ns: stored.stored_at_unix_ns,
-        event,
-    })
-}
-
 fn omission_for(stored: &StoredEvent, reason: EventTailOmissionReason) -> EventTailOmission {
     EventTailOmission {
         sequence: stored.sequence,
@@ -302,69 +224,18 @@ fn omission_for(stored: &StoredEvent, reason: EventTailOmissionReason) -> EventT
         reason,
     }
 }
-
-#[derive(Debug, Error)]
-pub(super) enum EventTailError {
-    #[error("invalid event tail selector: {0}")]
-    Selector(probe_core::SelectorError),
-    #[error("storage error: {0}")]
-    Storage(#[from] storage::StorageError),
-    #[error("export event sequence {sequence} was not found")]
-    EventNotFound { sequence: u64 },
-    #[error(
-        "export event sequence {sequence} payload has {payload_bytes} bytes, exceeding event_detail limit {max_payload_bytes} bytes"
-    )]
-    EventDetailTooLarge {
-        sequence: u64,
-        stored_at_unix_ns: u64,
-        payload_schema: String,
-        payload_bytes: usize,
-        max_payload_bytes: usize,
-    },
-    #[error(
-        "unexpected export payload schema at sequence {sequence}: expected {expected}, got {actual}"
-    )]
-    UnexpectedSchema {
-        sequence: u64,
-        expected: &'static str,
-        actual: String,
-    },
-    #[error("failed to decode event envelope: {0}")]
-    EventJson(#[from] serde_json::Error),
-}
-
-impl EventTailError {
-    pub(super) fn event_detail_too_large_snapshot(&self) -> Option<EventDetailTooLargeSnapshot> {
-        match self {
-            Self::EventDetailTooLarge {
-                sequence,
-                stored_at_unix_ns,
-                payload_schema,
-                payload_bytes,
-                max_payload_bytes,
-            } => Some(EventDetailTooLargeSnapshot {
-                sequence: *sequence,
-                stored_at_unix_ns: *stored_at_unix_ns,
-                payload_schema: payload_schema.clone(),
-                payload_bytes: *payload_bytes,
-                max_payload_bytes: *max_payload_bytes,
-            }),
-            _ => None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use pipeline::ExportEventWriter;
     use probe_core::{
         AddressPort, CaptureOrigin, CaptureSource, Direction, EventEnvelope, EventKind,
         FlowContext, FlowIdentity, HttpHeaders, ProcessContext, ProcessIdentity, ProcessSelector,
-        SelectorTerm, Timestamp, TrafficSelector, TransportProtocol,
+        SelectorTerm, SpoolPayloadSchema, Timestamp, TrafficSelector, TransportProtocol,
     };
     use storage::SpoolPayload;
     use tempfile::tempdir;
 
+    use super::super::model::EventTailKind;
     use super::*;
 
     #[test]
@@ -393,7 +264,8 @@ mod tests {
         assert_eq!(
             tail.events[0]
                 .event
-                .flow()
+                .flow
+                .as_ref()
                 .expect("flow event")
                 .process
                 .identity
@@ -468,14 +340,14 @@ mod tests {
         assert_eq!(tail.next_after_sequence, 2);
         assert_eq!(tail.events.len(), 1);
         assert_eq!(
-            tail.events[0].event.kind().event_type(),
+            tail.events[0].event.kind.event_type(),
             EventType::HttpRequestHeaders
         );
         Ok(())
     }
 
     #[test]
-    fn tail_record_budget_omits_large_batches_before_response_can_grow()
+    fn tail_record_budget_uses_compact_records_for_large_body_events()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
         let spool = FjallSpool::open(temp.path())?;
@@ -485,13 +357,10 @@ mod tests {
         let sample_record_bytes = tail_record_budget_bytes(&EventTailRecord {
             sequence: 1,
             stored_at_unix_ns: 1,
-            event: event.clone(),
+            event: EventTailEvent::from_envelope(&event),
         })?;
-        let event_count = MAX_TAIL_RECORD_BYTES
-            .checked_div(sample_record_bytes)
-            .unwrap_or_default()
-            + 2;
-        assert!(event_count <= MAX_TAIL_LIMIT);
+        assert!(sample_record_bytes < payload_bytes / 4);
+        let event_count = MAX_TAIL_LIMIT;
         for _ in 0..event_count {
             ExportEventWriter::new(&spool).append_occurrence(&event)?;
         }
@@ -508,13 +377,16 @@ mod tests {
             },
         )?;
 
-        assert!(tail.events.len() < event_count);
-        assert!(tail.budget.truncated);
+        assert_eq!(tail.events.len(), event_count);
+        assert!(!tail.budget.truncated);
         assert!(tail.budget.included_record_bytes <= tail.budget.max_record_bytes);
-        assert_eq!(tail.omissions.len(), 1);
-        assert_eq!(
-            tail.omissions[0].reason,
-            EventTailOmissionReason::ResponseBudgetExceeded
+        assert!(tail.omissions.is_empty());
+        assert!(
+            matches!(
+                &tail.events[0].event.kind,
+                EventTailKind::HttpBodyChunk(chunk) if chunk.data_len >= 16 * 1024
+            ),
+            "tail should preserve body length metadata without serializing body bytes"
         );
         Ok(())
     }
@@ -643,11 +515,11 @@ mod tests {
     }
 
     #[test]
-    fn event_detail_reads_single_event_ignored_by_tail_budget()
+    fn event_detail_reads_full_payload_for_compact_tail_event()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
         let spool = FjallSpool::open(temp.path())?;
-        let event = large_body_event_for_exe("/usr/bin/curl", MAX_TAIL_EVENT_PAYLOAD_BYTES);
+        let event = large_body_event_for_exe("/usr/bin/curl", 512 * 1024);
         ExportEventWriter::new(&spool).append_occurrence(&event)?;
 
         let tail = read_event_tail(
@@ -661,13 +533,20 @@ mod tests {
                 event_types: Vec::new(),
             },
         )?;
-        assert!(tail.events.is_empty());
-        assert_eq!(tail.omissions.len(), 1);
+        assert_eq!(tail.events.len(), 1);
+        assert!(tail.omissions.is_empty());
+        assert!(
+            matches!(
+                &tail.events[0].event.kind,
+                EventTailKind::HttpBodyChunk(chunk) if chunk.data_len >= 512 * 1024
+            ),
+            "tail should carry body metadata"
+        );
 
         let detail = read_event_detail(&spool, 1)?;
 
         assert_eq!(detail.sequence, 1);
-        assert!(detail.payload_bytes > MAX_TAIL_EVENT_PAYLOAD_BYTES);
+        assert!(detail.payload_bytes > tail.budget.included_record_bytes);
         assert_eq!(detail.event, event);
         assert_eq!(spool.export_cursor("primary")?, 0);
         Ok(())

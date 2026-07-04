@@ -189,6 +189,16 @@ impl CompiledSelector {
         self.node.matches_flow(flow, None).unwrap_or(false)
     }
 
+    pub fn matches_flow_with_unknown_process(
+        &self,
+        flow: &FlowContext,
+        direction: Option<Direction>,
+    ) -> bool {
+        self.node
+            .matches_flow_with_unknown_process(flow, direction)
+            .unwrap_or(false)
+    }
+
     /// Matches a flow candidate when only process identity and direction are known.
     ///
     /// This is intentionally fail-closed for selectors that require local/remote ports or remote

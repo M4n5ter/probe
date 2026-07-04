@@ -332,7 +332,7 @@ impl Default for TrafficState {
             follow_tail: true,
             status: TrafficStatus::idle("Traffic view uses the running admin socket"),
             last_export_sequence: 0,
-            detail_state: TrafficDetailState::Idle,
+            detail_state: TrafficDetailState::default(),
             event_filter: TrafficEventFilter::Application,
             view_mode: TrafficViewMode::Http,
             attribution_mode: EventTailAttributionMode::Strict,
@@ -393,38 +393,39 @@ impl TrafficState {
     pub(crate) fn selected_detail_lines(&self) -> Option<Vec<String>> {
         match self.active_view().active {
             TrafficViewMode::Http => {
-                return self
-                    .http_exchanges
-                    .get(self.http_view.selected_index())
-                    .map(HttpExchangeRow::detail_lines);
+                let exchange = self.http_exchanges.get(self.http_view.selected_index())?;
+                let mut lines = exchange.detail_lines();
+                self.append_group_detail_state(&mut lines, &exchange.detail_fetch_sequences());
+                return Some(lines);
             }
             TrafficViewMode::WebSocket => {
-                return self
+                let session = self
                     .websocket_sessions
-                    .get(self.websocket_view.selected_index())
-                    .map(WebSocketSessionRow::detail_lines);
+                    .get(self.websocket_view.selected_index())?;
+                let mut lines = session.detail_lines();
+                self.append_group_detail_state(&mut lines, &session.detail_fetch_sequences());
+                return Some(lines);
             }
             TrafficViewMode::Events => {}
         }
         let row = self.selected_row()?;
         let mut lines = row.detail_lines();
-        match (&self.detail_state, row.detail_fetch_sequence()) {
-            (
-                TrafficDetailState::Loaded {
-                    sequence,
-                    row: detail,
-                },
-                Some(row_sequence),
-            ) if *sequence == row_sequence => return Some(detail.detail_lines()),
-            (TrafficDetailState::Loading { sequence, .. }, Some(row_sequence))
-                if *sequence == row_sequence =>
-            {
+        match row.detail_fetch_sequence() {
+            Some(row_sequence) if self.detail_state.loaded(row_sequence).is_some() => {
+                return self
+                    .detail_state
+                    .loaded(row_sequence)
+                    .map(TrafficRow::detail_lines);
+            }
+            Some(row_sequence) if self.detail_state.is_loading(row_sequence) => {
                 lines.push("Full event detail: loading from admin event_detail".to_string());
             }
-            (TrafficDetailState::Failed { sequence, message }, Some(row_sequence))
-                if *sequence == row_sequence =>
-            {
+            Some(row_sequence) if self.detail_state.failure(row_sequence).is_some() => {
                 lines.push("Full event detail fetch failed".to_string());
+                let message = self
+                    .detail_state
+                    .failure(row_sequence)
+                    .expect("failure was checked");
                 lines.push(format!("Reason: {message}"));
             }
             _ => {}
@@ -433,22 +434,52 @@ impl TrafficState {
     }
 
     pub(crate) fn selected_detail_fetch_sequence(&self) -> Option<u64> {
-        if matches!(
-            self.active_view().active,
-            TrafficViewMode::Http | TrafficViewMode::WebSocket
-        ) {
-            return None;
+        let sequences = match self.active_view().active {
+            TrafficViewMode::Http => self
+                .http_exchanges
+                .get(self.http_view.selected_index())?
+                .detail_fetch_sequences(),
+            TrafficViewMode::WebSocket => self
+                .websocket_sessions
+                .get(self.websocket_view.selected_index())?
+                .detail_fetch_sequences(),
+            TrafficViewMode::Events => self
+                .selected_row()?
+                .detail_fetch_sequence()
+                .into_iter()
+                .collect(),
+        };
+        sequences
+            .into_iter()
+            .find(|sequence| self.detail_state.should_fetch(*sequence))
+    }
+
+    fn append_group_detail_state(&self, lines: &mut Vec<String>, sequences: &[u64]) {
+        if sequences.is_empty() {
+            return;
         }
-        let row = self.selected_row()?;
-        let sequence = row.detail_fetch_sequence()?;
-        match &self.detail_state {
-            TrafficDetailState::Loading {
-                sequence: loading, ..
+        let mut pending = Vec::new();
+        for row_sequence in sequences {
+            if let Some(detail) = self.detail_state.loaded(*row_sequence) {
+                lines.push(String::new());
+                lines.push(format!("Raw event detail for sequence {row_sequence}"));
+                lines.extend(detail.detail_lines());
+            } else if self.detail_state.is_loading(*row_sequence) {
+                lines.push(String::new());
+                lines.push(format!(
+                    "Raw event detail {row_sequence}: loading from admin event_detail"
+                ));
+            } else if let Some(message) = self.detail_state.failure(*row_sequence) {
+                lines.push(String::new());
+                lines.push(format!("Raw event detail {row_sequence} fetch failed"));
+                lines.push(format!("Reason: {message}"));
+            } else {
+                pending.push(row_sequence.to_string());
             }
-            | TrafficDetailState::Loaded {
-                sequence: loading, ..
-            } if *loading == sequence => None,
-            _ => Some(sequence),
+        }
+        if !pending.is_empty() {
+            lines.push(String::new());
+            lines.push(format!("Raw event details pending: {}", pending.join(", ")));
         }
     }
 
@@ -576,10 +607,7 @@ impl TrafficState {
     }
 
     pub(crate) fn mark_detail_loading(&mut self, sequence: u64, request_id: u64) {
-        self.detail_state = TrafficDetailState::Loading {
-            sequence,
-            request_id,
-        };
+        self.detail_state.mark_loading(sequence, request_id);
         self.status = TrafficStatus::active(format!("Loading full event detail {sequence}"));
     }
 
@@ -588,15 +616,13 @@ impl TrafficState {
     }
 
     pub(crate) fn apply_detail_load_result(&mut self, result: TrafficDetailLoadResult) -> bool {
-        if !matches!(
-            self.detail_state,
-            TrafficDetailState::Loading {
-                sequence,
-                request_id
-            } if sequence == result.sequence && request_id == result.request_id
-        ) {
+        if !self
+            .detail_state
+            .is_loading_request(result.sequence, result.request_id)
+        {
             return false;
         }
+        self.detail_state.clear_loading();
         match result.result {
             Ok(detail) => self.apply_detail(detail),
             Err(message) => self.mark_detail_error(result.sequence, message),
@@ -605,7 +631,7 @@ impl TrafficState {
     }
 
     pub(crate) fn clear_detail_state(&mut self) {
-        self.detail_state = TrafficDetailState::Idle;
+        self.detail_state.clear();
     }
 
     pub(crate) fn mark_admin_unavailable(&mut self, message: impl Into<String>) {
@@ -733,7 +759,7 @@ impl TrafficState {
         self.http_view.reset();
         self.websocket_view.reset();
         self.follow_tail = true;
-        self.detail_state = TrafficDetailState::Idle;
+        self.detail_state.clear();
         self.attribution_mode = EventTailAttributionMode::Strict;
         self.empty_filter_diagnostics = None;
     }
@@ -809,17 +835,12 @@ impl TrafficState {
     fn apply_detail(&mut self, detail: EventDetailSnapshot) {
         let row = TrafficRow::from_detail(detail);
         self.status = TrafficStatus::active(format!("Loaded full event detail {}", row.sequence));
-        self.detail_state = TrafficDetailState::Loaded {
-            sequence: row.sequence,
-            row: Box::new(row),
-        };
+        self.detail_state.insert_loaded(row);
     }
 
     fn mark_detail_error(&mut self, sequence: u64, message: String) {
-        self.detail_state = TrafficDetailState::Failed {
-            sequence,
-            message: terminal_safe_inline_text(message),
-        };
+        self.detail_state
+            .insert_failure(sequence, terminal_safe_inline_text(message));
         self.status =
             TrafficStatus::warning(format!("Failed to load full event detail {sequence}"));
     }
@@ -1105,7 +1126,7 @@ impl EmptyFilterDiagnostics {
         }
         let mut type_counts = BTreeMap::<String, usize>::new();
         for record in &snapshot.events {
-            let event_type = record.event.kind().event_type().as_str().to_string();
+            let event_type = record.event.kind.event_type().as_str().to_string();
             *type_counts.entry(event_type).or_default() += 1;
         }
         Some(Self {
@@ -1153,12 +1174,74 @@ fn should_probe_empty_filter(
     event_filter.is_filtered() && snapshot.events.is_empty() && snapshot.omissions.is_empty()
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TrafficDetailState {
+    loading: Option<TrafficDetailLoading>,
+    loaded: BTreeMap<u64, TrafficRow>,
+    failures: BTreeMap<u64, String>,
+}
+
+impl TrafficDetailState {
+    fn mark_loading(&mut self, sequence: u64, request_id: u64) {
+        self.failures.remove(&sequence);
+        self.loading = Some(TrafficDetailLoading {
+            sequence,
+            request_id,
+        });
+    }
+
+    fn is_loading_request(&self, sequence: u64, request_id: u64) -> bool {
+        matches!(
+            self.loading,
+            Some(TrafficDetailLoading {
+                sequence: loading_sequence,
+                request_id: loading_request_id,
+            }) if loading_sequence == sequence && loading_request_id == request_id
+        )
+    }
+
+    fn is_loading(&self, sequence: u64) -> bool {
+        self.loading
+            .as_ref()
+            .is_some_and(|loading| loading.sequence == sequence)
+    }
+
+    fn clear_loading(&mut self) {
+        self.loading = None;
+    }
+
+    fn insert_loaded(&mut self, row: TrafficRow) {
+        self.failures.remove(&row.sequence);
+        self.loaded.insert(row.sequence, row);
+    }
+
+    fn insert_failure(&mut self, sequence: u64, message: String) {
+        self.failures.insert(sequence, message);
+    }
+
+    fn loaded(&self, sequence: u64) -> Option<&TrafficRow> {
+        self.loaded.get(&sequence)
+    }
+
+    fn failure(&self, sequence: u64) -> Option<&String> {
+        self.failures.get(&sequence)
+    }
+
+    fn should_fetch(&self, sequence: u64) -> bool {
+        !self.loaded.contains_key(&sequence) && !self.is_loading(sequence)
+    }
+
+    fn clear(&mut self) {
+        self.loading = None;
+        self.loaded.clear();
+        self.failures.clear();
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum TrafficDetailState {
-    Idle,
-    Loading { sequence: u64, request_id: u64 },
-    Loaded { sequence: u64, row: Box<TrafficRow> },
-    Failed { sequence: u64, message: String },
+struct TrafficDetailLoading {
+    sequence: u64,
+    request_id: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1337,8 +1420,8 @@ mod tests {
     use super::*;
     use crate::{
         admin::{
-            EventDetailSnapshot, EventTailBudgetSnapshot, EventTailOmissionReason, EventTailRecord,
-            EventTailSnapshot,
+            EventDetailSnapshot, EventTailBudgetSnapshot, EventTailEvent, EventTailOmissionReason,
+            EventTailRecord, EventTailSnapshot,
         },
         status::{
             CaptureCandidateStatusSnapshot, CaptureOpenFailureStatusSnapshot, CaptureStatusSnapshot,
@@ -1558,7 +1641,62 @@ mod tests {
                 .selected_detail_lines()
                 .expect("HTTP exchange detail")
                 .iter()
-                .any(|line| line == "  Body chunk offset=0 end_stream=true: hello")
+                .any(|line| line == "  Body chunk offset=0 len=5 end_stream=true")
+        );
+        assert!(
+            traffic
+                .selected_detail_lines()
+                .expect("HTTP exchange detail")
+                .iter()
+                .any(|line| line == "  Body payload: open raw event detail")
+        );
+        assert_eq!(traffic.selected_detail_fetch_sequence(), Some(2));
+        traffic.mark_detail_loading(2, 41);
+        assert!(
+            traffic
+                .selected_detail_lines()
+                .expect("HTTP exchange detail")
+                .iter()
+                .any(|line| line == "Raw event detail 2: loading from admin event_detail")
+        );
+        traffic.apply_detail_load_result(TrafficDetailLoadResult {
+            sequence: 2,
+            request_id: 41,
+            result: Ok(EventDetailSnapshot {
+                sequence: 2,
+                stored_at_unix_ns: 200,
+                payload_schema: SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON.to_string(),
+                payload_bytes: 5,
+                event: body_event(b"hello"),
+            }),
+        });
+        assert_eq!(traffic.selected_detail_fetch_sequence(), Some(4));
+        assert!(
+            traffic
+                .selected_detail_lines()
+                .expect("HTTP exchange detail")
+                .iter()
+                .any(|line| line == "Body payload: hello")
+        );
+        traffic.mark_detail_loading(4, 42);
+        traffic.apply_detail_load_result(TrafficDetailLoadResult {
+            sequence: 4,
+            request_id: 42,
+            result: Ok(EventDetailSnapshot {
+                sequence: 4,
+                stored_at_unix_ns: 400,
+                payload_schema: SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON.to_string(),
+                payload_bytes: 2,
+                event: response_body_event(b"ok"),
+            }),
+        });
+        assert_eq!(traffic.selected_detail_fetch_sequence(), None);
+        assert!(
+            traffic
+                .selected_detail_lines()
+                .expect("HTTP exchange detail")
+                .iter()
+                .any(|line| line == "Body payload: ok")
         );
     }
 
@@ -1614,7 +1752,27 @@ mod tests {
                 .selected_detail_lines()
                 .expect("WebSocket session detail")
                 .iter()
-                .any(|line| line == "    Payload: hello")
+                .any(|line| line == "    Payload: open raw event detail")
+        );
+        assert_eq!(traffic.selected_detail_fetch_sequence(), Some(2));
+        traffic.mark_detail_loading(2, 42);
+        traffic.apply_detail_load_result(TrafficDetailLoadResult {
+            sequence: 2,
+            request_id: 42,
+            result: Ok(EventDetailSnapshot {
+                sequence: 2,
+                stored_at_unix_ns: 200,
+                payload_schema: SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON.to_string(),
+                payload_bytes: 5,
+                event: websocket_message_event(b"hello"),
+            }),
+        });
+        assert!(
+            traffic
+                .selected_detail_lines()
+                .expect("WebSocket session detail")
+                .iter()
+                .any(|line| line == "Payload: hello")
         );
     }
 
@@ -2251,11 +2409,7 @@ mod tests {
         let after_sequence = range.start().saturating_sub(1);
         let last_export_sequence = *range.end();
         let events = range
-            .map(|sequence| EventTailRecord {
-                sequence,
-                stored_at_unix_ns: sequence * 100,
-                event: gap_event(sequence),
-            })
+            .map(|sequence| tail_record(sequence, sequence * 100, gap_event(sequence)))
             .collect::<Vec<_>>();
         EventTailSnapshot {
             after_sequence,
@@ -2274,10 +2428,12 @@ mod tests {
         let after_sequence = range.start().saturating_sub(1);
         let last_export_sequence = *range.end();
         let events = range
-            .map(|sequence| EventTailRecord {
-                sequence,
-                stored_at_unix_ns: sequence * 100,
-                event: body_event(format!("body {sequence}").as_bytes()),
+            .map(|sequence| {
+                tail_record(
+                    sequence,
+                    sequence * 100,
+                    body_event(format!("body {sequence}").as_bytes()),
+                )
             })
             .collect::<Vec<_>>();
         EventTailSnapshot {
@@ -2295,26 +2451,10 @@ mod tests {
 
     fn tail_snapshot_with_http_exchange() -> EventTailSnapshot {
         let events = vec![
-            EventTailRecord {
-                sequence: 1,
-                stored_at_unix_ns: 100,
-                event: request_event("POST", "/api/tasks"),
-            },
-            EventTailRecord {
-                sequence: 2,
-                stored_at_unix_ns: 200,
-                event: body_event(b"hello"),
-            },
-            EventTailRecord {
-                sequence: 3,
-                stored_at_unix_ns: 300,
-                event: response_event(200, "OK"),
-            },
-            EventTailRecord {
-                sequence: 4,
-                stored_at_unix_ns: 400,
-                event: response_body_event(b"ok"),
-            },
+            tail_record(1, 100, request_event("POST", "/api/tasks")),
+            tail_record(2, 200, body_event(b"hello")),
+            tail_record(3, 300, response_event(200, "OK")),
+            tail_record(4, 400, response_body_event(b"ok")),
         ];
         EventTailSnapshot {
             after_sequence: 0,
@@ -2331,16 +2471,8 @@ mod tests {
 
     fn tail_snapshot_with_websocket_session() -> EventTailSnapshot {
         let events = vec![
-            EventTailRecord {
-                sequence: 1,
-                stored_at_unix_ns: 100,
-                event: websocket_handoff_event("/ws"),
-            },
-            EventTailRecord {
-                sequence: 2,
-                stored_at_unix_ns: 200,
-                event: websocket_message_event(b"hello"),
-            },
+            tail_record(1, 100, websocket_handoff_event("/ws")),
+            tail_record(2, 200, websocket_message_event(b"hello")),
         ];
         EventTailSnapshot {
             after_sequence: 0,
@@ -2359,10 +2491,12 @@ mod tests {
         let after_sequence = range.start().saturating_sub(1);
         let next_after_sequence = *range.end();
         let events = range
-            .map(|sequence| EventTailRecord {
-                sequence,
-                stored_at_unix_ns: sequence,
-                event: websocket_handoff_event_for_flow(sequence),
+            .map(|sequence| {
+                tail_record(
+                    sequence,
+                    sequence,
+                    websocket_handoff_event_for_flow(sequence),
+                )
             })
             .collect::<Vec<_>>();
         EventTailSnapshot {
@@ -2386,11 +2520,7 @@ mod tests {
             .unwrap_or_default();
         let events = records
             .into_iter()
-            .map(|(sequence, event)| EventTailRecord {
-                sequence,
-                stored_at_unix_ns: sequence,
-                event,
-            })
+            .map(|(sequence, event)| tail_record(sequence, sequence, event))
             .collect::<Vec<_>>();
         EventTailSnapshot {
             after_sequence: 0,
@@ -2402,6 +2532,14 @@ mod tests {
             budget: tail_budget(4096, 0, false),
             events,
             omissions: Vec::new(),
+        }
+    }
+
+    fn tail_record(sequence: u64, stored_at_unix_ns: u64, event: EventEnvelope) -> EventTailRecord {
+        EventTailRecord {
+            sequence,
+            stored_at_unix_ns,
+            event: EventTailEvent::from_envelope(&event),
         }
     }
 

@@ -560,11 +560,12 @@ mod tests {
         LiveCaptureBackend, PolicyConfig, PolicySourceConfig,
     };
     use probe_core::{
-        Action, AddressPort, CapabilityKind, CapabilityState, CaptureOrigin, CaptureSource,
-        Direction, EnforcementDecision, EnforcementMode, EnforcementOutcome, EventEnvelope,
-        EventKind, FlowContext, FlowIdentity, HttpHeaders, ProcessContext, ProcessIdentity,
-        ProcessSelector, ProtectiveActionProfile, RuntimeMode, Selector, SpoolPayloadSchema,
-        Timestamp, TrafficSelector, TransportProtocol, Verdict, VerdictScope,
+        Action, AddressPort, BodyChunk, CapabilityKind, CapabilityState, CaptureOrigin,
+        CaptureSource, Direction, EnforcementDecision, EnforcementMode, EnforcementOutcome,
+        EventEnvelope, EventKind, FlowContext, FlowIdentity, HttpHeaders, ProcessContext,
+        ProcessIdentity, ProcessSelector, ProtectiveActionProfile, RuntimeMode, Selector,
+        SpoolPayloadSchema, Timestamp, TrafficSelector, TransportProtocol, Verdict, VerdictScope,
+        WebSocketMessage, WebSocketMessageOpcode,
     };
     use runtime::{
         CaptureEvidenceMode, CapturePlanMode, CaptureProviderBuilder, CaptureProviderDescriptor,
@@ -705,7 +706,7 @@ mod tests {
             json!("/")
         );
         assert_eq!(
-            response["tail"]["events"][0]["event"]["subject"]["flow"]["remote"]["port"],
+            response["tail"]["events"][0]["event"]["flow"]["remote"]["port"],
             json!(8080)
         );
         assert_eq!(spool.export_cursor("primary")?, 0);
@@ -813,6 +814,131 @@ mod tests {
             response["detail"]["event"]["subject"]["flow"]["remote"]["port"],
             json!(8080)
         );
+
+        server.stop().await;
+        drop(spool);
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_tail_events_compact_body_payload_but_event_detail_retains_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-tail-compact-body")?;
+        let socket_path = temp.join("admin.sock");
+        let spool_path = temp.join("spool");
+        let spool = Arc::new(FjallSpool::open(&spool_path)?);
+        let body = b"request-body";
+        ExportEventWriter::new(spool.as_ref()).append_occurrence(&body_event(8080, body))?;
+        let plan = Arc::new(runtime_plan(spool_path)?);
+        let server = spawn_admin_server(
+            RuntimePlanHandle::new(Arc::clone(&plan)),
+            Arc::clone(&spool),
+            AdminServerConfig::unix_socket(socket_path.clone()),
+            AdminRuntimeState::default(),
+        )?;
+
+        let tail = crate::admin::send_admin_json_request(
+            &socket_path,
+            crate::admin::AdminRequest::TailEvents {
+                after_sequence: 0,
+                latest: false,
+                limit: 10,
+                selector: Some(Selector::term(
+                    ProcessSelector::default(),
+                    TrafficSelector {
+                        remote_ports: vec![8080],
+                        directions: vec![Direction::Outbound],
+                        ..TrafficSelector::default()
+                    },
+                )),
+                event_types: Vec::new(),
+            },
+        )
+        .await?;
+        let tail_kind = &tail["tail"]["events"][0]["event"]["kind"];
+
+        assert_eq!(tail["kind"], json!("event_tail"));
+        assert_eq!(tail_kind["type"], json!("http_body_chunk"));
+        assert_eq!(tail_kind["data_len"], json!(body.len()));
+        assert!(tail_kind.get("data").is_none());
+
+        let detail = crate::admin::send_admin_json_request(
+            &socket_path,
+            crate::admin::AdminRequest::EventDetail { sequence: 1 },
+        )
+        .await?;
+        let detail_kind = &detail["detail"]["event"]["kind"];
+
+        assert_eq!(detail["kind"], json!("event_detail"));
+        assert_eq!(detail_kind["type"], json!("http_body_chunk"));
+        assert!(detail_kind.get("data").is_some());
+
+        server.stop().await;
+        drop(spool);
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_tail_events_compact_websocket_payload_but_event_detail_retains_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-tail-compact-websocket")?;
+        let socket_path = temp.join("admin.sock");
+        let spool_path = temp.join("spool");
+        let spool = Arc::new(FjallSpool::open(&spool_path)?);
+        let payload = br#"{"message":"hello"}"#;
+        let fingerprint = vec![0x12, 0x34, 0x56];
+        ExportEventWriter::new(spool.as_ref()).append_occurrence(&websocket_message_event(
+            8080,
+            payload,
+            &fingerprint,
+        ))?;
+        let plan = Arc::new(runtime_plan(spool_path)?);
+        let server = spawn_admin_server(
+            RuntimePlanHandle::new(Arc::clone(&plan)),
+            Arc::clone(&spool),
+            AdminServerConfig::unix_socket(socket_path.clone()),
+            AdminRuntimeState::default(),
+        )?;
+
+        let tail = crate::admin::send_admin_json_request(
+            &socket_path,
+            crate::admin::AdminRequest::TailEvents {
+                after_sequence: 0,
+                latest: false,
+                limit: 10,
+                selector: Some(Selector::term(
+                    ProcessSelector::default(),
+                    TrafficSelector {
+                        remote_ports: vec![8080],
+                        directions: vec![Direction::Outbound],
+                        ..TrafficSelector::default()
+                    },
+                )),
+                event_types: Vec::new(),
+            },
+        )
+        .await?;
+        let tail_kind = &tail["tail"]["events"][0]["event"]["kind"];
+
+        assert_eq!(tail["kind"], json!("event_tail"));
+        assert_eq!(tail_kind["type"], json!("websocket_message"));
+        assert_eq!(tail_kind["payload_len"], json!(payload.len() as u64));
+        assert_eq!(tail_kind["payload_fingerprint"], json!(fingerprint));
+        assert!(tail_kind.get("payload").is_none());
+
+        let detail = crate::admin::send_admin_json_request(
+            &socket_path,
+            crate::admin::AdminRequest::EventDetail { sequence: 1 },
+        )
+        .await?;
+        let detail_kind = &detail["detail"]["event"]["kind"];
+
+        assert_eq!(detail["kind"], json!("event_detail"));
+        assert_eq!(detail_kind["type"], json!("websocket_message"));
+        assert_eq!(detail_kind["payload_len"], json!(payload.len() as u64));
+        assert!(detail_kind.get("payload").is_some());
 
         server.stop().await;
         drop(spool);
@@ -2103,6 +2229,52 @@ end
 
     fn request_event(remote_port: u16) -> EventEnvelope {
         request_event_for_process(remote_port, "replay")
+    }
+
+    fn body_event(remote_port: u16, body: &[u8]) -> EventEnvelope {
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            demo_flow_with_remote_port_and_process(remote_port, "replay"),
+            CaptureOrigin::from_source(CaptureSource::Replay),
+            "test",
+            EventKind::HttpBodyChunk(BodyChunk {
+                direction: Direction::Outbound,
+                stream_sequence: 1,
+                offset: 0,
+                data: body.to_vec().into(),
+                end_stream: true,
+            }),
+        )
+    }
+
+    fn websocket_message_event(
+        remote_port: u16,
+        payload: &[u8],
+        payload_fingerprint: &[u8],
+    ) -> EventEnvelope {
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            demo_flow_with_remote_port_and_process(remote_port, "replay"),
+            CaptureOrigin::from_source(CaptureSource::Replay),
+            "test",
+            EventKind::WebSocketMessage(WebSocketMessage {
+                direction: Direction::Outbound,
+                stream_sequence: 1,
+                message_sequence: 1,
+                first_frame_sequence: 1,
+                final_frame_sequence: 1,
+                opcode: WebSocketMessageOpcode::Text,
+                payload_len: payload.len() as u64,
+                payload: payload.to_vec().into(),
+                payload_fingerprint: payload_fingerprint.to_vec(),
+            }),
+        )
     }
 
     fn libpcap_unknown_process_request_event(remote_port: u16) -> EventEnvelope {

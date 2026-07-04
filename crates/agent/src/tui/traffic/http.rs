@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
-use probe_core::{Direction, EventEnvelope, EventKind, HttpHeaders};
+use probe_core::{Direction, HttpHeaders};
 
 use super::{
+    event_ref::TrafficEventRef,
     rows::TrafficRow,
     text::{bytes_detail, direction_label, escape_text, fit_preview_lines},
 };
@@ -76,6 +77,14 @@ impl HttpExchangeRow {
         ];
         fit_preview_lines(lines, max_lines)
     }
+
+    pub(crate) fn detail_fetch_sequences(&self) -> Vec<u64> {
+        self.request
+            .detail_fetch_sequences()
+            .into_iter()
+            .chain(self.response.detail_fetch_sequences())
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -86,7 +95,7 @@ struct HttpMessage {
 
 impl HttpMessage {
     fn body_len(&self) -> usize {
-        self.body.iter().map(|chunk| chunk.data.len()).sum()
+        self.body.iter().map(|chunk| chunk.data_len).sum()
     }
 
     fn detail_lines(&self, label: &str) -> Vec<String> {
@@ -125,19 +134,40 @@ impl HttpMessage {
         lines.push(format!("  Body bytes: {}", self.body_len()));
         if self.body.is_empty() {
             lines.push("  Body payload: -".to_string());
+        } else if self.body.iter().any(|chunk| chunk.data.is_none()) {
+            lines.push("  Body payload: open raw event detail".to_string());
+            lines.push(format!("  Body chunks: {}", self.body.len()));
+            for chunk in sorted_body_chunks(&self.body) {
+                lines.push(format!(
+                    "  Body chunk offset={} len={} end_stream={}",
+                    chunk.offset, chunk.data_len, chunk.end_stream
+                ));
+            }
         } else {
             lines.extend(self.body_payload_lines());
             lines.push(format!("  Body chunks: {}", self.body.len()));
             for chunk in sorted_body_chunks(&self.body) {
+                let data = chunk
+                    .data
+                    .as_ref()
+                    .expect("body payload was checked before rendering chunks");
                 lines.push(format!(
                     "  Body chunk offset={} end_stream={}: {}",
                     chunk.offset,
                     chunk.end_stream,
-                    bytes_detail(&chunk.data)
+                    bytes_detail(data)
                 ));
             }
         }
         lines
+    }
+
+    fn detail_fetch_sequences(&self) -> Vec<u64> {
+        self.body
+            .iter()
+            .filter(|chunk| chunk.data.is_none())
+            .map(|chunk| chunk.sequence)
+            .collect()
     }
 
     fn body_payload_lines(&self) -> Vec<String> {
@@ -172,8 +202,10 @@ impl HttpMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BodyChunk {
+    sequence: u64,
     offset: u64,
-    data: Vec<u8>,
+    data_len: usize,
+    data: Option<Vec<u8>>,
     end_stream: bool,
 }
 
@@ -204,11 +236,14 @@ impl BodyPayloadDetail {
                 has_gap = true;
                 next_offset = chunk.offset;
             }
+            let Some(data) = &chunk.data else {
+                return None;
+            };
             let overlap = next_offset.saturating_sub(chunk.offset) as usize;
-            if overlap >= chunk.data.len() {
+            if overlap >= data.len() {
                 continue;
             }
-            let new_bytes = &chunk.data[overlap..];
+            let new_bytes = &data[overlap..];
             bytes.extend_from_slice(new_bytes);
             next_offset = next_offset.saturating_add(new_bytes.len() as u64);
         }
@@ -264,28 +299,27 @@ impl HttpExchangeBuilder {
         }
     }
 
-    fn observe(&mut self, row: &TrafficRow, event: &EventEnvelope) {
+    fn observe(&mut self, row: &TrafficRow, event: TrafficEventRef<'_>) {
         self.first_sequence = self.first_sequence.min(row.sequence);
         self.latest_sequence = self.latest_sequence.max(row.sequence);
         self.raw_sequences.push(row.sequence);
-        match event.kind() {
-            EventKind::HttpRequestHeaders(headers) => self.request.headers = Some(headers.clone()),
-            EventKind::HttpResponseHeaders(headers) => {
-                self.response.headers = Some(headers.clone())
+        if let Some(headers) = event.http_request_headers() {
+            self.request.headers = Some(headers.clone());
+        } else if let Some(headers) = event.http_response_headers() {
+            self.response.headers = Some(headers.clone());
+        } else if let Some(chunk) = event.http_body_chunk() {
+            let body = BodyChunk {
+                sequence: row.sequence,
+                offset: chunk.offset,
+                data_len: chunk.data_len,
+                data: chunk.data.map(<[u8]>::to_vec),
+                end_stream: chunk.end_stream,
+            };
+            if self.body_direction_is_response(chunk.direction) {
+                self.response.body.push(body);
+            } else {
+                self.request.body.push(body);
             }
-            EventKind::HttpBodyChunk(chunk) => {
-                let body = BodyChunk {
-                    offset: chunk.offset,
-                    data: chunk.data.to_vec(),
-                    end_stream: chunk.end_stream,
-                };
-                if self.body_direction_is_response(chunk.direction) {
-                    self.response.body.push(body);
-                } else {
-                    self.request.body.push(body);
-                }
-            }
-            _ => {}
         }
     }
 
@@ -368,7 +402,7 @@ pub(super) fn build_http_exchange_rows(rows: &[TrafficRow]) -> Vec<HttpExchangeR
     let mut ordered_rows = rows.iter().collect::<Vec<_>>();
     ordered_rows.sort_by_key(|row| row.sequence);
     for row in ordered_rows {
-        let Some(event) = row.event() else {
+        let Some(event) = row.event_ref() else {
             continue;
         };
         let Some(key) = http_exchange_key(event) else {
@@ -387,15 +421,17 @@ pub(super) fn build_http_exchange_rows(rows: &[TrafficRow]) -> Vec<HttpExchangeR
     rows
 }
 
-fn http_exchange_key(event: &EventEnvelope) -> Option<HttpExchangeIdentity> {
+fn http_exchange_key(event: TrafficEventRef<'_>) -> Option<HttpExchangeIdentity> {
     let flow_id = event.flow()?.id.0.clone();
-    let stream_sequence = match event.kind() {
-        EventKind::HttpRequestHeaders(headers) | EventKind::HttpResponseHeaders(headers) => {
-            headers.stream_sequence
-        }
-        EventKind::HttpBodyChunk(chunk) => chunk.stream_sequence,
-        _ => return None,
-    };
+    let stream_sequence = event
+        .http_request_headers()
+        .map(|headers| headers.stream_sequence)
+        .or_else(|| {
+            event
+                .http_response_headers()
+                .map(|headers| headers.stream_sequence)
+        })
+        .or_else(|| event.http_body_chunk().map(|chunk| chunk.stream_sequence))?;
     Some(HttpExchangeIdentity {
         flow_id,
         stream_sequence,
@@ -411,8 +447,9 @@ fn sorted_body_chunks(chunks: &[BodyChunk]) -> Vec<&BodyChunk> {
 #[cfg(test)]
 mod tests {
     use probe_core::{
-        AddressPort, BodyChunk, CaptureOrigin, CaptureSource, FlowContext, FlowIdentity,
-        HttpHeaders, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
+        AddressPort, BodyChunk, CaptureOrigin, CaptureSource, EventEnvelope, EventKind,
+        FlowContext, FlowIdentity, HttpHeaders, ProcessContext, ProcessIdentity, Timestamp,
+        TransportProtocol,
     };
 
     use super::*;

@@ -1,13 +1,17 @@
 use std::fmt;
 
-use probe_core::{CaptureOrigin, CaptureSource, CaptureTrafficSecurity, EventEnvelope, EventKind};
+use probe_core::EventEnvelope;
 
-use crate::{
-    admin::{EventDetailSnapshot, EventTailBudgetSnapshot, EventTailOmission, EventTailRecord},
-    tui::copy::{MITM_HTTP_PATH_LABEL, MITM_TLS_PATH_LABEL},
+use crate::admin::{
+    EventDetailSnapshot, EventTailBudgetSnapshot, EventTailEvent, EventTailOmission,
+    EventTailRecord,
 };
 
-use super::text::{bytes_detail, direction_label, escape_text, fit_preview_lines};
+use super::{
+    event_display::{capture_path_short_label, event_detail_lines, event_kind_display},
+    event_ref::TrafficEventRef,
+    text::{direction_label, fit_preview_lines},
+};
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct TrafficRow {
@@ -23,7 +27,7 @@ pub(crate) struct TrafficRow {
 
 impl TrafficRow {
     pub(super) fn from_record(record: EventTailRecord) -> Self {
-        Self::from_event(record.sequence, record.event)
+        Self::from_tail_event(record.sequence, record.event)
     }
 
     pub(super) fn from_detail(detail: EventDetailSnapshot) -> Self {
@@ -55,14 +59,24 @@ impl TrafficRow {
 
     pub(crate) fn detail_lines(&self) -> Vec<String> {
         match &self.payload {
-            TrafficRowPayload::Event(event) => event_detail_lines(self.sequence, event),
+            TrafficRowPayload::FullEvent(event) => {
+                event_detail_lines(self.sequence, TrafficEventRef::Full(event))
+            }
+            TrafficRowPayload::TailEvent(event) => {
+                event_detail_lines(self.sequence, TrafficEventRef::Tail(event))
+            }
             TrafficRowPayload::Omission(omission) => omission_detail_lines(self.sequence, omission),
         }
     }
 
     pub(crate) fn preview_lines(&self, max_lines: usize) -> Vec<String> {
         match &self.payload {
-            TrafficRowPayload::Event(event) => event_preview_lines(self, event, max_lines),
+            TrafficRowPayload::FullEvent(event) => {
+                event_preview_lines(self, TrafficEventRef::Full(event), max_lines)
+            }
+            TrafficRowPayload::TailEvent(event) => {
+                event_preview_lines(self, TrafficEventRef::Tail(event), max_lines)
+            }
             TrafficRowPayload::Omission(omission) => {
                 omission_preview_lines(self.sequence, omission, max_lines)
             }
@@ -70,28 +84,33 @@ impl TrafficRow {
     }
 
     pub(crate) fn detail_fetch_sequence(&self) -> Option<u64> {
-        matches!(self.payload, TrafficRowPayload::Omission(_)).then_some(self.sequence)
+        matches!(
+            self.payload,
+            TrafficRowPayload::TailEvent(_) | TrafficRowPayload::Omission(_)
+        )
+        .then_some(self.sequence)
     }
 
-    pub(super) fn event(&self) -> Option<&EventEnvelope> {
+    pub(super) fn event_ref(&self) -> Option<TrafficEventRef<'_>> {
         match &self.payload {
-            TrafficRowPayload::Event(event) => Some(event),
+            TrafficRowPayload::FullEvent(event) => Some(TrafficEventRef::Full(event)),
+            TrafficRowPayload::TailEvent(event) => Some(TrafficEventRef::Tail(event)),
             TrafficRowPayload::Omission(_) => None,
         }
     }
 
     pub(super) fn from_event(sequence: u64, event: EventEnvelope) -> Self {
-        let flow = event.flow();
-        let event_kind = event_kind_display(event.kind(), false);
+        let event_ref = TrafficEventRef::Full(&event);
+        let flow = event_ref.flow();
+        let event_kind = event_kind_display(event_ref.kind(), false);
         Self {
             sequence,
             process: flow
                 .map(|flow| format!("{} ({})", flow.process.name, flow.process.identity.pid))
                 .unwrap_or_else(|| "provider".to_string()),
-            capture_path: capture_path_short_label(event.origin()),
-            event_type: event.kind().event_type().as_str().to_string(),
-            direction: event
-                .kind()
+            capture_path: capture_path_short_label(event_ref.origin()),
+            event_type: event_ref.event_type().as_str().to_string(),
+            direction: event_ref
                 .direction()
                 .map(direction_label)
                 .unwrap_or("-")
@@ -100,14 +119,39 @@ impl TrafficRow {
                 .map(|flow| format!("{}:{}", flow.remote.address, flow.remote.port))
                 .unwrap_or_else(|| "-".to_string()),
             summary: event_kind.summary,
-            payload: TrafficRowPayload::Event(Box::new(event)),
+            payload: TrafficRowPayload::FullEvent(Box::new(event)),
+        }
+    }
+
+    fn from_tail_event(sequence: u64, event: EventTailEvent) -> Self {
+        let event_ref = TrafficEventRef::Tail(&event);
+        let flow = event_ref.flow();
+        let event_kind = event_kind_display(event_ref.kind(), false);
+        Self {
+            sequence,
+            process: flow
+                .map(|flow| format!("{} ({})", flow.process.name, flow.process.identity.pid))
+                .unwrap_or_else(|| "provider".to_string()),
+            capture_path: capture_path_short_label(event_ref.origin()),
+            event_type: event_ref.event_type().as_str().to_string(),
+            direction: event_ref
+                .direction()
+                .map(direction_label)
+                .unwrap_or("-")
+                .to_string(),
+            endpoint: flow
+                .map(|flow| format!("{}:{}", flow.remote.address, flow.remote.port))
+                .unwrap_or_else(|| "-".to_string()),
+            summary: event_kind.summary,
+            payload: TrafficRowPayload::TailEvent(Box::new(event)),
         }
     }
 }
 
 #[derive(Clone, PartialEq, Eq)]
 enum TrafficRowPayload {
-    Event(Box<EventEnvelope>),
+    FullEvent(Box<EventEnvelope>),
+    TailEvent(Box<EventTailEvent>),
     Omission(TrafficOmissionRow),
 }
 
@@ -118,7 +162,11 @@ struct TrafficOmissionRow {
     budget: EventTailBudgetSnapshot,
 }
 
-fn event_preview_lines(row: &TrafficRow, event: &EventEnvelope, max_lines: usize) -> Vec<String> {
+fn event_preview_lines(
+    row: &TrafficRow,
+    event: TrafficEventRef<'_>,
+    max_lines: usize,
+) -> Vec<String> {
     let mut lines = vec![
         format!("Sequence: {}", row.sequence),
         format!("Event type: {} via {}", row.event_type, row.capture_path),
@@ -170,351 +218,6 @@ impl fmt::Debug for TrafficRow {
     }
 }
 
-fn capture_path_short_label(origin: CaptureOrigin) -> &'static str {
-    match origin.source() {
-        CaptureSource::L7MitmPlaintext => mitm_capture_path_short_label(origin.traffic_security()),
-        source => capture_source_short_label(source),
-    }
-}
-
-fn mitm_capture_path_short_label(traffic_security: CaptureTrafficSecurity) -> &'static str {
-    match traffic_security {
-        CaptureTrafficSecurity::Unknown => "mitm-data",
-        CaptureTrafficSecurity::Cleartext => MITM_HTTP_PATH_LABEL,
-        CaptureTrafficSecurity::TlsDecrypted => MITM_TLS_PATH_LABEL,
-    }
-}
-
-fn capture_source_short_label(source: CaptureSource) -> &'static str {
-    match source {
-        CaptureSource::EbpfSyscall => "ebpf",
-        CaptureSource::Libpcap => "libpcap",
-        CaptureSource::LibsslUprobe => "tls-uprobe",
-        CaptureSource::TlsSessionSecret => "tls-secret",
-        CaptureSource::ExternalPlaintextFeed => "plaintext",
-        CaptureSource::L7MitmPlaintext => "mitm-data",
-        CaptureSource::L7MitmControlPlane => "mitm-ctrl",
-        CaptureSource::Replay => "replay",
-        CaptureSource::Mock => "mock",
-    }
-}
-
-fn capture_path_detail_label(origin: CaptureOrigin) -> &'static str {
-    match origin.source() {
-        CaptureSource::L7MitmPlaintext => mitm_capture_path_detail_label(origin.traffic_security()),
-        source => capture_source_detail_label(source),
-    }
-}
-
-fn mitm_capture_path_detail_label(traffic_security: CaptureTrafficSecurity) -> &'static str {
-    match traffic_security {
-        CaptureTrafficSecurity::Unknown => "MITM proxy path",
-        CaptureTrafficSecurity::Cleartext => "MITM proxy path (plain HTTP)",
-        CaptureTrafficSecurity::TlsDecrypted => "MITM proxy path (TLS-decrypted HTTP)",
-    }
-}
-
-fn capture_source_detail_label(source: CaptureSource) -> &'static str {
-    match source {
-        CaptureSource::EbpfSyscall => "eBPF syscall capture",
-        CaptureSource::Libpcap => "libpcap passive capture",
-        CaptureSource::LibsslUprobe => "TLS plaintext uprobe",
-        CaptureSource::TlsSessionSecret => "TLS session secret decryption",
-        CaptureSource::ExternalPlaintextFeed => "external plaintext feed",
-        CaptureSource::L7MitmPlaintext => "MITM proxy path",
-        CaptureSource::L7MitmControlPlane => "MITM control plane",
-        CaptureSource::Replay => "replay",
-        CaptureSource::Mock => "mock",
-    }
-}
-
-struct EventKindDisplay {
-    summary: String,
-    details: Vec<String>,
-}
-
-fn event_kind_display(kind: &EventKind, include_details: bool) -> EventKindDisplay {
-    match kind {
-        EventKind::ConnectionOpened => EventKindDisplay {
-            summary: "connection opened".to_string(),
-            details: detail_if(include_details, || vec!["Connection: opened".to_string()]),
-        },
-        EventKind::ConnectionClosed => EventKindDisplay {
-            summary: "connection closed".to_string(),
-            details: detail_if(include_details, || vec!["Connection: closed".to_string()]),
-        },
-        EventKind::HttpRequestHeaders(headers) => EventKindDisplay {
-            summary: format!(
-                "{} {}",
-                headers.method.as_deref().unwrap_or("-"),
-                headers.target.as_deref().unwrap_or("-")
-            ),
-            details: detail_if(include_details, || http_header_detail_lines(headers)),
-        },
-        EventKind::HttpResponseHeaders(headers) => EventKindDisplay {
-            summary: format!(
-                "{} {}",
-                headers
-                    .status
-                    .map(|status| status.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-                headers.reason.as_deref().unwrap_or("")
-            ),
-            details: detail_if(include_details, || http_header_detail_lines(headers)),
-        },
-        EventKind::HttpBodyChunk(chunk) => EventKindDisplay {
-            summary: format!("body {} bytes at {}", chunk.data.len(), chunk.offset),
-            details: detail_if(include_details, || {
-                vec![
-                    format!("HTTP direction: {}", direction_label(chunk.direction)),
-                    format!("HTTP stream: {}", chunk.stream_sequence),
-                    format!("Body offset: {}", chunk.offset),
-                    format!("Body bytes: {}", chunk.data.len()),
-                    format!("End stream: {}", chunk.end_stream),
-                    format!("Body payload: {}", bytes_detail(chunk.data.as_ref())),
-                ]
-            }),
-        },
-        EventKind::SseEvent(event) => EventKindDisplay {
-            summary: format!("sse {} bytes", event.data.len()),
-            details: detail_if(include_details, || {
-                vec![
-                    format!("SSE direction: {}", direction_label(event.direction)),
-                    format!("SSE stream: {}", event.stream_sequence),
-                    format!("SSE event: {}", event.event.as_deref().unwrap_or("-")),
-                    format!("SSE id: {}", event.id.as_deref().unwrap_or("-")),
-                    format!(
-                        "SSE retry ms: {}",
-                        event
-                            .retry_ms
-                            .map(|retry| retry.to_string())
-                            .unwrap_or_else(|| "-".to_string())
-                    ),
-                    format!("SSE data: {}", escape_text(&event.data)),
-                ]
-            }),
-        },
-        EventKind::WebSocketHandoff(handoff) => EventKindDisplay {
-            summary: format!(
-                "websocket {}",
-                handoff.target.as_deref().unwrap_or("handoff")
-            ),
-            details: detail_if(include_details, || {
-                vec![
-                    format!(
-                        "WebSocket direction: {}",
-                        direction_label(handoff.direction)
-                    ),
-                    format!("WebSocket stream: {}", handoff.stream_sequence),
-                    format!("Target: {}", handoff.target.as_deref().unwrap_or("-")),
-                    format!(
-                        "Subprotocol: {}",
-                        handoff.subprotocol.as_deref().unwrap_or("-")
-                    ),
-                    format!("Extensions: {}", handoff.extensions.join(", ")),
-                ]
-            }),
-        },
-        EventKind::WebSocketFrame(frame) => EventKindDisplay {
-            summary: format!("ws frame {:?} {} bytes", frame.opcode, frame.payload_len),
-            details: detail_if(include_details, || {
-                vec![
-                    format!("WebSocket direction: {}", direction_label(frame.direction)),
-                    format!("WebSocket stream: {}", frame.stream_sequence),
-                    format!("Frame: {}", frame.frame_sequence),
-                    format!("Opcode: {:?}", frame.opcode),
-                    format!("FIN: {}", frame.fin),
-                    format!("Payload bytes: {}", frame.payload_len),
-                    format!("Masked: {}", frame.masked),
-                    format!("Fingerprint: {}", hex_preview(&frame.payload_fingerprint)),
-                ]
-            }),
-        },
-        EventKind::WebSocketMessage(message) => EventKindDisplay {
-            summary: format!(
-                "ws message {:?} {} bytes",
-                message.opcode, message.payload_len
-            ),
-            details: detail_if(include_details, || {
-                vec![
-                    format!(
-                        "WebSocket direction: {}",
-                        direction_label(message.direction)
-                    ),
-                    format!("WebSocket stream: {}", message.stream_sequence),
-                    format!("Message: {}", message.message_sequence),
-                    format!(
-                        "Frames: {}..{}",
-                        message.first_frame_sequence, message.final_frame_sequence
-                    ),
-                    format!("Opcode: {:?}", message.opcode),
-                    format!("Payload bytes: {}", message.payload_len),
-                    format!("Payload: {}", bytes_detail(message.payload.as_ref())),
-                    format!("Fingerprint: {}", hex_preview(&message.payload_fingerprint)),
-                ]
-            }),
-        },
-        EventKind::OpaqueStream(stream) => EventKindDisplay {
-            summary: stream.reason.clone(),
-            details: detail_if(include_details, || {
-                vec![
-                    format!("Direction: {}", direction_label(stream.direction)),
-                    format!("Reason: {}", stream.reason),
-                ]
-            }),
-        },
-        EventKind::CaptureLoss(loss) => EventKindDisplay {
-            summary: format!("capture loss {} events: {}", loss.lost_events, loss.reason),
-            details: detail_if(include_details, || {
-                vec![
-                    format!("Lost events: {}", loss.lost_events),
-                    format!("Reason: {}", loss.reason),
-                ]
-            }),
-        },
-        EventKind::Gap(gap) => EventKindDisplay {
-            summary: gap.reason.clone(),
-            details: detail_if(include_details, || {
-                vec![
-                    format!("Direction: {}", direction_label(gap.direction)),
-                    format!("Reason: {}", gap.reason),
-                ]
-            }),
-        },
-        EventKind::ProtocolError(error) => EventKindDisplay {
-            summary: error.reason.clone(),
-            details: detail_if(include_details, || {
-                vec![
-                    format!("Direction: {}", direction_label(error.direction)),
-                    format!("Reason: {}", error.reason),
-                ]
-            }),
-        },
-        EventKind::PolicyAlert(alert) => EventKindDisplay {
-            summary: alert.message.clone(),
-            details: detail_if(include_details, || {
-                vec![
-                    format!("Message: {}", alert.message),
-                    format!("Metadata: {}", escape_text(&alert.metadata.to_string())),
-                ]
-            }),
-        },
-        EventKind::PolicyVerdict(verdict) => EventKindDisplay {
-            summary: format!("verdict {:?}: {}", verdict.action, verdict.reason),
-            details: detail_if(include_details, || {
-                vec![
-                    format!("Action: {:?}", verdict.action),
-                    format!("Reason: {}", verdict.reason),
-                ]
-            }),
-        },
-        EventKind::PolicyRuntimeError(error) => EventKindDisplay {
-            summary: error.reason.clone(),
-            details: detail_if(include_details, || {
-                vec![
-                    format!("Policy event type: {}", error.event_type),
-                    format!("Reason: {}", error.reason),
-                ]
-            }),
-        },
-        EventKind::EnforcementDecision(decision) => EventKindDisplay {
-            summary: format!("{:?}: {}", decision.outcome, decision.reason),
-            details: detail_if(include_details, || {
-                vec![
-                    format!("Outcome: {:?}", decision.outcome),
-                    format!("Reason: {}", decision.reason),
-                ]
-            }),
-        },
-        EventKind::L7MitmAudit(audit) => EventKindDisplay {
-            summary: audit
-                .reason()
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("{:?}", audit.phase())),
-            details: detail_if(include_details, || {
-                vec![
-                    format!("Phase: {:?}", audit.phase()),
-                    format!("Reason: {}", audit.reason().unwrap_or("-")),
-                ]
-            }),
-        },
-    }
-}
-
-fn detail_if(include_details: bool, build: impl FnOnce() -> Vec<String>) -> Vec<String> {
-    if include_details { build() } else { Vec::new() }
-}
-
-fn http_header_detail_lines(headers: &probe_core::HttpHeaders) -> Vec<String> {
-    let mut lines = vec![
-        format!("HTTP direction: {}", direction_label(headers.direction)),
-        format!("HTTP stream: {}", headers.stream_sequence),
-        format!("HTTP version: {}", headers.version),
-    ];
-    if let Some(method) = &headers.method {
-        lines.push(format!("Method: {method}"));
-    }
-    if let Some(target) = &headers.target {
-        lines.push(format!("Target: {target}"));
-    }
-    if let Some(status) = headers.status {
-        lines.push(format!("Status: {status}"));
-    }
-    if let Some(reason) = &headers.reason {
-        lines.push(format!("Reason: {reason}"));
-    }
-    lines.push(format!("Headers: {}", headers.headers.len()));
-    lines.extend(
-        headers
-            .headers
-            .iter()
-            .map(|(name, value)| format!("{name}: {}", escape_text(value))),
-    );
-    lines
-}
-
-fn event_detail_lines(sequence: u64, event: &EventEnvelope) -> Vec<String> {
-    let mut lines = vec![
-        format!("Sequence: {sequence}"),
-        format!("Event id: {}", event.id().as_str()),
-        format!("Event type: {}", event.kind().event_type()),
-        format!("Timestamp ns: {}", event.timestamp().wall_time_unix_ns),
-        format!(
-            "Capture path: {}",
-            capture_path_detail_label(event.origin())
-        ),
-        format!(
-            "Origin: source={} provider={} traffic_security={}",
-            event.origin().source().wire_name(),
-            event.origin().provider().wire_name(),
-            event.origin().traffic_security().wire_name()
-        ),
-        format!("Config version: {}", event.config_version()),
-        format!("Degraded: {}", event.degraded()),
-    ];
-    if let Some(policy_version) = event.policy_version() {
-        lines.push(format!("Policy version: {policy_version}"));
-    }
-    if let Some(flow) = event.flow() {
-        lines.extend([
-            format!(
-                "Process: {} pid={} uid={} gid={}",
-                flow.process.name,
-                flow.process.identity.pid,
-                flow.process.identity.uid,
-                flow.process.identity.gid
-            ),
-            format!("Executable: {}", flow.process.identity.exe_path),
-            format!("Local: {}:{}", flow.local.address, flow.local.port),
-            format!("Remote: {}:{}", flow.remote.address, flow.remote.port),
-            format!("Protocol: {:?}", flow.protocol),
-            format!("Attribution confidence: {}", flow.attribution_confidence),
-        ]);
-    }
-    lines.extend(event_kind_display(event.kind(), true).details);
-    lines
-}
-
 fn omission_detail_lines(sequence: u64, row: &TrafficOmissionRow) -> Vec<String> {
     vec![
         format!("Sequence: {sequence}"),
@@ -541,28 +244,12 @@ fn omission_detail_lines(sequence: u64, row: &TrafficOmissionRow) -> Vec<String>
         ),
     ]
 }
-
-fn hex_preview(bytes: &[u8]) -> String {
-    let hex = bytes
-        .iter()
-        .take(32)
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join("");
-    if bytes.len() > 32 {
-        format!("{hex}...")
-    } else if hex.is_empty() {
-        "-".to_string()
-    } else {
-        hex
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use probe_core::{
-        AddressPort, BodyChunk, CaptureOrigin, CaptureSource, Direction, FlowContext, FlowIdentity,
-        HttpHeaders, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
+        AddressPort, BodyChunk, CaptureOrigin, CaptureSource, CaptureTrafficSecurity, Direction,
+        EventKind, FlowContext, FlowIdentity, HttpHeaders, ProcessContext, ProcessIdentity,
+        Timestamp, TransportProtocol,
     };
 
     use super::*;
