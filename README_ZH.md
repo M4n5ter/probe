@@ -237,6 +237,12 @@ collector-specific payload format 仍应在配置和 policy 文件中维护。
 不传 `--config` 时，TUI 使用 `PROBE_HOME/config/agent.toml`；文件不存在会创建一份最小安全配置。
 需要编辑指定文件时可以传 `--config ./agent.toml`。
 
+TUI 启动时会向配置中的 admin socket 发送轻量 `ping`。如果已有 live agent 响应，TUI 会复用它，
+并避免为了探活构建完整 status snapshot。没有可复用 agent 时，TUI 使用同一个 binary 启动本地托管
+agent；该子进程使用 `PROBE_HOME/run/tui/` 下的 runtime overlay、私有 admin socket 和 `agent.log`，
+不会因为 TUI 需要运行期 socket 而改写用户配置。托管启动失败时，TUI 会显示 `agent.log` 路径和短 tail，
+让真实启动错误可见。
+
 当配置中的 admin socket 已启用且 live agent 正在运行时，Traffic tab 会通过在线
 admin surface tail 已解析的 export event。它优先使用选中进程的 executable-path
 selector；如果选中进程没有可读 executable path，流量过滤会 fail closed，不会退回展示无关的全机流量。
@@ -265,8 +271,12 @@ interception selector 时，transparent interception 会继承 effective policy 
 `enforcement.interception.selector` 引用的条目变更，仍需要重启，直到 selector ownership
 具备独立 lifecycle owner。capture、observation、config version、TLS plaintext instrumentation 和 TLS
 decrypt-hint material rebuild verdict 会排入 runtime generation request，并由 live agent 在 capture safe
-point 交换。queued response 会携带 generation request id；TUI 会跟踪 status，直到该 request applied、failed，
-或超过后台等待窗口后仍 pending。在线 apply 失败、已入队 generation failed 或仍 pending 时，旧
+point 交换。live agent 会先对旧 provider 执行有界 handoff drain；旧 provider drain 成功或预算耗尽后，
+才消费 request、validate 并打开候选 provider。候选 provider 打开失败时旧 runtime 保持活跃；打开成功后
+完成 provider swap、runtime status 更新和 active plan 替换。持续流量不能让 generation swap 一直饥饿；
+预算耗尽后的 applied outcome 会报告为 forced handoff，让 operator 能区分完整 drain 和优先保证切换活性的
+强制推进。queued response 会携带 generation request id；TUI 会跟踪 status，直到该 request applied、
+failed，或超过后台等待窗口后仍 pending。在线 apply 失败、已入队 generation failed 或仍 pending 时，旧
 running agent 继续保留，TUI 在状态行报告结果。generation request 无法入队时，TUI-managed agent
 可以重启以收敛到保存配置；attached external agent 会提示显式重启或重试。export、storage、admin
 socket、watcher topology 等 setup-time topology 仍需要进程 rebuild。
@@ -1009,10 +1019,12 @@ policy source 和 `enforcement.selector` 变更在 enforcement reload watcher/po
 时可在线应用。顶层 `[selectors]` registry 变更，包括被 `enforcement.selector` 或
 `enforcement.interception.selector` 引用的条目变更，仍需要重启。
 Data-path rebuild verdict 会提交带 request id 的 `request_runtime_generation` action，并在 status 中表现为
-pending runtime generation；live agent 在 capture safe point 消费该 request 并记录 runtime generation outcome。
-capture、observation、config version、TLS plaintext instrumentation 和 TLS decrypt-hint material
-变更会构建候选 capture generation，只有候选 provider 打开成功后才交换到 live loop、更新 runtime
-status 并替换共享 active plan。online/data-path 混合变更保持 `restart_required`，直到存在能整体
+pending runtime generation。live agent 在旧 provider drain 成功或有界预算耗尽后消费 request，
+validate 并打开候选 provider，再记录 runtime generation outcome；持续流量不能无限阻止 request 被处理。
+预算耗尽后的成功切换会在 outcome 中标记 forced handoff。capture、observation、config version、TLS plaintext
+instrumentation 和 TLS decrypt-hint material 变更会构建候选 capture generation，只有候选 provider
+打开成功后才交换到 live loop、更新 runtime status 并替换共享 active plan。online/data-path 混合变更保持
+`restart_required`，直到存在能整体
 应用候选配置且不会产生 partial commit 的事务型 generation owner。generation request 无法入队时，
 旧 runtime 保持活跃；TUI-managed agent 可以通过重启收敛到保存配置，attached external agent 会提示
 显式重启或重试。selectors、MITM/export TLS materials、enforcement execution surface、export、

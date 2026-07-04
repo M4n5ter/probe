@@ -85,10 +85,18 @@ pub(crate) enum RuntimeGenerationReloadResultSnapshot {
     Applied {
         generation: u64,
         config_version: String,
+        handoff: RuntimeGenerationHandoffOutcomeSnapshot,
     },
     Failed {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub(crate) enum RuntimeGenerationHandoffOutcomeSnapshot {
+    Drained,
+    Forced { after_batches: u32 },
 }
 
 #[derive(Debug, Default)]
@@ -187,7 +195,12 @@ impl RuntimeGenerationState {
         Some(request)
     }
 
-    pub(crate) fn record_reload_applied(&self, request_id: u64, config_version: impl Into<String>) {
+    pub(crate) fn record_reload_applied(
+        &self,
+        request_id: u64,
+        config_version: impl Into<String>,
+        handoff: RuntimeGenerationHandoffOutcomeSnapshot,
+    ) {
         let mut control = self
             .inner
             .lock()
@@ -202,6 +215,7 @@ impl RuntimeGenerationState {
             result: RuntimeGenerationReloadResultSnapshot::Applied {
                 generation: control.snapshot.active.generation,
                 config_version,
+                handoff,
             },
         });
     }
@@ -322,7 +336,11 @@ mod tests {
             .expect("queued request should begin");
         assert!(state.has_pending_or_applying_reload());
 
-        state.record_reload_applied(applying.snapshot.request_id, "candidate");
+        state.record_reload_applied(
+            applying.snapshot.request_id,
+            "candidate",
+            RuntimeGenerationHandoffOutcomeSnapshot::Drained,
+        );
         assert!(!state.has_pending_or_applying_reload());
     }
 
@@ -415,7 +433,11 @@ mod tests {
             .expect("request should queue");
         state.begin_pending_reload();
 
-        state.record_reload_applied(queued.request_id, "candidate");
+        state.record_reload_applied(
+            queued.request_id,
+            "candidate",
+            RuntimeGenerationHandoffOutcomeSnapshot::Forced { after_batches: 8 },
+        );
 
         let snapshot = state.snapshot();
         assert_eq!(snapshot.active.generation, 2);
@@ -425,7 +447,8 @@ mod tests {
             snapshot.last_outcome.map(|outcome| outcome.result),
             Some(RuntimeGenerationReloadResultSnapshot::Applied {
                 generation: 2,
-                config_version
+                config_version,
+                handoff: RuntimeGenerationHandoffOutcomeSnapshot::Forced { after_batches: 8 },
             }) if config_version == "candidate"
         ));
     }

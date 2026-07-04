@@ -484,9 +484,11 @@ async fn wait_for_admin_socket_after_readiness(
 }
 
 async fn admin_socket_responds(socket_path: &Path) -> bool {
-    send_admin_json_request_with_timeout(socket_path, AdminRequest::Status, ADMIN_PROBE_TIMEOUT)
+    send_admin_json_request_with_timeout(socket_path, AdminRequest::Ping, ADMIN_PROBE_TIMEOUT)
         .await
-        .is_ok()
+        .is_ok_and(|response| {
+            response.get("kind").and_then(serde_json::Value::as_str) == Some("pong")
+        })
 }
 
 async fn terminate_child(child: &mut tokio::process::Child) {
@@ -624,6 +626,64 @@ mod tests {
         if let TuiAgentMode::Managed(agent) = &mut supervisor.mode {
             let _ = agent.child.wait().await;
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_socket_probe_uses_lightweight_ping() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let socket_path = temp.path().join("admin.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path)?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept admin probe");
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            let mut request = String::new();
+            {
+                let mut reader = BufReader::new(&mut stream);
+                reader
+                    .read_line(&mut request)
+                    .await
+                    .expect("read admin probe");
+            }
+            let request: serde_json::Value =
+                serde_json::from_str(&request).expect("admin probe should be JSON");
+            assert_eq!(request["command"], "ping");
+            stream
+                .write_all(b"{\"kind\":\"pong\"}\n")
+                .await
+                .expect("write pong");
+        });
+
+        assert!(admin_socket_responds(&socket_path).await);
+        server.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_socket_probe_rejects_non_pong_response() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempfile::tempdir()?;
+        let socket_path = temp.path().join("admin.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path)?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept admin probe");
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            let mut request = String::new();
+            {
+                let mut reader = BufReader::new(&mut stream);
+                reader
+                    .read_line(&mut request)
+                    .await
+                    .expect("read admin probe");
+            }
+            stream
+                .write_all(b"{\"kind\":\"status\"}\n")
+                .await
+                .expect("write non-pong response");
+        });
+
+        assert!(!admin_socket_responds(&socket_path).await);
+        server.await?;
         Ok(())
     }
 

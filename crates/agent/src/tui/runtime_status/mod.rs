@@ -301,9 +301,13 @@ impl TrafficRuntimeDiagnostics {
                 RuntimeGenerationReloadResultSnapshot::Applied {
                     generation,
                     config_version,
+                    handoff,
                 } => lines.push(format!(
-                    "last outcome: request {} applied as generation {} ({})",
-                    outcome.request_id, generation, config_version
+                    "last outcome: request {} applied as generation {} ({}){}",
+                    outcome.request_id,
+                    generation,
+                    config_version,
+                    runtime_generation_handoff_suffix(handoff)
                 )),
                 RuntimeGenerationReloadResultSnapshot::Failed { message } => lines.push(format!(
                     "last outcome: request {} failed: {message}",
@@ -331,6 +335,19 @@ fn runtime_generation_request_line(request: &RuntimeGenerationReloadRequestSnaps
 
 fn candidate_config_version_label(config_version: Option<&str>) -> &str {
     config_version.unwrap_or("<unknown config_version>")
+}
+
+fn runtime_generation_handoff_suffix(
+    handoff: &crate::runtime_generation::RuntimeGenerationHandoffOutcomeSnapshot,
+) -> String {
+    match handoff {
+        crate::runtime_generation::RuntimeGenerationHandoffOutcomeSnapshot::Drained => {
+            "; handoff drained".to_string()
+        }
+        crate::runtime_generation::RuntimeGenerationHandoffOutcomeSnapshot::Forced {
+            after_batches,
+        } => format!("; handoff forced after {after_batches} drain batches"),
+    }
 }
 
 fn combine_diagnostic_messages(
@@ -976,6 +993,56 @@ mod tests {
         assert_detail_line(
             &lines,
             "last outcome: request 8 failed: candidate capture provider failed to open",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_surface_forced_runtime_generation_handoff()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "kind": "traffic_status",
+            "projection": {
+                "runtime_generation": {
+                    "active": { "generation": 2, "config_version": "candidate" },
+                    "pending": null,
+                    "applying": null,
+                    "last_outcome": {
+                        "request_id": 9,
+                        "completed_unix_ns": 50,
+                        "result": {
+                            "result": "applied",
+                            "generation": 2,
+                            "config_version": "candidate",
+                            "handoff": {
+                                "status": "forced",
+                                "after_batches": 8
+                            }
+                        }
+                    },
+                    "capture_control": {
+                        "safe_points": 5,
+                        "last_safe_point_unix_ns": 60
+                    }
+                },
+                "capture": {
+                    "selection": "auto",
+                    "selected_backend": "ebpf",
+                    "selected_input_source": "live_host",
+                    "mode": "live",
+                    "reason": null,
+                    "candidates": [],
+                    "open_failures": []
+                }
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+
+        let lines = diagnostics.detail_lines();
+        assert_detail_line(
+            &lines,
+            "last outcome: request 9 applied as generation 2 (candidate); handoff forced after 8 drain batches",
         );
         Ok(())
     }

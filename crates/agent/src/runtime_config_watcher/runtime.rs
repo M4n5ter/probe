@@ -543,7 +543,11 @@ mod tests {
 
         let insert_stale_pending_after_applying = async {
             tokio::time::sleep(RUNTIME_GENERATION_BUSY_RETRY_INTERVAL / 2).await;
-            runtime_generation.record_reload_applied(applying.request_id, "applying");
+            runtime_generation.record_reload_applied(
+                applying.request_id,
+                "applying",
+                crate::runtime_generation::RuntimeGenerationHandoffOutcomeSnapshot::Drained,
+            );
             runtime_generation.request_reload(RuntimeGenerationReloadRequestInput {
                 candidate_path: config_path.clone(),
                 base_config: current.config.clone(),

@@ -20,7 +20,7 @@ use crate::{
     tls_plaintext::{TlsDecryptHintRuntimeState, TlsPlaintextRuntimeState},
 };
 
-use super::RuntimeGenerationState;
+use super::{RuntimeGenerationHandoffOutcomeSnapshot, RuntimeGenerationState};
 
 pub(crate) struct RuntimeGenerationExecutor {
     runtime_generation: RuntimeGenerationState,
@@ -64,6 +64,7 @@ impl RuntimeGenerationExecutor {
         &self,
         active_plan: &mut RuntimePlan,
         provider: &mut Box<dyn CaptureProvider>,
+        handoff: RuntimeGenerationHandoffOutcomeSnapshot,
         on_applied_config_version: impl FnOnce(&str),
     ) -> RuntimeGenerationProcessResult {
         let Some(request) = self.runtime_generation.begin_pending_reload() else {
@@ -116,6 +117,7 @@ impl RuntimeGenerationExecutor {
                         self.runtime_generation.record_reload_applied(
                             request.snapshot.request_id,
                             config_version.clone(),
+                            handoff,
                         );
                         RuntimeGenerationProcessResult::Applied { config_version }
                     }
@@ -324,6 +326,7 @@ mod tests {
             .expect("runtime generation outcome should serialize");
         assert_eq!(outcome["request_id"], request.request_id);
         assert_eq!(outcome["result"]["result"], "applied");
+        assert_eq!(outcome["result"]["handoff"]["status"], "drained");
         assert_eq!(
             runtime
                 .plan_handle
@@ -424,9 +427,13 @@ mod tests {
         let mut runtime = RuntimeGenerationReloadTestRuntime::new(AgentConfig::default())?;
 
         let mut handoff_config_version = None;
-        let result = runtime.process_reload_with(&runtime_generation, |config_version| {
-            handoff_config_version = Some(config_version.to_string());
-        });
+        let result = runtime.process_reload_with(
+            &runtime_generation,
+            RuntimeGenerationHandoffOutcomeSnapshot::Forced { after_batches: 8 },
+            |config_version| {
+                handoff_config_version = Some(config_version.to_string());
+            },
+        );
 
         assert_eq!(
             result,
@@ -435,6 +442,10 @@ mod tests {
             }
         );
         assert_eq!(handoff_config_version.as_deref(), Some("candidate"));
+        let outcome = serde_json::to_value(runtime_generation.snapshot().last_outcome)
+            .expect("runtime generation outcome should serialize");
+        assert_eq!(outcome["result"]["handoff"]["status"], "forced");
+        assert_eq!(outcome["result"]["handoff"]["after_batches"], 8);
         Ok(())
     }
 
@@ -738,12 +749,17 @@ mod tests {
             &mut self,
             runtime_generation: &RuntimeGenerationState,
         ) -> RuntimeGenerationProcessResult {
-            self.process_reload_with(runtime_generation, |_| {})
+            self.process_reload_with(
+                runtime_generation,
+                RuntimeGenerationHandoffOutcomeSnapshot::Drained,
+                |_| {},
+            )
         }
 
         fn process_reload_with(
             &mut self,
             runtime_generation: &RuntimeGenerationState,
+            handoff: RuntimeGenerationHandoffOutcomeSnapshot,
             on_applied_config_version: impl FnOnce(&str),
         ) -> RuntimeGenerationProcessResult {
             let executor = RuntimeGenerationExecutor::new(
@@ -758,6 +774,7 @@ mod tests {
             executor.process_capture_safe_point(
                 &mut self.active_plan,
                 &mut self.provider,
+                handoff,
                 on_applied_config_version,
             )
         }

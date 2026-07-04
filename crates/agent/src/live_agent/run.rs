@@ -38,7 +38,9 @@ use crate::{
     policy_reload_watcher::{self, PolicyReloadWatcherHandle},
     runtime_composition::build_runtime_composition,
     runtime_config_watcher::{self, RuntimeConfigWatcherContext, RuntimeConfigWatcherHandle},
-    runtime_generation::{RuntimeGenerationExecutor, RuntimeGenerationState},
+    runtime_generation::{
+        RuntimeGenerationExecutor, RuntimeGenerationHandoffOutcomeSnapshot, RuntimeGenerationState,
+    },
     runtime_plan::RuntimePlanHandle,
     runtime_reload::RuntimeReloadGate,
     shutdown,
@@ -53,6 +55,7 @@ use crate::{
 const INGRESS_RECOVERY_BATCH_SIZE: usize = 1_024;
 const LIVE_CAPTURE_BATCH_POLLS: u64 = 8;
 const LIVE_CAPTURE_HANDOFF_DRAIN_POLLS: u64 = 1_024;
+const LIVE_CAPTURE_HANDOFF_MAX_DRAIN_BATCHES: u32 = 8;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RunOptions {
     pub max_events: Option<u64>,
@@ -450,6 +453,7 @@ impl BlockingCaptureRun {
             active_interception_guard.transparent_interception =
                 transparent_interception.activate(transparent_interception_setup_scope)?;
             signal_readiness(readiness)?;
+            let mut handoff_drain = RuntimeGenerationHandoffDrain::default();
             loop {
                 if shutdown::requested(&shutdown_requested) {
                     break;
@@ -470,14 +474,27 @@ impl BlockingCaptureRun {
                     if provider_finished || shutdown::requested(&shutdown_requested) {
                         break;
                     }
-                    if !handoff_drained {
-                        continue;
+                    let handoff = match handoff_drain.observe(handoff_drained) {
+                        RuntimeGenerationHandoffDecision::WaitForDrain => continue,
+                        RuntimeGenerationHandoffDecision::Proceed(handoff) => handoff,
+                    };
+                    if let RuntimeGenerationHandoffOutcomeSnapshot::Forced { after_batches } =
+                        handoff
+                    {
+                        eprintln!(
+                            "runtime generation handoff forced after {after_batches} non-drained capture drain batch(es)"
+                        );
                     }
                     runtime_generation.record_capture_safe_point();
                     let _runtime_generation_result = runtime_generation_executor
-                        .process_capture_safe_point(&mut plan, &mut provider, |config_version| {
-                            pipeline.set_config_version(config_version);
-                        });
+                        .process_capture_safe_point(
+                            &mut plan,
+                            &mut provider,
+                            handoff,
+                            |config_version| {
+                                pipeline.set_config_version(config_version);
+                            },
+                        );
                 }
                 let Some(run_options) = live_capture_run_options(
                     max_events,
@@ -509,6 +526,41 @@ impl BlockingCaptureRun {
             l7_mitm_cleanup_result,
             storage_retention_worker,
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RuntimeGenerationHandoffDrain {
+    not_drained_batches: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeGenerationHandoffDecision {
+    WaitForDrain,
+    Proceed(RuntimeGenerationHandoffOutcomeSnapshot),
+}
+
+impl RuntimeGenerationHandoffDrain {
+    fn observe(&mut self, drained: bool) -> RuntimeGenerationHandoffDecision {
+        if drained {
+            self.reset();
+            return RuntimeGenerationHandoffDecision::Proceed(
+                RuntimeGenerationHandoffOutcomeSnapshot::Drained,
+            );
+        }
+        self.not_drained_batches = self.not_drained_batches.saturating_add(1);
+        if self.not_drained_batches < LIVE_CAPTURE_HANDOFF_MAX_DRAIN_BATCHES {
+            return RuntimeGenerationHandoffDecision::WaitForDrain;
+        }
+        let after_batches = self.not_drained_batches;
+        self.reset();
+        RuntimeGenerationHandoffDecision::Proceed(RuntimeGenerationHandoffOutcomeSnapshot::Forced {
+            after_batches,
+        })
+    }
+
+    fn reset(&mut self) {
+        self.not_drained_batches = 0;
     }
 }
 
@@ -740,6 +792,47 @@ mod tests {
 
         assert_eq!(options.max_events, Some(2));
         assert_eq!(options.max_polls, Some(LIVE_CAPTURE_HANDOFF_DRAIN_POLLS));
+    }
+
+    #[test]
+    fn runtime_generation_handoff_decision_waits_until_bounded_budget_is_exhausted() {
+        let mut handoff = RuntimeGenerationHandoffDrain::default();
+
+        for _ in 1..LIVE_CAPTURE_HANDOFF_MAX_DRAIN_BATCHES {
+            assert_eq!(
+                handoff.observe(false),
+                RuntimeGenerationHandoffDecision::WaitForDrain
+            );
+        }
+
+        assert_eq!(
+            handoff.observe(false),
+            RuntimeGenerationHandoffDecision::Proceed(
+                RuntimeGenerationHandoffOutcomeSnapshot::Forced {
+                    after_batches: LIVE_CAPTURE_HANDOFF_MAX_DRAIN_BATCHES
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn runtime_generation_handoff_decision_resets_after_successful_drain() {
+        let mut handoff = RuntimeGenerationHandoffDrain::default();
+        assert_eq!(
+            handoff.observe(false),
+            RuntimeGenerationHandoffDecision::WaitForDrain
+        );
+
+        assert_eq!(
+            handoff.observe(true),
+            RuntimeGenerationHandoffDecision::Proceed(
+                RuntimeGenerationHandoffOutcomeSnapshot::Drained
+            )
+        );
+        assert_eq!(
+            handoff.observe(false),
+            RuntimeGenerationHandoffDecision::WaitForDrain
+        );
     }
 
     #[tokio::test]

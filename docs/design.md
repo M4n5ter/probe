@@ -290,8 +290,8 @@ Operator TUI 能力事实：
   `PROBE_HOME/config/agent.toml`；文件不存在会创建一份最小安全配置，其中 admin socket path
   指向 `PROBE_HOME/run/admin.sock`，但 admin socket 保持禁用。TUI 的本地工作台 runtime attachment
   不通过隐式改写用户配置获得。
-- TUI 启动时探测配置中的 admin socket。若 socket 响应 `status`，TUI 复用该运行中 agent。
-  若没有可用 agent，TUI 使用同一个 binary 启动 `run --config <runtime-config>` 托管子进程，
+- TUI 启动时向配置中的 admin socket 发送轻量 `ping`。若 socket 响应 `pong`，TUI 复用该运行中 agent，
+  不为了存活探测构建完整 status snapshot。若没有可用 agent，TUI 使用同一个 binary 启动 `run --config <runtime-config>` 托管子进程，
   runtime config 位于 `PROBE_HOME/run/tui/<session>/agent.toml`，启用同目录私有 admin socket，
   并把 stdout/stderr 写入同目录 `agent.log`。TUI 退出时向托管子进程发送 `SIGTERM`
   并在超时后终止该子进程；复用已有 agent 时不管理其生命周期。托管启动失败和运行期退出都会显示
@@ -359,6 +359,10 @@ Operator TUI 能力事实：
   变更，admin response 会返回带 `request_id` 的 `request_runtime_generation` queued action；TUI 保存动作展示
   queued request 并保持交互可用，generation outcome 通过 admin `status.runtime_generation` 和 TUI
   Traffic/Data Path diagnostics 使用的 `traffic_status.runtime_generation` projection 展示。
+  live agent 在旧 provider drain 成功或有界预算耗尽后消费 request、validate 并打开候选 provider。
+  candidate open 失败时旧 runtime 保持活跃；candidate open 成功后才 swap provider、更新 runtime status
+  并替换 active plan。持续流量不能无限推迟 request 处理；预算耗尽后的成功切换会在 applied outcome
+  中标记 forced handoff。
   在线 apply 失败、generation 仍 pending 或后续 generation 失败时，旧 running agent 继续保留；generation
   request 无法入队表示保存的候选配置尚未进入 live data path，TUI-managed agent 可以重启以收敛到保存配置，
   attached external agent 会提示显式重启或重试。planning 明确要求 setup-time rebuild 的 storage path、
@@ -5046,8 +5050,10 @@ Full config hot reload：
 - runtime generation request 由 admin apply 阶段基于已读取、已解析的 typed candidate config 创建；
   executor 消费 pending request 后执行 artifact hydration、static runtime validation 和 runtime composition build。
 - capture、observations、config version、TLS plaintext instrumentation 和 TLS decrypt-hint material 变更会在
-  候选 capture provider 成功打开后替换 live loop provider、更新 runtime status、替换 agent-wide active
-  `RuntimePlan` handle，并推进 active runtime generation。
+  旧 provider drain 成功或有界预算耗尽后消费 queued request，随后构建并打开候选 capture provider。
+  candidate open 失败时旧 provider 和旧 `RuntimePlan` 继续生效；candidate open 成功后，live loop 替换
+  provider、更新 runtime status、替换 agent-wide active `RuntimePlan` handle，并推进 active runtime
+  generation。预算耗尽后的成功切换会记录 forced handoff outcome。
 - generation executor 的二次校验只接受纯 `runtime_generation` diff。混合 online/data-path 候选配置保持
   `restart_required`，不能在 admin apply 阶段拆成两个非事务提交。
 - selectors、TLS material registry/source changes 和 enforcement execution surface 仍缺完整 lifecycle owner；这些 section
@@ -5073,8 +5079,8 @@ Full config hot reload：
 - main TOML file watcher 默认为 `agent run --config` 文件建立；文件事件经 debounce
   后复用 `apply_config_reload`。
 - capture/observations/TLS plaintext generation 由 `apply_config_reload` 提交
-  `request_runtime_generation`；live agent 在 capture safe point validate-then-swap
-  capture provider、TLS plaintext/decrypt-hint runtime state 和 active plan。
+  `request_runtime_generation`；live agent 对旧 provider 执行有界 handoff drain，在 drain 成功或预算耗尽后
+  validate/open candidate，然后 swap capture provider、TLS plaintext/decrypt-hint runtime state 和 active plan。
 - mixed online/data-path config 保持 `restart_required`；需要完整事务型 generation owner
   后才能整体 validate-then-swap。
 - selectors/MITM TLS/enforcement execution generation 缺少对应 lifecycle owner；

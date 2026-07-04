@@ -268,14 +268,15 @@ minimal safe config if the file does not exist. The generated admin socket path
 is `PROBE_HOME/run/admin.sock`, but the generated config keeps admin disabled.
 Pass `--config ./agent.toml` when editing an explicit file.
 
-On startup, the TUI probes the configured admin socket. If a running agent
-responds, the TUI reuses it. Otherwise, the TUI starts a managed local agent
-from the same binary and stops that child process when the TUI exits. The
-managed child uses a TUI-owned runtime overlay under `PROBE_HOME/run/tui/`;
-that overlay enables a private admin socket and writes stdout/stderr to
-`agent.log`. The user's config is not mutated just because the TUI needs a
-runtime admin socket. If managed startup fails, the TUI error includes the log
-path and a short tail so the real agent startup error is visible.
+On startup, the TUI sends a lightweight `ping` to the configured admin socket.
+If a running agent answers, the TUI reuses it without building a full status
+snapshot. Otherwise, the TUI starts a managed local agent from the same binary
+and stops that child process when the TUI exits. The managed child uses a
+TUI-owned runtime overlay under `PROBE_HOME/run/tui/`; that overlay enables a
+private admin socket and writes stdout/stderr to `agent.log`. The user's config
+is not mutated just because the TUI needs a runtime admin socket. If managed
+startup fails, the TUI error includes the log path and a short tail so the real
+agent startup error is visible.
 
 The Traffic tab tails parsed export events from the active agent admin surface.
 It uses the selected process executable-path selector when available; if the
@@ -1174,15 +1175,20 @@ exporter id set, endpoint, headers, codec, file path, Unix HTTP socket path, and
 batch quota changes affect subsequent batches. Export retention cursor owners
 are reconciled from the active plan on each retention sweep.
 Data-path rebuild verdicts can queue a `request_runtime_generation` action with
-a request id and appear as a pending runtime generation in status; the live agent
-consumes queued requests at capture safe points and records a runtime generation
-outcome. The TUI save path returns after the request is queued and keeps the
-session usable; Traffic/Data Path diagnostics surface pending, applying, and
-failed generation states from `traffic_status.runtime_generation`. Capture,
+a request id and appear as a pending runtime generation in status. The live agent
+consumes queued requests at capture safe points after the old provider has
+drained or the bounded handoff budget is exhausted. It then validates and opens
+the candidate provider. Candidate open failure keeps the old runtime active;
+candidate success swaps the provider, updates runtime status, and replaces the
+shared active plan. Continuous traffic cannot starve the generation swap. If the
+handoff budget is exhausted, the applied outcome is reported as a forced handoff
+so operators can distinguish liveness-over-completeness from a fully drained
+handoff. The TUI save path returns after the request is queued and keeps the
+session usable; Traffic/Data Path diagnostics surface pending, applying, failed,
+and forced handoff states from `traffic_status.runtime_generation`. Capture,
 observation, config version, TLS plaintext instrumentation, and TLS decrypt-hint
-material changes rebuild a candidate capture generation, swap it into the live
-loop, update runtime status, and replace the shared active plan only after the
-candidate opens. Mixed online/data-path changes remain
+material changes rebuild a candidate capture generation through that
+validate-then-swap path. Mixed online/data-path changes remain
 `restart_required` until a transactional generation owner can apply the whole
 candidate without partial commits. If a generation request cannot be queued, the
 old runtime stays active; a TUI-managed agent can restart to converge on the

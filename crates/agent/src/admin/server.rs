@@ -279,6 +279,7 @@ async fn handle_admin_request(
     runtime_state: &AdminRuntimeState,
 ) -> AdminResponse {
     match request {
+        AdminRequest::Ping => AdminResponse::Pong,
         AdminRequest::ReloadPolicies => {
             let _config_apply_guard = runtime_state.config_apply_gate.lock().await;
             let plan = plan_handle.snapshot();
@@ -632,6 +633,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_ping_returns_lightweight_pong() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-ping")?;
+        let socket_path = temp.join("admin.sock");
+        let spool_path = temp.join("spool");
+        let spool = Arc::new(FjallSpool::open(&spool_path)?);
+        let plan = Arc::new(runtime_plan(spool_path)?);
+        let server = spawn_admin_server(
+            RuntimePlanHandle::new(Arc::clone(&plan)),
+            Arc::clone(&spool),
+            AdminServerConfig::unix_socket(socket_path.clone()),
+            AdminRuntimeState::default(),
+        )?;
+
+        let response = send_admin_request(&socket_path, json!({ "command": "ping" })).await?;
+        let client_response =
+            crate::admin::send_admin_json_request(&socket_path, crate::admin::AdminRequest::Ping)
+                .await?;
+
+        assert_eq!(response["kind"], json!("pong"));
+        assert_eq!(client_response["kind"], json!("pong"));
+        server.stop().await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn admin_tail_events_filters_export_events_without_advancing_sink_cursor()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("admin-tail-events")?;
@@ -897,6 +923,7 @@ mod tests {
         assert_eq!(
             response["dump"]["protocol"]["commands"],
             json!([
+                { "name": "ping", "mutating": false },
                 { "name": "status", "mutating": false },
                 { "name": "traffic_status", "mutating": false },
                 { "name": "metrics", "mutating": false },

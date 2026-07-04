@@ -43,6 +43,7 @@ macro_rules! admin_requests {
 }
 
 admin_requests! {
+    Ping => ("ping", false),
     Status => ("status", false),
     TrafficStatus => ("traffic_status", false),
     Metrics => ("metrics", false),
@@ -68,6 +69,7 @@ admin_requests! {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub(super) enum AdminResponse {
+    Pong,
     Status {
         snapshot: Box<crate::status::AgentStatusSnapshot>,
     },
