@@ -63,6 +63,17 @@ impl WebSocketSessionRow {
         lines
     }
 
+    pub(crate) fn detail_lines_with_loaded_rows<'a>(
+        &self,
+        loaded_rows: impl IntoIterator<Item = &'a TrafficRow>,
+    ) -> Vec<String> {
+        let mut hydrated = self.clone();
+        for row in loaded_rows {
+            hydrated.apply_loaded_row(row);
+        }
+        hydrated.detail_lines()
+    }
+
     pub(crate) fn preview_lines(&self, max_lines: usize) -> Vec<String> {
         let lines = vec![
             format!("Sequence: {}", self.sequence),
@@ -84,6 +95,28 @@ impl WebSocketSessionRow {
             .filter(|message| message.payload.is_none())
             .map(|message| message.sequence)
             .collect()
+    }
+
+    fn apply_loaded_row(&mut self, row: &TrafficRow) {
+        let Some(event) = row.event_ref() else {
+            return;
+        };
+        if websocket_session_key(event).as_ref() != Some(&self.identity) {
+            return;
+        }
+        let Some(message) = event.websocket_message() else {
+            return;
+        };
+        let Some(existing) = self
+            .message_events
+            .iter_mut()
+            .find(|existing| existing.sequence == row.sequence)
+        else {
+            return;
+        };
+        existing.payload_len = message.payload_len;
+        existing.payload = message.payload.map(<[u8]>::to_vec);
+        existing.payload_fingerprint = message.payload_fingerprint.to_vec();
     }
 
     fn handoff_detail_lines(&self) -> Vec<String> {
@@ -139,7 +172,7 @@ impl WebSocketSessionRow {
                     .payload
                     .as_deref()
                     .map(bytes_detail)
-                    .unwrap_or_else(|| "open raw event detail".to_string())
+                    .unwrap_or_else(|| "not loaded in tail response".to_string())
             ));
             lines.push(format!(
                 "    Fingerprint: {}",
@@ -385,6 +418,8 @@ mod tests {
         WebSocketFrame, WebSocketMessage,
     };
 
+    use crate::admin::{EventTailEvent, EventTailRecord};
+
     use super::*;
 
     #[test]
@@ -509,6 +544,60 @@ mod tests {
                 .map(|session| session.target.as_str())
                 .collect::<Vec<_>>(),
             vec!["/early", "/late"]
+        );
+    }
+
+    #[test]
+    fn loaded_detail_rows_hydrate_websocket_message_payloads() {
+        let message = event(EventKind::WebSocketMessage(WebSocketMessage {
+            direction: Direction::Outbound,
+            stream_sequence: 3,
+            message_sequence: 1,
+            first_frame_sequence: 1,
+            final_frame_sequence: 1,
+            opcode: WebSocketMessageOpcode::Text,
+            payload_len: 5,
+            payload: b"hello".to_vec().into(),
+            payload_fingerprint: vec![0xbb],
+        }));
+        let tail_row = TrafficRow::from_record(EventTailRecord {
+            sequence: 3,
+            stored_at_unix_ns: 300,
+            event: EventTailEvent::from_envelope(&message),
+        });
+        let loaded_row = TrafficRow::from_event(3, message);
+        let rows = vec![
+            TrafficRow::from_event(
+                1,
+                event(EventKind::WebSocketHandoff(WebSocketHandoff {
+                    direction: Direction::Outbound,
+                    stream_sequence: 3,
+                    target: Some("/ws".to_string()),
+                    subprotocol: None,
+                    extensions: Vec::new(),
+                })),
+            ),
+            tail_row,
+        ];
+        let sessions = build_websocket_session_rows(&rows);
+        let [session] = sessions.as_slice() else {
+            panic!("expected one websocket session: {sessions:?}");
+        };
+
+        assert!(
+            session
+                .detail_lines()
+                .iter()
+                .any(|line| line == "    Payload: not loaded in tail response")
+        );
+        let loaded = [loaded_row];
+        let hydrated = session.detail_lines_with_loaded_rows(loaded.iter());
+
+        assert!(hydrated.iter().any(|line| line == "    Payload: hello"));
+        assert!(
+            !hydrated
+                .iter()
+                .any(|line| line == "    Payload: not loaded in tail response")
         );
     }
 

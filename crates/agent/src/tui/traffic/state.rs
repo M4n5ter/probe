@@ -458,7 +458,6 @@ impl TrafficState {
                 self.append_detail_load_state(
                     &mut lines,
                     &fetch_sequences,
-                    LoadedDetailPresentation::Consume,
                     DetailLoadLabels::payload(),
                 );
                 return Some(lines);
@@ -467,12 +466,13 @@ impl TrafficState {
                 let session = self
                     .websocket_sessions
                     .get(self.websocket_view.selected_index())?;
-                let mut lines = session.detail_lines();
+                let fetch_sequences = session.detail_fetch_sequences();
+                let loaded_rows = self.loaded_detail_rows(&fetch_sequences);
+                let mut lines = session.detail_lines_with_loaded_rows(loaded_rows);
                 self.append_detail_load_state(
                     &mut lines,
-                    &session.detail_fetch_sequences(),
-                    LoadedDetailPresentation::AppendRawEvent,
-                    DetailLoadLabels::raw_event(),
+                    &fetch_sequences,
+                    DetailLoadLabels::payload(),
                 );
                 return Some(lines);
             }
@@ -550,7 +550,6 @@ impl TrafficState {
         &self,
         lines: &mut Vec<String>,
         sequences: &[u64],
-        loaded_presentation: LoadedDetailPresentation,
         labels: DetailLoadLabels,
     ) {
         if sequences.is_empty() {
@@ -558,12 +557,8 @@ impl TrafficState {
         }
         let mut pending = Vec::new();
         for row_sequence in sequences {
-            if let Some(detail) = self.detail_state.loaded(*row_sequence) {
-                if loaded_presentation == LoadedDetailPresentation::AppendRawEvent {
-                    lines.push(String::new());
-                    lines.push(format!("{} for sequence {row_sequence}", labels.item));
-                    lines.extend(detail.detail_lines());
-                }
+            if self.detail_state.loaded(*row_sequence).is_some() {
+                continue;
             } else if self.detail_state.is_loading(*row_sequence) {
                 lines.push(String::new());
                 lines.push(format!(
@@ -1300,12 +1295,6 @@ enum DetailFetchMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LoadedDetailPresentation {
-    Consume,
-    AppendRawEvent,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DetailLoadLabels {
     item: &'static str,
     pending: &'static str,
@@ -1316,13 +1305,6 @@ impl DetailLoadLabels {
         Self {
             item: "Payload detail",
             pending: "Payload details pending",
-        }
-    }
-
-    fn raw_event() -> Self {
-        Self {
-            item: "Raw event detail",
-            pending: "Raw event details pending",
         }
     }
 }
@@ -1921,7 +1903,7 @@ mod tests {
                 .selected_detail_lines()
                 .expect("WebSocket session detail")
                 .iter()
-                .any(|line| line == "    Payload: open raw event detail")
+                .any(|line| line == "    Payload: not loaded in tail response")
         );
         assert_eq!(traffic.selected_detail_auto_fetch_sequence(), Some(2));
         traffic.mark_detail_loading(2, 42);
@@ -1941,7 +1923,14 @@ mod tests {
                 .selected_detail_lines()
                 .expect("WebSocket session detail")
                 .iter()
-                .any(|line| line == "Payload: hello")
+                .any(|line| line == "    Payload: hello")
+        );
+        assert!(
+            !traffic
+                .selected_detail_lines()
+                .expect("WebSocket session detail")
+                .iter()
+                .any(|line| line.contains("Raw event detail"))
         );
     }
 
