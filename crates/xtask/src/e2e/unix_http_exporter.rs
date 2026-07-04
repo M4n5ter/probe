@@ -9,8 +9,8 @@ use super::plaintext_export_batches::{
     compression_codec_name, decode_and_assert_event_records,
 };
 use super::plaintext_scenario::{
-    PLAINTEXT_FEED_EVENT_COUNT, PlaintextFeedScenario, PlaintextFlow, PlaintextHttpRequest,
-    PlaintextPolicy, PlaintextProcess, PlaintextScenarioIds,
+    PLAINTEXT_FEED_EVENT_COUNT, PLAINTEXT_FEED_EXPORT_EVENT_COUNT, PlaintextFeedScenario,
+    PlaintextFlow, PlaintextHttpRequest, PlaintextPolicy, PlaintextProcess, PlaintextScenarioIds,
 };
 use super::webhook_receiver::{ReceivedBatch, UnixHttpBatchReceiver};
 
@@ -146,6 +146,7 @@ fn assert_unix_http_batches(
         &batch_envelopes,
         AGENT_ID,
         COLLECTOR_SINK,
+        PLAINTEXT_FEED_EXPORT_EVENT_COUNT,
         "unix_http batches",
     )?;
     let envelopes = decode_and_assert_event_records(&batch_envelopes, "unix_http batches")?;

@@ -9,8 +9,8 @@ use super::plaintext_export_batches::{
     assert_file_export_batch_records, compression_codec_name, decode_and_assert_event_records,
 };
 use super::plaintext_scenario::{
-    PLAINTEXT_FEED_EVENT_COUNT, PlaintextFeedScenario, PlaintextFlow, PlaintextHttpRequest,
-    PlaintextPolicy, PlaintextProcess, PlaintextScenarioIds,
+    PLAINTEXT_FEED_EVENT_COUNT, PLAINTEXT_FEED_EXPORT_EVENT_COUNT, PlaintextFeedScenario,
+    PlaintextFlow, PlaintextHttpRequest, PlaintextPolicy, PlaintextProcess, PlaintextScenarioIds,
 };
 
 const FILE_SINK: &str = "local-file";
@@ -114,8 +114,13 @@ fn assert_file_export(
 ) -> Result<u64, Box<dyn std::error::Error>> {
     let (records, batches) =
         assert_file_export_batch_records(path, AGENT_ID, FILE_SINK, TEST_CODEC, "file exporter")?;
-    let expected_cursor =
-        assert_batch_sequence_contract(&batches, AGENT_ID, FILE_SINK, "file exporter records")?;
+    let expected_cursor = assert_batch_sequence_contract(
+        &batches,
+        AGENT_ID,
+        FILE_SINK,
+        PLAINTEXT_FEED_EXPORT_EVENT_COUNT,
+        "file exporter records",
+    )?;
     let envelopes = decode_and_assert_event_records(&batches, "file exporter records")?;
     assert_expected_export_set(&envelopes, scenario, "file exporter records")?;
 

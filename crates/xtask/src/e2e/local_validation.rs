@@ -10,10 +10,10 @@ use std::{
 use capture::CaptureEvent;
 use exporter::CompressionCodec;
 use probe_config::{
-    CaptureSelection, CompressionCodecName, ExportFailureBackoffConfig, ExportWorkerScheduleConfig,
-    ExporterConfig, ExporterTransportConfig,
+    AgentConfig, CaptureSelection, CompressionCodecName, ExportFailureBackoffConfig,
+    ExportWorkerScheduleConfig, ExporterConfig, ExporterTransportConfig,
 };
-use probe_core::{ProcessSelector, Selector, TrafficSelector};
+use probe_core::{EventEnvelope, ProcessSelector, Selector, TrafficSelector};
 
 use super::{
     agent_admin::{send_admin_request, wait_for_agent_pipeline_progress},
@@ -37,8 +37,11 @@ const AGENT_ID: &str = "local-validation-agent";
 const CONFIG_VERSION: &str = "local-validation";
 const POLICY_ID: &str = "local-validation-policy";
 const POLICY_VERSION: &str = "local";
+const RELOADED_POLICY_VERSION: &str = "reloaded";
 const CONNECTION_ID: &str = "local-validation-conn";
+const RELOADED_CONNECTION_ID: &str = "local-validation-reloaded-conn";
 const REQUEST_TARGET: &str = "/local-validation";
+const RELOADED_REQUEST_TARGET: &str = "/local-validation-reloaded";
 const FILE_SINK: &str = "local-validation-file";
 const FILE_CODEC: CompressionCodec = CompressionCodec::None;
 const EXPORT_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -50,6 +53,44 @@ const CURSOR_WAIT_INTERVAL: Duration = Duration::from_millis(100);
 struct FileExportObservation {
     cursor: u64,
     events: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ReloadValidation<'a> {
+    process_exe_path: &'a str,
+    rounds: [&'a PlaintextFeedScenario; 2],
+}
+
+impl<'a> ReloadValidation<'a> {
+    fn new(
+        initial: &'a PlaintextFeedScenario,
+        reloaded: &'a PlaintextFeedScenario,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let process_exe_path = initial.process_exe_path();
+        if reloaded.process_exe_path() != process_exe_path {
+            return Err(e2e_error(format!(
+                "local validation reload rounds must share one process selector, got {process_exe_path} and {}",
+                reloaded.process_exe_path()
+            ))
+            .into());
+        }
+        Ok(Self {
+            process_exe_path,
+            rounds: [initial, reloaded],
+        })
+    }
+
+    fn round_count(self) -> usize {
+        self.rounds.len()
+    }
+
+    fn expected_ingress_event_count(self) -> usize {
+        PLAINTEXT_FEED_EVENT_COUNT * self.round_count()
+    }
+
+    fn expected_export_event_count(self) -> usize {
+        PLAINTEXT_FEED_EXPORT_EVENT_COUNT * self.round_count()
+    }
 }
 
 pub(crate) fn run() -> ExitCode {
@@ -66,7 +107,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     ensure_e2e_packages_built(["agent"])?;
     run_with_temp_root("local-validation", run_at)?;
     println!(
-        "local validation passed: capture_event_feed -> HTTP parser -> Lua policy -> durable export -> admin tail -> file exporter"
+        "local validation passed: capture_event_feed -> HTTP parser -> Lua policy -> durable export -> admin tail -> file exporter; admin apply_config_reload switched policy between traffic rounds"
     );
     Ok(())
 }
@@ -75,20 +116,34 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(root)?;
     let feed_path = root.join("capture-events.jsonl");
     let policy_path = root.join("local-validation-policy.bundle");
+    let reloaded_policy_path = root.join("local-validation-policy-reloaded.bundle");
     let config_path = root.join("agent.toml");
+    let candidate_config_path = root.join("agent-reloaded.toml");
     let spool_path = root.join("spool");
     let admin_socket_path = root.join("admin.sock");
     let agent_ready_socket_path = root.join("agent.ready.sock");
     let export_path = root.join("export.jsonl");
 
-    let scenario = scenario();
+    let scenario = initial_scenario();
+    let reloaded = reloaded_scenario();
+    let validation = ReloadValidation::new(&scenario, &reloaded)?;
     fs::File::create(&feed_path)?;
     scenario.write_policy_bundle(&policy_path)?;
+    reloaded.write_policy_bundle(&reloaded_policy_path)?;
     write_agent_config(
         &scenario,
         &config_path,
         &feed_path,
         &policy_path,
+        &spool_path,
+        &admin_socket_path,
+        &export_path,
+    )?;
+    write_agent_config(
+        &reloaded,
+        &candidate_config_path,
+        &feed_path,
+        &reloaded_policy_path,
         &spool_path,
         &admin_socket_path,
         &export_path,
@@ -106,15 +161,24 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
         u64::try_from(PLAINTEXT_FEED_EVENT_COUNT)?,
         u64::try_from(PLAINTEXT_FEED_EXPORT_EVENT_COUNT)?,
     )?;
-    let exported = wait_for_file_export(agent.child_mut(), &export_path, &scenario)?;
+    assert_config_reload_plan_and_apply(&admin_socket_path, &candidate_config_path, &reloaded)?;
+    append_capture_events(&feed_path, &reloaded.capture_events())?;
+    wait_for_agent_pipeline_progress(
+        agent.child_mut(),
+        &admin_socket_path,
+        u64::try_from(validation.round_count())?,
+        u64::try_from(validation.expected_ingress_event_count())?,
+        u64::try_from(validation.expected_export_event_count())?,
+    )?;
+    let exported = wait_for_file_export(agent.child_mut(), &export_path, &validation)?;
     wait_for_export_cursor(
         agent.child_mut(),
         &admin_socket_path,
         FILE_SINK,
         exported.cursor,
     )?;
-    let tailed = assert_admin_tail(&admin_socket_path, &scenario)?;
-    assert_admin_tail_selector_miss(&admin_socket_path)?;
+    let tailed = assert_admin_tail(&admin_socket_path, &validation)?;
+    assert_admin_tail_selector_miss(&admin_socket_path, validation.expected_export_event_count())?;
     stop_running_child(agent.child_mut(), "agent")?;
     agent.unwatch();
 
@@ -125,7 +189,7 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn scenario() -> PlaintextFeedScenario {
+fn initial_scenario() -> PlaintextFeedScenario {
     PlaintextFeedScenario::new(
         PlaintextScenarioIds::new(
             AGENT_ID,
@@ -151,6 +215,32 @@ fn scenario() -> PlaintextFeedScenario {
     ))
 }
 
+fn reloaded_scenario() -> PlaintextFeedScenario {
+    PlaintextFeedScenario::new(
+        PlaintextScenarioIds::new(
+            AGENT_ID,
+            CONFIG_VERSION,
+            POLICY_ID,
+            RELOADED_POLICY_VERSION,
+            RELOADED_CONNECTION_ID,
+        ),
+        PlaintextHttpRequest::get(RELOADED_REQUEST_TARGET, "local.validation.test"),
+        PlaintextPolicy::alerting("reloaded local validation observed "),
+    )
+    .with_flow(PlaintextFlow::new(
+        52_101,
+        8_081,
+        4_243,
+        PlaintextProcess::new(
+            4_242,
+            7_777,
+            "traffic-probe-local-validation",
+            "/usr/bin/traffic-probe-local-validation",
+            "local-validation-hash",
+        ),
+    ))
+}
+
 fn write_agent_config(
     scenario: &PlaintextFeedScenario,
     path: &Path,
@@ -160,6 +250,26 @@ fn write_agent_config(
     admin_socket_path: &Path,
     export_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let config = agent_config(
+        scenario,
+        feed_path,
+        policy_path,
+        spool_path,
+        admin_socket_path,
+        export_path,
+    );
+    fs::write(path, toml::to_string(&config)?)?;
+    Ok(())
+}
+
+fn agent_config(
+    scenario: &PlaintextFeedScenario,
+    feed_path: &Path,
+    policy_path: &Path,
+    spool_path: &Path,
+    admin_socket_path: &Path,
+    export_path: &Path,
+) -> AgentConfig {
     let mut config = scenario.agent_config(
         feed_path.to_path_buf(),
         policy_path.to_path_buf(),
@@ -190,8 +300,7 @@ fn write_agent_config(
         codec: CompressionCodecName::None,
         worker: Default::default(),
     });
-    fs::write(path, toml::to_string(&config)?)?;
-    Ok(())
+    config
 }
 
 fn append_capture_events(
@@ -208,13 +317,99 @@ fn append_capture_events(
     Ok(())
 }
 
+fn assert_config_reload_plan_and_apply(
+    admin_socket_path: &Path,
+    candidate_config_path: &Path,
+    reloaded: &PlaintextFeedScenario,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let plan = send_admin_request(
+        admin_socket_path,
+        serde_json::json!({
+            "command": "plan_config_reload",
+            "path": candidate_config_path,
+        }),
+    )?;
+    if plan["kind"] != serde_json::json!("config_reload_plan")
+        || plan["plan"]["decision"]["kind"] != serde_json::json!("apply_online")
+        || !changed_sections_include_apply_online_policy(&plan["plan"]["changed_sections"])
+    {
+        return Err(e2e_error(format!(
+            "admin config reload plan did not describe an online policy reload: {plan}"
+        ))
+        .into());
+    }
+
+    let apply = send_admin_request(
+        admin_socket_path,
+        serde_json::json!({
+            "command": "apply_config_reload",
+            "path": candidate_config_path,
+        }),
+    )?;
+    if apply["kind"] != serde_json::json!("config_reload_apply")
+        || apply["apply"]["plan"]["decision"]["kind"] != serde_json::json!("apply_online")
+        || apply["apply"]["active_plan_updated"] != serde_json::json!(true)
+        || !reload_policies_action_succeeded(&apply["apply"]["actions"])
+    {
+        return Err(e2e_error(format!(
+            "admin config reload apply did not reload policies online: {apply}"
+        ))
+        .into());
+    }
+
+    let status = send_admin_request(
+        admin_socket_path,
+        serde_json::json!({
+            "command": "status",
+        }),
+    )?;
+    if status["kind"] != serde_json::json!("status")
+        || !status_policy_version_is_active(&status, &reloaded.expected_policy_version())
+    {
+        return Err(e2e_error(format!(
+            "admin status did not expose reloaded policy version {}: {status}",
+            reloaded.expected_policy_version()
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn changed_sections_include_apply_online_policy(changed_sections: &serde_json::Value) -> bool {
+    changed_sections.as_array().is_some_and(|changes| {
+        changes.iter().any(|change| {
+            change["section"] == serde_json::json!("policies")
+                && change["reload_mode"] == serde_json::json!("apply_online")
+        })
+    })
+}
+
+fn reload_policies_action_succeeded(actions: &serde_json::Value) -> bool {
+    actions.as_array().is_some_and(|actions| {
+        actions.iter().any(|action| {
+            action["action"] == serde_json::json!("reload_policies")
+                && action["outcome"]["result"] == serde_json::json!("succeeded")
+        })
+    })
+}
+
+fn status_policy_version_is_active(status: &serde_json::Value, expected: &str) -> bool {
+    status["snapshot"]["policy"]["active"]
+        .as_array()
+        .is_some_and(|policies| {
+            policies
+                .iter()
+                .any(|policy| policy["runtime"]["policy_version"].as_str() == Some(expected))
+        })
+}
+
 fn assert_admin_tail(
     admin_socket_path: &Path,
-    scenario: &PlaintextFeedScenario,
+    validation: &ReloadValidation<'_>,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let selector = Selector::term(
         ProcessSelector {
-            exe_path_globs: vec![scenario.process_exe_path().to_string()],
+            exe_path_globs: vec![validation.process_exe_path.to_string()],
             ..ProcessSelector::default()
         },
         TrafficSelector::default(),
@@ -232,23 +427,49 @@ fn assert_admin_tail(
             "admin tail omitted event array in response: {response}"
         ))
     })?;
-    assert_expected_compact_tail_set(records, scenario)?;
+    assert_expected_compact_tail_sets(records, validation)?;
     let next_after_sequence = tail["next_after_sequence"].as_u64().ok_or_else(|| {
         e2e_error(format!(
             "admin tail omitted next_after_sequence in response: {response}"
         ))
     })?;
-    if next_after_sequence < u64::try_from(PLAINTEXT_FEED_EXPORT_EVENT_COUNT)? {
+    let expected_export_events = validation.expected_export_event_count();
+    if next_after_sequence < u64::try_from(expected_export_events)? {
         return Err(e2e_error(format!(
-            "admin tail advanced only to sequence {next_after_sequence}, expected at least {PLAINTEXT_FEED_EXPORT_EVENT_COUNT}"
+            "admin tail advanced only to sequence {next_after_sequence}, expected at least {expected_export_events}"
         ))
         .into());
     }
     Ok(records.len())
 }
 
-fn assert_expected_compact_tail_set(
+fn assert_expected_compact_tail_sets(
     records: &[serde_json::Value],
+    validation: &ReloadValidation<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let expected = validation.expected_export_event_count();
+    if records.len() != expected {
+        return Err(e2e_error(format!(
+            "local validation admin tail expected {expected} compact events, got {}",
+            records.len()
+        ))
+        .into());
+    }
+    for scenario in validation.rounds {
+        let expected_flow_id = scenario.expected_flow_id();
+        let matching = records
+            .iter()
+            .filter(|record| {
+                compact_tail_event_flow_id(&record["event"]) == Some(expected_flow_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert_expected_compact_tail_set(&matching, scenario)?;
+    }
+    Ok(())
+}
+
+fn assert_expected_compact_tail_set(
+    records: &[&serde_json::Value],
     scenario: &PlaintextFeedScenario,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if records.len() != PLAINTEXT_FEED_EXPORT_EVENT_COUNT {
@@ -340,8 +561,13 @@ fn assert_compact_tail_event_scope(
     Ok(())
 }
 
+fn compact_tail_event_flow_id(event: &serde_json::Value) -> Option<&str> {
+    event["flow"]["id"].as_str()
+}
+
 fn assert_admin_tail_selector_miss(
     admin_socket_path: &Path,
+    expected_export_events: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let selector = Selector::term(
         ProcessSelector {
@@ -375,9 +601,9 @@ fn assert_admin_tail_selector_miss(
             "admin tail selector miss omitted next_after_sequence in response: {response}"
         ))
     })?;
-    if next_after_sequence < u64::try_from(PLAINTEXT_FEED_EXPORT_EVENT_COUNT)? {
+    if next_after_sequence < u64::try_from(expected_export_events)? {
         return Err(e2e_error(format!(
-            "admin tail selector miss scanned only to sequence {next_after_sequence}, expected at least {PLAINTEXT_FEED_EXPORT_EVENT_COUNT}"
+            "admin tail selector miss scanned only to sequence {next_after_sequence}, expected at least {expected_export_events}"
         ))
         .into());
     }
@@ -398,7 +624,7 @@ fn tail_events_request(selector: Selector) -> serde_json::Value {
 fn wait_for_file_export(
     agent: &mut Child,
     path: &Path,
-    scenario: &PlaintextFeedScenario,
+    validation: &ReloadValidation<'_>,
 ) -> Result<FileExportObservation, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + EXPORT_WAIT_TIMEOUT;
     let mut last_error = None::<String>;
@@ -418,7 +644,7 @@ fn wait_for_file_export(
             ))
             .into());
         }
-        match assert_file_export(path, scenario) {
+        match assert_file_export(path, validation) {
             Ok(exported) => return Ok(exported),
             Err(error) => last_error = Some(error.to_string()),
         }
@@ -428,7 +654,7 @@ fn wait_for_file_export(
 
 fn assert_file_export(
     path: &Path,
-    scenario: &PlaintextFeedScenario,
+    validation: &ReloadValidation<'_>,
 ) -> Result<FileExportObservation, Box<dyn std::error::Error>> {
     let (_records, batches) = assert_file_export_batch_records(
         path,
@@ -441,14 +667,40 @@ fn assert_file_export(
         &batches,
         AGENT_ID,
         FILE_SINK,
+        validation.expected_export_event_count(),
         "local validation file exporter",
     )?;
     let envelopes = decode_and_assert_event_records(&batches, "local validation file exporter")?;
-    assert_expected_export_set(&envelopes, scenario, "local validation file exporter")?;
+    assert_expected_export_sets(&envelopes, validation, "local validation file exporter")?;
     Ok(FileExportObservation {
         cursor,
         events: envelopes.len(),
     })
+}
+
+fn assert_expected_export_sets(
+    envelopes: &[EventEnvelope],
+    validation: &ReloadValidation<'_>,
+    label: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let expected = validation.expected_export_event_count();
+    if envelopes.len() != expected {
+        return Err(e2e_error(format!(
+            "{label} expected {expected} exported events, got {}",
+            envelopes.len()
+        ))
+        .into());
+    }
+    for scenario in validation.rounds {
+        let matching = envelopes
+            .iter()
+            .filter(|envelope| scenario.feed_case().matches_export_flow(envelope))
+            .cloned()
+            .collect::<Vec<_>>();
+        let scenario_label = format!("{label} {}", scenario.request_target());
+        assert_expected_export_set(&matching, scenario, &scenario_label)?;
+    }
+    Ok(())
 }
 
 fn wait_for_export_cursor(

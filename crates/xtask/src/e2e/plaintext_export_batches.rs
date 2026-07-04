@@ -190,6 +190,7 @@ pub(crate) fn assert_batch_sequence_contract(
     batches: &[BatchEnvelope],
     agent_id: &str,
     sink_id: &str,
+    expected_event_count: usize,
     label: &str,
 ) -> Result<u64, Box<dyn std::error::Error>> {
     let mut all_sequences = Vec::new();
@@ -256,9 +257,8 @@ pub(crate) fn assert_batch_sequence_contract(
         ))
         .into());
     }
-    let expected_sequences = (1..=u64::try_from(PLAINTEXT_FEED_EXPORT_EVENT_COUNT)
-        .unwrap_or(u64::MAX))
-        .collect::<Vec<_>>();
+    let expected_sequences =
+        (1..=u64::try_from(expected_event_count).unwrap_or(u64::MAX)).collect::<Vec<_>>();
     if all_sequences != expected_sequences {
         return Err(e2e_error(format!(
             "{label} carried export sequences in order {:?}, expected {:?}",

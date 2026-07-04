@@ -237,6 +237,7 @@ pub(super) const E2E_CASES: &[E2eCase] = &[
             E2eCapability::LuaPolicyBundle,
             E2eCapability::DurableSpoolExport,
             E2eCapability::FileExport,
+            E2eCapability::AdminReload,
             E2eCapability::AdminTail,
         ],
         run: E2eCaseRun::ExitCode(run_local_validation),
