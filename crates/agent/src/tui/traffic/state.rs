@@ -742,10 +742,12 @@ impl TrafficState {
 
     pub(crate) fn cycle_event_filter(&mut self) {
         self.event_filter = self.event_filter.next();
+        self.view_mode = preferred_view_for_event_filter(self.event_filter);
         self.reset_tail();
         self.status = TrafficStatus::idle(format!(
-            "Traffic event filter changed to {}",
-            self.event_filter.label()
+            "Traffic event filter changed to {}; showing {} view",
+            self.event_filter.label(),
+            self.view_mode.label()
         ));
     }
 
@@ -1160,6 +1162,16 @@ impl TrafficViewMode {
             Self::WebSocket => Self::Events,
             Self::Events => Self::Http,
         }
+    }
+}
+
+fn preferred_view_for_event_filter(event_filter: TrafficEventFilter) -> TrafficViewMode {
+    match event_filter {
+        TrafficEventFilter::Application | TrafficEventFilter::Http => TrafficViewMode::Http,
+        TrafficEventFilter::WebSocket => TrafficViewMode::WebSocket,
+        TrafficEventFilter::Security
+        | TrafficEventFilter::Diagnostics
+        | TrafficEventFilter::All => TrafficViewMode::Events,
     }
 }
 
@@ -1670,12 +1682,42 @@ mod tests {
         traffic.cycle_event_filter();
 
         assert_eq!(traffic.event_filter_label(), "HTTP");
+        assert_eq!(traffic.view_mode_label(), "HTTP");
         assert!(traffic.rows().is_empty());
         assert_eq!(traffic.after_sequence, 0);
         assert_eq!(
             traffic.status().text,
-            "Traffic event filter changed to HTTP"
+            "Traffic event filter changed to HTTP; showing HTTP view"
         );
+    }
+
+    #[test]
+    fn event_filter_switches_to_the_matching_reader_view() {
+        let mut traffic = TrafficState::default();
+
+        traffic.cycle_event_filter();
+        assert_eq!(traffic.event_filter_label(), "HTTP");
+        assert_eq!(traffic.view_mode_label(), "HTTP");
+
+        traffic.cycle_event_filter();
+        assert_eq!(traffic.event_filter_label(), "WebSocket");
+        assert_eq!(traffic.view_mode_label(), "WebSocket");
+
+        traffic.cycle_event_filter();
+        assert_eq!(traffic.event_filter_label(), "Security");
+        assert_eq!(traffic.view_mode_label(), "Events");
+
+        traffic.cycle_event_filter();
+        assert_eq!(traffic.event_filter_label(), "Diagnostics");
+        assert_eq!(traffic.view_mode_label(), "Events");
+
+        traffic.cycle_event_filter();
+        assert_eq!(traffic.event_filter_label(), "All");
+        assert_eq!(traffic.view_mode_label(), "Events");
+
+        traffic.cycle_event_filter();
+        assert_eq!(traffic.event_filter_label(), "Parsed");
+        assert_eq!(traffic.view_mode_label(), "HTTP");
     }
 
     #[test]
@@ -1698,7 +1740,7 @@ mod tests {
         assert_eq!(traffic.event_filter_label(), "HTTP");
         assert_eq!(
             traffic.status().text,
-            "Traffic event filter changed to HTTP"
+            "Traffic event filter changed to HTTP; showing HTTP view"
         );
     }
 
