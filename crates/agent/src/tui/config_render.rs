@@ -167,6 +167,18 @@ pub(super) fn render_preserving_config(
         "listen_addr",
         value(config.admin.prometheus.listen_addr.to_string()),
     );
+    set_value(
+        &mut document,
+        &["runtime_reload"],
+        "watch_config",
+        value(config.runtime_reload.watch_config),
+    );
+    set_u64(
+        &mut document,
+        &["runtime_reload"],
+        "debounce_ms",
+        config.runtime_reload.debounce_ms,
+    )?;
     Ok(document.to_string())
 }
 
@@ -446,17 +458,12 @@ fn set_optional_u64(
     document: &mut DocumentMut,
     table_path: &[&str],
     key: &str,
-    records: Option<u64>,
+    number: Option<u64>,
 ) -> Result<(), TuiError> {
-    match records {
-        Some(records) => {
-            let records = i64::try_from(records).map_err(|_| {
-                TuiError::UnsupportedTomlShape(format!(
-                    "{key} value {records} does not fit a TOML integer"
-                ))
-            })?;
+    match number {
+        Some(number) => {
             let table = table_at_path(document, table_path);
-            set_table_item(table, key, value(records));
+            set_table_item(table, key, toml_u64_value(key, number)?);
         }
         None => {
             if let Some(table) = table_at_existing_path_mut(document, table_path) {
@@ -465,6 +472,23 @@ fn set_optional_u64(
         }
     }
     Ok(())
+}
+
+fn set_u64(
+    document: &mut DocumentMut,
+    table_path: &[&str],
+    key: &str,
+    number: u64,
+) -> Result<(), TuiError> {
+    set_value(document, table_path, key, toml_u64_value(key, number)?);
+    Ok(())
+}
+
+fn toml_u64_value(key: &str, number: u64) -> Result<Item, TuiError> {
+    let number = i64::try_from(number).map_err(|_| {
+        TuiError::UnsupportedTomlShape(format!("{key} value {number} does not fit a TOML integer"))
+    })?;
+    Ok(value(number))
 }
 
 fn set_optional_path(
@@ -682,6 +706,10 @@ max_records = 10000
 
 [storage.retention.export]
 max_records = 10000
+
+[runtime_reload]
+watch_config = true
+debounce_ms = 500
 "#;
         let mut config = AgentConfig::from_toml_str(source)?;
         config.agent_id = "probe-a".to_string();
@@ -690,6 +718,8 @@ max_records = 10000
         config.exporters[0].codec = CompressionCodecName::Gzip;
         config.storage.retention.ingress.max_records = Some(100_000);
         config.storage.retention.export.max_records = Some(1_000_000);
+        config.runtime_reload.watch_config = false;
+        config.runtime_reload.debounce_ms = 1_000;
 
         let rendered = render_preserving_config(source, &config, Path::new("/tmp/agent.toml"))?;
 
@@ -704,6 +734,9 @@ max_records = 10000
         assert!(rendered.contains("[storage.retention.export]"));
         assert!(rendered.contains("max_records = 100000"));
         assert!(rendered.contains("max_records = 1000000"));
+        assert!(rendered.contains("[runtime_reload]"));
+        assert!(rendered.contains("watch_config = false"));
+        assert!(rendered.contains("debounce_ms = 1000"));
         AgentConfig::from_toml_str(&rendered)?.validate_basic()?;
         Ok(())
     }

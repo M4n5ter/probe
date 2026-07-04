@@ -2,9 +2,10 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use probe_config::{
     AgentConfig, CaptureSelection, CompressionCodecName, ConnectionEnforcementBackendConfig,
-    ExporterConfig, ExporterTransportConfig, ExporterWorkerConfig,
-    TransparentInterceptionStrategyConfig, default_admin_socket_path, default_export_file_path,
-    default_export_unix_http_socket_path,
+    DEFAULT_RUNTIME_RELOAD_WATCH_DEBOUNCE_MS, ExporterConfig, ExporterTransportConfig,
+    ExporterWorkerConfig, MAX_RUNTIME_RELOAD_WATCH_DEBOUNCE_MS,
+    MIN_RUNTIME_RELOAD_WATCH_DEBOUNCE_MS, TransparentInterceptionStrategyConfig,
+    default_admin_socket_path, default_export_file_path, default_export_unix_http_socket_path,
 };
 use probe_core::{EnforcementMode, Selector};
 
@@ -23,6 +24,8 @@ pub(crate) enum FieldId {
     AdminEnabled,
     AdminSocketPath,
     AdminPrometheusEnabled,
+    RuntimeReloadWatchConfig,
+    RuntimeReloadDebounce,
     ExportWorkerEnabled,
     AddDefaultExporter,
     ExporterTransport(usize),
@@ -51,6 +54,8 @@ impl FieldId {
             Self::AdminEnabled => "Admin socket",
             Self::AdminSocketPath => "Admin socket path",
             Self::AdminPrometheusEnabled => "Prometheus listener",
+            Self::RuntimeReloadWatchConfig => "Config hot reload",
+            Self::RuntimeReloadDebounce => "Reload debounce",
             Self::ExportWorkerEnabled => "Export worker",
             Self::AddDefaultExporter => "Add exporter",
             Self::ExporterTransport(_) => "Exporter transport",
@@ -79,10 +84,13 @@ impl FieldId {
             | Self::ExporterCodec(_)
             | Self::IngressRetentionMaxRecords
             | Self::ExportRetentionMaxRecords
+            | Self::RuntimeReloadDebounce
             | Self::EnforcementMode
             | Self::ConnectionBackend
             | Self::InterceptionStrategy => "cycle value",
-            Self::ExportWorkerEnabled | Self::TlsPlaintextEnabled => "toggle",
+            Self::ExportWorkerEnabled
+            | Self::RuntimeReloadWatchConfig
+            | Self::TlsPlaintextEnabled => "toggle",
             Self::AdminEnabled | Self::AdminPrometheusEnabled => "toggle",
             Self::ExporterWebhookEndpoint(_)
             | Self::ExporterFilePath(_)
@@ -113,6 +121,8 @@ pub(crate) fn fields_for_tab(tab: TuiTab, config: &AgentConfig) -> Vec<FieldId> 
             FieldId::AdminEnabled,
             FieldId::AdminSocketPath,
             FieldId::AdminPrometheusEnabled,
+            FieldId::RuntimeReloadWatchConfig,
+            FieldId::RuntimeReloadDebounce,
         ],
         TuiTab::Capture => vec![
             FieldId::CaptureSelection,
@@ -164,6 +174,10 @@ pub(crate) fn field_value(
         FieldId::AdminEnabled => bool_state(config.admin.enabled),
         FieldId::AdminSocketPath => config.admin.socket_path.display().to_string(),
         FieldId::AdminPrometheusEnabled => bool_state(config.admin.prometheus.enabled),
+        FieldId::RuntimeReloadWatchConfig => bool_state(config.runtime_reload.watch_config),
+        FieldId::RuntimeReloadDebounce => {
+            format!("{} ms", config.runtime_reload.debounce_ms)
+        }
         FieldId::ExportWorkerEnabled => bool_state(config.export.worker.enabled),
         FieldId::AddDefaultExporter => {
             format!(
@@ -310,6 +324,15 @@ pub(crate) fn apply_field(
                 }
             }
             FieldApplyOutcome::Changed("Prometheus listener toggled")
+        }
+        FieldId::RuntimeReloadWatchConfig => {
+            config.runtime_reload.watch_config = !config.runtime_reload.watch_config;
+            FieldApplyOutcome::Changed("Runtime config hot reload toggled")
+        }
+        FieldId::RuntimeReloadDebounce => {
+            config.runtime_reload.debounce_ms =
+                cycle_runtime_reload_debounce(config.runtime_reload.debounce_ms, direction);
+            FieldApplyOutcome::Changed("Runtime config reload debounce changed")
         }
         FieldId::ExportWorkerEnabled => {
             config.export.worker.enabled = !config.export.worker.enabled;
@@ -700,6 +723,39 @@ fn cycle_retention_records(value: Option<u64>, direction: isize) -> Option<u64> 
     VALUES[cycle_index(index, VALUES.len(), direction)]
 }
 
+fn cycle_runtime_reload_debounce(value: u64, direction: isize) -> u64 {
+    const VALUES: [u64; 7] = [
+        MIN_RUNTIME_RELOAD_WATCH_DEBOUNCE_MS,
+        100,
+        250,
+        DEFAULT_RUNTIME_RELOAD_WATCH_DEBOUNCE_MS,
+        1_000,
+        2_000,
+        5_000,
+    ];
+    debug_assert!(
+        VALUES
+            .iter()
+            .all(|value| *value <= MAX_RUNTIME_RELOAD_WATCH_DEBOUNCE_MS)
+    );
+    if let Some(index) = VALUES.iter().position(|item| *item == value) {
+        return VALUES[cycle_index(index, VALUES.len(), direction)];
+    }
+    if direction >= 0 {
+        return VALUES
+            .iter()
+            .copied()
+            .find(|candidate| *candidate > value)
+            .unwrap_or(VALUES[0]);
+    }
+    VALUES
+        .iter()
+        .copied()
+        .rev()
+        .find(|candidate| *candidate < value)
+        .unwrap_or(*VALUES.last().expect("debounce presets are non-empty"))
+}
+
 fn nearest_retention_index(value: Option<u64>, direction: isize, values: &[Option<u64>]) -> usize {
     let Some(records) = value else {
         return 0;
@@ -789,6 +845,64 @@ fn retention_record_cycle_handles_unbounded_presets_and_custom_values() {
         cycle_retention_records(Some(20_000_000), -1),
         Some(10_000_000)
     );
+}
+
+#[cfg(test)]
+#[test]
+fn runtime_reload_debounce_cycle_handles_presets_and_custom_values() {
+    assert_eq!(
+        cycle_runtime_reload_debounce(DEFAULT_RUNTIME_RELOAD_WATCH_DEBOUNCE_MS, 1),
+        1_000
+    );
+    assert_eq!(
+        cycle_runtime_reload_debounce(DEFAULT_RUNTIME_RELOAD_WATCH_DEBOUNCE_MS, -1),
+        250
+    );
+    assert_eq!(cycle_runtime_reload_debounce(750, 1), 1_000);
+    assert_eq!(
+        cycle_runtime_reload_debounce(750, -1),
+        DEFAULT_RUNTIME_RELOAD_WATCH_DEBOUNCE_MS
+    );
+    assert_eq!(cycle_runtime_reload_debounce(5_000, 1), 50);
+    assert_eq!(
+        cycle_runtime_reload_debounce(MIN_RUNTIME_RELOAD_WATCH_DEBOUNCE_MS - 1, 1),
+        MIN_RUNTIME_RELOAD_WATCH_DEBOUNCE_MS
+    );
+    assert_eq!(
+        cycle_runtime_reload_debounce(MIN_RUNTIME_RELOAD_WATCH_DEBOUNCE_MS - 1, -1),
+        5_000
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn runtime_reload_watch_config_toggles_without_admin_side_effects() {
+    let mut config = AgentConfig::default();
+    config.admin.enabled = true;
+    config.runtime_reload.watch_config = true;
+
+    let outcome = apply_field(&mut config, FieldId::RuntimeReloadWatchConfig, 1, None);
+
+    assert_eq!(
+        outcome,
+        FieldApplyOutcome::Changed("Runtime config hot reload toggled")
+    );
+    assert!(!config.runtime_reload.watch_config);
+    assert!(config.admin.enabled);
+}
+
+#[cfg(test)]
+#[test]
+fn runtime_reload_debounce_field_uses_curated_presets() {
+    let mut config = AgentConfig::default();
+
+    let outcome = apply_field(&mut config, FieldId::RuntimeReloadDebounce, 1, None);
+
+    assert_eq!(
+        outcome,
+        FieldApplyOutcome::Changed("Runtime config reload debounce changed")
+    );
+    assert_eq!(config.runtime_reload.debounce_ms, 1_000);
 }
 
 #[cfg(test)]

@@ -2747,9 +2747,7 @@ mod tests {
     fn runtime_reload_action_shares_keyboard_and_mouse_action_path() {
         let mut keyboard_app = test_app();
         keyboard_app.select_tab(TuiTab::Runtime);
-        keyboard_app.handle_action(TuiAction::MoveDown);
-        keyboard_app.handle_action(TuiAction::MoveDown);
-        keyboard_app.handle_action(TuiAction::MoveDown);
+        keyboard_app.select_control(ControlId::ReloadRuntimeActions);
         let keyboard_effect = keyboard_app.handle_action(TuiAction::NextValue);
         let left_effect = keyboard_app.handle_action(TuiAction::PreviousValue);
 
@@ -2764,6 +2762,34 @@ mod tests {
         assert_eq!(left_effect, None);
         assert!(!keyboard_app.dirty());
         assert!(!mouse_app.dirty());
+    }
+
+    #[test]
+    fn runtime_reload_fields_share_keyboard_and_mouse_action_path() {
+        let mut keyboard_app = test_app();
+        keyboard_app.select_tab(TuiTab::Runtime);
+        keyboard_app.select_field(FieldId::RuntimeReloadWatchConfig);
+        keyboard_app.handle_action(TuiAction::NextValue);
+        keyboard_app.select_field(FieldId::RuntimeReloadDebounce);
+        keyboard_app.handle_action(TuiAction::NextValue);
+
+        let mut mouse_app = test_app();
+        mouse_app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Runtime)));
+        mouse_app.handle_action(TuiAction::Click(HitTarget::Field(
+            FieldId::RuntimeReloadWatchConfig,
+        )));
+        mouse_app.handle_action(TuiAction::Click(HitTarget::Field(
+            FieldId::RuntimeReloadDebounce,
+        )));
+
+        assert_eq!(
+            keyboard_app.config.runtime_reload,
+            mouse_app.config.runtime_reload
+        );
+        assert!(!keyboard_app.config.runtime_reload.watch_config);
+        assert_eq!(keyboard_app.config.runtime_reload.debounce_ms, 1_000);
+        assert!(keyboard_app.dirty());
+        assert!(mouse_app.dirty());
     }
 
     #[test]

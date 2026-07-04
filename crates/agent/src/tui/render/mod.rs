@@ -639,10 +639,17 @@ mod tests {
         let output = terminal.backend().to_string();
         assert!(output.contains("Runtime"));
         assert!(output.contains("Admin socket"));
+        assert!(output.contains("Config hot reload"));
+        assert!(output.contains("Reload debounce"));
         assert!(output.contains("Reload runtime actions"));
-        assert_eq!(
-            hit_map.hit(2, 11),
-            Some(HitTarget::Control(ControlId::ReloadRuntimeActions))
+        assert!(
+            first_hit_coordinate(
+                &hit_map,
+                HitTarget::Control(ControlId::ReloadRuntimeActions),
+                100,
+                24,
+            )
+            .is_some()
         );
         Ok(())
     }
