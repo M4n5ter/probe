@@ -293,17 +293,23 @@ exchange row and keeps the full observed payload detail in the detail popup. The
 WebSocket view groups Upgrade handoff, frame metadata, and bounded message
 payload into one session row. Raw events stay available for SSE events,
 connection lifecycle, parser gaps, and capture-provider diagnostics.
-The same tab also exposes `Watch`, `Out MITM`, and `In MITM` actions so a
-selected process can be scoped for passive traffic or product-proxy MITM without
-switching to a separate configuration screen. The outbound MITM quick action
-defaults to ports 80 and 443 so plain HTTP and TLS-decrypted HTTP enter the same
-plaintext bridge and traffic view.
+The same tab exposes `Watch`, `Auto`, `eBPF`, and `libpcap` actions for the
+selected process. `Watch` toggles a bidirectional process observation profile
+with the default `Auto` data path; `Auto`, `eBPF`, and `libpcap` explicitly
+select that profile's data-path mode. Saving then goes through the runtime
+reload contract when an active admin socket is available. The Traffic tab also
+surfaces MITM data-path readiness, but reliable MITM itself is configured
+through the Enforcement and TLS surfaces because transparent interception owns
+nftables, proxy lifecycle, client trust, and plaintext bridge resources as one
+setup-time data path.
 
 The Runtime tab can call the online admin `reload_runtime_actions` command. It
 reloads the runtime owners that are explicitly safe to update online, currently
 policy bundles and the enforcement policy source, and reports partial failures
 per action. Saving from the TUI uses `apply_config_reload` when an active admin
-socket is available.
+socket is available; capture, observation, config-version, and supported TLS
+material changes are handed to runtime generation instead of requiring the user
+to restart the TUI manually.
 
 The main-config reload contract is owner-scoped:
 

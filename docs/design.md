@@ -327,12 +327,17 @@ Operator TUI 能力事实：
   capture_loss 和其它低层事件排查。
   HTTP 与 WebSocket 聚合详情使用 `tail_events` 已返回的 bounded event payload；raw omission
   row 需要完整 retained payload 详情时才通过 `event_detail` 后台补齐。
-  Traffic tab 的 action bar 将 `[Watch]`、`[Out MITM]` 和 `[In MITM]` 放在事件浏览入口；键盘 `w`、`o`、`i`
-  与鼠标点击进入同一 typed action path。`Watch` 仅改变 traffic selector；MITM quick actions 会为选中进程写入 scoped
-  product-proxy MITM、client trust、plaintext bridge 和 policy hook contract。出站 quick action 默认约束
-  `remote_ports = [80, 443]`，让普通明文 HTTP 和 TLS 解密后 HTTP 进入同一条 plaintext bridge；保存后由
-  TUI-managed agent restart 应用。MITM quick actions 同时保证 `capture.selection = "auto"` 的 live fallback
-  backend 列表有效：空列表会恢复为 `ebpf, libpcap`，重复项会去重并保留用户顺序。
+  Traffic tab 的 action bar 将 `[Watch]`、`[Auto]`、`[eBPF]` 和 `[libpcap]`
+  放在事件浏览入口；键盘 `w`、`a`、`e`、`l` 与鼠标点击进入同一 typed action path。
+  `Watch` 为选中进程写入或移除默认 `Auto` 的双向 process observation profile；
+  `Auto`、`eBPF` 和 `libpcap` 显式选择同一 profile 的 data-path mode。
+  保存配置时，TUI 通过 `apply_config_reload` 触发 active agent；observation 变更进入 runtime generation，
+  而不是要求用户手动重启。
+  Traffic tab 同时展示 MITM data-path readiness 和下一步诊断，但不把 reliable MITM
+  建模成旧式入站/出站按钮。transparent interception 由 Enforcement/TLS 配置面拥有，
+  因为它需要同时维护 nftables、proxy lifecycle、client trust、plaintext bridge 和 policy hook contract。
+  当前配置模型表达一个 transparent interception strategy；双向 reliable MITM 需要先具备单一的双向观测意图，
+  不能由两个相互独立的按钮伪装成同一个进程级数据路径。
   当没有 active admin socket 时，Traffic tab fail-closed 并显示 agent runtime 不可用状态。
 - `tail_events` 是 non-mutating admin command。它读取 `after_sequence` 之后的 export records，按可选 selector
   过滤，并返回 `next_after_sequence`；该响应 cursor 不会 ack 任何 exporter sink cursor。

@@ -281,10 +281,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             Span::raw(" filter  "),
             Span::styled("t", Style::default().fg(Color::Gray)),
             Span::raw(" live  "),
-            Span::styled("a/e/l/m", Style::default().fg(Color::Gray)),
+            Span::styled("a/e/l", Style::default().fg(Color::Gray)),
             Span::raw(" observe  "),
-            Span::styled("x", Style::default().fg(Color::Gray)),
-            Span::raw(" mitm off  "),
         ]);
     }
     spans.extend([
@@ -731,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    fn render_traffic_registers_capture_and_mitm_action_hits()
+    fn render_traffic_registers_process_observation_action_hits()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut app = test_app();
         app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Traffic)));
@@ -752,6 +750,8 @@ mod tests {
         assert!(output.contains("[eBPF]"));
         assert!(output.contains("[libpcap]"));
         assert!(!output.contains("[MITM]"));
+        assert!(!output.contains("a/e/l/m observe"));
+        assert!(!output.contains("mitm off"));
         assert!(output.contains("Traffic Readiness"));
         assert!(output.contains("Data path source: local config"));
         assert!(
