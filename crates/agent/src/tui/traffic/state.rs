@@ -1,4 +1,4 @@
-use std::{cmp::Reverse, collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, path::PathBuf};
 
 use probe_core::Selector;
 
@@ -192,18 +192,13 @@ impl TrafficViewport {
         self.scroll = self.scroll.min(len.saturating_sub(1));
     }
 
-    fn select_tail(&mut self, _len: usize, _visible_rows: usize) {
-        self.selected_index = 0;
-        self.scroll = 0;
-    }
-
-    fn keep_tail_viewport(&mut self, len: usize, visible_rows: usize) {
+    fn select_tail(&mut self, len: usize, visible_rows: usize) {
         if len == 0 {
             self.reset();
             return;
         }
-        self.scroll = 0;
-        self.clamp_selection_to_viewport(len, visible_rows);
+        self.selected_index = len.saturating_sub(1);
+        self.scroll = Self::max_scroll(len, visible_rows);
     }
 
     fn move_selection(&mut self, len: usize, delta: isize, visible_rows: usize) -> Option<bool> {
@@ -213,7 +208,7 @@ impl TrafficViewport {
         let raw = self.selected_index as isize + delta;
         self.selected_index = raw.clamp(0, len.saturating_sub(1) as isize) as usize;
         self.keep_selected_visible(visible_rows);
-        Some(self.selection_is_at_tail())
+        Some(self.selection_is_at_tail(len))
     }
 
     fn select_row(&mut self, len: usize, index: usize, visible_rows: usize) -> Option<bool> {
@@ -222,7 +217,7 @@ impl TrafficViewport {
         }
         self.selected_index = index;
         self.keep_selected_visible(visible_rows);
-        Some(self.selection_is_at_tail())
+        Some(self.selection_is_at_tail(len))
     }
 
     fn scroll_viewport(&mut self, len: usize, delta: isize, visible_rows: usize) -> Option<bool> {
@@ -232,7 +227,12 @@ impl TrafficViewport {
         let max_scroll = Self::max_scroll(len, visible_rows);
         self.scroll = scroll_position(self.scroll, delta, max_scroll);
         self.clamp_selection_to_viewport(len, visible_rows);
-        Some(self.viewport_is_at_tail())
+        if self.viewport_is_at_tail(len, visible_rows) {
+            self.selected_index = len.saturating_sub(1);
+            Some(true)
+        } else {
+            Some(false)
+        }
     }
 
     fn drag_scrollbar(
@@ -248,13 +248,18 @@ impl TrafficViewport {
         let max_scroll = Self::max_scroll(len, visible_rows);
         if max_scroll == 0 {
             self.scroll = 0;
-            self.selected_index = 0;
+            self.selected_index = len.saturating_sub(1);
             return Some(true);
         }
         let track = height.saturating_sub(1).max(1);
         self.scroll = offset.min(track).saturating_mul(max_scroll) / track;
         self.clamp_selection_to_viewport(len, visible_rows);
-        Some(self.viewport_is_at_tail())
+        if self.viewport_is_at_tail(len, visible_rows) {
+            self.selected_index = len.saturating_sub(1);
+            Some(true)
+        } else {
+            Some(false)
+        }
     }
 
     fn keep_selected_visible(&mut self, visible_rows: usize) {
@@ -285,12 +290,12 @@ impl TrafficViewport {
         self.selected_index = self.selected_index.min(max_index);
     }
 
-    fn selection_is_at_tail(self) -> bool {
-        self.selected_index == 0
+    fn selection_is_at_tail(self, len: usize) -> bool {
+        len > 0 && self.selected_index == len.saturating_sub(1)
     }
 
-    fn viewport_is_at_tail(self) -> bool {
-        self.scroll == 0
+    fn viewport_is_at_tail(self, len: usize, visible_rows: usize) -> bool {
+        self.scroll == Self::max_scroll(len, visible_rows)
     }
 
     fn max_scroll(len: usize, visible_rows: usize) -> usize {
@@ -546,10 +551,7 @@ impl TrafficState {
     pub(crate) fn set_viewport_rows(&mut self, rows: usize) {
         self.viewport_rows = rows.max(1);
         if self.follow_tail {
-            let projection = self.active_projection();
-            let visible_rows = self.viewport_rows;
-            self.viewport_mut(projection.mode)
-                .keep_tail_viewport(projection.len, visible_rows);
+            self.sync_tail_viewports(self.viewport_rows);
         } else {
             self.clamp_viewports_to_visible_rows();
         }
@@ -693,7 +695,11 @@ impl TrafficState {
 
     pub(crate) fn cycle_view_mode(&mut self) {
         self.view_mode = self.view_mode.next();
-        self.clamp_selection();
+        if self.follow_tail {
+            self.sync_tail_viewports(self.viewport_rows);
+        } else {
+            self.clamp_selection();
+        }
         self.status = TrafficStatus::idle(format!(
             "Traffic view changed to {}",
             self.view_mode_label()
@@ -738,7 +744,7 @@ impl TrafficState {
             self.viewport_mut(projection.mode)
                 .move_selection(projection.len, delta, visible_rows);
         if let Some(follow_tail) = follow_tail {
-            self.follow_tail = follow_tail;
+            self.set_follow_tail(follow_tail, visible_rows);
         }
     }
 
@@ -748,7 +754,7 @@ impl TrafficState {
             self.viewport_mut(projection.mode)
                 .select_row(projection.len, index, visible_rows);
         if let Some(follow_tail) = follow_tail {
-            self.follow_tail = follow_tail;
+            self.set_follow_tail(follow_tail, visible_rows);
         }
     }
 
@@ -758,7 +764,7 @@ impl TrafficState {
             self.viewport_mut(projection.mode)
                 .scroll_viewport(projection.len, delta, visible_rows);
         if let Some(follow_tail) = follow_tail {
-            self.follow_tail = follow_tail;
+            self.set_follow_tail(follow_tail, visible_rows);
         }
     }
 
@@ -771,7 +777,7 @@ impl TrafficState {
             visible_rows,
         );
         if let Some(follow_tail) = follow_tail {
-            self.follow_tail = follow_tail;
+            self.set_follow_tail(follow_tail, visible_rows);
         }
     }
 
@@ -782,7 +788,7 @@ impl TrafficState {
             self.status = TrafficStatus::idle("Following latest matching traffic events");
             return;
         }
-        self.select_tail(visible_rows);
+        self.sync_tail_viewports(visible_rows);
         self.status = TrafficStatus::active("Following latest matching traffic events");
     }
 
@@ -848,15 +854,16 @@ impl TrafficState {
             self.attribution_mode,
         );
         self.rows.extend(traffic_rows_for_snapshot(snapshot));
-        self.rows.sort_by_key(|row| Reverse(row.sequence));
+        self.rows.sort_by_key(|row| row.sequence);
         self.rows.dedup_by_key(|row| row.sequence);
         self.rebuild_protocol_views();
         if self.rows.len() > MAX_ROWS {
-            self.rows.truncate(MAX_ROWS);
+            let overflow = self.rows.len() - MAX_ROWS;
+            self.rows.drain(0..overflow);
             self.rebuild_protocol_views();
         }
         if self.follow_tail && has_new_rows {
-            self.select_tail(self.viewport_rows);
+            self.sync_tail_viewports(self.viewport_rows);
         } else if !self.follow_tail {
             self.restore_viewport_anchors(event_anchor_sequence, http_anchor, websocket_anchor);
             self.restore_event_selection(selected_event_sequence);
@@ -895,10 +902,18 @@ impl TrafficState {
         }
     }
 
-    fn select_tail(&mut self, visible_rows: usize) {
-        let projection = self.active_projection();
-        self.viewport_mut(projection.mode)
-            .select_tail(projection.len, visible_rows);
+    fn set_follow_tail(&mut self, follow_tail: bool, visible_rows: usize) {
+        self.follow_tail = follow_tail;
+        if follow_tail {
+            self.sync_tail_viewports(visible_rows);
+        }
+    }
+
+    fn sync_tail_viewports(&mut self, visible_rows: usize) {
+        for mode in TrafficViewMode::all() {
+            let len = self.projection_len(mode);
+            self.viewport_mut(mode).select_tail(len, visible_rows);
+        }
         self.follow_tail = true;
     }
 
@@ -1419,7 +1434,7 @@ fn traffic_rows_for_snapshot(snapshot: EventTailSnapshot) -> Vec<TrafficRow> {
                 .map(|omission| TrafficRow::from_omission(omission, scanned, budget.clone())),
         )
         .collect::<Vec<_>>();
-    rows.sort_by_key(|row| Reverse(row.sequence));
+    rows.sort_by_key(|row| row.sequence);
     rows
 }
 
@@ -1903,7 +1918,7 @@ mod tests {
         traffic.set_viewport_rows(10);
         traffic.apply_snapshot(tail_snapshot_with_websocket_handoffs(1..=MAX_ROWS as u64));
 
-        let old_session_index = MAX_ROWS - 6;
+        let old_session_index = 5;
         traffic.select_row(old_session_index, 10);
         assert!(!traffic.following_tail());
         assert_eq!(traffic.websocket_sessions()[old_session_index].sequence, 6);
@@ -1927,8 +1942,8 @@ mod tests {
             (25, websocket_handoff_event_with_flow("flow-d", 25, "/d")),
         ]));
 
-        assert_eq!(traffic.websocket_sessions()[1].target, "/b");
-        traffic.select_row(1, 10);
+        assert_eq!(traffic.websocket_sessions()[0].target, "/b");
+        traffic.select_row(0, 10);
         assert!(!traffic.following_tail());
 
         traffic.apply_snapshot(tail_snapshot_from_records(vec![
@@ -1960,7 +1975,7 @@ mod tests {
                 .collect(),
         ));
 
-        traffic.scroll_viewport(2, 3);
+        traffic.select_row(3, 3);
         assert_eq!(
             traffic.http_exchanges()[traffic.http_scroll()].target,
             "/http/4"
@@ -1987,7 +2002,7 @@ mod tests {
             traffic.http_exchanges()[traffic.http_scroll()].target,
             "/http/4"
         );
-        assert_eq!(traffic.http_scroll(), 4);
+        assert_eq!(traffic.http_scroll(), 3);
         assert!(!traffic.following_tail());
     }
 
@@ -2011,7 +2026,7 @@ mod tests {
                 .collect(),
         ));
 
-        traffic.scroll_viewport(2, 3);
+        traffic.select_row(3, 3);
         assert_eq!(
             traffic.websocket_sessions()[traffic.websocket_scroll()].target,
             "/ws/4"
@@ -2037,7 +2052,7 @@ mod tests {
             traffic.websocket_sessions()[traffic.websocket_scroll()].target,
             "/ws/4"
         );
-        assert_eq!(traffic.websocket_scroll(), 4);
+        assert_eq!(traffic.websocket_scroll(), 3);
         assert!(!traffic.following_tail());
     }
 
@@ -2054,8 +2069,8 @@ mod tests {
             ),
         ]));
 
-        assert_eq!(traffic.http_exchanges()[1].target, "/long");
-        traffic.select_row(1, 10);
+        assert_eq!(traffic.http_exchanges()[0].target, "/long");
+        traffic.select_row(0, 10);
         assert!(!traffic.following_tail());
 
         let long_late_sequence = MAX_ROWS as u64 + 40;
@@ -2082,6 +2097,64 @@ mod tests {
     }
 
     #[test]
+    fn live_tail_applies_to_each_projection_when_switching_views() {
+        let mut traffic = TrafficState::default();
+        traffic.set_viewport_rows(3);
+
+        traffic.apply_snapshot(tail_snapshot_with_mixed_projection_events());
+
+        assert!(traffic.following_tail());
+        assert_eq!(
+            traffic.http_exchanges()[traffic.selected_http_exchange_index()].target,
+            "/http/2"
+        );
+
+        traffic.cycle_view_mode();
+        assert_eq!(traffic.view_mode_label(), "WebSocket");
+        assert_eq!(
+            traffic.websocket_sessions()[traffic.selected_websocket_session_index()].target,
+            "/ws/2"
+        );
+
+        traffic.cycle_view_mode();
+        assert_eq!(traffic.view_mode_label(), "Events");
+        let row = traffic
+            .selected_row()
+            .expect("latest event row is selected");
+        assert_eq!(row.sequence, 5);
+        assert!(traffic.following_tail());
+    }
+
+    #[test]
+    fn paused_projection_selection_survives_view_switching() {
+        let mut traffic = TrafficState::default();
+        traffic.set_viewport_rows(3);
+        traffic.apply_snapshot(tail_snapshot_with_mixed_projection_events());
+        traffic.cycle_view_mode();
+        assert_eq!(traffic.view_mode_label(), "WebSocket");
+
+        traffic.select_row(0, 3);
+        assert!(!traffic.following_tail());
+        assert_eq!(
+            traffic.websocket_sessions()[traffic.selected_websocket_session_index()].target,
+            "/ws/1"
+        );
+
+        traffic.cycle_view_mode();
+        assert_eq!(traffic.view_mode_label(), "Events");
+        traffic.cycle_view_mode();
+        assert_eq!(traffic.view_mode_label(), "HTTP");
+        traffic.cycle_view_mode();
+        assert_eq!(traffic.view_mode_label(), "WebSocket");
+
+        assert_eq!(traffic.tail_mode_label(), "Paused");
+        assert_eq!(
+            traffic.websocket_sessions()[traffic.selected_websocket_session_index()].target,
+            "/ws/1"
+        );
+    }
+
+    #[test]
     fn traffic_tail_follows_new_events_by_default() {
         let mut traffic = traffic_in_events_view();
         traffic.set_viewport_rows(5);
@@ -2089,17 +2162,17 @@ mod tests {
         traffic.apply_snapshot(tail_snapshot_with_body_events(1..=10));
 
         assert_eq!(traffic.rows().len(), 10);
-        assert_eq!(traffic.rows()[0].sequence, 10);
-        assert_eq!(traffic.selected_index(), 0);
-        assert_eq!(traffic.scroll(), 0);
+        assert_eq!(traffic.rows()[9].sequence, 10);
+        assert_eq!(traffic.selected_index(), 9);
+        assert_eq!(traffic.scroll(), 5);
         assert!(traffic.following_tail());
 
         traffic.apply_snapshot(tail_snapshot_with_body_events(11..=12));
 
         assert_eq!(traffic.rows().len(), 12);
-        assert_eq!(traffic.rows()[0].sequence, 12);
-        assert_eq!(traffic.selected_index(), 0);
-        assert_eq!(traffic.scroll(), 0);
+        assert_eq!(traffic.rows()[11].sequence, 12);
+        assert_eq!(traffic.selected_index(), 11);
+        assert_eq!(traffic.scroll(), 7);
         assert!(traffic.following_tail());
     }
 
@@ -2109,38 +2182,38 @@ mod tests {
         traffic.set_viewport_rows(5);
         traffic.apply_snapshot(tail_snapshot_with_body_events(1..=10));
 
-        traffic.scroll_viewport(3, 5);
+        traffic.scroll_viewport(-3, 5);
 
-        assert_eq!(traffic.scroll(), 3);
-        assert_eq!(traffic.selected_index(), 3);
+        assert_eq!(traffic.scroll(), 2);
+        assert_eq!(traffic.selected_index(), 6);
         assert_eq!(traffic.rows()[traffic.selected_index()].sequence, 7);
-        assert_eq!(traffic.rows()[traffic.scroll()].sequence, 7);
+        assert_eq!(traffic.rows()[traffic.scroll()].sequence, 3);
         assert!(!traffic.following_tail());
 
         traffic.apply_snapshot(tail_snapshot_with_body_events(11..=12));
 
         assert_eq!(traffic.rows()[traffic.selected_index()].sequence, 7);
-        assert_eq!(traffic.rows()[traffic.scroll()].sequence, 7);
-        assert_eq!(traffic.scroll(), 5);
+        assert_eq!(traffic.rows()[traffic.scroll()].sequence, 3);
+        assert_eq!(traffic.scroll(), 2);
         assert!(!traffic.following_tail());
 
-        traffic.scroll_viewport(-5, 5);
+        traffic.scroll_viewport(5, 5);
 
-        assert_eq!(traffic.selected_index(), 4);
-        assert_eq!(traffic.scroll(), 0);
+        assert_eq!(traffic.selected_index(), 11);
+        assert_eq!(traffic.scroll(), 7);
         assert!(traffic.following_tail());
 
         traffic.set_viewport_rows(5);
 
-        assert_eq!(traffic.selected_index(), 4);
-        assert_eq!(traffic.scroll(), 0);
+        assert_eq!(traffic.selected_index(), 11);
+        assert_eq!(traffic.scroll(), 7);
         assert!(traffic.following_tail());
 
         traffic.apply_snapshot(tail_snapshot_with_body_events(13..=14));
 
-        assert_eq!(traffic.rows()[0].sequence, 14);
-        assert_eq!(traffic.selected_index(), 0);
-        assert_eq!(traffic.scroll(), 0);
+        assert_eq!(traffic.rows()[13].sequence, 14);
+        assert_eq!(traffic.selected_index(), 13);
+        assert_eq!(traffic.scroll(), 9);
         assert!(traffic.following_tail());
     }
 
@@ -2150,17 +2223,17 @@ mod tests {
         traffic.set_viewport_rows(5);
         traffic.apply_snapshot(tail_snapshot_with_body_events(1..=10));
 
-        traffic.scroll_viewport(3, 5);
+        traffic.scroll_viewport(-3, 5);
         traffic.apply_snapshot(tail_snapshot_with_body_events(11..=12));
         assert_eq!(traffic.rows()[traffic.selected_index()].sequence, 7);
-        assert_eq!(traffic.rows()[traffic.scroll()].sequence, 7);
-        assert_eq!(traffic.scroll(), 5);
+        assert_eq!(traffic.rows()[traffic.scroll()].sequence, 3);
+        assert_eq!(traffic.scroll(), 2);
         assert!(!traffic.following_tail());
 
-        traffic.drag_scrollbar(0, 10, 5);
+        traffic.drag_scrollbar(9, 10, 5);
 
-        assert_eq!(traffic.selected_index(), 4);
-        assert_eq!(traffic.scroll(), 0);
+        assert_eq!(traffic.selected_index(), 11);
+        assert_eq!(traffic.scroll(), 7);
         assert!(traffic.following_tail());
     }
 
@@ -2170,15 +2243,15 @@ mod tests {
         traffic.set_viewport_rows(5);
         traffic.apply_snapshot(tail_snapshot_with_body_events(1..=10));
 
-        traffic.scroll_viewport(3, 5);
+        traffic.scroll_viewport(-3, 5);
         traffic.apply_snapshot(tail_snapshot_with_body_events(11..=12));
-        traffic.scroll_viewport(-5, 5);
+        traffic.scroll_viewport(5, 5);
         assert!(traffic.following_tail());
-        assert_eq!(traffic.selected_index(), 4);
+        assert_eq!(traffic.selected_index(), 11);
 
         traffic.apply_snapshot(tail_snapshot_with_response_budget_omission_at(13));
 
-        assert_eq!(traffic.selected_index(), 0);
+        assert_eq!(traffic.selected_index(), 12);
         let row = traffic.selected_row().expect("omission row is selected");
         assert_eq!(row.sequence, 13);
         assert_eq!(row.event_type, "tail omission");
@@ -2190,7 +2263,7 @@ mod tests {
         traffic.set_viewport_rows(5);
         traffic.apply_snapshot(tail_snapshot_with_body_events(1..=10));
 
-        traffic.scroll_viewport(3, 5);
+        traffic.scroll_viewport(-3, 5);
         traffic.apply_snapshot(tail_snapshot_with_body_events(11..=12));
         assert_eq!(traffic.tail_mode_label(), "Paused");
         assert!(!traffic.following_tail());
@@ -2198,8 +2271,8 @@ mod tests {
         traffic.jump_to_tail(5);
 
         assert_eq!(traffic.tail_mode_label(), "Live");
-        assert_eq!(traffic.selected_index(), 0);
-        assert_eq!(traffic.scroll(), 0);
+        assert_eq!(traffic.selected_index(), 11);
+        assert_eq!(traffic.scroll(), 7);
         assert!(traffic.following_tail());
     }
 
@@ -2593,6 +2666,28 @@ mod tests {
             events,
             omissions: Vec::new(),
         }
+    }
+
+    fn tail_snapshot_with_mixed_projection_events() -> EventTailSnapshot {
+        tail_snapshot_from_records(vec![
+            (
+                1,
+                request_event_with_flow("http-flow-1", 1, "GET", "/http/1"),
+            ),
+            (
+                2,
+                websocket_handoff_event_with_flow("ws-flow-1", 2, "/ws/1"),
+            ),
+            (
+                3,
+                request_event_with_flow("http-flow-2", 3, "GET", "/http/2"),
+            ),
+            (
+                4,
+                websocket_handoff_event_with_flow("ws-flow-2", 4, "/ws/2"),
+            ),
+            (5, gap_event(5)),
+        ])
     }
 
     fn tail_snapshot_from_records(records: Vec<(u64, EventEnvelope)>) -> EventTailSnapshot {
