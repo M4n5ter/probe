@@ -53,7 +53,6 @@ admin_requests! {
         latest: bool,
         limit: usize,
         selector: Option<probe_core::Selector>,
-        attribution_mode: super::event_tail::EventTailAttributionMode,
         event_types: Vec<probe_core::EventType>,
     } => ("tail_events", false),
     EventDetail {

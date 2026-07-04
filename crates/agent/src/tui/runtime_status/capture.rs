@@ -249,10 +249,6 @@ impl CaptureDiagnostics {
         self.snapshot.selected_input_source == Some(CaptureInputSource::MitmPlaintextBridge)
     }
 
-    pub(super) fn using_libpcap_live_host(&self) -> bool {
-        self.using_live_host() && self.snapshot.selected_backend == Some(CaptureBackend::Libpcap)
-    }
-
     pub(super) fn mitm_bridge_passive_context_message(&self) -> Option<CaptureDiagnosticMessage> {
         if !self.using_mitm_plaintext_bridge() {
             return None;

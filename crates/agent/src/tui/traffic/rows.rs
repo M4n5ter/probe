@@ -526,9 +526,9 @@ fn omission_detail_lines(sequence: u64, row: &TrafficOmissionRow) -> Vec<String>
         "Tail diagnostics".to_string(),
         format!("scanned records: {}", row.scanned),
         format!(
-            "response budget: {}/{} bytes{}",
-            row.budget.included_payload_bytes,
-            row.budget.max_response_payload_bytes,
+            "record budget: {}/{} bytes{}",
+            row.budget.included_record_bytes,
+            row.budget.max_record_bytes,
             if row.budget.truncated {
                 " (truncated)"
             } else {

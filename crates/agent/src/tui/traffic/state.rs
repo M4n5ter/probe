@@ -82,7 +82,6 @@ impl TrafficRefreshRequest {
 pub(crate) struct TrafficRefreshResult {
     selector_key: String,
     event_filter: TrafficEventFilter,
-    attribution_mode: EventTailAttributionMode,
     result: Result<TrafficRefreshSnapshot, String>,
 }
 
@@ -92,10 +91,7 @@ struct TrafficRefreshSnapshot {
     empty_filter_diagnostics: Option<EmptyFilterDiagnostics>,
 }
 
-pub(crate) async fn load_traffic_refresh(
-    request: TrafficRefreshRequest,
-    attribution_mode: EventTailAttributionMode,
-) -> TrafficRefreshResult {
+pub(crate) async fn load_traffic_refresh(request: TrafficRefreshRequest) -> TrafficRefreshResult {
     let event_types = request
         .event_filter
         .event_type_filter()
@@ -105,7 +101,6 @@ pub(crate) async fn load_traffic_refresh(
         request.after_sequence,
         request.latest_window,
         request.selector.clone(),
-        attribution_mode,
         &event_types,
     )
     .await;
@@ -118,7 +113,6 @@ pub(crate) async fn load_traffic_refresh(
                     request.after_sequence,
                     request.latest_window,
                     request.selector,
-                    attribution_mode,
                     &[],
                 )
                 .await
@@ -139,7 +133,6 @@ pub(crate) async fn load_traffic_refresh(
     TrafficRefreshResult {
         selector_key: request.selector_key,
         event_filter: request.event_filter,
-        attribution_mode,
         result,
     }
 }
@@ -544,7 +537,6 @@ impl TrafficState {
         {
             return false;
         }
-        self.attribution_mode = result.attribution_mode;
         match result.result {
             Ok(snapshot) => {
                 self.apply_snapshot(snapshot.tail);
@@ -731,6 +723,7 @@ impl TrafficState {
         self.after_sequence = snapshot.next_after_sequence;
         self.latest_window = false;
         self.last_export_sequence = snapshot.last_export_sequence;
+        self.attribution_mode = snapshot.attribution_mode;
         let received = snapshot.events.len();
         let selected_http_sequence = (!self.follow_tail)
             .then(|| {
@@ -1369,7 +1362,6 @@ mod tests {
         let applied = traffic.apply_refresh_result(TrafficRefreshResult {
             selector_key: request.selector_key,
             event_filter: request.event_filter,
-            attribution_mode: EventTailAttributionMode::Strict,
             result: Ok(TrafficRefreshSnapshot {
                 tail: tail_snapshot_with_gap_events(1..=1),
                 empty_filter_diagnostics: None,
@@ -1697,7 +1689,7 @@ mod tests {
         assert!(
             details
                 .iter()
-                .any(|line| line == "response budget: 128/256 bytes (truncated)")
+                .any(|line| line == "record budget: 128/256 bytes (truncated)")
         );
         assert!(details.iter().any(|line| {
             line == "Payload schema: traffic.probe.event_envelope.subject_origin.json"
@@ -1903,19 +1895,28 @@ mod tests {
         }
     }
 
+    fn tail_budget(
+        max_record_bytes: usize,
+        included_record_bytes: usize,
+        truncated: bool,
+    ) -> EventTailBudgetSnapshot {
+        EventTailBudgetSnapshot {
+            max_event_payload_bytes: 512,
+            max_record_bytes,
+            included_record_bytes,
+            truncated,
+        }
+    }
+
     fn tail_snapshot_with_response_budget_omission() -> EventTailSnapshot {
         EventTailSnapshot {
             after_sequence: 0,
             next_after_sequence: 2,
             last_export_sequence: 2,
+            attribution_mode: EventTailAttributionMode::Strict,
             limit: 64,
             scanned: 2,
-            budget: EventTailBudgetSnapshot {
-                max_event_payload_bytes: 512,
-                max_response_payload_bytes: 256,
-                included_payload_bytes: 128,
-                truncated: true,
-            },
+            budget: tail_budget(256, 128, true),
             events: Vec::new(),
             omissions: vec![EventTailOmission {
                 sequence: 2,
@@ -1932,14 +1933,10 @@ mod tests {
             after_sequence: 0,
             next_after_sequence: scanned as u64,
             last_export_sequence: scanned as u64,
+            attribution_mode: EventTailAttributionMode::Strict,
             limit: 64,
             scanned,
-            budget: EventTailBudgetSnapshot {
-                max_event_payload_bytes: 512,
-                max_response_payload_bytes: 4096,
-                included_payload_bytes: 0,
-                truncated: false,
-            },
+            budget: tail_budget(4096, 0, false),
             events: Vec::new(),
             omissions: Vec::new(),
         }
@@ -1959,14 +1956,10 @@ mod tests {
             after_sequence,
             next_after_sequence: last_export_sequence,
             last_export_sequence,
+            attribution_mode: EventTailAttributionMode::Strict,
             limit: events.len(),
             scanned: events.len(),
-            budget: EventTailBudgetSnapshot {
-                max_event_payload_bytes: 512,
-                max_response_payload_bytes: 4096,
-                included_payload_bytes: 0,
-                truncated: false,
-            },
+            budget: tail_budget(4096, 0, false),
             events,
             omissions: Vec::new(),
         }
@@ -1986,14 +1979,10 @@ mod tests {
             after_sequence,
             next_after_sequence: last_export_sequence,
             last_export_sequence,
+            attribution_mode: EventTailAttributionMode::Strict,
             limit: events.len(),
             scanned: events.len(),
-            budget: EventTailBudgetSnapshot {
-                max_event_payload_bytes: 512,
-                max_response_payload_bytes: 4096,
-                included_payload_bytes: 0,
-                truncated: false,
-            },
+            budget: tail_budget(4096, 0, false),
             events,
             omissions: Vec::new(),
         }
@@ -2026,14 +2015,10 @@ mod tests {
             after_sequence: 0,
             next_after_sequence: 4,
             last_export_sequence: 4,
+            attribution_mode: EventTailAttributionMode::Strict,
             limit: events.len(),
             scanned: events.len(),
-            budget: EventTailBudgetSnapshot {
-                max_event_payload_bytes: 512,
-                max_response_payload_bytes: 4096,
-                included_payload_bytes: 0,
-                truncated: false,
-            },
+            budget: tail_budget(4096, 0, false),
             events,
             omissions: Vec::new(),
         }
@@ -2056,14 +2041,10 @@ mod tests {
             after_sequence: 0,
             next_after_sequence: 2,
             last_export_sequence: 2,
+            attribution_mode: EventTailAttributionMode::Strict,
             limit: events.len(),
             scanned: events.len(),
-            budget: EventTailBudgetSnapshot {
-                max_event_payload_bytes: 512,
-                max_response_payload_bytes: 4096,
-                included_payload_bytes: 0,
-                truncated: false,
-            },
+            budget: tail_budget(4096, 0, false),
             events,
             omissions: Vec::new(),
         }
@@ -2083,14 +2064,10 @@ mod tests {
             after_sequence,
             next_after_sequence,
             last_export_sequence: next_after_sequence,
+            attribution_mode: EventTailAttributionMode::Strict,
             limit: events.len(),
             scanned: events.len(),
-            budget: EventTailBudgetSnapshot {
-                max_event_payload_bytes: 512,
-                max_response_payload_bytes: 4096,
-                included_payload_bytes: 0,
-                truncated: false,
-            },
+            budget: tail_budget(4096, 0, false),
             events,
             omissions: Vec::new(),
         }
@@ -2114,14 +2091,10 @@ mod tests {
             after_sequence: 0,
             next_after_sequence,
             last_export_sequence: next_after_sequence,
+            attribution_mode: EventTailAttributionMode::Strict,
             limit: events.len(),
             scanned: events.len(),
-            budget: EventTailBudgetSnapshot {
-                max_event_payload_bytes: 512,
-                max_response_payload_bytes: 4096,
-                included_payload_bytes: 0,
-                truncated: false,
-            },
+            budget: tail_budget(4096, 0, false),
             events,
             omissions: Vec::new(),
         }

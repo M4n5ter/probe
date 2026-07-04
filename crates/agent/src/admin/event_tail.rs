@@ -8,7 +8,7 @@ use thiserror::Error;
 const MAX_TAIL_LIMIT: usize = 256;
 const MAX_TAIL_SCAN: usize = 2_048;
 const MAX_TAIL_EVENT_PAYLOAD_BYTES: usize = 512 * 1024;
-const MAX_TAIL_RESPONSE_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+const MAX_TAIL_RECORD_BYTES: usize = 2 * 1024 * 1024;
 const MAX_EVENT_DETAIL_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const SELECTOR_SCAN_MULTIPLIER: usize = 8;
 
@@ -35,6 +35,7 @@ pub(crate) struct EventTailSnapshot {
     pub after_sequence: u64,
     pub next_after_sequence: u64,
     pub last_export_sequence: u64,
+    pub attribution_mode: EventTailAttributionMode,
     pub limit: usize,
     pub scanned: usize,
     pub budget: EventTailBudgetSnapshot,
@@ -70,8 +71,8 @@ pub(crate) struct EventDetailTooLargeSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct EventTailBudgetSnapshot {
     pub max_event_payload_bytes: usize,
-    pub max_response_payload_bytes: usize,
-    pub included_payload_bytes: usize,
+    pub max_record_bytes: usize,
+    pub included_record_bytes: usize,
     pub truncated: bool,
 }
 
@@ -120,7 +121,7 @@ pub(super) fn read_event_tail(
     let mut next_after_sequence = after_sequence;
     let mut events = Vec::new();
     let mut omissions = Vec::new();
-    let mut included_payload_bytes = 0_usize;
+    let mut included_record_bytes = 0_usize;
     let mut truncated = false;
     let mut scanned = 0;
 
@@ -137,27 +138,26 @@ pub(super) fn read_event_tail(
             }
             continue;
         }
+        let payload_schema = stored_event.payload.schema().to_string();
         let record = decode_tail_record(stored_event)?;
         if event_type_filter.matches(&record.event)
             && selector.as_ref().is_none_or(|selector| {
                 selector_matches_event(selector, &record.event, request.attribution_mode)
             })
         {
-            if included_payload_bytes.saturating_add(payload_bytes)
-                > MAX_TAIL_RESPONSE_PAYLOAD_BYTES
-            {
+            let record_bytes = tail_record_budget_bytes(&record)?;
+            if included_record_bytes.saturating_add(record_bytes) > MAX_TAIL_RECORD_BYTES {
                 omissions.push(EventTailOmission {
                     sequence: record.sequence,
                     stored_at_unix_ns: record.stored_at_unix_ns,
-                    payload_schema: SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON
-                        .to_string(),
+                    payload_schema,
                     payload_bytes,
                     reason: EventTailOmissionReason::ResponseBudgetExceeded,
                 });
                 truncated = true;
                 break;
             }
-            included_payload_bytes = included_payload_bytes.saturating_add(payload_bytes);
+            included_record_bytes = included_record_bytes.saturating_add(record_bytes);
             events.push(record);
         }
         if events.len() >= limit {
@@ -169,17 +169,22 @@ pub(super) fn read_event_tail(
         after_sequence,
         next_after_sequence,
         last_export_sequence,
+        attribution_mode: request.attribution_mode,
         limit,
         scanned,
         budget: EventTailBudgetSnapshot {
             max_event_payload_bytes: MAX_TAIL_EVENT_PAYLOAD_BYTES,
-            max_response_payload_bytes: MAX_TAIL_RESPONSE_PAYLOAD_BYTES,
-            included_payload_bytes,
+            max_record_bytes: MAX_TAIL_RECORD_BYTES,
+            included_record_bytes,
             truncated,
         },
         events,
         omissions,
     })
+}
+
+fn tail_record_budget_bytes(record: &EventTailRecord) -> Result<usize, EventTailError> {
+    Ok(serde_json::to_vec(record)?.len())
 }
 
 fn selector_matches_event(
@@ -465,6 +470,51 @@ mod tests {
         assert_eq!(
             tail.events[0].event.kind().event_type(),
             EventType::HttpRequestHeaders
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tail_record_budget_omits_large_batches_before_response_can_grow()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        let event = large_body_event_for_exe("/usr/bin/curl", 16 * 1024);
+        let payload_bytes = serde_json::to_vec(&event)?.len();
+        assert!(payload_bytes < MAX_TAIL_EVENT_PAYLOAD_BYTES);
+        let sample_record_bytes = tail_record_budget_bytes(&EventTailRecord {
+            sequence: 1,
+            stored_at_unix_ns: 1,
+            event: event.clone(),
+        })?;
+        let event_count = MAX_TAIL_RECORD_BYTES
+            .checked_div(sample_record_bytes)
+            .unwrap_or_default()
+            + 2;
+        assert!(event_count <= MAX_TAIL_LIMIT);
+        for _ in 0..event_count {
+            ExportEventWriter::new(&spool).append_occurrence(&event)?;
+        }
+
+        let tail = read_event_tail(
+            &spool,
+            EventTailRequest {
+                after_sequence: 0,
+                latest: false,
+                limit: MAX_TAIL_LIMIT,
+                selector: None,
+                attribution_mode: EventTailAttributionMode::Strict,
+                event_types: Vec::new(),
+            },
+        )?;
+
+        assert!(tail.events.len() < event_count);
+        assert!(tail.budget.truncated);
+        assert!(tail.budget.included_record_bytes <= tail.budget.max_record_bytes);
+        assert_eq!(tail.omissions.len(), 1);
+        assert_eq!(
+            tail.omissions[0].reason,
+            EventTailOmissionReason::ResponseBudgetExceeded
         );
         Ok(())
     }

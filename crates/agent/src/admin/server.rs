@@ -8,7 +8,8 @@ use std::{
     time::Duration,
 };
 
-use runtime::RuntimePlan;
+use probe_config::CaptureBackend;
+use runtime::{CaptureInputSource, CapturePlanMode, RuntimePlan};
 use storage::FjallSpool;
 use tokio::{
     io::AsyncWriteExt,
@@ -21,7 +22,7 @@ use pipeline::{PipelinePolicySet, PipelineRuntimeMetrics};
 
 use super::{
     debug_dump::AdminDebugDump,
-    event_tail::{EventTailRequest, read_event_detail, read_event_tail},
+    event_tail::{EventTailAttributionMode, EventTailRequest, read_event_detail, read_event_tail},
     protocol::{AdminRequest, AdminResponse, read_admin_request},
     reload::{RuntimeReloadAction, reload_action_response, reload_runtime_actions_response},
     socket::{AdminError, AdminServerConfig, bind_admin_socket, bind_prometheus_listener},
@@ -349,26 +350,32 @@ async fn handle_admin_request(
             latest,
             limit,
             selector,
-            attribution_mode,
             event_types,
-        } => match read_event_tail(
-            spool,
-            EventTailRequest {
-                after_sequence,
-                latest,
-                limit,
-                selector,
-                attribution_mode,
-                event_types,
-            },
-        ) {
-            Ok(tail) => AdminResponse::EventTail {
-                tail: Box::new(tail),
-            },
-            Err(error) => AdminResponse::Error {
-                message: error.to_string(),
-            },
-        },
+        } => {
+            let attribution_mode = {
+                let _config_apply_guard = runtime_state.config_apply_gate.lock().await;
+                let plan = plan_handle.snapshot();
+                tail_attribution_mode(plan.as_ref(), runtime_state)
+            };
+            match read_event_tail(
+                spool,
+                EventTailRequest {
+                    after_sequence,
+                    latest,
+                    limit,
+                    selector,
+                    attribution_mode,
+                    event_types,
+                },
+            ) {
+                Ok(tail) => AdminResponse::EventTail {
+                    tail: Box::new(tail),
+                },
+                Err(error) => AdminResponse::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
         AdminRequest::EventDetail { sequence } => match read_event_detail(spool, sequence) {
             Ok(detail) => AdminResponse::EventDetail {
                 detail: Box::new(detail),
@@ -444,6 +451,51 @@ fn build_admin_traffic_status_projection(
     runtime_state: &AdminRuntimeState,
 ) -> TrafficStatusProjection {
     build_traffic_status_projection_with_runtime(plan, runtime_status_input(runtime_state))
+}
+
+fn tail_attribution_mode(
+    plan: &RuntimePlan,
+    runtime_state: &AdminRuntimeState,
+) -> EventTailAttributionMode {
+    let Some(runtime) = runtime_state.capture.snapshot() else {
+        return pending_tail_attribution_mode(plan);
+    };
+    tail_attribution_mode_for_selection(
+        Some(runtime.selected_backend),
+        Some(runtime.selected_input_source),
+        runtime.plan_mode,
+    )
+}
+
+fn pending_tail_attribution_mode(plan: &RuntimePlan) -> EventTailAttributionMode {
+    if plan
+        .capture
+        .live_provider_open_candidates()
+        .iter()
+        .any(|candidate| candidate.backend == CaptureBackend::Libpcap)
+    {
+        return EventTailAttributionMode::IncludeUnknownProcess;
+    }
+    tail_attribution_mode_for_selection(
+        plan.capture.selected_backend,
+        plan.capture.selected_input_source,
+        plan.capture.mode,
+    )
+}
+
+fn tail_attribution_mode_for_selection(
+    selected_backend: Option<CaptureBackend>,
+    selected_input_source: Option<CaptureInputSource>,
+    plan_mode: CapturePlanMode,
+) -> EventTailAttributionMode {
+    if selected_backend == Some(CaptureBackend::Libpcap)
+        && selected_input_source == Some(CaptureInputSource::LiveHost)
+        && plan_mode == CapturePlanMode::Live
+    {
+        EventTailAttributionMode::IncludeUnknownProcess
+    } else {
+        EventTailAttributionMode::Strict
+    }
 }
 
 fn runtime_status_input(runtime_state: &AdminRuntimeState) -> RuntimeStatusInput {
@@ -610,7 +662,6 @@ mod tests {
                         ..TrafficSelector::default()
                     },
                 )),
-                attribution_mode: crate::admin::EventTailAttributionMode::Strict,
                 event_types: Vec::new(),
             },
         )
@@ -631,6 +682,75 @@ mod tests {
             response["tail"]["events"][0]["event"]["subject"]["flow"]["remote"]["port"],
             json!(8080)
         );
+        assert_eq!(spool.export_cursor("primary")?, 0);
+
+        server.stop().await;
+        drop(spool);
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_tail_events_include_libpcap_unknown_candidates_while_capture_runtime_is_pending()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-tail-pending-libpcap")?;
+        let socket_path = temp.join("admin.sock");
+        let spool_path = temp.join("spool");
+        let spool = Arc::new(FjallSpool::open(&spool_path)?);
+        ExportEventWriter::new(spool.as_ref())
+            .append_occurrence(&libpcap_unknown_process_request_event(8080))?;
+        let mut config = config_with_storage_path(spool_path);
+        config.capture.selection = CaptureSelection::Auto;
+        let registry = ProviderRegistry::new(
+            vec![
+                CaptureProviderDescriptor::available(
+                    CaptureBackend::Ebpf,
+                    CaptureProviderBuilder::Ebpf,
+                ),
+                CaptureProviderDescriptor::available(
+                    CaptureBackend::Libpcap,
+                    CaptureProviderBuilder::Libpcap,
+                ),
+            ],
+            test_platform_capabilities(),
+        );
+        let plan = Arc::new(RuntimePlan::build(config, &registry)?);
+        let server = spawn_admin_server(
+            RuntimePlanHandle::new(Arc::clone(&plan)),
+            Arc::clone(&spool),
+            AdminServerConfig::unix_socket(socket_path.clone()),
+            AdminRuntimeState::default(),
+        )?;
+
+        let response = crate::admin::send_admin_json_request(
+            &socket_path,
+            crate::admin::AdminRequest::TailEvents {
+                after_sequence: 0,
+                latest: false,
+                limit: 10,
+                selector: Some(Selector::term(
+                    ProcessSelector {
+                        exe_path_globs: vec!["/app/backend".to_string()],
+                        ..ProcessSelector::default()
+                    },
+                    TrafficSelector {
+                        remote_ports: vec![8080],
+                        directions: vec![Direction::Outbound],
+                        ..TrafficSelector::default()
+                    },
+                )),
+                event_types: Vec::new(),
+            },
+        )
+        .await?;
+
+        assert_eq!(response["kind"], json!("event_tail"));
+        assert_eq!(
+            response["tail"]["attribution_mode"],
+            json!("include_unknown_process")
+        );
+        assert_eq!(response["tail"]["events"].as_array().map(Vec::len), Some(1));
+        assert_eq!(response["tail"]["next_after_sequence"], json!(1));
         assert_eq!(spool.export_cursor("primary")?, 0);
 
         server.stop().await;
@@ -1956,6 +2076,38 @@ end
 
     fn request_event(remote_port: u16) -> EventEnvelope {
         request_event_for_process(remote_port, "replay")
+    }
+
+    fn libpcap_unknown_process_request_event(remote_port: u16) -> EventEnvelope {
+        let mut flow = demo_flow_with_remote_port_and_process(remote_port, "unknown");
+        flow.process.identity.pid = 0;
+        flow.process.identity.tgid = 0;
+        flow.process.identity.start_time_ticks = 0;
+        flow.process.identity.boot_id = "libpcap".to_string();
+        flow.process.identity.exe_path = "unknown".to_string();
+        flow.process.identity.cmdline_hash = "unknown".to_string();
+        flow.process.identity.runtime_hint = Some("libpcap_fallback".to_string());
+        flow.process.name = "unknown".to_string();
+        flow.process.cmdline.clear();
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            flow,
+            CaptureOrigin::from_source(CaptureSource::Libpcap),
+            "test",
+            EventKind::HttpRequestHeaders(HttpHeaders {
+                direction: Direction::Outbound,
+                stream_sequence: 1,
+                method: Some("GET".to_string()),
+                target: Some("/".to_string()),
+                status: None,
+                reason: None,
+                version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+            }),
+        )
     }
 
     fn request_event_for_process(remote_port: u16, process_name: &str) -> EventEnvelope {

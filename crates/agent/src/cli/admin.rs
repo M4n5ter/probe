@@ -5,7 +5,7 @@ use probe_core::{EventType, ProcessSelector, Selector, SelectorTerm, TrafficSele
 use serde_json::Value;
 
 use crate::{
-    admin::{AdminRequest, EventTailAttributionMode, send_admin_json_request},
+    admin::{AdminRequest, send_admin_json_request},
     error::AgentError,
     event_type_groups,
 };
@@ -25,8 +25,6 @@ pub(super) enum AdminCliCommand {
         limit: usize,
         #[arg(long)]
         process_exe_glob: Option<String>,
-        #[arg(long)]
-        include_unknown_process: bool,
         #[arg(long)]
         http: bool,
         #[arg(long = "event-type")]
@@ -87,7 +85,6 @@ fn admin_request(command: AdminCliCommand) -> AdminRequest {
             latest,
             limit,
             process_exe_glob,
-            include_unknown_process,
             http,
             event_types,
         } => AdminRequest::TailEvents {
@@ -95,7 +92,6 @@ fn admin_request(command: AdminCliCommand) -> AdminRequest {
             latest,
             limit,
             selector: process_exe_glob.map(process_exe_selector),
-            attribution_mode: tail_attribution_mode(include_unknown_process),
             event_types: tail_event_types(http, event_types),
         },
         AdminCliCommand::EventDetail { sequence } => AdminRequest::EventDetail { sequence },
@@ -108,14 +104,6 @@ fn admin_request(command: AdminCliCommand) -> AdminRequest {
         AdminCliCommand::ReloadRuntimeActions => AdminRequest::ReloadRuntimeActions,
         AdminCliCommand::ReloadPolicies => AdminRequest::ReloadPolicies,
         AdminCliCommand::ReloadEnforcementPolicy => AdminRequest::ReloadEnforcementPolicy,
-    }
-}
-
-fn tail_attribution_mode(include_unknown_process: bool) -> EventTailAttributionMode {
-    if include_unknown_process {
-        EventTailAttributionMode::IncludeUnknownProcess
-    } else {
-        EventTailAttributionMode::Strict
     }
 }
 
@@ -201,7 +189,6 @@ mod tests {
                 latest: false,
                 limit: 10,
                 process_exe_glob: Some("/usr/bin/curl".to_string()),
-                include_unknown_process: true,
                 http: true,
                 event_types: vec![EventType::Gap, EventType::HttpRequestHeaders],
             }),
@@ -210,7 +197,6 @@ mod tests {
                 latest: false,
                 limit: 10,
                 selector: Some(process_exe_selector("/usr/bin/curl".to_string())),
-                attribution_mode: EventTailAttributionMode::IncludeUnknownProcess,
                 event_types: vec![
                     EventType::Gap,
                     EventType::HttpBodyChunk,

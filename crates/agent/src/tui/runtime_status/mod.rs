@@ -142,14 +142,6 @@ impl TrafficRuntimeDiagnostics {
         combine_diagnostic_messages(generation_message, data_path_message)
     }
 
-    pub(crate) fn tail_attribution_mode(&self) -> crate::admin::EventTailAttributionMode {
-        if self.capture.using_libpcap_live_host() {
-            crate::admin::EventTailAttributionMode::IncludeUnknownProcess
-        } else {
-            crate::admin::EventTailAttributionMode::Strict
-        }
-    }
-
     fn mitm_bridge_status_message(
         &self,
         traffic_empty: bool,
@@ -1560,10 +1552,6 @@ mod tests {
                 "Capture using libpcap; passive fallback occurred (ebpf: permission denied)"
                     .to_string()
             ))
-        );
-        assert_eq!(
-            diagnostics.tail_attribution_mode(),
-            crate::admin::EventTailAttributionMode::IncludeUnknownProcess
         );
         Ok(())
     }

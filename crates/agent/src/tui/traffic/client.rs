@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use crate::admin::{
     AdminClientError, AdminRequest, EventDetailSnapshot, EventDetailTooLargeSnapshot,
-    EventTailAttributionMode, EventTailSnapshot, send_admin_json_request_with_timeout,
+    EventTailSnapshot, send_admin_json_request_with_timeout,
 };
 
 const TAIL_TIMEOUT: Duration = Duration::from_secs(1);
@@ -19,7 +19,6 @@ pub(super) async fn request_tail_events(
     after_sequence: u64,
     latest: bool,
     selector: Selector,
-    attribution_mode: EventTailAttributionMode,
     event_types: &[EventType],
 ) -> Result<EventTailSnapshot, TrafficClientError> {
     let mut limit = TAIL_LIMIT;
@@ -29,7 +28,6 @@ pub(super) async fn request_tail_events(
             after_sequence,
             latest,
             selector.clone(),
-            attribution_mode,
             event_types,
             limit,
         )
@@ -54,7 +52,6 @@ async fn request_tail_events_with_limit(
     after_sequence: u64,
     latest: bool,
     selector: Selector,
-    attribution_mode: EventTailAttributionMode,
     event_types: &[EventType],
     limit: usize,
 ) -> Result<EventTailSnapshot, TrafficClientError> {
@@ -65,7 +62,6 @@ async fn request_tail_events_with_limit(
             latest,
             limit,
             selector: Some(selector),
-            attribution_mode,
             event_types: event_types.to_vec(),
         },
         TAIL_TIMEOUT,
@@ -221,15 +217,7 @@ mod tests {
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
 
-        let tail = request_tail_events(
-            &socket_path,
-            0,
-            false,
-            Selector::default(),
-            EventTailAttributionMode::Strict,
-            &[],
-        )
-        .await?;
+        let tail = request_tail_events(&socket_path, 0, false, Selector::default(), &[]).await?;
 
         assert_eq!(tail.limit, TAIL_LIMIT / TAIL_RETRY_DIVISOR);
         server.await??;
@@ -259,12 +247,13 @@ mod tests {
                 "after_sequence": 0,
                 "next_after_sequence": 0,
                 "last_export_sequence": 0,
+                "attribution_mode": "strict",
                 "limit": limit,
                 "scanned": 0,
                 "budget": {
                     "max_event_payload_bytes": 524288,
-                    "max_response_payload_bytes": 2097152,
-                    "included_payload_bytes": 0,
+                    "max_record_bytes": 2097152,
+                    "included_record_bytes": 0,
                     "truncated": false
                 },
                 "events": [],

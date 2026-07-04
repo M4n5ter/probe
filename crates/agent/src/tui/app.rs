@@ -158,17 +158,13 @@ pub(crate) async fn load_traffic_refresh_with_diagnostics(
     request: TrafficRefreshLoadRequest,
 ) -> TrafficRefreshLoadResult {
     let identity = request.identity;
-    let diagnostics = request_traffic_runtime_diagnostics(&identity.socket_path)
-        .await
-        .map_err(|error| error.to_string());
-    let attribution_mode = diagnostics
-        .as_ref()
-        .map(TrafficRuntimeDiagnostics::tail_attribution_mode)
-        .unwrap_or(crate::admin::EventTailAttributionMode::Strict);
-    let traffic = load_traffic_refresh(request.traffic, attribution_mode).await;
+    let diagnostics_socket_path = identity.socket_path.clone();
+    let diagnostics = request_traffic_runtime_diagnostics(&diagnostics_socket_path);
+    let traffic = load_traffic_refresh(request.traffic);
+    let (diagnostics, traffic) = tokio::join!(diagnostics, traffic);
     TrafficRefreshLoadResult {
         identity,
-        diagnostics,
+        diagnostics: diagnostics.map_err(|error| error.to_string()),
         traffic,
     }
 }
