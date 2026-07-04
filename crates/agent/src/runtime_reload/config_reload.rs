@@ -464,6 +464,9 @@ fn online_reload_config_update(
             ConfigReloadSection::Storage => {
                 update.storage_retention = Some(candidate.storage.retention.clone());
             }
+            ConfigReloadSection::RuntimeReload => {
+                update.runtime_reload = Some(candidate.runtime_reload.clone());
+            }
             ConfigReloadSection::Enforcement => {
                 update.enforcement_policy = Some(OnlineEnforcementPolicyConfigUpdate {
                     selector: candidate.enforcement.selector.clone(),
@@ -606,6 +609,11 @@ fn section_reload_mode(
             ConfigReloadSectionReloadMode::ApplyOnline
         }
         ConfigReloadSection::Export => ConfigReloadSectionReloadMode::ApplyOnline,
+        ConfigReloadSection::RuntimeReload
+            if runtime_reload_can_apply_online(current, candidate) =>
+        {
+            ConfigReloadSectionReloadMode::ApplyOnline
+        }
         ConfigReloadSection::Tls if tls_can_use_runtime_generation(current, candidate) => {
             ConfigReloadSectionReloadMode::RuntimeGeneration
         }
@@ -644,6 +652,11 @@ fn section_change_reason(
         }
         ConfigReloadSection::Export => {
             "export worker lifecycle and export retention cursor owners reconcile the active export plan online"
+        }
+        ConfigReloadSection::RuntimeReload
+            if runtime_reload_can_apply_online(current, candidate) =>
+        {
+            "runtime reload config does not require creating a new file watcher"
         }
         ConfigReloadSection::Tls if tls_can_use_runtime_generation(current, candidate) => {
             "TLS plaintext instrumentation and decrypt hint materials are rebuilt by runtime generation swaps"
@@ -700,9 +713,9 @@ fn online_reload_owner(change: &ConfigReloadSectionChange) -> Option<ConfigReloa
 
 fn online_section_owner(section: ConfigReloadSection) -> Option<ConfigReloadOnlineOwner> {
     match section {
-        ConfigReloadSection::Export | ConfigReloadSection::Storage => {
-            Some(ConfigReloadOnlineOwner::PlanOnly)
-        }
+        ConfigReloadSection::Export
+        | ConfigReloadSection::Storage
+        | ConfigReloadSection::RuntimeReload => Some(ConfigReloadOnlineOwner::PlanOnly),
         ConfigReloadSection::Policies | ConfigReloadSection::Enforcement => {
             Some(ConfigReloadOnlineOwner::ActionGated)
         }
@@ -722,7 +735,7 @@ fn runtime_generation_handoff_sections(
         if section_can_use_runtime_generation(change) {
             has_generation_section = true;
             sections.push(change.section);
-        } else if online_reload_owner(change) == Some(ConfigReloadOnlineOwner::PlanOnly) {
+        } else if generation_carried_plan_only_owner(change) {
             sections.push(change.section);
         } else {
             return None;
@@ -742,6 +755,10 @@ fn policies_can_apply_online(current: &AgentConfig, candidate: &AgentConfig) -> 
     current.policy_reload == candidate.policy_reload
         && !current.policy_reload.watch_local_bundles
         && !current.policy_reload.poll_remote_bundles
+}
+
+fn runtime_reload_can_apply_online(current: &AgentConfig, candidate: &AgentConfig) -> bool {
+    current.runtime_reload.watch_config || !candidate.runtime_reload.watch_config
 }
 
 fn selectors_can_use_runtime_generation(current: &AgentConfig, candidate: &AgentConfig) -> bool {
@@ -1036,7 +1053,7 @@ pub(crate) fn runtime_generation_plan_only_conflicts(
     CONFIG_RELOAD_SECTIONS
         .into_iter()
         .map(|spec| spec.section)
-        .filter(|section| online_section_owner(*section) == Some(ConfigReloadOnlineOwner::PlanOnly))
+        .filter(|section| generation_carried_plan_only_section(*section))
         .filter(|section| {
             section_changed(*section, base, active) && section_changed(*section, active, candidate)
         })
@@ -1047,6 +1064,18 @@ pub(crate) fn runtime_generation_plan_only_conflicts(
 
 fn section_can_use_runtime_generation(change: &ConfigReloadSectionChange) -> bool {
     change.reload_mode == ConfigReloadSectionReloadMode::RuntimeGeneration
+}
+
+fn generation_carried_plan_only_owner(change: &ConfigReloadSectionChange) -> bool {
+    change.reload_mode == ConfigReloadSectionReloadMode::ApplyOnline
+        && generation_carried_plan_only_section(change.section)
+}
+
+fn generation_carried_plan_only_section(section: ConfigReloadSection) -> bool {
+    matches!(
+        section,
+        ConfigReloadSection::Export | ConfigReloadSection::Storage
+    )
 }
 
 fn section_name(section: ConfigReloadSection) -> &'static str {
@@ -1689,6 +1718,39 @@ mod tests {
         assert_eq!(
             plan_handle.snapshot().storage.retention.ingress.max_records,
             Some(100_000)
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn complete_config_reload_apply_replaces_plan_for_runtime_reload_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-runtime-reload-apply")?;
+        let current = runtime_plan(base_config(temp.join("spool")))?;
+        let mut candidate = current.config.clone();
+        candidate.runtime_reload.watch_config = false;
+        candidate.runtime_reload.debounce_ms = 1_000;
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+        let plan_handle = RuntimePlanHandle::new(Arc::new(current.clone()));
+
+        let outcome = apply_config_reload(
+            &current,
+            &PipelinePolicySet::default(),
+            &PolicyReloadGate::default(),
+            None,
+            &EnforcementReloadGate::default(),
+            &candidate_path,
+        )
+        .await;
+        let snapshot = complete_config_reload_apply(outcome, &plan_handle, None);
+
+        assert!(snapshot.active_plan_updated);
+        assert!(snapshot.actions.is_empty());
+        assert_eq!(
+            plan_handle.snapshot().config.runtime_reload,
+            candidate.runtime_reload
         );
         fs::remove_dir_all(temp)?;
         Ok(())
@@ -2960,12 +3022,119 @@ mod tests {
     }
 
     #[test]
-    fn config_reload_plan_keeps_runtime_reload_topology_changes_restart_required()
+    fn config_reload_plan_can_apply_runtime_reload_debounce_changes_online()
     -> Result<(), Box<dyn std::error::Error>> {
-        let temp = test_dir("config-reload-runtime-watcher")?;
+        let temp = test_dir("config-reload-runtime-reload-debounce")?;
+        let current = runtime_plan(base_config(temp.join("spool")))?;
+        let mut candidate = current.config.clone();
+        candidate.runtime_reload.debounce_ms = 1_000;
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current.config, &candidate_path);
+
+        assert!(
+            matches!(plan.decision, ConfigReloadDecision::ApplyOnline { .. }),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.reload_mode))
+                .collect::<Vec<_>>(),
+            vec![(
+                ConfigReloadSection::RuntimeReload,
+                ConfigReloadSectionReloadMode::ApplyOnline
+            )]
+        );
+        assert!(
+            plan.changed_sections[0]
+                .reason
+                .contains("does not require creating a new file watcher")
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_can_disable_running_runtime_reload_watcher_online()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-runtime-reload-disable")?;
         let current = runtime_plan(base_config(temp.join("spool")))?;
         let mut candidate = current.config.clone();
         candidate.runtime_reload.watch_config = false;
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current.config, &candidate_path);
+
+        assert!(
+            matches!(plan.decision, ConfigReloadDecision::ApplyOnline { .. }),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.reload_mode))
+                .collect::<Vec<_>>(),
+            vec![(
+                ConfigReloadSection::RuntimeReload,
+                ConfigReloadSectionReloadMode::ApplyOnline
+            )]
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_does_not_carry_runtime_reload_changes_with_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-runtime-reload-not-generation-carried")?;
+        let current = runtime_plan(base_config(temp.join("spool")))?;
+        let mut candidate = current.config.clone();
+        candidate.capture.fallback_backends = vec![LiveCaptureBackend::Libpcap];
+        candidate.runtime_reload.watch_config = false;
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current.config, &candidate_path);
+
+        assert!(
+            matches!(plan.decision, ConfigReloadDecision::RestartRequired { .. }),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.reload_mode))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    ConfigReloadSection::Capture,
+                    ConfigReloadSectionReloadMode::RuntimeGeneration
+                ),
+                (
+                    ConfigReloadSection::RuntimeReload,
+                    ConfigReloadSectionReloadMode::ApplyOnline
+                ),
+            ]
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_keeps_runtime_reload_watcher_enable_restart_required()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-runtime-reload-enable")?;
+        let mut current_config = base_config(temp.join("spool"));
+        current_config.runtime_reload.watch_config = false;
+        let current = runtime_plan(current_config)?;
+        let mut candidate = current.config.clone();
+        candidate.runtime_reload.watch_config = true;
         let candidate_path = temp.join("agent.toml");
         fs::write(&candidate_path, toml::to_string(&candidate)?)?;
 

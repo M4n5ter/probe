@@ -323,6 +323,10 @@ The main-config reload contract is owner-scoped:
 - Storage retention changes apply online when `storage.path` is unchanged. The
   ingress and export retention lanes reconcile max-age, max-records, sweep
   interval, and prune batch limits from the active plan.
+- Runtime reload debounce changes and disabling an already running main-config
+  watcher apply online. Enabling the watcher for a runtime that started with
+  `runtime_reload.watch_config = false` remains restart-required because no
+  file-watcher lifecycle owner exists in that process.
 - Export and storage retention changes can apply together because both are
   plan-only active-plan updates. Action-gated owners such as policy and
   enforcement reload remain single-owner apply operations.
@@ -346,8 +350,10 @@ The main-config reload contract is owner-scoped:
   change remains restart-required until those owners can be applied in the same
   transaction.
 
-Storage path, admin socket, watcher topology, interception topology, and TLS
-material registry/source changes still require a process rebuild.
+Storage path, admin socket, new watcher topology, interception topology, and
+TLS material registry/source changes still require a process rebuild. Runtime
+reload debounce changes and disabling an existing main-config watcher are
+handled online.
 Online apply failures keep the old running agent alive and are reported in the
 status line instead of forcing a managed-agent restart. The same tab edits admin
 socket settings for future runs; the current TUI session keeps using the active
@@ -1214,11 +1220,11 @@ agent reports that an explicit restart or retry is required. Selector changes
 referenced by enabled policy selectors, `enforcement.selector`, or enabled
 transparent interception setup selectors, TLS material registry/source changes,
 enforcement execution surface changes, storage path, admin, agent id, and
-watcher topology changes are not silently applied by this path and remain
-`restart_required` until their lifecycle owners exist.
-The `[runtime_reload]` section controls the watcher topology itself, so changing
-it is also `restart_required`; the running watcher does not rebuild its own
-lifecycle.
+watcher topology creation are not silently applied by this path and remain
+`restart_required` until their lifecycle owners exist. Existing main-config
+watchers can update their active debounce from `[runtime_reload]` and can stop
+processing file events when `watch_config` becomes `false`; starting a watcher
+for a runtime that was launched without one still requires a process restart.
 Candidate config reads use the same non-symlink regular file and 1 MiB size
 contract, and do not echo raw config lines in parse errors.
 

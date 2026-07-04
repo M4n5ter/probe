@@ -1,6 +1,6 @@
 use probe_config::{
     AgentConfig, EnforcementPolicySourceConfig, ExportRuntimeConfig, ExporterConfig, PolicyConfig,
-    StorageRetentionConfig,
+    RuntimeReloadConfig, StorageRetentionConfig,
 };
 use probe_core::{CapabilityMatrix, Selector};
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,7 @@ pub struct OnlineReloadConfigUpdate {
     pub policies: Option<Vec<PolicyConfig>>,
     pub export: Option<OnlineExportConfigUpdate>,
     pub storage_retention: Option<StorageRetentionConfig>,
+    pub runtime_reload: Option<RuntimeReloadConfig>,
     pub enforcement_policy: Option<OnlineEnforcementPolicyConfigUpdate>,
 }
 
@@ -57,6 +58,7 @@ impl OnlineReloadConfigUpdate {
         self.policies.is_none()
             && self.export.is_none()
             && self.storage_retention.is_none()
+            && self.runtime_reload.is_none()
             && self.enforcement_policy.is_none()
     }
 }
@@ -117,6 +119,9 @@ impl RuntimePlan {
         if let Some(retention) = update.storage_retention {
             config.storage.retention = retention;
             update_storage = true;
+        }
+        if let Some(runtime_reload) = update.runtime_reload {
+            config.runtime_reload = runtime_reload;
         }
         if let Some(OnlineEnforcementPolicyConfigUpdate { selector, source }) =
             update.enforcement_policy
@@ -410,6 +415,37 @@ mod tests {
             updated.storage.retention.ingress.prune_batch_limit.get(),
             128
         );
+        Ok(())
+    }
+
+    #[test]
+    fn online_runtime_reload_update_replaces_config_without_recomputing_unowned_plans()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ProviderRegistry::new(
+            vec![capture_provider(
+                CaptureBackend::Replay,
+                CaptureProviderBuilder::Replay,
+                RuntimeMode::Available,
+            )],
+            test_platform_capabilities(),
+        );
+        let mut config = AgentConfig::default();
+        config.runtime_reload.watch_config = true;
+        config.runtime_reload.debounce_ms = 500;
+        let plan = RuntimePlan::build(config, &registry)?;
+        let mut runtime_reload = plan.config.runtime_reload.clone();
+        runtime_reload.watch_config = false;
+        runtime_reload.debounce_ms = 1_000;
+
+        let updated = plan.with_online_reload_update(OnlineReloadConfigUpdate {
+            runtime_reload: Some(runtime_reload.clone()),
+            ..OnlineReloadConfigUpdate::default()
+        });
+
+        assert_eq!(updated.config.runtime_reload, runtime_reload);
+        assert_eq!(updated.capture, plan.capture);
+        assert_eq!(updated.export, plan.export);
+        assert_eq!(updated.enforcement, plan.enforcement);
         Ok(())
     }
 

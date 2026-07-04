@@ -269,7 +269,9 @@ Runtime tab 可以调用在线 admin `reload_runtime_actions` 命令，重载 ac
 policy watcher/poller topology 不变且未启用时
 在线应用；enforcement policy source 和 `enforcement.selector` 变更在 enforcement reload watcher/poller topology
 未启用，且 transparent interception 未启用或由显式 `enforcement.interception.selector` 固定 setup scope
-时在线应用。显式 `enforcement.interception.selector` 拥有透明接管 setup-time 范围；
+时在线应用。runtime reload debounce 变更和关闭已经运行中的主配置 watcher 可在线应用；为启动时
+`runtime_reload.watch_config = false` 的运行时启用 watcher 仍需要重启，因为该进程内没有可创建
+file-watcher 的 lifecycle owner。显式 `enforcement.interception.selector` 拥有透明接管 setup-time 范围；
 `enforcement.selector` 和 enforcement manifest selector 只影响 policy/planner 范围。缺少显式
 interception selector 时，transparent interception 会继承 effective policy selector，因此相关 policy
 配置变更仍需要重启。顶层 `[selectors]` registry 变更在变更 entry 未被 enabled policy selector、
@@ -284,8 +286,9 @@ point 交换。live agent 会先对旧 provider 执行有界 handoff drain；旧
 强制推进。queued response 会携带 generation request id；TUI 会跟踪 status，直到该 request applied、
 failed，或超过后台等待窗口后仍 pending。在线 apply 失败、已入队 generation failed 或仍 pending 时，旧
 running agent 继续保留，TUI 在状态行报告结果。generation request 无法入队时，TUI-managed agent
-可以重启以收敛到保存配置；attached external agent 会提示显式重启或重试。export、storage、admin
-socket、watcher topology 等 setup-time topology 仍需要进程 rebuild。
+可以重启以收敛到保存配置；attached external agent 会提示显式重启或重试。storage path、admin
+socket、需要创建新 watcher 的 topology、interception topology 和 TLS material registry/source
+仍需要进程 rebuild。runtime reload debounce 变更和关闭已存在的主配置 watcher 可在线处理。
 
 ### 最小 Policy 与 Webhook 接线
 
@@ -1038,8 +1041,9 @@ generation request 携带；action-gated online/data-path 混合变更保持 `re
 runtime 保持活跃；TUI-managed agent 可以通过重启收敛到保存配置，attached external agent 会提示显式
 重启或重试。被 enabled policy selector、`enforcement.selector` 或启用中的 interception setup selector
 引用的 selector changes、MITM/export TLS materials、enforcement execution surface、storage path、admin、
-agent id 和 watcher topology 变更不会被该路径静默应用，在对应 lifecycle owner 存在前保持
-`restart_required`。
+agent id 和 watcher topology 创建不会被该路径静默应用，在对应 lifecycle owner 存在前保持
+`restart_required`。已存在的主配置 watcher 可以从 `[runtime_reload]` 更新 active debounce，也可以在
+`watch_config` 变为 `false` 后停止处理文件事件；为启动时未创建 watcher 的运行时启用 watcher 仍需要重启。
 
 Prometheus listener 是只读、loopback-only 的 `GET /metrics` surface；控制命令仍留在私有 Unix
 socket。runtime status 和 metrics 会暴露 capture input activity、pipeline progress、

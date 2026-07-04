@@ -15,7 +15,7 @@ use crate::{
     policy_reload::PolicyReloadGate,
     reload_watcher::{
         ReloadFuture, ReloadWatchPath, ReloadWatcherError, ReloadWatcherHandle, absolute_path,
-        spawn_reload_watcher,
+        spawn_reload_watcher_with_dynamic_debounce,
     },
     runtime_generation::RuntimeGenerationState,
     runtime_plan::RuntimePlanHandle,
@@ -84,13 +84,12 @@ pub(crate) fn spawn_watcher(
         return Ok(None);
     };
     let target = runtime_config_watch_target(&config_path)?;
-    let debounce = Duration::from_millis(initial_plan.config.runtime_reload.debounce_ms);
     drop(initial_plan);
     let event_path = target.config_path.clone();
-    let inner = spawn_reload_watcher(
+    let inner = spawn_reload_watcher_with_dynamic_debounce(
         "runtime config reload watcher",
         runtime_config_watch_paths(&target),
-        debounce,
+        runtime_config_reload_debounce,
         move |event| notify_event_requests_reload(event, &event_path),
         WatcherReloadContext { context, target },
         reload_after_quiet_period,
@@ -103,6 +102,14 @@ pub(crate) fn spawn_watcher(
 struct WatcherReloadContext {
     context: RuntimeConfigWatcherContext,
     target: RuntimeConfigWatchTarget,
+}
+
+fn runtime_config_reload_debounce(context: &WatcherReloadContext) -> Duration {
+    runtime_config_reload_debounce_for_context(&context.context)
+}
+
+fn runtime_config_reload_debounce_for_context(context: &RuntimeConfigWatcherContext) -> Duration {
+    Duration::from_millis(context.plan.snapshot().config.runtime_reload.debounce_ms)
 }
 
 fn runtime_config_watcher_error(error: ReloadWatcherError) -> RuntimeConfigWatcherError {
@@ -119,9 +126,17 @@ fn reload_after_quiet_period<'a>(
     context: &'a WatcherReloadContext,
 ) -> ReloadFuture<'a> {
     Box::pin(async move {
+        if !runtime_config_reload_enabled(&context.context) {
+            info!("runtime config reload watcher ignored config change while disabled");
+            return;
+        }
         refresh_config_watches(watcher, &context.target);
         reload_after_config_change(&context.context, &context.target.config_path).await;
     })
+}
+
+fn runtime_config_reload_enabled(context: &RuntimeConfigWatcherContext) -> bool {
+    context.plan.snapshot().config.runtime_reload.watch_config
 }
 
 fn notify_event_requests_reload(event: notify::Result<Event>, config_path: &Path) -> bool {
@@ -357,10 +372,13 @@ mod tests {
     use std::{fs, sync::Arc};
 
     use notify::{
-        Event, EventKind,
+        Config, Event, EventKind, RecommendedWatcher,
         event::{AccessKind, DataChange, ModifyKind, RenameMode},
     };
-    use probe_config::{AgentConfig, CaptureSelection, LiveCaptureBackend, StorageConfig};
+    use probe_config::{
+        AgentConfig, CaptureSelection, IngressJournalRetentionConfig, LiveCaptureBackend,
+        StorageConfig, StorageRetentionConfig,
+    };
     use probe_core::{CapabilityKind, CapabilityState};
     use runtime::{
         CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry, RuntimePlan,
@@ -404,6 +422,79 @@ mod tests {
         };
 
         assert!(!event_requests_reload(&event, &config_path));
+    }
+
+    #[test]
+    fn runtime_config_reload_debounce_follows_active_plan() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut config = base_config(PathBuf::from("/tmp/probe-spool"));
+        config.runtime_reload.debounce_ms = 500;
+        let context = watcher_context(runtime_plan(config)?);
+        let mut updated_config = context.plan.snapshot().config.clone();
+        updated_config.runtime_reload.debounce_ms = 1_000;
+
+        assert_eq!(
+            runtime_config_reload_debounce_for_context(&context),
+            Duration::from_millis(500)
+        );
+        context.plan.replace(runtime_plan(updated_config)?);
+        assert_eq!(
+            runtime_config_reload_debounce_for_context(&context),
+            Duration::from_millis(1_000)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_config_reload_enabled_follows_active_plan() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut config = base_config(PathBuf::from("/tmp/probe-spool"));
+        config.runtime_reload.watch_config = false;
+        let context = watcher_context(runtime_plan(config)?);
+
+        assert!(!runtime_config_reload_enabled(&context));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disabled_runtime_config_reload_watcher_ignores_candidate_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let mut current_config = base_config(temp.path().join("spool"));
+        current_config.runtime_reload.watch_config = false;
+        let current = runtime_plan(current_config)?;
+        let mut candidate = current.config.clone();
+        candidate.storage.retention = StorageRetentionConfig {
+            ingress: IngressJournalRetentionConfig {
+                max_age_ms: None,
+                max_records: Some(100_000),
+                sweep_interval_ms: 5_000,
+                prune_batch_limit: 128,
+            },
+            ..StorageRetentionConfig::default()
+        };
+        let config_path = temp.path().join("agent.toml");
+        fs::write(&config_path, toml::to_string(&candidate)?)?;
+        let context = watcher_context(current);
+        let target = runtime_config_watch_target(&config_path)?;
+        let watch_context = WatcherReloadContext { context, target };
+        let mut watcher = RecommendedWatcher::new(|_| {}, Config::default())?;
+
+        reload_after_quiet_period(&mut watcher, &watch_context).await;
+
+        assert_eq!(
+            watch_context
+                .context
+                .plan
+                .snapshot()
+                .config
+                .storage
+                .retention
+                .ingress
+                .max_records,
+            None
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -517,6 +608,20 @@ mod tests {
         assert_eq!(pending.request_id, 3);
         assert_eq!(pending.candidate_config_version.as_deref(), Some("latest"));
         Ok(())
+    }
+
+    fn watcher_context(plan: RuntimePlan) -> RuntimeConfigWatcherContext {
+        RuntimeConfigWatcherContext {
+            runtime_generation: RuntimeGenerationState::for_config_version(
+                plan.config.config_version.clone(),
+            ),
+            plan: RuntimePlanHandle::new(Arc::new(plan)),
+            policy_set: PipelinePolicySet::default(),
+            policy_reload_gate: PolicyReloadGate::default(),
+            config_apply_gate: RuntimeReloadGate::default(),
+            enforcement_runtime: None,
+            enforcement_reload_gate: EnforcementReloadGate::default(),
+        }
     }
 
     fn runtime_plan(config: AgentConfig) -> Result<RuntimePlan, runtime::RuntimeError> {

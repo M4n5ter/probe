@@ -375,7 +375,8 @@ Operator TUI 能力事实：
   在线 apply 失败、generation 仍 pending 或后续 generation 失败时，旧 running agent 继续保留；generation
   request 无法入队表示保存的候选配置尚未进入 live data path，TUI-managed agent 可以重启以收敛到保存配置，
   attached external agent 会提示显式重启或重试。planning 明确要求 setup-time rebuild 的 storage path、
-  TLS material registry/source changes、admin、interception 或 watcher topology 变更仍进入重启提示。
+  TLS material registry/source changes、admin、interception 或需要创建新 watcher 的 topology 变更仍进入重启提示。
+  runtime reload debounce 变更和关闭已存在的主配置 watcher 可在线处理。
 - Runtime tab 也可以调用 `reload_runtime_actions`。该动作只执行 active `RuntimePlan`
   中可安全在线切换的 runtime owners：policy bundle reload 和 enforcement policy source reload。
   响应按 action 独立展示成功或失败；它不替换运行中的主 agent config，也不改变 exporter sink cursor。
@@ -3690,6 +3691,8 @@ WSL2 或受限内核即使支持 sock_diag 查询，也可能无法实际销毁 
   生成并调和的 runtime 配置。
 - watcher 观察 `agent run --config` 文件和父目录，支持常见编辑器 atomic replace，经 debounce 后复用
   `apply_config_reload`。
+- 已存在的主配置 watcher 从 active plan 读取 `runtime_reload.debounce_ms`，并在
+  `watch_config = false` 后停止处理后续文件事件。
 - 主配置 watcher 只应用现有 reload planning 支持的变更。新配置验证失败、在线 action 失败或 generation queue 失败时保留当前
   active config，并输出 reload outcome。
 
@@ -4929,7 +4932,8 @@ Config reload planning：
   `restart_required`，直到存在能整体应用候选配置且不会产生 partial commit 的事务型 generation owner。
 - `restart_required` 表示至少一个 changed section 仍由 setup-time service、background topology 或
   one-shot runtime owner 管理。
-- `[runtime_reload]` 控制主配置 watcher topology；该 section 变化保持 `process_restart`。
+- `[runtime_reload]` 的 debounce 变更和关闭已存在主配置 watcher 可在线应用；为启动时
+  `watch_config = false` 的运行时创建 watcher 仍保持 `process_restart`。
 - `observations` 作为独立 section 表示进程观察 profile 变化；这些 profile 会投影到 capture backend 选择、
   deep observation selector 和进程级 data path ownership，不能被折叠成普通 `[capture]` diff。
 - 每个 changed section 携带 reason，说明该 top-level 配置域绑定的运行时 owner。
@@ -4956,7 +4960,9 @@ Runtime config watcher：
 - watcher 只在 `agent run --config` 指向 non-symlink regular 主 TOML 文件，且该文件的
   immediate parent 是 non-symlink directory 时建立。
 - watcher 同时监听配置文件和父目录，以覆盖原地写入和 atomic replace。
-- watcher 使用 `runtime_reload.debounce_ms` 合并短时间文件事件；默认 500ms，配置校验范围是 50ms 到 60s。
+- watcher 从 active plan 读取 `runtime_reload.debounce_ms` 合并短时间文件事件；默认 500ms，配置校验范围是 50ms 到 60s。
+- `runtime_reload.debounce_ms` 变更和 `watch_config: true -> false` 可在线应用；
+  `watch_config: false -> true` 需要进程重启，因为启动时未创建的 watcher 没有 active lifecycle owner。
 - watcher 触发后复用 `apply_config_reload` 的 validate-then-swap / request-generation 语义。
 - runtime generation queue busy 时，watcher 等待 generation idle，随后重读同一主配置文件并重试，以收敛到最新文件内容。
 - watcher 不建立第二套 TOML 解释器，不绕过 admin reload planning，也不隐式重启进程。
@@ -5103,8 +5109,8 @@ Full config hot reload：
 - enabled policy selector、`enforcement.selector` 或启用中的 interception setup selector 引用的
   selector registry 变更、MITM TLS 和 enforcement execution generation 缺少对应 lifecycle owner；
   config reload planning 保持 `restart_required`，不提交 runtime generation request。
-- setup-time service topology 需要对应 lifecycle owner；runtime reload watcher、admin socket
-  和 storage path 不随 data path generation 隐式切换。
+- setup-time service topology 需要对应 lifecycle owner；admin socket、storage path，以及启动时未创建的
+  runtime reload watcher 不随 data path generation 隐式切换。
 
 当前实现边界：
 

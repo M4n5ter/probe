@@ -80,6 +80,30 @@ where
     E: Fn(notify::Result<Event>) -> bool + Send + 'static,
     R: for<'a> Fn(&'a mut RecommendedWatcher, &'a C) -> ReloadFuture<'a> + Send + 'static,
 {
+    spawn_reload_watcher_with_dynamic_debounce(
+        label,
+        watch_paths,
+        move |_| debounce,
+        event_requests_reload,
+        context,
+        reload,
+    )
+}
+
+pub(crate) fn spawn_reload_watcher_with_dynamic_debounce<C, E, D, R>(
+    label: &'static str,
+    watch_paths: impl IntoIterator<Item = ReloadWatchPath>,
+    debounce: D,
+    event_requests_reload: E,
+    context: C,
+    reload: R,
+) -> Result<ReloadWatcherHandle, ReloadWatcherError>
+where
+    C: Send + 'static,
+    E: Fn(notify::Result<Event>) -> bool + Send + 'static,
+    D: Fn(&C) -> Duration + Send + 'static,
+    R: for<'a> Fn(&'a mut RecommendedWatcher, &'a C) -> ReloadFuture<'a> + Send + 'static,
+{
     let (event_sender, event_receiver) = mpsc::channel(1);
     let mut watcher = RecommendedWatcher::new(
         move |event| {
@@ -124,7 +148,7 @@ where
 async fn run_reload_watcher<C, R>(
     mut watcher: RecommendedWatcher,
     mut events: mpsc::Receiver<()>,
-    debounce: Duration,
+    debounce: impl Fn(&C) -> Duration,
     context: C,
     shutdown: WatcherShutdown,
     reload: R,
@@ -137,6 +161,7 @@ async fn run_reload_watcher<C, R>(
                 if event.is_none() {
                     break;
                 }
+                let debounce = debounce(&context);
                 if !wait_for_quiet_period(&mut events, debounce, &shutdown).await {
                     break;
                 }
