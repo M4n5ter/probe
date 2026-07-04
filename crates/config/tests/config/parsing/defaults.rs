@@ -33,7 +33,7 @@ fn minimal_config_uses_defaults() -> Result<(), Box<dyn std::error::Error>> {
     );
     assert_eq!(config.exporters, Vec::<ExporterConfig>::new());
     assert_eq!(config.runtime_reload, RuntimeReloadConfig::default());
-    assert!(!config.runtime_reload.watch_config);
+    assert!(config.runtime_reload.watch_config);
     assert_eq!(
         config.runtime_reload.debounce_ms,
         DEFAULT_RUNTIME_RELOAD_WATCH_DEBOUNCE_MS

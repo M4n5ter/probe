@@ -14,7 +14,7 @@ pub struct RuntimeReloadConfig {
 impl Default for RuntimeReloadConfig {
     fn default() -> Self {
         Self {
-            watch_config: false,
+            watch_config: true,
             debounce_ms: DEFAULT_RUNTIME_RELOAD_WATCH_DEBOUNCE_MS,
         }
     }

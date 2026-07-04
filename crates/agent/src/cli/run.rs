@@ -1,5 +1,6 @@
 use std::{
     ffi::{OsStr, OsString},
+    fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -16,6 +17,7 @@ use probe_core::{
     AddressPort, Direction, EnforcementMode, FlowContext, FlowIdentity, ProcessContext,
     ProcessIdentity, Timestamp, TransportProtocol,
 };
+use probe_io::{BoundedFileError, BoundedFileErrorKind};
 use runtime::EMBEDDED_PRODUCT_PROXY_COMMAND;
 use storage::FjallSpool;
 
@@ -36,6 +38,7 @@ use crate::{
 use super::admin::{AdminCliCommand, run_admin_command};
 
 const REPLAY_POLICY_SOURCE_BYTES: u64 = 1024 * 1024;
+const MAX_MAIN_CONFIG_BYTES: u64 = 1024 * 1024;
 const READY_SOCKET_ENV: &str = "TRAFFIC_PROBE_READY_SOCKET";
 
 #[derive(Debug, Parser)]
@@ -276,13 +279,13 @@ fn parse_ready_socket(value: OsString) -> Result<PathBuf, AgentError> {
 }
 
 fn read_runtime_composition(
-    path: &PathBuf,
+    path: &Path,
 ) -> Result<crate::runtime_composition::RuntimeComposition, AgentError> {
     let config = prepare_runtime_config(read_config(path)?)?;
     build_runtime_composition(config)
 }
 
-async fn run_check_command(path: &PathBuf) -> Result<(), AgentError> {
+async fn run_check_command(path: &Path) -> Result<(), AgentError> {
     let config = read_config(path)?;
     emit_check_command_output(build_check_command_output(config).await?)
 }
@@ -353,16 +356,65 @@ fn read_config_or_default(path: Option<&PathBuf>) -> Result<AgentConfig, AgentEr
     }
 }
 
-fn read_config(path: &PathBuf) -> Result<AgentConfig, AgentError> {
-    let content = std::fs::read_to_string(path).map_err(|source| AgentError::ReadFile {
-        path: path.display().to_string(),
-        source,
-    })?;
+fn read_config(path: &Path) -> Result<AgentConfig, AgentError> {
+    validate_main_config_parent(path)?;
+    let content = probe_io::read_bounded_regular_file_to_string(path, MAX_MAIN_CONFIG_BYTES)
+        .map_err(main_config_file_error)?;
     AgentConfig::from_toml_str(&content).map_err(AgentError::Config)
 }
 
+fn validate_main_config_parent(path: &Path) -> Result<(), AgentError> {
+    let config_dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent_metadata =
+        fs::symlink_metadata(config_dir).map_err(|source| AgentError::ReadFile {
+            path: config_dir.display().to_string(),
+            source,
+        })?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(AgentError::InvalidConfigPath {
+            path: config_dir.display().to_string(),
+            reason: "parent directory must be a non-symlink directory".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn main_config_file_error(error: BoundedFileError) -> AgentError {
+    match error.kind() {
+        BoundedFileErrorKind::NotFound
+        | BoundedFileErrorKind::Inspect
+        | BoundedFileErrorKind::Open
+        | BoundedFileErrorKind::Read => {
+            let mut parts = error.into_parts();
+            match parts.take_source() {
+                Some(source) => AgentError::ReadFile {
+                    path: parts.path.display().to_string(),
+                    source,
+                },
+                None => AgentError::InvalidConfigPath {
+                    path: parts.path.display().to_string(),
+                    reason: "does not exist".to_string(),
+                },
+            }
+        }
+        BoundedFileErrorKind::Symlink
+        | BoundedFileErrorKind::Directory
+        | BoundedFileErrorKind::NotRegular => AgentError::InvalidConfigPath {
+            path: error.path().display().to_string(),
+            reason: "must be a non-symlink regular file".to_string(),
+        },
+        BoundedFileErrorKind::TooLarge => AgentError::InvalidConfigPath {
+            path: error.path().display().to_string(),
+            reason: format!("must not exceed {MAX_MAIN_CONFIG_BYTES} byte(s)"),
+        },
+    }
+}
+
 async fn replay(command: ReplayCommand) -> Result<(), AgentError> {
-    let bytes = std::fs::read(&command.input).map_err(|source| AgentError::ReadFile {
+    let bytes = fs::read(&command.input).map_err(|source| AgentError::ReadFile {
         path: command.input.display().to_string(),
         source,
     })?;
@@ -485,7 +537,7 @@ fn synthetic_replay_process() -> ProcessContext {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, os::unix::fs::symlink};
 
     use capture::{CaptureEvent, CapturedBytes};
     use probe_config::{CaptureSelection, EnforcementPolicySourceConfig, PolicyConfig};
@@ -591,6 +643,54 @@ mod tests {
         assert_eq!(flow.process.identity.tgid, 0);
         assert_eq!(flow.attribution_confidence, 0);
         assert_eq!(flow.process.identity.boot_id, "replay");
+    }
+
+    #[test]
+    fn read_config_rejects_symlink_config_path() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("read-config-symlink")?;
+        let target = temp.join("target.toml");
+        let link = temp.join("agent.toml");
+        fs::write(&target, "agent_id = \"probe\"\n")?;
+        symlink(&target, &link)?;
+
+        let error = read_config(&link).expect_err("symlink config path must be rejected");
+
+        assert!(matches!(error, AgentError::InvalidConfigPath { .. }));
+        assert!(error.to_string().contains("non-symlink regular file"));
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn read_config_rejects_symlink_config_parent() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("read-config-symlink-parent")?;
+        let real_dir = temp.join("real");
+        let link_dir = temp.join("config");
+        fs::create_dir(&real_dir)?;
+        fs::write(real_dir.join("agent.toml"), "agent_id = \"probe\"\n")?;
+        symlink(&real_dir, &link_dir)?;
+
+        let error = read_config(&link_dir.join("agent.toml"))
+            .expect_err("symlink config parent must be rejected");
+
+        assert!(matches!(error, AgentError::InvalidConfigPath { .. }));
+        assert!(error.to_string().contains("non-symlink directory"));
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn read_config_rejects_oversized_config_file() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("read-config-oversized")?;
+        let config_path = temp.join("agent.toml");
+        fs::File::create(&config_path)?.set_len(MAX_MAIN_CONFIG_BYTES + 1)?;
+
+        let error = read_config(&config_path).expect_err("oversized config must be rejected");
+
+        assert!(matches!(error, AgentError::InvalidConfigPath { .. }));
+        assert!(error.to_string().contains("must not exceed"));
+        fs::remove_dir_all(temp)?;
+        Ok(())
     }
 
     #[tokio::test]

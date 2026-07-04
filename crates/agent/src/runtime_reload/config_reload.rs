@@ -2186,8 +2186,7 @@ mod tests {
         let temp = test_dir("config-reload-runtime-watcher")?;
         let current = runtime_plan(base_config(temp.join("spool")))?;
         let mut candidate = current.config.clone();
-        candidate.runtime_reload.watch_config = true;
-        candidate.runtime_reload.debounce_ms = 250;
+        candidate.runtime_reload.watch_config = false;
         let candidate_path = temp.join("agent.toml");
         fs::write(&candidate_path, toml::to_string(&candidate)?)?;
 

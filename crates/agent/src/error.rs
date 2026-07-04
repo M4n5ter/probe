@@ -17,6 +17,8 @@ pub(crate) enum AgentError {
         path: String,
         source: std::io::Error,
     },
+    #[error("invalid config path {path}: {reason}")]
+    InvalidConfigPath { path: String, reason: String },
     #[error("failed to signal readiness through {target}: {source}")]
     SignalReadiness {
         target: String,

@@ -1110,20 +1110,32 @@ enabled = true
 listen_addr = "127.0.0.1:9464"
 ```
 
-Daemon deployments can use the main-config watcher enabled by the first-run
-configuration. The watcher observes the `--config` file and its parent
-directory, debounces editor writes and atomic replaces, then runs the same
-`apply-config-reload` contract used by the admin socket and TUI. TUI-managed
-agent subprocesses disable their own watcher because the TUI already owns
-runtime reconciliation for those temporary runtime configs. If a data-path
-generation request is already pending or applying, the watcher waits for that
-generation to become idle, rereads the config file, and retries against the
-latest file contents:
+Daemon deployments enable the main-config watcher by default whenever
+`agent run --config` points at a non-symlink regular TOML file whose immediate
+parent is a non-symlink directory. The watcher observes the config file and its
+parent directory, debounces editor writes and atomic replaces, then runs the
+same `apply-config-reload` contract used by the admin socket and TUI.
+TUI-managed agent subprocesses disable their own watcher because the TUI already
+owns runtime reconciliation for those temporary runtime configs.
+Main config reads are capped at 1 MiB and reject symlink file paths or symlink
+immediate parent directories before parsing.
+If a data-path generation request is already pending or applying, the watcher
+waits for that generation to become idle, rereads the config file, and retries
+against the latest file contents. The section can be omitted to use the
+defaults. Write it explicitly only when tuning debounce:
 
 ```toml
 [runtime_reload]
 watch_config = true
 debounce_ms = 500
+```
+
+Set `watch_config = false` only for a runtime whose config file is generated and
+reconciled by another owner:
+
+```toml
+[runtime_reload]
+watch_config = false
 ```
 
 Admin reloads validate new policy or enforcement state before swapping runtime
@@ -1171,8 +1183,8 @@ watcher topology changes are not silently applied by this path and remain
 The `[runtime_reload]` section controls the watcher topology itself, so changing
 it is also `restart_required`; the running watcher does not rebuild its own
 lifecycle.
-Candidate config reads require a regular file, reject symlinks and oversized
-files, and do not echo raw config lines in parse errors.
+Candidate config reads use the same non-symlink regular file and 1 MiB size
+contract, and do not echo raw config lines in parse errors.
 
 The Prometheus listener is read-only, loopback-only, and serves only
 `GET /metrics`; control commands stay on the private Unix socket. Runtime status

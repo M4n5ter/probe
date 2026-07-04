@@ -3649,7 +3649,8 @@ WSL2 或受限内核即使支持 sock_diag 查询，也可能无法实际销毁 
 配置形态：
 
 - 主配置使用 TOML。
-- 主配置从单个 TOML 文件读取。
+- 主配置从单个 non-symlink regular TOML 文件读取，大小上限为 1 MiB；该文件的 immediate
+  parent 必须是 non-symlink directory。
 - 配置化 policy 通过 `policies[].source` 指向本地 bundle directory 或 remote bundle document。
 - 配置化 enforcement policy 通过 `enforcement.policy.source` 指向本地 manifest、manifest directory 或 remote manifest document。
 - 目录化拆分（例如 `policies.d`、`exporters.d`、`selectors.d`）是目标形态，尚未实现。
@@ -3659,8 +3660,10 @@ WSL2 或受限内核即使支持 sock_diag 查询，也可能无法实际销毁 
   hot reload owner 中证明。
 - 本地 policy bundle watcher 触发当前配置引用的全量 enabled policy source reload，不重读主配置。
 - 本地 enforcement manifest watcher 触发当前 plan 的 enforcement policy source reload，不重读主配置。
-- `[runtime_reload] watch_config = true` 触发主 TOML 文件 watcher。watcher 观察 `agent run --config`
-  文件和父目录，支持常见编辑器 atomic replace，经 debounce 后复用 `apply_config_reload`。
+- 主配置 watcher 默认启用；`[runtime_reload] watch_config = false` 用于由外部 owner
+  生成并调和的 runtime 配置。
+- watcher 观察 `agent run --config` 文件和父目录，支持常见编辑器 atomic replace，经 debounce 后复用
+  `apply_config_reload`。
 - 主配置 watcher 只应用现有 reload planning 支持的变更。新配置验证失败、在线 action 失败或 generation queue 失败时保留当前
   active config，并输出 reload outcome。
 
@@ -4873,7 +4876,7 @@ Prometheus listener：
 Config reload planning：
 
 - `plan_config_reload` 读取 agent 所在主机上的本地候选 TOML 路径。
-- 候选 TOML 必须是 regular file，读取使用 no-follow bounded file primitive，大小上限为 1 MiB。
+- 候选 TOML 必须是 non-symlink regular file，读取使用 no-follow bounded file primitive，大小上限为 1 MiB。
 - 该命令执行配置 parse/schema validation 和 static runtime validation。
 - 该命令不执行 setup-time active probes，例如 socket destroy 自测、MITM TCP readiness probe 或 host rule mutation。
 - parse error 只返回 parser message 和 byte span，不回显 raw config line。
@@ -4919,14 +4922,18 @@ Config reload planning：
 
 Runtime config watcher：
 
-- `[runtime_reload] watch_config = true` 会为 `agent run --config` 指向的主 TOML 文件建立后台 watcher。
+- `RuntimeReloadConfig` 默认开启主配置 watcher。
+- `[runtime_reload] watch_config = false` 是显式 opt-out，只用于由外部 owner
+  生成并调和的 runtime 配置，例如 TUI-managed agent 的临时配置文件。
+- watcher 只在 `agent run --config` 指向 non-symlink regular 主 TOML 文件，且该文件的
+  immediate parent 是 non-symlink directory 时建立。
 - watcher 同时监听配置文件和父目录，以覆盖原地写入和 atomic replace。
 - watcher 使用 `runtime_reload.debounce_ms` 合并短时间文件事件；默认 500ms，配置校验范围是 50ms 到 60s。
 - watcher 触发后复用 `apply_config_reload` 的 validate-then-swap / request-generation 语义。
 - runtime generation queue busy 时，watcher 等待 generation idle，随后重读同一主配置文件并重试，以收敛到最新文件内容。
 - watcher 不建立第二套 TOML 解释器，不绕过 admin reload planning，也不隐式重启进程。
 - watcher reload 失败时保持当前 active plan、active policy set、active enforcement policy 和 active capture generation。
-- `agent run` 没有配置路径时，即使配置启用了 watcher，也不会启动主配置 watcher。
+- `agent run` 没有配置路径时，即使配置保留默认 watcher 设置，也不会启动主配置 watcher。
 
 Admin reload：
 
@@ -5015,8 +5022,8 @@ Full config hot reload：
   在无事件时返回 `Idle` 或 `Finished`。
 - runtime generation status 已暴露 active generation、pending request、applying request、last outcome 和 capture control safe point。
 - pending request 由 `apply_config_reload` 针对 data path generation rebuild verdict 产生。
-- 主配置 watcher 由 `[runtime_reload] watch_config = true` 启动，监听 `agent run --config`
-  指向的主 TOML 文件和父目录。它不解释 TOML，而是复用 `apply_config_reload` 的 planning/apply contract。
+- 主配置 watcher 默认监听 `agent run --config` 指向的主 TOML 文件和父目录。
+  它不解释 TOML，而是复用 `apply_config_reload` 的 planning/apply contract。
 - runtime generation request 由 admin apply 阶段基于已读取、已解析的 typed candidate config 创建；
   executor 消费 pending request 后执行 artifact hydration、static runtime validation 和 runtime composition build。
 - capture、observations、config version、TLS plaintext instrumentation 和 TLS decrypt-hint material 变更会在
@@ -5044,8 +5051,8 @@ Full config hot reload：
   无 transparent interception setup-time rules 时应用 policy source 和主配置
   `enforcement.selector` 变更，并更新 active plan。顶层 `[selectors]` registry
   变更仍为 restart-required。
-- main TOML file watcher 由 `[runtime_reload] watch_config = true` 为 `agent run --config`
-  文件建立；文件事件经 debounce 后复用 `apply_config_reload`。
+- main TOML file watcher 默认为 `agent run --config` 文件建立；文件事件经 debounce
+  后复用 `apply_config_reload`。
 - capture/observations/TLS plaintext generation 由 `apply_config_reload` 提交
   `request_runtime_generation`；live agent 在 capture safe point validate-then-swap
   capture provider、TLS plaintext/decrypt-hint runtime state 和 active plan。

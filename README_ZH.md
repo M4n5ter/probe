@@ -966,16 +966,26 @@ enabled = true
 listen_addr = "127.0.0.1:9464"
 ```
 
-首次生成的配置会启用主配置 watcher。守护进程部署中，watcher 会观察 `--config` 文件及其父目录，
+守护进程通过 `agent run --config` 指向 non-symlink regular TOML 文件，且该文件的 immediate
+parent 是 non-symlink directory 时，默认启用主配置 watcher。watcher 会观察配置文件及其父目录，
 对编辑器写入和 atomic replace 做 debounce，然后复用 admin socket 和 TUI 使用的
 `apply-config-reload` 契约。TUI-managed agent 子进程会关闭自身 watcher，因为 TUI 已经负责这些临时
-runtime config 的 runtime reconciliation。若 data-path generation request 正在 pending 或 applying，
-watcher 会等待 generation 空闲，重新读取配置文件，并按最新文件内容重试：
+runtime config 的 runtime reconciliation。若 data-path generation request 正在
+pending 或 applying，watcher 会等待 generation 空闲，重新读取配置文件，并按最新文件内容重试。
+主配置读取上限为 1 MiB，并在解析前拒绝 symlink file path 或 symlink immediate parent directory。
+省略该 section 即使用默认值。只有需要调整 debounce 时，才需要显式写出该 section：
 
 ```toml
 [runtime_reload]
 watch_config = true
 debounce_ms = 500
+```
+
+只有当 runtime 配置由另一个 owner 生成并调和时，才应显式设置 `watch_config = false`：
+
+```toml
+[runtime_reload]
+watch_config = false
 ```
 
 admin reload 会先校验新 policy 或 enforcement state，再替换 runtime state。
