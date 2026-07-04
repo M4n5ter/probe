@@ -414,6 +414,7 @@ fn render_vertical_scrollbar(
     if content_len <= viewport_len || area.width == 0 || area.height == 0 {
         return;
     }
+    let position = scrollbar_content_position(position, content_len, viewport_len);
     let mut state = ScrollbarState::new(content_len)
         .position(position)
         .viewport_content_length(viewport_len);
@@ -424,6 +425,17 @@ fn render_vertical_scrollbar(
         area,
         &mut state,
     );
+}
+
+fn scrollbar_content_position(scroll: usize, content_len: usize, viewport_len: usize) -> usize {
+    let max_scroll = content_len.saturating_sub(viewport_len.max(1));
+    if max_scroll == 0 {
+        return 0;
+    }
+    scroll
+        .min(max_scroll)
+        .saturating_mul(content_len.saturating_sub(1))
+        / max_scroll
 }
 
 fn status_color(kind: StatusKind) -> Color {
@@ -812,6 +824,39 @@ mod tests {
 
         assert_eq!(table_data_row_start(table), 22);
         assert_eq!(table_scroll_track(table), Rect::new(10, 22, 80, 12));
+    }
+
+    #[test]
+    fn scrollbar_position_maps_viewport_scroll_to_content_edges() {
+        assert_eq!(scrollbar_content_position(0, 100, 10), 0);
+        assert_eq!(scrollbar_content_position(90, 100, 10), 99);
+        assert_eq!(scrollbar_content_position(usize::MAX, 100, 10), 99);
+    }
+
+    #[test]
+    fn scrollbar_position_handles_short_content() {
+        assert_eq!(scrollbar_content_position(0, 5, 10), 0);
+        assert_eq!(scrollbar_content_position(3, 5, 5), 0);
+    }
+
+    #[test]
+    fn vertical_scrollbar_renders_bottom_scroll_at_bottom_track_cell()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut terminal = Terminal::new(TestBackend::new(4, 8))?;
+
+        terminal.draw(|frame| {
+            render_vertical_scrollbar(frame, Rect::new(0, 0, 4, 8), 100, 90, 10);
+        })?;
+
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((3, 6))
+                .map(|cell| cell.style().fg),
+            Some(Some(Color::Cyan))
+        );
+        Ok(())
     }
 
     #[test]

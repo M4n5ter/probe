@@ -1110,12 +1110,15 @@ enabled = true
 listen_addr = "127.0.0.1:9464"
 ```
 
-Daemon deployments can also enable a main-config watcher. The watcher observes
-the `--config` file and its parent directory, debounces editor writes and atomic
-replaces, then runs the same `apply-config-reload` contract used by the admin
-socket and TUI. If a data-path generation request is already pending or
-applying, the watcher waits for that generation to become idle, rereads the
-config file, and retries against the latest file contents:
+Daemon deployments can use the main-config watcher enabled by the first-run
+configuration. The watcher observes the `--config` file and its parent
+directory, debounces editor writes and atomic replaces, then runs the same
+`apply-config-reload` contract used by the admin socket and TUI. TUI-managed
+agent subprocesses disable their own watcher because the TUI already owns
+runtime reconciliation for those temporary runtime configs. If a data-path
+generation request is already pending or applying, the watcher waits for that
+generation to become idle, rereads the config file, and retries against the
+latest file contents:
 
 ```toml
 [runtime_reload]

@@ -5,7 +5,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use probe_config::{AgentConfig, ConfigError, default_admin_socket_path, default_storage_path};
+use probe_config::{
+    AgentConfig, ConfigError, DEFAULT_RUNTIME_RELOAD_WATCH_DEBOUNCE_MS, default_admin_socket_path,
+    default_storage_path,
+};
 use rustix::{
     fs::{FlockOperation, Gid, Mode, OFlags, Uid, fchmod, fchown, flock},
     process::geteuid,
@@ -153,6 +156,10 @@ path = "{}"
 [export.worker]
 enabled = true
 
+[runtime_reload]
+watch_config = true
+debounce_ms = {}
+
 [enforcement]
 mode = "audit_only"
 backend = "none"
@@ -162,6 +169,7 @@ enabled = false
 socket_path = "{}"
 "#,
         default_storage_path().display(),
+        DEFAULT_RUNTIME_RELOAD_WATCH_DEBOUNCE_MS,
         default_admin_socket_path().display()
     )
 }
@@ -973,9 +981,15 @@ codec = "zstd"
         assert_eq!(loaded.config.capture.selection, CaptureSelection::Auto);
         assert_eq!(loaded.config.storage.path, default_storage_path());
         assert!(loaded.config.exporters.is_empty());
+        assert!(loaded.config.runtime_reload.watch_config);
+        assert_eq!(
+            loaded.config.runtime_reload.debounce_ms,
+            DEFAULT_RUNTIME_RELOAD_WATCH_DEBOUNCE_MS
+        );
         assert_eq!(loaded.config.enforcement.mode, EnforcementMode::AuditOnly);
         assert!(!loaded.config.admin.enabled);
         assert_eq!(loaded.config.admin.socket_path, default_admin_socket_path());
+        assert!(loaded.source.contains("[runtime_reload]"));
         assert!(loaded.source.contains("[admin]"));
         assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
         loaded.config.validate_basic()?;

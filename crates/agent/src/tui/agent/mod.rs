@@ -8,7 +8,10 @@ use std::{
 };
 
 use probe_config::{AgentConfig, probe_home_path};
-use rustix::process::{Pid, Signal, kill_process};
+use rustix::{
+    fs::OFlags,
+    process::{Pid, Signal, kill_process},
+};
 use tokio::{process::Command, time::Instant};
 
 use super::{
@@ -68,6 +71,21 @@ impl TuiAgentSupervisor {
 
     pub(crate) fn is_managed(&self) -> bool {
         matches!(self.mode, TuiAgentMode::Managed(_))
+    }
+
+    pub(crate) fn prepare_config_reload_candidate(
+        &self,
+        config: &AgentConfig,
+        user_config_path: &Path,
+    ) -> Result<PathBuf, TuiError> {
+        match &self.mode {
+            TuiAgentMode::Existing => Ok(user_config_path.to_path_buf()),
+            TuiAgentMode::Managed(agent) => {
+                let runtime_config = managed_runtime_config(config, &agent.socket_path);
+                replace_runtime_config(&runtime_config, &agent.runtime_config_path)?;
+                Ok(agent.runtime_config_path.clone())
+            }
+        }
     }
 
     pub(crate) async fn restart(self, config: &AgentConfig) -> Result<Self, TuiError> {
@@ -280,6 +298,7 @@ fn managed_runtime_config(config: &AgentConfig, socket_path: &Path) -> AgentConf
     let mut runtime_config = config.clone();
     runtime_config.admin.enabled = true;
     runtime_config.admin.socket_path = socket_path.to_path_buf();
+    runtime_config.runtime_reload.watch_config = false;
     runtime_config
 }
 
@@ -291,14 +310,53 @@ fn current_exe() -> Result<PathBuf, TuiError> {
 }
 
 fn write_runtime_config(config: &AgentConfig, path: &Path) -> Result<(), TuiError> {
+    write_runtime_config_file(config, path, RuntimeConfigWriteMode::CreateNew)
+}
+
+fn replace_runtime_config(config: &AgentConfig, path: &Path) -> Result<(), TuiError> {
+    write_runtime_config_file(config, path, RuntimeConfigWriteMode::Replace)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RuntimeConfigWriteMode {
+    CreateNew,
+    Replace,
+}
+
+impl RuntimeConfigWriteMode {
+    fn configure(self, options: &mut OpenOptions) {
+        options.write(true).mode(0o600);
+        match self {
+            Self::CreateNew => {
+                options.create_new(true);
+            }
+            Self::Replace => {
+                options.create(true).truncate(true);
+            }
+        };
+        options.custom_flags(OFlags::NOFOLLOW.bits() as i32);
+    }
+
+    fn open_action(self) -> &'static str {
+        match self {
+            Self::CreateNew => "create TUI runtime config",
+            Self::Replace => "replace TUI runtime config",
+        }
+    }
+}
+
+fn write_runtime_config_file(
+    config: &AgentConfig,
+    path: &Path,
+    mode: RuntimeConfigWriteMode,
+) -> Result<(), TuiError> {
     let body = toml::to_string(config)?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    let mut options = OpenOptions::new();
+    mode.configure(&mut options);
+    let mut file = options
         .open(path)
         .map_err(|source| TuiError::AgentSupervisor {
-            action: "create TUI runtime config",
+            action: mode.open_action(),
             source,
         })?;
     use std::io::Write as _;
@@ -511,6 +569,7 @@ mod tests {
         let mut config = AgentConfig::default();
         config.admin.enabled = false;
         config.admin.socket_path = PathBuf::from("/tmp/probe.sock");
+        config.runtime_reload.watch_config = true;
         let socket_path =
             PathBuf::from("/home/operator/.local/state/traffic-probe/run/tui/x/admin.sock");
 
@@ -518,8 +577,54 @@ mod tests {
 
         assert!(!config.admin.enabled);
         assert_eq!(config.admin.socket_path, PathBuf::from("/tmp/probe.sock"));
+        assert!(config.runtime_reload.watch_config);
         assert!(runtime_config.admin.enabled);
         assert_eq!(runtime_config.admin.socket_path, socket_path);
+        assert!(!runtime_config.runtime_reload.watch_config);
+    }
+
+    #[tokio::test]
+    async fn managed_config_reload_candidate_uses_projected_runtime_config()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let runtime_config_path = temp.path().join("agent.toml");
+        let socket_path = temp.path().join("admin.sock");
+        fs::write(&runtime_config_path, "stale")?;
+        let child = tokio::process::Command::new("/bin/true")
+            .kill_on_drop(true)
+            .spawn()?;
+        let mut supervisor = TuiAgentSupervisor {
+            mode: TuiAgentMode::Managed(Box::new(ManagedAgent {
+                child,
+                runtime_dir: temp.path().to_path_buf(),
+                runtime_config_path: runtime_config_path.clone(),
+                socket_path: socket_path.clone(),
+                readiness_path: temp.path().join("ready.sock"),
+                log_path: temp.path().join("agent.log"),
+            })),
+        };
+        let mut config = AgentConfig::default();
+        config.admin.enabled = false;
+        config.admin.socket_path = PathBuf::from("/tmp/user-admin.sock");
+        config.runtime_reload.watch_config = true;
+
+        let candidate_path = supervisor
+            .prepare_config_reload_candidate(&config, Path::new("/tmp/user-agent.toml"))?;
+
+        assert_eq!(candidate_path, runtime_config_path);
+        assert!(config.runtime_reload.watch_config);
+        assert_eq!(
+            config.admin.socket_path,
+            PathBuf::from("/tmp/user-admin.sock")
+        );
+        let written = AgentConfig::from_toml_str(&fs::read_to_string(&candidate_path)?)?;
+        assert!(written.admin.enabled);
+        assert_eq!(written.admin.socket_path, socket_path);
+        assert!(!written.runtime_reload.watch_config);
+        if let TuiAgentMode::Managed(agent) = &mut supervisor.mode {
+            let _ = agent.child.wait().await;
+        }
+        Ok(())
     }
 
     #[test]

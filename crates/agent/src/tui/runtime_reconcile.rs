@@ -130,7 +130,13 @@ async fn saved_runtime_reconcile(
         config_path,
         saved_status,
     } = queued;
-    let plan_note = runtime_apply_plan_note(active_socket_path.as_deref(), &config_path).await;
+    let plan_note = runtime_apply_plan_note(
+        supervisor.as_ref(),
+        active_socket_path.as_deref(),
+        &config,
+        &config_path,
+    )
+    .await;
     if let (Some(_running), Some(note)) = (&supervisor, &plan_note)
         && note.follow_up == RuntimeApplyFollowUp::KeepRunning
     {
@@ -195,12 +201,27 @@ async fn saved_runtime_reconcile(
 }
 
 async fn runtime_apply_plan_note(
+    supervisor: Option<&TuiAgentSupervisor>,
     active_socket_path: Option<&Path>,
+    config: &AgentConfig,
     config_path: &Path,
 ) -> Option<RuntimeApplyPlanNote> {
     let socket_path = active_socket_path?;
+    let candidate_path = match supervisor {
+        Some(running) => match running.prepare_config_reload_candidate(config, config_path) {
+            Ok(path) => path,
+            Err(error) => {
+                return Some(RuntimeApplyPlanNote {
+                    follow_up: RuntimeApplyFollowUp::RestartToApply,
+                    status_kind: StatusKind::Warning,
+                    text: format!("runtime config apply unavailable: {error}"),
+                });
+            }
+        },
+        None => config_path.to_path_buf(),
+    };
     Some(
-        match request_config_reload_apply(socket_path, config_path).await {
+        match request_config_reload_apply(socket_path, &candidate_path).await {
             Ok(summary) => {
                 let disposition = summary.disposition();
                 RuntimeApplyPlanNote {

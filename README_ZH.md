@@ -966,6 +966,18 @@ enabled = true
 listen_addr = "127.0.0.1:9464"
 ```
 
+首次生成的配置会启用主配置 watcher。守护进程部署中，watcher 会观察 `--config` 文件及其父目录，
+对编辑器写入和 atomic replace 做 debounce，然后复用 admin socket 和 TUI 使用的
+`apply-config-reload` 契约。TUI-managed agent 子进程会关闭自身 watcher，因为 TUI 已经负责这些临时
+runtime config 的 runtime reconciliation。若 data-path generation request 正在 pending 或 applying，
+watcher 会等待 generation 空闲，重新读取配置文件，并按最新文件内容重试：
+
+```toml
+[runtime_reload]
+watch_config = true
+debounce_ms = 500
+```
+
 admin reload 会先校验新 policy 或 enforcement state，再替换 runtime state。
 `reload-runtime-actions` 会执行 active `RuntimePlan` 下安全的 runtime action，并独立报告每个
 action 的结果，因此 enforcement reload 失败不会掩盖 policy reload 成功。CLI 会先打印完整 JSON response，
