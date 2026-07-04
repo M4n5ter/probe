@@ -352,9 +352,10 @@ Operator TUI 能力事实：
   lane 会从 active plan 读取 max-age、max-records、sweep interval 和 prune batch limit。
   enforcement policy source 和 `enforcement.selector` 变更在 enforcement reload watcher/poller topology
   未启用，且 transparent interception 未启用或由显式 `enforcement.interception.selector`
-  固定 setup scope 时可在线生效。顶层 `[selectors]` registry 变更，包括被 `enforcement.selector`
-  或 `enforcement.interception.selector` 引用的条目变更，仍需要重启，直到 selector ownership
-  具备独立 lifecycle owner。
+  固定 setup scope 时可在线生效。顶层 `[selectors]` registry 变更在变更 entry 未被 enabled policy
+  selector、`enforcement.selector` 或启用中的 transparent interception setup selector 引用时进入
+  runtime generation；若 action-gated selector consumer 引用了变更 entry，则仍需要重启，直到这些
+  owner 能够在同一个事务中应用。
   对 capture、process observation、config version、TLS plaintext instrumentation 和 TLS decrypt-hint material
   变更，admin response 会返回带 `request_id` 的 `request_runtime_generation` queued action；TUI 保存动作展示
   queued request 并保持交互可用，generation outcome 通过 admin `status.runtime_generation` 和 TUI
@@ -4914,8 +4915,9 @@ Config reload planning：
   `enforcement.interception.selector` 固定 setup scope。
 - policy 与 enforcement 属于 action-gated online owner；它们不与其它 online section 混合应用，
   避免 action 成功而 active plan 未替换造成 partial runtime mutation。
-- `queue_runtime_generation` 表示所有 changed section 属于 data-path generation owner。
-- 同一候选配置不能混合在线 owner 和 data-path generation owner；这类候选保持
+- `queue_runtime_generation` 表示 changed section 属于 runtime generation owner，或属于可随候选
+  plan 携带的 plan-only owner。
+- action-gated online owner 不能与 data-path generation owner 混合；这类候选保持
   `restart_required`，直到存在能整体应用候选配置且不会产生 partial commit 的事务型 generation owner。
 - `restart_required` 表示至少一个 changed section 仍由 setup-time service、background topology 或
   one-shot runtime owner 管理。
@@ -4960,8 +4962,8 @@ Admin reload：
   失败时不替换 active plan。
 - `apply_config_reload` 对 planning 判定为 `queue_runtime_generation` 的候选主配置提交 runtime
   generation request，但不提前替换 active plan。
-- 混合 online/data-path 候选配置保持 `restart_required`，避免在线 owner 成功而 data-path generation
-  未提交或未应用造成 partial commit。
+- action-gated online/data-path 候选配置保持 `restart_required`，避免在线 owner 成功而 data-path
+  generation 未提交或未应用造成 partial commit；plan-only section 可随 generation candidate 携带。
 - reload commands 只作用于 active `RuntimePlan` 已经拥有可交换 runtime owner 的资源。
 - `reload_runtime_actions` 不重读主 TOML，不替换 active config，也不改变 capture/export/TLS/admin/interception 配置。
 - `reload_runtime_actions` 执行当前可在线切换的 runtime actions，并按 action 独立返回 `succeeded` 或 `failed` outcome。
@@ -4973,10 +4975,10 @@ Command contract：
 - `plan_config_reload` 不执行 mutation；owner 是候选配置 validator；成功返回
   `config_reload_plan`；read、parse 或 validate 失败返回 `invalid_candidate`。
 - `apply_config_reload` 的 owner 是兼容的 plan-only online owners、单个 action-gated
-  online owner 或纯 data-path generation owner；成功返回 `config_reload_apply`，
+  online owner 或 runtime generation owner；成功返回 `config_reload_apply`，
   包含 plan、actions 和 `active_plan_updated`。在线 action 失败时保留旧 active plan；
   runtime generation queue busy 时返回 busy action；runtime generation owner 缺失时返回
-  failed action；setup-time、不兼容 mixed-owner 或 mixed online/data-path section
+  failed action；setup-time、不兼容 mixed-owner 或 action-gated online/data-path section
   返回 restart verdict。
 - `request_runtime_generation` 的 owner 是 live agent runtime generation owner；成功返回带
   `request_id` 的 `queued` action outcome，并在 status 中出现 pending generation request。
@@ -5049,16 +5051,20 @@ Full config hot reload：
   它不解释 TOML，而是复用 `apply_config_reload` 的 planning/apply contract。
 - runtime generation request 由 admin apply 阶段基于已读取、已解析的 typed candidate config 创建；
   executor 消费 pending request 后执行 artifact hydration、static runtime validation 和 runtime composition build。
-- capture、observations、config version、TLS plaintext instrumentation 和 TLS decrypt-hint material 变更会在
-  旧 provider drain 成功或有界预算耗尽后消费 queued request，随后构建并打开候选 capture provider。
+- capture、observations、data-path-only selector registry、config version、TLS plaintext instrumentation
+  和 TLS decrypt-hint material 变更会在旧 provider drain 成功或有界预算耗尽后消费 queued request，随后构建并打开候选 capture provider。
   candidate open 失败时旧 provider 和旧 `RuntimePlan` 继续生效；candidate open 成功后，live loop 替换
   provider、更新 runtime status、替换 agent-wide active `RuntimePlan` handle，并推进 active runtime
   generation。预算耗尽后的成功切换会记录 forced handoff outcome。
-- generation executor 的二次校验只接受纯 `runtime_generation` diff。混合 online/data-path 候选配置保持
-  `restart_required`，不能在 admin apply 阶段拆成两个非事务提交。
-- selectors、TLS material registry/source changes 和 enforcement execution surface 仍缺完整 lifecycle owner；这些 section
-  保持 `restart_required`，不进入 runtime generation queue。enforcement policy source 和主配置
-  `enforcement.selector` 已由 enforcement reload owner 在线 validate-then-swap。
+- generation executor 的二次校验只接受 runtime generation owner 和 plan-only owner 的组合 diff。
+  action-gated online/data-path 候选配置保持 `restart_required`，不能在 admin apply 阶段拆成两个非事务提交；
+  plan-only storage retention 和 export plan 变更可在 active plan 未独立前进时随 generation request 携带。
+- 被 enabled policy selector、`enforcement.selector` 或启用中的 transparent interception setup selector
+  引用的 selector registry changes、TLS material registry/source changes 和 enforcement execution surface
+  仍缺完整 lifecycle owner；这些 section 保持 `restart_required`，不进入 runtime generation queue。
+  未被 action-gated selector consumer 引用的 selector registry changes 由 runtime generation owner
+  validate-then-swap。enforcement policy source 和主配置 `enforcement.selector` 已由 enforcement reload
+  owner 在线 validate-then-swap。
 
 在线可交换边界：
 
@@ -5075,36 +5081,42 @@ Full config hot reload：
 - main TOML enforcement policy config 可在无 enforcement reload watcher/poller topology，
   且 transparent interception 未启用或由显式 `enforcement.interception.selector`
   固定 setup scope 时应用 policy source 和主配置 `enforcement.selector` 变更，并更新 active plan。
-  顶层 `[selectors]` registry 变更仍为 restart-required。
+  未被 action-gated selector consumer 引用的 `[selectors]` registry 变更可进入 runtime generation；
+  enabled policy selector、`enforcement.selector` 或启用中的 interception setup selector 引用的变更仍为
+  restart-required。
 - main TOML file watcher 默认为 `agent run --config` 文件建立；文件事件经 debounce
   后复用 `apply_config_reload`。
 - capture/observations/TLS plaintext generation 由 `apply_config_reload` 提交
   `request_runtime_generation`；live agent 对旧 provider 执行有界 handoff drain，在 drain 成功或预算耗尽后
   validate/open candidate，然后 swap capture provider、TLS plaintext/decrypt-hint runtime state 和 active plan。
-- mixed online/data-path config 保持 `restart_required`；需要完整事务型 generation owner
-  后才能整体 validate-then-swap。
-- selectors/MITM TLS/enforcement execution generation 缺少对应 lifecycle owner；
+- action-gated online/data-path mixed config 保持 `restart_required`；需要完整事务型 generation owner
+  后才能整体 validate-then-swap。plan-only storage retention 和 export plan 变更可作为 generation
+  candidate 的一部分携带，并通过 active-plan conflict 检查避免覆盖更新。
+- enabled policy selector、`enforcement.selector` 或启用中的 interception setup selector 引用的
+  selector registry 变更、MITM TLS 和 enforcement execution generation 缺少对应 lifecycle owner；
   config reload planning 保持 `restart_required`，不提交 runtime generation request。
 - setup-time service topology 需要对应 lifecycle owner；runtime reload watcher、admin socket
   和 storage path 不随 data path generation 隐式切换。
 
 当前实现边界：
 
-- 当前 runtime generation queue 接收 capture、observations、agent `config_version`、TLS plaintext instrumentation
-  和 TLS decrypt-hint material 变更。
+- 当前 runtime generation queue 接收 capture、observations、data-path-only selector registry、agent
+  `config_version`、TLS plaintext instrumentation 和 TLS decrypt-hint material 变更。
 - 当前主配置 watcher 可触发 policy-only 在线应用、export 主配置在线应用、storage retention 在线应用、enforcement policy source /
-  `enforcement.selector` 在线应用和纯 data-path runtime generation queue。
-- selectors、TLS material registry/source changes、enforcement execution surface、MITM bridge、transparent interception、
-  storage path 和 runtime/admin topology 仍由 startup/setup-time owner 持有；planning 必须保持 `restart_required`，
-  不能因为目标模型存在 data path generation 概念而提前排队。
+  `enforcement.selector` 在线应用，以及可携带 plan-only 更新的 runtime generation queue。
+- 被 enabled policy selector、`enforcement.selector` 或启用中的 transparent interception setup selector
+  引用的 selector registry changes、TLS material registry/source changes、enforcement execution surface、
+  MITM bridge、transparent interception、storage path 和 runtime/admin topology 仍由 startup/setup-time
+  owner 持有；planning 必须保持 `restart_required`，不能因为目标模型存在 data path generation 概念而提前排队。
 
 目标运行时约束：
 
-- capture data path、TLS plaintext、MITM bridge 和 transparent interception host rules 属于目标完整
-  generation 生命周期；当前实现只允许已具备 owner 的 TLS plaintext instrumentation 和 decrypt-hint material
-  进入 runtime generation queue。
+- capture data path、selector registry、TLS plaintext、MITM bridge 和 transparent interception host rules
+  属于目标完整 generation 生命周期；当前实现只允许已具备 owner 的 data-path-only selector registry、
+  TLS plaintext instrumentation 和 decrypt-hint material 进入 runtime generation queue。
 - 完整 data path generation 应包含 capture backend、process observations、selectors、TLS plaintext、MITM bridge
-  和 transparent interception；selectors、MITM bridge 和 transparent interception host-rule owner 存在前，
+  和 transparent interception；enabled policy selector、`enforcement.selector` 或启用中的 interception
+  setup selector 引用的 selectors、MITM bridge 和 transparent interception host-rule owner 存在前，
   当前实现不得把它们放入 runtime generation queue。
 - setup-time host rules 不能被 planner-only enforcement reload 隐式改变。
 - exporter cursor 和 durable spool path 不能被 capture generation swap 偷换；涉及存储路径或 exporter topology 的配置需要独立 owner。

@@ -1,10 +1,15 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
 use pipeline::PipelinePolicySet;
 use probe_config::{
-    AgentConfig, ConfigError, EnforcementConfig, EnforcementPolicyConfig,
-    EnforcementPolicyReloadConfig, TlsConfig, TlsMaterialConfig, TlsMaterialKind,
+    AgentConfig, ConfigError, EnforcementConfig, EnforcementInterceptionConfig,
+    EnforcementPolicyConfig, EnforcementPolicyReloadConfig, TlsConfig, TlsMaterialConfig,
+    TlsMaterialKind,
 };
+use probe_core::{Selector, SelectorRegistry};
 use runtime::{
     OnlineEnforcementPolicyConfigUpdate, OnlineExportConfigUpdate, OnlineReloadConfigUpdate,
     RuntimePlan, validate_static_runtime_config,
@@ -620,6 +625,11 @@ fn section_reload_mode(
         ConfigReloadSection::Capture | ConfigReloadSection::Observations => {
             ConfigReloadSectionReloadMode::RuntimeGeneration
         }
+        ConfigReloadSection::Selectors
+            if selectors_can_use_runtime_generation(current, candidate) =>
+        {
+            ConfigReloadSectionReloadMode::RuntimeGeneration
+        }
         ConfigReloadSection::Policies if policies_can_apply_online(current, candidate) => {
             ConfigReloadSectionReloadMode::ApplyOnline
         }
@@ -657,6 +667,11 @@ fn section_change_reason(
         }
         ConfigReloadSection::Storage if storage_can_apply_online(current, candidate) => {
             "durable spool path is setup-time; storage retention is reconciled by a plan-aware online worker"
+        }
+        ConfigReloadSection::Selectors
+            if selectors_can_use_runtime_generation(current, candidate) =>
+        {
+            "changed selector registry entries are not referenced by action-gated policy, enforcement, or interception selectors"
         }
         ConfigReloadSection::Export => {
             "export worker lifecycle and export retention cursor owners reconcile the active export plan online"
@@ -766,6 +781,140 @@ fn policies_can_apply_online(current: &AgentConfig, candidate: &AgentConfig) -> 
     current.policy_reload == candidate.policy_reload
         && !current.policy_reload.watch_local_bundles
         && !current.policy_reload.poll_remote_bundles
+}
+
+fn selectors_can_use_runtime_generation(current: &AgentConfig, candidate: &AgentConfig) -> bool {
+    let changed_names = changed_selector_registry_names(&current.selectors, &candidate.selectors);
+    !config_policy_selectors_reference_changed_registry(current, &changed_names)
+        && !config_policy_selectors_reference_changed_registry(candidate, &changed_names)
+        && !enforcement_selectors_reference_changed_registry(
+            &current.enforcement,
+            &current.selectors,
+            &changed_names,
+        )
+        && !enforcement_selectors_reference_changed_registry(
+            &candidate.enforcement,
+            &candidate.selectors,
+            &changed_names,
+        )
+}
+
+fn changed_selector_registry_names(
+    current: &SelectorRegistry,
+    candidate: &SelectorRegistry,
+) -> BTreeSet<String> {
+    current
+        .iter()
+        .map(|(name, _)| name)
+        .chain(candidate.iter().map(|(name, _)| name))
+        .filter(|name| current.get(name) != candidate.get(name))
+        .cloned()
+        .collect()
+}
+
+fn config_policy_selectors_reference_changed_registry(
+    config: &AgentConfig,
+    changed_names: &BTreeSet<String>,
+) -> bool {
+    config
+        .policies
+        .iter()
+        .filter(|policy| policy.enabled)
+        .filter_map(|policy| policy.selector.as_ref())
+        .any(|selector| {
+            selector_references_changed_registry_name(
+                selector,
+                &config.selectors,
+                changed_names,
+                &mut BTreeSet::new(),
+            )
+        })
+}
+
+fn enforcement_selectors_reference_changed_registry(
+    enforcement: &EnforcementConfig,
+    registry: &SelectorRegistry,
+    changed_names: &BTreeSet<String>,
+) -> bool {
+    selector_option_references_changed_registry_name(
+        enforcement.selector.as_ref(),
+        registry,
+        changed_names,
+    ) || interception_setup_selector_references_changed_registry_name(
+        &enforcement.interception,
+        registry,
+        changed_names,
+    )
+}
+
+fn interception_setup_selector_references_changed_registry_name(
+    interception: &EnforcementInterceptionConfig,
+    registry: &SelectorRegistry,
+    changed_names: &BTreeSet<String>,
+) -> bool {
+    interception.strategy.is_enabled()
+        && selector_option_references_changed_registry_name(
+            interception.selector.as_ref(),
+            registry,
+            changed_names,
+        )
+}
+
+fn selector_option_references_changed_registry_name(
+    selector: Option<&Selector>,
+    registry: &SelectorRegistry,
+    changed_names: &BTreeSet<String>,
+) -> bool {
+    selector.is_some_and(|selector| {
+        selector_references_changed_registry_name(
+            selector,
+            registry,
+            changed_names,
+            &mut BTreeSet::new(),
+        )
+    })
+}
+
+fn selector_references_changed_registry_name(
+    selector: &Selector,
+    registry: &SelectorRegistry,
+    changed_names: &BTreeSet<String>,
+    resolving: &mut BTreeSet<String>,
+) -> bool {
+    match selector {
+        Selector::Match { .. } => false,
+        Selector::All { selectors } | Selector::Any { selectors } => {
+            selectors.iter().any(|selector| {
+                selector_references_changed_registry_name(
+                    selector,
+                    registry,
+                    changed_names,
+                    resolving,
+                )
+            })
+        }
+        Selector::Not { selector } => {
+            selector_references_changed_registry_name(selector, registry, changed_names, resolving)
+        }
+        Selector::Ref { name } => {
+            if changed_names.contains(name) {
+                return true;
+            }
+            if !resolving.insert(name.clone()) {
+                return true;
+            }
+            let references_changed_name = registry.get(name).is_none_or(|selector| {
+                selector_references_changed_registry_name(
+                    selector,
+                    registry,
+                    changed_names,
+                    resolving,
+                )
+            });
+            resolving.remove(name);
+            references_changed_name
+        }
+    }
 }
 
 fn storage_can_apply_online(current: &AgentConfig, candidate: &AgentConfig) -> bool {
@@ -974,7 +1123,7 @@ mod tests {
     };
     use probe_core::{
         CapabilityKind, CapabilityState, Direction, EnforcementMode, ProcessSelector, Selector,
-        TrafficSelector,
+        SelectorRegistry, TrafficSelector,
     };
     use runtime::{
         CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry, RuntimePlan,
@@ -1887,6 +2036,437 @@ mod tests {
         let request = runtime_generation_reload_request(&plan, &current.config, &candidate)
             .expect("TLS decrypt hints should rebuild the capture generation");
         assert_eq!(request.changed_sections, ["tls"]);
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_queues_data_path_selector_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-selector-generation")?;
+        let mut current_config = base_config(temp.join("spool"));
+        current_config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: temp.join("enforcement.toml"),
+        };
+        let current = runtime_plan(current_config)?;
+        let mut candidate = current.config.clone();
+        candidate.selectors = SelectorRegistry::new([(
+            "backend".to_string(),
+            Selector::term(
+                ProcessSelector {
+                    names: vec!["backend".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            ),
+        )]);
+        candidate.capture.deep_observe_selector = Some(Selector::Ref {
+            name: "backend".to_string(),
+        });
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current.config, &candidate_path);
+
+        assert!(
+            matches!(
+                plan.decision,
+                ConfigReloadDecision::QueueRuntimeGeneration { .. }
+            ),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.reload_mode))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    ConfigReloadSection::Capture,
+                    ConfigReloadSectionReloadMode::RuntimeGeneration,
+                ),
+                (
+                    ConfigReloadSection::Selectors,
+                    ConfigReloadSectionReloadMode::RuntimeGeneration,
+                ),
+            ]
+        );
+        let request = runtime_generation_reload_request(&plan, &current.config, &candidate)
+            .expect("data-path selector changes should queue with capture generation");
+        assert_eq!(request.changed_sections, ["capture", "selectors"]);
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_queues_selector_generation_with_unrelated_policies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-selector-unrelated-policies")?;
+        let mut current_config = base_config(temp.join("spool"));
+        current_config.selectors = SelectorRegistry::new([(
+            "backend".to_string(),
+            Selector::term(
+                ProcessSelector {
+                    names: vec!["frontend".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            ),
+        )]);
+        current_config.policies.push(PolicyConfig {
+            id: "inline".to_string(),
+            source: PolicySourceConfig::LocalDirectory {
+                path: temp.join("inline.bundle"),
+            },
+            selector: Some(Selector::term(
+                ProcessSelector {
+                    names: vec!["policy-owned".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            )),
+            ..PolicyConfig::default()
+        });
+        current_config.policies.push(PolicyConfig {
+            id: "disabled".to_string(),
+            source: PolicySourceConfig::LocalDirectory {
+                path: temp.join("disabled.bundle"),
+            },
+            enabled: false,
+            selector: Some(Selector::Ref {
+                name: "backend".to_string(),
+            }),
+            ..PolicyConfig::default()
+        });
+        let current = runtime_plan(current_config)?;
+        let mut candidate = current.config.clone();
+        candidate.selectors = SelectorRegistry::new([(
+            "backend".to_string(),
+            Selector::term(
+                ProcessSelector {
+                    names: vec!["backend".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            ),
+        )]);
+        candidate.capture.deep_observe_selector = Some(Selector::Ref {
+            name: "backend".to_string(),
+        });
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current.config, &candidate_path);
+
+        assert!(
+            matches!(
+                plan.decision,
+                ConfigReloadDecision::QueueRuntimeGeneration { .. }
+            ),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.reload_mode))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    ConfigReloadSection::Capture,
+                    ConfigReloadSectionReloadMode::RuntimeGeneration,
+                ),
+                (
+                    ConfigReloadSection::Selectors,
+                    ConfigReloadSectionReloadMode::RuntimeGeneration,
+                ),
+            ]
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_queues_selector_generation_with_inline_enforcement_selector()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-selector-inline-enforcement")?;
+        let mut current_config = base_config(temp.join("spool"));
+        current_config.enforcement.selector = Some(Selector::term(
+            ProcessSelector {
+                names: vec!["protected".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector::default(),
+        ));
+        let current = runtime_plan(current_config)?;
+        let mut candidate = current.config.clone();
+        candidate.selectors = SelectorRegistry::new([(
+            "backend".to_string(),
+            Selector::term(
+                ProcessSelector {
+                    names: vec!["backend".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            ),
+        )]);
+        candidate.capture.deep_observe_selector = Some(Selector::Ref {
+            name: "backend".to_string(),
+        });
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current.config, &candidate_path);
+
+        assert!(
+            matches!(
+                plan.decision,
+                ConfigReloadDecision::QueueRuntimeGeneration { .. }
+            ),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.reload_mode))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    ConfigReloadSection::Capture,
+                    ConfigReloadSectionReloadMode::RuntimeGeneration,
+                ),
+                (
+                    ConfigReloadSection::Selectors,
+                    ConfigReloadSectionReloadMode::RuntimeGeneration,
+                ),
+            ]
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_queues_selector_generation_with_inline_interception_selector()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-selector-inline-interception")?;
+        let current_config =
+            transparent_interception_config(temp.join("spool"), InterceptionSetupScope::Explicit);
+        let mut candidate = current_config.clone();
+        candidate.selectors = SelectorRegistry::new([(
+            "backend".to_string(),
+            Selector::term(
+                ProcessSelector {
+                    names: vec!["backend".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            ),
+        )]);
+        candidate.capture.deep_observe_selector = Some(Selector::Ref {
+            name: "backend".to_string(),
+        });
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current_config, &candidate_path);
+
+        assert!(
+            matches!(
+                plan.decision,
+                ConfigReloadDecision::QueueRuntimeGeneration { .. }
+            ),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.reload_mode))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    ConfigReloadSection::Capture,
+                    ConfigReloadSectionReloadMode::RuntimeGeneration,
+                ),
+                (
+                    ConfigReloadSection::Selectors,
+                    ConfigReloadSectionReloadMode::RuntimeGeneration,
+                ),
+            ]
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_keeps_policy_selector_registry_changes_restart_required()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-policy-selector-restart")?;
+        let mut current_config = base_config(temp.join("spool"));
+        current_config.selectors = SelectorRegistry::new([(
+            "protected".to_string(),
+            Selector::term(
+                ProcessSelector {
+                    names: vec!["frontend".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            ),
+        )]);
+        current_config.policies.push(PolicyConfig {
+            id: "guard".to_string(),
+            source: PolicySourceConfig::LocalDirectory {
+                path: temp.join("guard.bundle"),
+            },
+            selector: Some(Selector::Ref {
+                name: "protected".to_string(),
+            }),
+            ..PolicyConfig::default()
+        });
+        let current = runtime_plan(current_config)?;
+        let mut candidate = current.config.clone();
+        candidate.selectors = SelectorRegistry::new([(
+            "protected".to_string(),
+            Selector::term(
+                ProcessSelector {
+                    names: vec!["backend".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            ),
+        )]);
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current.config, &candidate_path);
+
+        assert!(
+            matches!(plan.decision, ConfigReloadDecision::RestartRequired { .. }),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.reload_mode))
+                .collect::<Vec<_>>(),
+            vec![(
+                ConfigReloadSection::Selectors,
+                ConfigReloadSectionReloadMode::ProcessRestart,
+            )]
+        );
+        assert!(runtime_generation_reload_request(&plan, &current.config, &candidate).is_none());
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_keeps_enforcement_selector_registry_changes_restart_required()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-enforcement-selector-restart")?;
+        let mut current_config = base_config(temp.join("spool"));
+        current_config.selectors = SelectorRegistry::new([(
+            "protected".to_string(),
+            Selector::term(
+                ProcessSelector {
+                    names: vec!["frontend".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            ),
+        )]);
+        current_config.enforcement.selector = Some(Selector::Ref {
+            name: "protected".to_string(),
+        });
+        let current = runtime_plan(current_config)?;
+        let mut candidate = current.config.clone();
+        candidate.selectors = SelectorRegistry::new([(
+            "protected".to_string(),
+            Selector::term(
+                ProcessSelector {
+                    names: vec!["backend".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            ),
+        )]);
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current.config, &candidate_path);
+
+        assert!(
+            matches!(plan.decision, ConfigReloadDecision::RestartRequired { .. }),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.reload_mode))
+                .collect::<Vec<_>>(),
+            vec![(
+                ConfigReloadSection::Selectors,
+                ConfigReloadSectionReloadMode::ProcessRestart,
+            )]
+        );
+        assert!(runtime_generation_reload_request(&plan, &current.config, &candidate).is_none());
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_keeps_interception_selector_registry_changes_restart_required()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-interception-selector-restart")?;
+        let mut current_config =
+            transparent_interception_config(temp.join("spool"), InterceptionSetupScope::Explicit);
+        current_config.selectors = SelectorRegistry::new([(
+            "protected".to_string(),
+            Selector::term(
+                ProcessSelector {
+                    names: vec!["frontend".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            ),
+        )]);
+        current_config.enforcement.interception.selector = Some(Selector::Ref {
+            name: "protected".to_string(),
+        });
+        let mut candidate = current_config.clone();
+        candidate.selectors = SelectorRegistry::new([(
+            "protected".to_string(),
+            Selector::term(
+                ProcessSelector {
+                    names: vec!["backend".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            ),
+        )]);
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current_config, &candidate_path);
+
+        assert!(
+            matches!(plan.decision, ConfigReloadDecision::RestartRequired { .. }),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.reload_mode))
+                .collect::<Vec<_>>(),
+            vec![(
+                ConfigReloadSection::Selectors,
+                ConfigReloadSectionReloadMode::ProcessRestart,
+            )]
+        );
         fs::remove_dir_all(temp)?;
         Ok(())
     }

@@ -331,12 +331,15 @@ The main-config reload contract is owner-scoped:
 - Capture, observation, config version, TLS plaintext instrumentation, and TLS
   decrypt-hint material changes are queued as runtime generation requests and
   swapped by the live agent at capture safe points.
+- Top-level `[selectors]` registry changes are queued with runtime generation
+  when the changed entries are not referenced by enabled policy selectors,
+  `enforcement.selector`, or the enabled transparent interception setup
+  selector. If an action-gated selector consumer references a changed entry, the
+  change remains restart-required until those owners can be applied in the same
+  transaction.
 
-Top-level `[selectors]` registry changes, including entries referenced by
-`enforcement.selector` or `enforcement.interception.selector`, still require
-restart until selector ownership has a lifecycle owner. Storage path, admin
-socket, watcher topology, interception topology, and TLS material
-registry/source changes still require a process rebuild.
+Storage path, admin socket, watcher topology, interception topology, and TLS
+material registry/source changes still require a process rebuild.
 Online apply failures keep the old running agent alive and are reported in the
 status line instead of forcing a managed-agent restart. The same tab edits admin
 socket settings for future runs; the current TUI session keeps using the active
@@ -1160,20 +1163,24 @@ response. Candidate main configs can be parsed and statically validated with
 changed section carries a `reload_mode` of `apply_online`,
 `runtime_generation`, or `process_restart`. `apply-config-reload` can atomically
 replace the active plan for compatible plan-only online updates, runs a single
-action-gated online owner when required, or queues a pure data-path runtime
-generation request without replacing the active plan first.
+action-gated online owner when required, or queues a runtime generation request
+without replacing the active plan first. Runtime generation requests may carry
+compatible plan-only storage retention and export plan updates; action-gated
+owners are not mixed into the same request.
 Policy-only config changes are online-applicable when local watcher and remote
 poller topology is disabled. Enforcement policy source and
 `enforcement.selector` changes are online-applicable when enforcement reload
 watcher and poller topology is disabled and transparent interception is either
 disabled or scoped by an explicit `enforcement.interception.selector`.
-Top-level `[selectors]` registry changes remain restart-required, even when an
-updated entry is referenced by `enforcement.selector` or
-`enforcement.interception.selector`. Export changes are online-applicable
-through the running export lifecycle; worker enablement, worker schedule,
-exporter id set, endpoint, headers, codec, file path, Unix HTTP socket path, and
-batch quota changes affect subsequent batches. Export retention cursor owners
-are reconciled from the active plan on each retention sweep.
+Top-level `[selectors]` registry changes queue with runtime generation when the
+changed entries are not referenced by enabled policy selectors,
+`enforcement.selector`, or the enabled transparent interception setup selector.
+Changed entries referenced by those action-gated selector consumers remain
+restart-required. Export changes are online-applicable through the running
+export lifecycle; worker enablement, worker schedule, exporter id set, endpoint,
+headers, codec, file path, Unix HTTP socket path, and batch quota changes affect
+subsequent batches. Export retention cursor owners are reconciled from the
+active plan on each retention sweep.
 Data-path rebuild verdicts can queue a `request_runtime_generation` action with
 a request id and appear as a pending runtime generation in status. The live agent
 consumes queued requests at capture safe points after the old provider has
@@ -1186,14 +1193,18 @@ so operators can distinguish liveness-over-completeness from a fully drained
 handoff. The TUI save path returns after the request is queued and keeps the
 session usable; Traffic/Data Path diagnostics surface pending, applying, failed,
 and forced handoff states from `traffic_status.runtime_generation`. Capture,
-observation, config version, TLS plaintext instrumentation, and TLS decrypt-hint
-material changes rebuild a candidate capture generation through that
-validate-then-swap path. Mixed online/data-path changes remain
-`restart_required` until a transactional generation owner can apply the whole
-candidate without partial commits. If a generation request cannot be queued, the
-old runtime stays active; a TUI-managed agent can restart to converge on the
-saved config, while an attached external agent reports that an explicit restart
-or retry is required. Selectors, TLS material registry/source changes,
+observation, data-path-only selector registry changes, config version, TLS
+plaintext instrumentation, and TLS decrypt-hint material changes rebuild a
+candidate capture generation through that validate-then-swap path. Plan-only
+storage retention and export plan changes may be carried by the generation
+request when the active plan has not moved independently. Action-gated
+online/data-path mixtures remain `restart_required` until a transactional
+generation owner can apply the whole candidate without partial commits. If a
+generation request cannot be queued, the old runtime stays active; a TUI-managed
+agent can restart to converge on the saved config, while an attached external
+agent reports that an explicit restart or retry is required. Selector changes
+referenced by enabled policy selectors, `enforcement.selector`, or enabled
+transparent interception setup selectors, TLS material registry/source changes,
 enforcement execution surface changes, storage path, admin, agent id, and
 watcher topology changes are not silently applied by this path and remain
 `restart_required` until their lifecycle owners exist.

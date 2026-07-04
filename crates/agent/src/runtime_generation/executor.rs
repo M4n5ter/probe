@@ -249,6 +249,7 @@ mod tests {
         IngressJournalRetentionConfig, PolicyConfig, PolicySourceConfig, StorageRetentionConfig,
         TlsMaterialConfig, TlsMaterialKind,
     };
+    use probe_core::{ProcessSelector, Selector, SelectorRegistry, TrafficSelector};
 
     use super::*;
     use crate::{
@@ -345,6 +346,54 @@ mod tests {
                 .selected_backend,
             CaptureBackend::CaptureEventFeed
         );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_generation_reload_swaps_data_path_selector_registry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let feed_path = temp.path().join("events.jsonl");
+        std::fs::write(&feed_path, "")?;
+        let mut candidate = AgentConfig::default();
+        candidate.capture.selection = CaptureSelection::CaptureEventFeed;
+        candidate.capture.capture_event_feed.path = Some(feed_path);
+        candidate.capture.capture_event_feed.follow = Some(false);
+        candidate.selectors = SelectorRegistry::new([(
+            "backend".to_string(),
+            Selector::term(
+                ProcessSelector {
+                    names: vec!["backend".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            ),
+        )]);
+        candidate.capture.deep_observe_selector = Some(Selector::Ref {
+            name: "backend".to_string(),
+        });
+        let runtime_generation = RuntimeGenerationState::for_config_version("local");
+        runtime_generation.request_reload(RuntimeGenerationReloadRequestInput {
+            candidate_path: temp.path().join("candidate.toml"),
+            base_config: AgentConfig::default(),
+            candidate_config: candidate.clone(),
+            current_config_version: "local".to_string(),
+            candidate_config_version: Some(candidate.config_version.clone()),
+            changed_sections: vec!["capture".to_string(), "selectors".to_string()],
+        })?;
+        let mut runtime = RuntimeGenerationReloadTestRuntime::new(AgentConfig::default())?;
+
+        runtime.process_reload(&runtime_generation);
+
+        let active = runtime.plan_handle.snapshot();
+        assert!(active.config.selectors.get("backend").is_some());
+        assert_eq!(
+            active.config.capture.deep_observe_selector,
+            Some(Selector::Ref {
+                name: "backend".to_string(),
+            })
+        );
+        assert_eq!(runtime.provider.name(), "capture_event_feed_jsonl");
         Ok(())
     }
 
