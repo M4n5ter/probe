@@ -665,7 +665,7 @@ fn section_change_reason(
             "TLS plaintext instrumentation and decrypt hint materials are rebuilt by runtime generation swaps"
         }
         ConfigReloadSection::Enforcement if enforcement_can_apply_online(current, candidate) => {
-            "enforcement policy source and enforcement.selector are owned by an online reload gate"
+            "enforcement policy config is owned by an online reload gate when setup-time interception scope is unchanged"
         }
         ConfigReloadSection::Enforcement => {
             "enforcement mode, backend, interception, or reload topology is still owned by setup-time services"
@@ -800,7 +800,7 @@ fn enforcement_can_apply_online(current: &AgentConfig, candidate: &AgentConfig) 
     current_mode == candidate_mode
         && current_backend == candidate_backend
         && current_interception == candidate_interception
-        && !current_interception.strategy.is_enabled()
+        && current_interception.setup_scope_is_independent_from_enforcement_policy()
         && enforcement_reload_topology_can_apply_online(current_reload, candidate_reload)
 }
 
@@ -2068,6 +2068,81 @@ mod tests {
     }
 
     #[test]
+    fn config_reload_plan_can_apply_interception_policy_config_changes_online_with_stable_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-interception-enforcement-online")?;
+        let current_config =
+            transparent_interception_config(temp.join("spool"), InterceptionSetupScope::Explicit);
+        let mut candidate = current_config.clone();
+        candidate.enforcement.selector = Some(Selector::term(
+            ProcessSelector {
+                names: vec!["backend".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector::default(),
+        ));
+        candidate.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: temp.join("enforcement-next.toml"),
+        };
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current_config, &candidate_path);
+
+        assert!(
+            matches!(plan.decision, ConfigReloadDecision::ApplyOnline { .. }),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.reload_mode))
+                .collect::<Vec<_>>(),
+            vec![(
+                ConfigReloadSection::Enforcement,
+                ConfigReloadSectionReloadMode::ApplyOnline
+            )]
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_reload_plan_keeps_interception_policy_config_restart_required_without_stable_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-interception-enforcement-restart")?;
+        let current_config =
+            transparent_interception_config(temp.join("spool"), InterceptionSetupScope::Inherited);
+        let mut candidate = current_config.clone();
+        candidate.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: temp.join("enforcement-next.toml"),
+        };
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let plan = plan_config_reload(&current_config, &candidate_path);
+
+        assert!(
+            matches!(plan.decision, ConfigReloadDecision::RestartRequired { .. }),
+            "{:?}",
+            plan.decision
+        );
+        assert_eq!(
+            plan.changed_sections
+                .iter()
+                .map(|change| (change.section, change.reload_mode))
+                .collect::<Vec<_>>(),
+            vec![(
+                ConfigReloadSection::Enforcement,
+                ConfigReloadSectionReloadMode::ProcessRestart
+            )]
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
     fn config_reload_plan_keeps_enforcement_reload_topology_changes_restart_required()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("config-reload-enforcement-reload-topology")?;
@@ -2339,6 +2414,51 @@ mod tests {
             },
             ..AgentConfig::default()
         }
+    }
+
+    fn transparent_interception_config(
+        storage_path: PathBuf,
+        setup_scope: InterceptionSetupScope,
+    ) -> AgentConfig {
+        let mut config = base_config(storage_path);
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.selector = match setup_scope {
+            InterceptionSetupScope::Explicit => None,
+            InterceptionSetupScope::Inherited => Some(Selector::term(
+                ProcessSelector {
+                    names: vec!["backend".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector {
+                    local_ports: vec![8443],
+                    directions: vec![Direction::Inbound],
+                    ..TrafficSelector::default()
+                },
+            )),
+        };
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxy;
+        config.enforcement.interception.proxy.listen_port = Some(15001);
+        config.enforcement.interception.selector = match setup_scope {
+            InterceptionSetupScope::Explicit => Some(Selector::term(
+                ProcessSelector::default(),
+                TrafficSelector {
+                    local_ports: vec![8443],
+                    directions: vec![Direction::Inbound],
+                    ..TrafficSelector::default()
+                },
+            )),
+            InterceptionSetupScope::Inherited => None,
+        };
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: "/etc/traffic-probe/enforcement.toml".into(),
+        };
+        config
+    }
+
+    enum InterceptionSetupScope {
+        Explicit,
+        Inherited,
     }
 
     fn webhook_exporter(id: &str, endpoint: &str) -> ExporterConfig {

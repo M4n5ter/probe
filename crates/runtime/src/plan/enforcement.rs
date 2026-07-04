@@ -156,6 +156,13 @@ pub struct EnforcementInterceptionPlan {
 }
 
 impl EnforcementInterceptionPlan {
+    pub fn setup_scope_is_independent_from_enforcement_policy(&self) -> bool {
+        matches!(
+            self.execution,
+            TransparentInterceptionExecutionPlan::Disabled
+        ) || self.selector_configured
+    }
+
     fn from_config(
         config: &AgentConfig,
         capabilities: &CapabilityMatrix,

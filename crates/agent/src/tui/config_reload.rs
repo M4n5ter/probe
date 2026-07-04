@@ -575,7 +575,7 @@ mod tests {
                         "reason": "changed sections are owned by runtime reload gates"
                     }),
                     json!([
-                        { "section": "enforcement", "reload_mode": "apply_online", "reason": "enforcement policy source and enforcement.selector are owned by an online reload gate" }
+                        { "section": "enforcement", "reload_mode": "apply_online", "reason": "enforcement policy config is owned by an online reload gate when setup-time interception scope is unchanged" }
                     ])
                 ),
                 "active_plan_updated": true,

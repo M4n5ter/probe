@@ -118,6 +118,12 @@ pub struct EnforcementInterceptionConfig {
     pub mitm: TransparentInterceptionMitmConfig,
 }
 
+impl EnforcementInterceptionConfig {
+    pub fn setup_scope_is_independent_from_enforcement_policy(&self) -> bool {
+        !self.strategy.is_enabled() || self.selector.is_some()
+    }
+}
+
 fn normalized_ip_address(address: IpAddr) -> IpAddr {
     match address {
         IpAddr::V4(_) => address,

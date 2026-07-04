@@ -182,8 +182,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poller_rejects_setup_time_interception_plan() -> Result<(), Box<dyn std::error::Error>>
-    {
+    async fn poller_accepts_transparent_interception_with_explicit_selector()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
@@ -209,12 +209,54 @@ mod tests {
         )?);
         let runtime_state = empty_runtime_state().await?;
 
-        let Err(error) = spawn_poller(
+        let poller = spawn_poller(
             RuntimePlanHandle::new(plan),
             runtime_state,
             EnforcementReloadGate::default(),
-        ) else {
-            panic!("setup-time interception plan must reject remote poller reload");
+        )?
+        .expect("explicit interception selector should keep remote poller reload eligible");
+
+        poller.stop().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poller_rejects_interception_plan_without_explicit_selector()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxy;
+        config.enforcement.interception.proxy.listen_port = Some(15001);
+        config.enforcement.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                local_ports: vec![8443],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::Remote {
+            endpoint: "https://control.example/enforcement.toml".to_string(),
+            max_body_bytes: None,
+        };
+        config.enforcement.policy.reload.poll_remote_manifest = true;
+        let plan = Arc::new(runtime_plan_from_config_with_registry(
+            config,
+            transparent_interception_registry(),
+        )?);
+        let runtime_state = empty_runtime_state().await?;
+
+        let error = match spawn_poller(
+            RuntimePlanHandle::new(plan),
+            runtime_state,
+            EnforcementReloadGate::default(),
+        ) {
+            Ok(_) => {
+                panic!("inherited interception setup scope should reject remote poller reload")
+            }
+            Err(error) => error,
         };
 
         assert!(matches!(

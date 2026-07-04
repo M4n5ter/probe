@@ -318,17 +318,24 @@ The main-config reload contract is owner-scoped:
   plan-only active-plan updates. Action-gated owners such as policy and
   enforcement reload remain single-owner apply operations.
 - Enforcement policy source and `enforcement.selector` changes apply online
-  when enforcement reload watcher and poller topology is disabled and
-  transparent interception is not owning setup-time host rules.
+  when enforcement reload watcher and poller topology is disabled and either
+  transparent interception is disabled or its setup scope is fixed by an
+  explicit `enforcement.interception.selector`.
+- When `enforcement.interception.selector` is set, it owns the setup-time
+  transparent interception scope. `enforcement.selector` and enforcement
+  manifest selectors remain policy/planner scope and can be swapped online
+  under the rule above. Without an explicit interception selector, transparent
+  interception inherits the effective policy selector, so those policy config
+  changes remain restart-required.
 - Capture, observation, config version, TLS plaintext instrumentation, and TLS
   decrypt-hint material changes are queued as runtime generation requests and
   swapped by the live agent at capture safe points.
 
 Top-level `[selectors]` registry changes, including entries referenced by
-`enforcement.selector`, still require restart until selector ownership has a
-lifecycle owner. Storage path, admin socket, watcher topology, interception
-topology, and TLS material registry/source changes still require a process
-rebuild.
+`enforcement.selector` or `enforcement.interception.selector`, still require
+restart until selector ownership has a lifecycle owner. Storage path, admin
+socket, watcher topology, interception topology, and TLS material
+registry/source changes still require a process rebuild.
 Online apply failures keep the old running agent alive and are reported in the
 status line instead of forcing a managed-agent restart. The same tab edits admin
 socket settings for future runs; the current TUI session keeps using the active
@@ -963,7 +970,10 @@ name = "managed_https"
 
 Enforcement manifests may also declare their own `[selectors.<name>]` registry.
 Manifest refs are resolved inside the manifest namespace before the agent
-combines them with the main config `enforcement.selector`.
+combines them with the main config `enforcement.selector`. This effective
+policy selector does not narrow or expand a separately configured
+`enforcement.interception.selector`; that selector owns the transparent
+interception setup scope.
 
 Selector list fields default to empty lists when omitted. Empty process or
 traffic dimensions mean "do not constrain this dimension"; they are not parse
@@ -1154,14 +1164,15 @@ generation request without replacing the active plan first.
 Policy-only config changes are online-applicable when local watcher and remote
 poller topology is disabled. Enforcement policy source and
 `enforcement.selector` changes are online-applicable when enforcement reload
-watcher and poller topology is disabled and transparent interception is not
-owning setup-time host rules. Top-level `[selectors]` registry changes remain
-restart-required, even when an updated entry is referenced by
-`enforcement.selector`. Export changes are online-applicable through the running
-export lifecycle; worker enablement, worker schedule, exporter id set, endpoint,
-headers, codec, file path, Unix HTTP socket path, and batch quota changes affect
-subsequent batches. Export retention cursor owners are reconciled from the
-active plan on each retention sweep.
+watcher and poller topology is disabled and transparent interception is either
+disabled or scoped by an explicit `enforcement.interception.selector`.
+Top-level `[selectors]` registry changes remain restart-required, even when an
+updated entry is referenced by `enforcement.selector` or
+`enforcement.interception.selector`. Export changes are online-applicable
+through the running export lifecycle; worker enablement, worker schedule,
+exporter id set, endpoint, headers, codec, file path, Unix HTTP socket path, and
+batch quota changes affect subsequent batches. Export retention cursor owners
+are reconciled from the active plan on each retention sweep.
 Data-path rebuild verdicts can queue a `request_runtime_generation` action with
 a request id and appear as a pending runtime generation in status; the live agent
 consumes queued requests at capture safe points and records a runtime generation

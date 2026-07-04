@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use probe_core::EnforcementMode;
-use runtime::{EnforcementPolicySourcePlan, RuntimePlan, TransparentInterceptionExecutionPlan};
+use runtime::{EnforcementPolicySourcePlan, RuntimePlan};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -25,7 +25,7 @@ pub(crate) enum EnforcementReloadError {
     #[error("enforcement runtime state is not available")]
     RuntimeStateUnavailable,
     #[error(
-        "online enforcement policy reload is not supported while transparent interception owns setup-time host rules"
+        "online enforcement policy reload with transparent interception requires a stable explicit interception selector"
     )]
     SetupTimeInterception,
     #[error("enforce mode requires an explicit enforcement policy source")]
@@ -71,13 +71,14 @@ pub(crate) async fn reload_enforcement_policy(
 }
 
 fn reject_setup_time_interception_reload(plan: &RuntimePlan) -> Result<(), EnforcementReloadError> {
-    if !matches!(
-        plan.enforcement.interception.execution,
-        TransparentInterceptionExecutionPlan::Disabled
-    ) {
-        return Err(EnforcementReloadError::SetupTimeInterception);
+    if plan
+        .enforcement
+        .interception
+        .setup_scope_is_independent_from_enforcement_policy()
+    {
+        return Ok(());
     }
-    Ok(())
+    Err(EnforcementReloadError::SetupTimeInterception)
 }
 
 fn reject_enforce_without_policy_source(plan: &RuntimePlan) -> Result<(), EnforcementReloadError> {
@@ -114,6 +115,8 @@ mod tests {
         CaptureProviderBuilder, CaptureProviderDescriptor, EnforcementExecutionSurface,
         ProviderRegistry, RuntimePlan,
     };
+
+    use crate::configured_enforcement::RuntimeEnforcementPlanner;
 
     use super::*;
 
@@ -162,20 +165,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn setup_time_interception_plan_rejects_online_reload()
+    async fn transparent_interception_with_explicit_selector_allows_online_reload()
     -> Result<(), Box<dyn std::error::Error>> {
-        let plan = transparent_interception_plan()?;
-        let planner = ScopedEnforcementPlanner::new(EnforcementMode::AuditOnly, None)?;
-        let selector_registry = probe_core::SelectorRegistry::default();
-        let active_policy =
-            crate::configured_enforcement::load_configured_enforcement_policy_runtime(
-                None,
-                &selector_registry,
-                &runtime::EnforcementPolicySourcePlan::None,
-                crate::configured_enforcement::EnforcementPolicySourceLoadContext::default(),
-            )
-            .await?;
-        let (_, runtime_state) = EnforcementRuntimeState::from_planner(planner, active_policy);
+        let temp = tempfile::tempdir()?;
+        let manifest_path = temp.path().join("enforcement.toml");
+        write_enforcement_manifest(&manifest_path, "reloaded", 443, Action::Deny)?;
+        let plan = transparent_interception_plan(&manifest_path, InterceptionSetupScope::Explicit)?;
+        assert!(plan.enforcement.interception.selector_configured);
+        let (mut planner_view, runtime_state) = runtime_state_for_reload_test().await?;
+
+        let summary = reload_enforcement_policy(
+            &plan,
+            Some(&runtime_state),
+            &EnforcementReloadGate::default(),
+        )
+        .await?;
+
+        assert!(summary.active_policy.effective_selector_configured());
+        let decision = enforcement_decision(&mut planner_view, Action::Deny, 443)?;
+        assert_eq!(decision.outcome, EnforcementOutcome::AuditOnly);
+        assert!(decision.selector_matched);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn setup_time_interception_without_explicit_selector_rejects_online_reload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = transparent_interception_plan(
+            std::path::Path::new("/tmp/traffic-probe-enforcement.toml"),
+            InterceptionSetupScope::Inherited,
+        )?;
+        assert!(!plan.enforcement.interception.selector_configured);
+        let (_, runtime_state) = runtime_state_for_reload_test().await?;
 
         let error = match reload_enforcement_policy(
             &plan,
@@ -184,7 +205,9 @@ mod tests {
         )
         .await
         {
-            Ok(_) => panic!("setup-time host rules cannot be reloaded by planner swap"),
+            Ok(_) => {
+                panic!("inherited interception setup scope cannot be reloaded by planner swap")
+            }
             Err(error) => error,
         };
 
@@ -195,14 +218,23 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn mitm_policy_hook_plan_with_setup_rules_rejects_online_reload()
+    #[test]
+    fn mitm_policy_hook_plan_with_explicit_selector_allows_online_reload_validation()
     -> Result<(), Box<dyn std::error::Error>> {
         let plan = mitm_policy_hook_interception_plan()?;
         assert_eq!(
             plan.enforcement.execution_surface,
             Some(EnforcementExecutionSurface::L7MitmProxyHook)
         );
+        assert!(plan.enforcement.interception.selector_configured);
+
+        validate_enforcement_policy_reload_plan(&plan)?;
+        Ok(())
+    }
+
+    async fn runtime_state_for_reload_test()
+    -> Result<(RuntimeEnforcementPlanner, EnforcementRuntimeState), Box<dyn std::error::Error>>
+    {
         let planner = ScopedEnforcementPlanner::new(EnforcementMode::AuditOnly, None)?;
         let selector_registry = probe_core::SelectorRegistry::default();
         let active_policy =
@@ -213,24 +245,10 @@ mod tests {
                 crate::configured_enforcement::EnforcementPolicySourceLoadContext::default(),
             )
             .await?;
-        let (_, runtime_state) = EnforcementRuntimeState::from_planner(planner, active_policy);
-
-        let error = match reload_enforcement_policy(
-            &plan,
-            Some(&runtime_state),
-            &EnforcementReloadGate::default(),
-        )
-        .await
-        {
-            Ok(_) => panic!("MITM hook setup-time host rules cannot be reloaded by planner swap"),
-            Err(error) => error,
-        };
-
-        assert!(matches!(
-            error,
-            EnforcementReloadError::SetupTimeInterception
-        ));
-        Ok(())
+        Ok(EnforcementRuntimeState::from_planner(
+            planner,
+            active_policy,
+        ))
     }
 
     fn config_with_storage_path(storage_path: std::path::PathBuf) -> AgentConfig {
@@ -247,25 +265,41 @@ mod tests {
         }
     }
 
-    fn transparent_interception_plan() -> Result<RuntimePlan, runtime::RuntimeError> {
+    fn transparent_interception_plan(
+        policy_source_path: &std::path::Path,
+        setup_scope: InterceptionSetupScope,
+    ) -> Result<RuntimePlan, runtime::RuntimeError> {
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Libpcap;
         config.enforcement.mode = EnforcementMode::Enforce;
         config.enforcement.interception.strategy =
             TransparentInterceptionStrategyConfig::InboundTproxy;
         config.enforcement.interception.proxy.listen_port = Some(15001);
-        config.enforcement.interception.selector = Some(Selector::term(
+        let setup_selector = Selector::term(
             ProcessSelector::default(),
             TrafficSelector {
                 local_ports: vec![8443],
                 directions: vec![Direction::Inbound],
                 ..TrafficSelector::default()
             },
-        ));
+        );
+        match setup_scope {
+            InterceptionSetupScope::Explicit => {
+                config.enforcement.interception.selector = Some(setup_selector);
+            }
+            InterceptionSetupScope::Inherited => {
+                config.enforcement.selector = Some(setup_selector);
+            }
+        }
         config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
-            path: "/tmp/traffic-probe-enforcement.toml".into(),
+            path: policy_source_path.into(),
         };
         RuntimePlan::build(config, &transparent_interception_registry())
+    }
+
+    enum InterceptionSetupScope {
+        Explicit,
+        Inherited,
     }
 
     fn mitm_policy_hook_interception_plan() -> Result<RuntimePlan, runtime::RuntimeError> {

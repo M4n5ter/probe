@@ -634,7 +634,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watcher_rejects_setup_time_interception_plan() -> TestResult {
+    async fn watcher_accepts_transparent_interception_with_explicit_selector() -> TestResult {
         let temp = tempfile::tempdir()?;
         let manifest_path = temp.path().join("enforcement.toml");
         write_enforcement_manifest(&manifest_path, "initial", 80, Action::Deny)?;
@@ -662,12 +662,53 @@ mod tests {
         )?);
         let runtime_state = empty_runtime_state().await?;
 
-        let Err(error) = spawn_watcher(
+        let watcher = spawn_watcher(
             RuntimePlanHandle::new(plan),
             runtime_state,
             EnforcementReloadGate::default(),
-        ) else {
-            panic!("setup-time interception plan must reject watcher reload");
+        )?
+        .expect("explicit interception selector should keep watcher reload eligible");
+
+        watcher.stop().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn watcher_rejects_interception_plan_without_explicit_selector() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let manifest_path = temp.path().join("enforcement.toml");
+        write_enforcement_manifest(&manifest_path, "initial", 80, Action::Deny)?;
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.enforcement.mode = EnforcementMode::Enforce;
+        config.enforcement.interception.strategy =
+            TransparentInterceptionStrategyConfig::InboundTproxy;
+        config.enforcement.interception.proxy.listen_port = Some(15001);
+        config.enforcement.selector = Some(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                local_ports: vec![8443],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        ));
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: manifest_path,
+        };
+        config.enforcement.policy.reload = reload_config();
+        let plan = Arc::new(RuntimePlan::build(
+            config,
+            &transparent_interception_registry(),
+        )?);
+        let runtime_state = empty_runtime_state().await?;
+
+        let error = match spawn_watcher(
+            RuntimePlanHandle::new(plan),
+            runtime_state,
+            EnforcementReloadGate::default(),
+        ) {
+            Ok(_) => panic!("inherited interception setup scope should reject watcher reload"),
+            Err(error) => error,
         };
 
         assert!(matches!(

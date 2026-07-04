@@ -1,12 +1,9 @@
-use probe_core::{ResolvedSelector, Selector};
+use probe_core::ResolvedSelector;
 
 use super::{
     TransparentInterceptionSetupDirection, TransparentInterceptionSetupPlan,
     TransparentInterceptionSetupProjectionError,
 };
-
-type SetupSelectorResult =
-    Result<Option<ResolvedSelector>, TransparentInterceptionSetupProjectionError>;
 
 #[derive(Debug, Clone, Copy)]
 pub struct TransparentInterceptionSetupSelectorSources<'a> {
@@ -17,8 +14,8 @@ pub struct TransparentInterceptionSetupSelectorSources<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransparentInterceptionSetupSelectors {
-    local_config_scope: SetupSelectorResult,
-    final_effective_scope: SetupSelectorResult,
+    local_config_scope: Option<ResolvedSelector>,
+    final_effective_scope: Option<ResolvedSelector>,
 }
 
 impl TransparentInterceptionSetupSelectors {
@@ -36,21 +33,15 @@ impl TransparentInterceptionSetupSelectors {
     }
 
     pub fn local_config_scope(&self) -> Option<&ResolvedSelector> {
-        self.local_config_scope
-            .as_ref()
-            .ok()
-            .and_then(Option::as_ref)
+        self.local_config_scope.as_ref()
     }
 
     pub fn final_effective_scope(&self) -> Option<&ResolvedSelector> {
-        self.final_effective_scope
-            .as_ref()
-            .ok()
-            .and_then(Option::as_ref)
+        self.final_effective_scope.as_ref()
     }
 
     pub fn local_config_scope_configured(&self) -> bool {
-        !matches!(self.local_config_scope, Ok(None))
+        self.local_config_scope.is_some()
     }
 
     pub fn local_setup_plan(
@@ -69,50 +60,48 @@ impl TransparentInterceptionSetupSelectors {
 }
 
 fn setup_plan(
-    selector: &SetupSelectorResult,
+    selector: &Option<ResolvedSelector>,
     direction: TransparentInterceptionSetupDirection,
 ) -> Result<TransparentInterceptionSetupPlan, TransparentInterceptionSetupProjectionError> {
-    match selector {
-        Ok(selector) => TransparentInterceptionSetupPlan::from_selector(
-            selector.as_ref().map(ResolvedSelector::as_selector),
-            direction,
-        ),
-        Err(error) => Err(error.clone()),
-    }
+    TransparentInterceptionSetupPlan::from_selector(
+        selector.as_ref().map(ResolvedSelector::as_selector),
+        direction,
+    )
 }
 
 fn setup_selector(
     enforcement_selector: Option<&ResolvedSelector>,
     interception_selector: Option<&ResolvedSelector>,
-) -> SetupSelectorResult {
-    match (enforcement_selector, interception_selector) {
-        (Some(enforcement), Some(interception)) => ResolvedSelector::new(Selector::All {
-            selectors: vec![
-                enforcement.as_selector().clone(),
-                interception.as_selector().clone(),
-            ],
-        })
-        .map(Some)
-        .map_err(
-            |error| TransparentInterceptionSetupProjectionError::Unsupported {
-                reason: format!("invalid composed setup selector: {error}"),
-            },
-        ),
-        (Some(selector), None) | (None, Some(selector)) => Ok(Some(selector.clone())),
-        (None, None) => Ok(None),
-    }
+) -> Option<ResolvedSelector> {
+    interception_selector.or(enforcement_selector).cloned()
 }
 
 #[cfg(test)]
 mod tests {
-    use probe_core::{ProcessSelector, TrafficSelector};
+    use probe_core::{Direction, ProcessSelector, Selector, TrafficSelector};
 
     use super::*;
 
     #[test]
-    fn selector_composition_over_budget_returns_projection_error() {
-        let enforcement = resolved_selector_with_match_terms(2_048);
-        let interception = resolved_selector_with_match_terms(2_048);
+    fn explicit_interception_selector_owns_setup_scope() {
+        let enforcement = ResolvedSelector::new(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                local_ports: vec![8443],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        ))
+        .expect("test selector should be valid");
+        let interception = ResolvedSelector::new(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                local_ports: vec![9443],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        ))
+        .expect("test selector should be valid");
         let selectors = TransparentInterceptionSetupSelectors::from_sources(
             TransparentInterceptionSetupSelectorSources {
                 local_enforcement_selector: Some(&enforcement),
@@ -122,19 +111,51 @@ mod tests {
         );
 
         assert!(selectors.local_config_scope_configured());
-        let error = selectors
+        let TransparentInterceptionSetupPlan::HostRules(local_rules) = selectors
             .local_setup_plan(TransparentInterceptionSetupDirection::Inbound)
-            .expect_err("over-budget composition should fail closed");
+            .expect("explicit interception selector should project to host rules")
+        else {
+            panic!("explicit interception selector should own local setup scope");
+        };
+        let TransparentInterceptionSetupPlan::HostRules(final_rules) = selectors
+            .final_setup_plan(TransparentInterceptionSetupDirection::Inbound)
+            .expect("explicit interception selector should project to host rules")
+        else {
+            panic!("explicit interception selector should own final setup scope");
+        };
 
-        assert!(error.to_string().contains("maximum expanded node count"));
+        assert_eq!(local_rules.explicit_local_ports(), Some(vec![9443]));
+        assert_eq!(final_rules.explicit_local_ports(), Some(vec![9443]));
     }
 
-    fn resolved_selector_with_match_terms(count: usize) -> ResolvedSelector {
-        ResolvedSelector::new(Selector::All {
-            selectors: (0..count)
-                .map(|_| Selector::term(ProcessSelector::default(), TrafficSelector::default()))
-                .collect(),
-        })
-        .expect("test selector should fit the per-source resolved selector budget")
+    #[test]
+    fn enforcement_selector_is_setup_scope_when_interception_selector_is_absent() {
+        let enforcement = ResolvedSelector::new(Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                local_ports: vec![8443],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        ))
+        .expect("test selector should be valid");
+        let selectors = TransparentInterceptionSetupSelectors::from_sources(
+            TransparentInterceptionSetupSelectorSources {
+                local_enforcement_selector: Some(&enforcement),
+                effective_enforcement_selector: Some(&enforcement),
+                interception_selector: None,
+            },
+        );
+
+        let TransparentInterceptionSetupPlan::HostRules(local_rules) = selectors
+            .local_setup_plan(TransparentInterceptionSetupDirection::Inbound)
+            .expect("enforcement selector should project to host rules")
+        else {
+            panic!(
+                "enforcement selector should own setup scope when interception selector is absent"
+            );
+        };
+
+        assert_eq!(local_rules.explicit_local_ports(), Some(vec![8443]));
     }
 }
