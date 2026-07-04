@@ -33,8 +33,14 @@ pub(crate) struct TuiAgentSupervisor {
 
 #[derive(Debug)]
 enum TuiAgentMode {
-    Existing,
+    Existing(ExistingAgent),
     Managed(Box<ManagedAgent>),
+}
+
+#[derive(Debug)]
+struct ExistingAgent {
+    runtime_dir: PathBuf,
+    runtime_config_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -52,7 +58,7 @@ impl TuiAgentSupervisor {
         let configured_socket_path = config.admin.socket_path.clone();
         if admin_socket_responds(&configured_socket_path).await {
             return Ok(Self {
-                mode: TuiAgentMode::Existing,
+                mode: TuiAgentMode::Existing(ExistingAgent::create()?),
             });
         }
         spawn_managed_agent(config).await
@@ -60,7 +66,9 @@ impl TuiAgentSupervisor {
 
     pub(crate) fn attachment(&self, config: &AgentConfig) -> RuntimeAttachment {
         match &self.mode {
-            TuiAgentMode::Existing => RuntimeAttachment::existing(config.admin.socket_path.clone()),
+            TuiAgentMode::Existing(_) => {
+                RuntimeAttachment::existing(config.admin.socket_path.clone())
+            }
             TuiAgentMode::Managed(agent) => RuntimeAttachment::managed(
                 agent.socket_path.clone(),
                 agent.child.id(),
@@ -76,10 +84,12 @@ impl TuiAgentSupervisor {
     pub(crate) fn prepare_config_reload_candidate(
         &self,
         config: &AgentConfig,
-        user_config_path: &Path,
     ) -> Result<PathBuf, TuiError> {
         match &self.mode {
-            TuiAgentMode::Existing => Ok(user_config_path.to_path_buf()),
+            TuiAgentMode::Existing(agent) => {
+                replace_runtime_config(config, &agent.runtime_config_path)?;
+                Ok(agent.runtime_config_path.clone())
+            }
             TuiAgentMode::Managed(agent) => {
                 let runtime_config = managed_runtime_config(config, &agent.socket_path);
                 replace_runtime_config(&runtime_config, &agent.runtime_config_path)?;
@@ -90,8 +100,8 @@ impl TuiAgentSupervisor {
 
     pub(crate) async fn restart(self, config: &AgentConfig) -> Result<Self, TuiError> {
         match self.mode {
-            TuiAgentMode::Existing => Ok(Self {
-                mode: TuiAgentMode::Existing,
+            TuiAgentMode::Existing(agent) => Ok(Self {
+                mode: TuiAgentMode::Existing(agent),
             }),
             TuiAgentMode::Managed(agent) => {
                 stop_managed_agent(*agent).await;
@@ -117,9 +127,42 @@ impl TuiAgentSupervisor {
     }
 
     pub(crate) async fn stop(self) {
-        if let TuiAgentMode::Managed(agent) = self.mode {
-            stop_managed_agent(*agent).await;
+        match self.mode {
+            TuiAgentMode::Existing(agent) => cleanup_existing_agent(agent),
+            TuiAgentMode::Managed(agent) => stop_managed_agent(*agent).await,
         }
+    }
+}
+
+impl ExistingAgent {
+    fn create() -> Result<Self, TuiError> {
+        let runtime_dir = probe_home_path(
+            PathBuf::from("run")
+                .join("tui")
+                .join("existing")
+                .join(runtime_config_suffix()),
+        );
+        ensure_private_directory(&runtime_dir)?;
+        Ok(Self {
+            runtime_config_path: runtime_dir.join("reload-candidate.toml"),
+            runtime_dir,
+        })
+    }
+}
+
+fn cleanup_existing_agent(agent: ExistingAgent) {
+    remove_runtime_file(
+        &agent.runtime_config_path,
+        "TUI existing agent reload candidate",
+    );
+    if let Err(error) = fs::remove_dir(&agent.runtime_dir)
+        && error.kind() != std::io::ErrorKind::NotFound
+        && error.kind() != std::io::ErrorKind::DirectoryNotEmpty
+    {
+        eprintln!(
+            "failed to remove TUI existing agent runtime directory {}: {error}",
+            agent.runtime_dir.display()
+        );
     }
 }
 
@@ -585,6 +628,39 @@ mod tests {
         assert!(!runtime_config.runtime_reload.watch_config);
     }
 
+    #[test]
+    fn existing_config_reload_candidate_uses_tui_owned_snapshot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let runtime_config_path = temp.path().join("reload-candidate.toml");
+        let user_config_path = temp.path().join("user-agent.toml");
+        let user_config = AgentConfig {
+            config_version: "external".to_string(),
+            ..AgentConfig::default()
+        };
+        fs::write(&user_config_path, toml::to_string(&user_config)?)?;
+        let supervisor = TuiAgentSupervisor {
+            mode: TuiAgentMode::Existing(ExistingAgent {
+                runtime_dir: temp.path().to_path_buf(),
+                runtime_config_path: runtime_config_path.clone(),
+            }),
+        };
+        let snapshot_config = AgentConfig {
+            config_version: "snapshot".to_string(),
+            ..AgentConfig::default()
+        };
+
+        let candidate_path = supervisor.prepare_config_reload_candidate(&snapshot_config)?;
+
+        assert_eq!(candidate_path, runtime_config_path);
+        assert_ne!(candidate_path, user_config_path);
+        let written = AgentConfig::from_toml_str(&fs::read_to_string(&candidate_path)?)?;
+        assert_eq!(written, snapshot_config);
+        let user_written = AgentConfig::from_toml_str(&fs::read_to_string(&user_config_path)?)?;
+        assert_eq!(user_written, user_config);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn managed_config_reload_candidate_uses_projected_runtime_config()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -610,8 +686,7 @@ mod tests {
         config.admin.socket_path = PathBuf::from("/tmp/user-admin.sock");
         config.runtime_reload.watch_config = true;
 
-        let candidate_path = supervisor
-            .prepare_config_reload_candidate(&config, Path::new("/tmp/user-agent.toml"))?;
+        let candidate_path = supervisor.prepare_config_reload_candidate(&config)?;
 
         assert_eq!(candidate_path, runtime_config_path);
         assert!(config.runtime_reload.watch_config);

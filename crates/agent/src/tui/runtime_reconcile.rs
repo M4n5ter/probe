@@ -227,7 +227,7 @@ async fn runtime_apply_plan_note(
 ) -> Option<RuntimeApplyPlanNote> {
     let socket_path = active_socket_path?;
     let candidate_path = match supervisor {
-        Some(running) => match running.prepare_config_reload_candidate(config, config_path) {
+        Some(running) => match running.prepare_config_reload_candidate(config) {
             Ok(path) => path,
             Err(error) => {
                 return Some(RuntimeApplyPlanNote {

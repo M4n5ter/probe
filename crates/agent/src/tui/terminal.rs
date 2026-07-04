@@ -23,11 +23,7 @@ use super::{
         load_traffic_refresh_with_diagnostics,
     },
     config_edit::{TuiError, load_config, load_or_create_config},
-    config_save_task::{
-        ConfigSaveCompletion, PendingConfigSave, apply_config_save_completion,
-        reject_reload_during_config_save, start_config_save, take_finished_config_save,
-        wait_for_config_save,
-    },
+    config_save_task::{ConfigSaveCompletion, ConfigSaveState, SavedConfigRuntimeReconcile},
     hit::HitMap,
     process_catalog_task::{
         STARTUP_BACKGROUND_STATUS, apply_process_catalog_load_result,
@@ -69,15 +65,16 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
             .checked_sub(TRAFFIC_REFRESH_INTERVAL)
             .unwrap_or_else(Instant::now);
         let mut last_agent_poll = Instant::now();
-        let mut pending_config_save: Option<PendingConfigSave> = None;
+        let mut config_saves = ConfigSaveState::default();
         let mut pending_traffic_detail: Option<PendingTrafficDetail> = None;
         let mut pending_traffic_refresh: Option<PendingTrafficRefresh> = None;
 
         loop {
-            if let Some(completion) = take_finished_config_save(&mut pending_config_save).await {
+            if let Some(completion) = config_saves.take_finished().await {
                 apply_config_save_and_queue_runtime(
                     &mut loaded.source,
                     &mut supervisor,
+                    &mut config_saves,
                     &mut pending_runtime_reconcile,
                     &mut queued_runtime_reconcile,
                     &mut app,
@@ -150,7 +147,7 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
                     &mut terminal,
                     &mut loaded.source,
                     &mut supervisor,
-                    &mut pending_config_save,
+                    &mut config_saves,
                     &mut pending_runtime_reconcile,
                     &mut queued_runtime_reconcile,
                     &mut app,
@@ -173,8 +170,7 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
                 match effect {
                     TuiEffect::SaveConfig { saved_status } => {
                         let should_reconcile_runtime = app.dirty() || supervisor.as_ref().is_none();
-                        start_config_save(
-                            &mut pending_config_save,
+                        config_saves.start_or_queue(
                             &loaded.source,
                             &mut app,
                             saved_status,
@@ -182,7 +178,7 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
                         );
                     }
                     TuiEffect::ReloadConfig => {
-                        if reject_reload_during_config_save(&pending_config_save, &mut app) {
+                        if config_saves.reject_reload(&mut app) {
                             continue;
                         }
                         match load_config(app.config_path()) {
@@ -263,20 +259,19 @@ struct PendingTrafficRefresh {
 fn apply_config_save_and_queue_runtime(
     loaded_source: &mut String,
     supervisor: &mut Option<TuiAgentSupervisor>,
+    config_saves: &mut ConfigSaveState,
     pending_runtime_reconcile: &mut Option<PendingRuntimeReconcile>,
     queued_runtime_reconcile: &mut Option<QueuedRuntimeReconcile>,
     app: &mut TuiApp,
     completion: ConfigSaveCompletion,
 ) {
-    if let Some(reconcile) = apply_config_save_completion(loaded_source, app, completion) {
-        queue_runtime_reconcile_for_config(
+    if let Some(reconcile) = config_saves.apply_completion(loaded_source, app, completion) {
+        queue_saved_runtime_reconcile(
             supervisor,
             pending_runtime_reconcile,
             queued_runtime_reconcile,
             app,
-            reconcile.config,
-            reconcile.config_path,
-            reconcile.status,
+            reconcile,
         );
     }
 }
@@ -285,18 +280,19 @@ async fn finish_before_quit(
     terminal: &mut TerminalSession,
     loaded_source: &mut String,
     supervisor: &mut Option<TuiAgentSupervisor>,
-    pending_config_save: &mut Option<PendingConfigSave>,
+    config_saves: &mut ConfigSaveState,
     pending_runtime_reconcile: &mut Option<PendingRuntimeReconcile>,
     queued_runtime_reconcile: &mut Option<QueuedRuntimeReconcile>,
     app: &mut TuiApp,
 ) -> Result<(), TuiError> {
-    if pending_config_save.is_some() {
+    while config_saves.has_work() {
         app.mark_info("Waiting for config save to finish before quit");
         let _ = terminal.draw(app)?;
-        if let Some(completion) = wait_for_config_save(pending_config_save).await {
+        if let Some(completion) = config_saves.wait_for_pending().await {
             apply_config_save_and_queue_runtime(
                 loaded_source,
                 supervisor,
+                config_saves,
                 pending_runtime_reconcile,
                 queued_runtime_reconcile,
                 app,
@@ -371,6 +367,24 @@ fn queue_runtime_reconcile(
         app.config().clone(),
         app.config_path().clone(),
         status,
+    );
+}
+
+fn queue_saved_runtime_reconcile(
+    supervisor: &mut Option<TuiAgentSupervisor>,
+    pending_runtime_reconcile: &mut Option<PendingRuntimeReconcile>,
+    queued_runtime_reconcile: &mut Option<QueuedRuntimeReconcile>,
+    app: &mut TuiApp,
+    reconcile: SavedConfigRuntimeReconcile,
+) {
+    queue_runtime_reconcile_for_config(
+        supervisor,
+        pending_runtime_reconcile,
+        queued_runtime_reconcile,
+        app,
+        reconcile.config,
+        reconcile.config_path,
+        reconcile.status,
     );
 }
 
