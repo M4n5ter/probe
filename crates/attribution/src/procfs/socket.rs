@@ -43,7 +43,83 @@ pub struct SocketProcessContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TcpListenerProcessLookup {
     pub listeners: Vec<TcpListenerProcessContext>,
-    pub unattributed_socket_inodes: Vec<u64>,
+    pub unattributed_listeners: Vec<TcpUnattributedListener>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpUnattributedListener {
+    pub socket_inode: u64,
+    pub local: TcpEndpoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TcpListenerEndpointCandidate {
+    source: TcpListenerEndpointCandidateSource,
+    local: TcpEndpoint,
+    socket_inode: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpListenerEndpointCandidateSource {
+    Attributed(usize),
+    Unattributed(usize),
+}
+
+impl TcpListenerProcessLookup {
+    fn endpoint_candidates(&self) -> Vec<TcpListenerEndpointCandidate> {
+        self.listeners
+            .iter()
+            .enumerate()
+            .map(|(index, listener)| TcpListenerEndpointCandidate {
+                source: TcpListenerEndpointCandidateSource::Attributed(index),
+                local: listener.observed.local,
+                socket_inode: listener.observed.socket_inode,
+            })
+            .chain(
+                self.unattributed_listeners
+                    .iter()
+                    .enumerate()
+                    .map(|(index, listener)| TcpListenerEndpointCandidate {
+                        source: TcpListenerEndpointCandidateSource::Unattributed(index),
+                        local: listener.local,
+                        socket_inode: listener.socket_inode,
+                    }),
+            )
+            .collect()
+    }
+
+    fn select_endpoint_candidates(self, candidates: &[TcpListenerEndpointCandidate]) -> Self {
+        let mut selected_listeners = vec![false; self.listeners.len()];
+        let mut selected_unattributed_listeners = vec![false; self.unattributed_listeners.len()];
+        for candidate in candidates {
+            match candidate.source {
+                TcpListenerEndpointCandidateSource::Attributed(index) => {
+                    selected_listeners[index] = true;
+                }
+                TcpListenerEndpointCandidateSource::Unattributed(index) => {
+                    selected_unattributed_listeners[index] = true;
+                }
+            }
+        }
+        let listeners = self
+            .listeners
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, listener)| selected_listeners[index].then_some(listener))
+            .collect();
+        let unattributed_listeners = self
+            .unattributed_listeners
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, listener)| {
+                selected_unattributed_listeners[index].then_some(listener)
+            })
+            .collect();
+        Self {
+            listeners,
+            unattributed_listeners,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,7 +241,7 @@ impl ProcfsSocketResolver {
         let Some(snapshot) = self.snapshot.as_ref().map(|cached| &cached.snapshot) else {
             return Ok(TcpListenerProcessLookup {
                 listeners: Vec::new(),
-                unattributed_socket_inodes: Vec::new(),
+                unattributed_listeners: Vec::new(),
             });
         };
         self.attributor
@@ -180,7 +256,7 @@ impl ProcfsSocketResolver {
         let Some(snapshot) = self.snapshot.as_ref().map(|cached| &cached.snapshot) else {
             return Ok(TcpListenerProcessLookup {
                 listeners: Vec::new(),
-                unattributed_socket_inodes: Vec::new(),
+                unattributed_listeners: Vec::new(),
             });
         };
         self.attributor
@@ -192,7 +268,7 @@ impl ProcfsSocketResolver {
         let Some(snapshot) = self.snapshot.as_ref().map(|cached| &cached.snapshot) else {
             return Ok(TcpListenerProcessLookup {
                 listeners: Vec::new(),
-                unattributed_socket_inodes: Vec::new(),
+                unattributed_listeners: Vec::new(),
             });
         };
         self.attributor
@@ -366,14 +442,14 @@ impl ProcfsSocketAttributor {
         }
 
         let mut listeners = Vec::new();
-        let mut unattributed_socket_inodes = Vec::new();
+        let mut unattributed_listeners = Vec::new();
         for listener in snapshot
             .tcp_listeners
             .iter()
             .filter(|listener| local_port.is_none_or(|port| listener.local.port == port))
         {
             let Some(pids) = snapshot.inode_pids.get(&listener.inode) else {
-                push_unique(&mut unattributed_socket_inodes, listener.inode);
+                push_unique_unattributed_listener(&mut unattributed_listeners, listener);
                 continue;
             };
             for pid in pids {
@@ -386,7 +462,7 @@ impl ProcfsSocketAttributor {
                             *pid,
                         ) =>
                     {
-                        push_unique(&mut unattributed_socket_inodes, listener.inode);
+                        push_unique_unattributed_listener(&mut unattributed_listeners, listener);
                         continue;
                     }
                     Err(error) => return Err(error),
@@ -402,7 +478,7 @@ impl ProcfsSocketAttributor {
         }
         Ok(TcpListenerProcessLookup {
             listeners,
-            unattributed_socket_inodes,
+            unattributed_listeners,
         })
     }
 
@@ -417,6 +493,9 @@ impl ProcfsSocketAttributor {
         let lookup =
             self.identify_observed_tcp_listeners_in_snapshot(Some(target_endpoint.port), snapshot)?;
         let lookup = filter_listener_lookup_by_endpoint(lookup, target_endpoint, snapshot);
+        if !lookup.unattributed_listeners.is_empty() {
+            return Ok(None);
+        }
         let [target] = lookup.listeners.as_slice() else {
             return Ok(None);
         };
@@ -448,7 +527,7 @@ impl ProcfsSocketAttributor {
         }
         Ok(TcpListenerProcessLookup {
             listeners,
-            unattributed_socket_inodes: lookup.unattributed_socket_inodes,
+            unattributed_listeners: lookup.unattributed_listeners,
         })
     }
 
@@ -745,12 +824,6 @@ fn optional_error_for_expected_remote(
         .flatten()
 }
 
-fn push_unique(values: &mut Vec<u64>, value: u64) {
-    if !values.contains(&value) {
-        values.push(value);
-    }
-}
-
 fn push_unique_listener(
     listeners: &mut Vec<ProcfsTcpListenerEntry>,
     listener: ProcfsTcpListenerEntry,
@@ -767,22 +840,29 @@ fn push_unique_listener(
     listeners.push(listener);
 }
 
+fn push_unique_unattributed_listener(
+    listeners: &mut Vec<TcpUnattributedListener>,
+    listener: &ProcfsTcpListenerEntry,
+) {
+    let unattributed = TcpUnattributedListener {
+        socket_inode: listener.inode,
+        local: listener.local,
+    };
+    if !listeners.contains(&unattributed) {
+        listeners.push(unattributed);
+    }
+}
+
 fn filter_listener_lookup_by_endpoint(
     lookup: TcpListenerProcessLookup,
     observed: TcpEndpoint,
     snapshot: &ProcfsSocketSnapshot,
 ) -> TcpListenerProcessLookup {
-    let (rank, listeners) = best_ranked_listener_matches(lookup.listeners, observed, snapshot);
-    let listeners = if rank.is_some_and(ListenerEndpointMatchRank::requires_unique_logical_listener)
-    {
-        unique_logical_listener(listeners)
-    } else {
-        listeners
-    };
-    TcpListenerProcessLookup {
-        listeners,
-        unattributed_socket_inodes: lookup.unattributed_socket_inodes,
+    let (rank, mut candidates) = best_ranked_listener_matches(&lookup, observed, snapshot);
+    if rank.is_some_and(ListenerEndpointMatchRank::requires_unique_logical_listener) {
+        retain_unique_logical_listener(&mut candidates);
     }
+    lookup.select_endpoint_candidates(&candidates)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -801,48 +881,54 @@ impl ListenerEndpointMatchRank {
 }
 
 fn best_ranked_listener_matches(
-    listeners: Vec<TcpListenerProcessContext>,
+    lookup: &TcpListenerProcessLookup,
     observed: TcpEndpoint,
     snapshot: &ProcfsSocketSnapshot,
 ) -> (
     Option<ListenerEndpointMatchRank>,
-    Vec<TcpListenerProcessContext>,
+    Vec<TcpListenerEndpointCandidate>,
 ) {
     let mut best_rank = None;
-    let mut best_listeners = Vec::new();
-    for listener in listeners {
-        let Some(rank) = listener_endpoint_match_rank(&listener, observed, snapshot) else {
+    let mut best_candidates = Vec::new();
+    for candidate in lookup.endpoint_candidates() {
+        let Some(rank) = listener_endpoint_match_rank(&candidate, observed, snapshot) else {
             continue;
         };
         if best_rank.is_none_or(|best| rank > best) {
             best_rank = Some(rank);
-            best_listeners.clear();
+            best_candidates.clear();
         }
         if best_rank == Some(rank) {
-            best_listeners.push(listener);
+            best_candidates.push(candidate);
         }
     }
-    (best_rank, best_listeners)
+    (best_rank, best_candidates)
 }
 
 fn listener_endpoint_match_rank(
-    listener: &TcpListenerProcessContext,
+    candidate: &TcpListenerEndpointCandidate,
     observed: TcpEndpoint,
     snapshot: &ProcfsSocketSnapshot,
 ) -> Option<ListenerEndpointMatchRank> {
-    if listener.observed.local.port != observed.port {
+    let listener_local = candidate.local;
+    if listener_local.port != observed.port {
         return None;
     }
-    if listener.observed.local.address == observed.address {
+    if listener_local.address == observed.address {
         return Some(ListenerEndpointMatchRank::Exact);
     }
-    if !listener.observed.local.address.is_unspecified()
-        || !listener_wildcard_matches_observed_family(listener, observed)
+    if !listener_local.address.is_unspecified()
+        || !listener_wildcard_matches_observed_family(listener_local, observed)
     {
         return None;
     }
-    let same_family = listener_wildcard_same_family(listener, observed);
-    if listener_namespace_contains_address(listener, observed.address, snapshot) {
+    let same_family = listener_wildcard_same_family(listener_local, observed);
+    if listener_namespace_contains_address(
+        listener_local,
+        candidate.socket_inode,
+        observed.address,
+        snapshot,
+    ) {
         if same_family {
             Some(ListenerEndpointMatchRank::SameFamilyNamespaceWildcard)
         } else {
@@ -855,57 +941,49 @@ fn listener_endpoint_match_rank(
     }
 }
 
-fn listener_wildcard_same_family(
-    listener: &TcpListenerProcessContext,
-    observed: TcpEndpoint,
-) -> bool {
-    endpoint_uses_family(listener.observed.local, ProcfsTcpTableFamily::Ipv4)
+fn listener_wildcard_same_family(listener_local: TcpEndpoint, observed: TcpEndpoint) -> bool {
+    endpoint_uses_family(listener_local, ProcfsTcpTableFamily::Ipv4)
         && endpoint_uses_family(observed, ProcfsTcpTableFamily::Ipv4)
-        || endpoint_uses_family(listener.observed.local, ProcfsTcpTableFamily::Ipv6)
+        || endpoint_uses_family(listener_local, ProcfsTcpTableFamily::Ipv6)
             && endpoint_uses_family(observed, ProcfsTcpTableFamily::Ipv6)
 }
 
 fn listener_wildcard_matches_observed_family(
-    listener: &TcpListenerProcessContext,
+    listener_local: TcpEndpoint,
     observed: TcpEndpoint,
 ) -> bool {
-    if endpoint_uses_family(listener.observed.local, ProcfsTcpTableFamily::Ipv4) {
+    if endpoint_uses_family(listener_local, ProcfsTcpTableFamily::Ipv4) {
         return endpoint_uses_family(observed, ProcfsTcpTableFamily::Ipv4);
     }
-    if endpoint_uses_family(listener.observed.local, ProcfsTcpTableFamily::Ipv6) {
+    if endpoint_uses_family(listener_local, ProcfsTcpTableFamily::Ipv6) {
         return true;
     }
     false
 }
 
-fn unique_logical_listener(
-    listeners: Vec<TcpListenerProcessContext>,
-) -> Vec<TcpListenerProcessContext> {
+fn retain_unique_logical_listener(candidates: &mut Vec<TcpListenerEndpointCandidate>) {
     let mut identities = Vec::new();
-    for listener in &listeners {
-        let identity = (listener.observed.local, listener.observed.socket_inode);
+    for candidate in candidates.iter() {
+        let identity = (candidate.local, candidate.socket_inode);
         if !identities.contains(&identity) {
             identities.push(identity);
         }
     }
-    if identities.len() == 1 {
-        listeners
-    } else {
-        Vec::new()
+    if identities.len() != 1 {
+        candidates.clear();
     }
 }
 
 fn listener_namespace_contains_address(
-    listener: &TcpListenerProcessContext,
+    listener_local: TcpEndpoint,
+    listener_inode: u64,
     observed_address: IpAddr,
     snapshot: &ProcfsSocketSnapshot,
 ) -> bool {
     snapshot
         .tcp_listeners
         .iter()
-        .find(|entry| {
-            entry.local == listener.observed.local && entry.inode == listener.observed.socket_inode
-        })
+        .find(|entry| entry.local == listener_local && entry.inode == listener_inode)
         .and_then(|entry| entry.namespace.as_ref())
         .and_then(|namespace| snapshot.namespace_local_addresses.get(namespace))
         .is_some_and(|addresses| addresses.contains(&observed_address))
@@ -1035,7 +1113,7 @@ mod tests {
 
         let lookup = resolver.resolve_tcp_listeners_by_local_port(8443)?;
 
-        assert_eq!(lookup.unattributed_socket_inodes, Vec::<u64>::new());
+        assert!(lookup.unattributed_listeners.is_empty());
         let [listener] = lookup.listeners.as_slice() else {
             panic!("expected one attributed listener: {lookup:?}");
         };
@@ -1055,7 +1133,10 @@ mod tests {
         let lookup = resolver.resolve_tcp_listeners_by_local_port(8443)?;
 
         assert!(lookup.listeners.is_empty());
-        assert_eq!(lookup.unattributed_socket_inodes, vec![424_242]);
+        assert_eq!(
+            lookup.unattributed_listeners,
+            vec![unattributed_listener("127.0.0.1".parse()?, 8443, 424_242)]
+        );
         Ok(())
     }
 
@@ -1069,7 +1150,7 @@ mod tests {
 
         let lookup = resolver.resolve_tcp_listeners_by_local_port(8443)?;
 
-        assert_eq!(lookup.unattributed_socket_inodes, Vec::<u64>::new());
+        assert!(lookup.unattributed_listeners.is_empty());
         let mut pids = lookup
             .listeners
             .iter()
@@ -1101,7 +1182,7 @@ mod tests {
 
         let lookup = resolver.resolve_tcp_listeners_by_local_port(8080)?;
 
-        assert_eq!(lookup.unattributed_socket_inodes, Vec::<u64>::new());
+        assert!(lookup.unattributed_listeners.is_empty());
         let [listener] = lookup.listeners.as_slice() else {
             panic!("expected one process-namespace listener: {lookup:?}");
         };
@@ -1144,6 +1225,58 @@ mod tests {
 
         let [listener] = lookup.listeners.as_slice() else {
             panic!("expected one endpoint-matched listener: {lookup:?}");
+        };
+        assert_eq!(listener.owner.process.identity.pid, 321);
+        assert_eq!(listener.owner.process.name, "target-api");
+        assert_eq!(listener.observed.socket_inode, 424_242);
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_listener_lookup_filters_unattributed_listeners_by_endpoint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[
+            tcp_line(0, "0100007F:1F90", "00000000:0000", "0A", 424_242),
+            tcp_line(1, "0200007F:1F90", "00000000:0000", "0A", 535_353),
+        ])?;
+        proc.write_process_with_socket(321, "target-api", 424_242)?;
+        let mut resolver = ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path());
+
+        let lookup = resolver.resolve_tcp_listeners_by_local_endpoint(TcpEndpoint::new(
+            "127.0.0.1".parse()?,
+            8080,
+        ))?;
+
+        assert!(lookup.unattributed_listeners.is_empty());
+        let [listener] = lookup.listeners.as_slice() else {
+            panic!("expected endpoint-matched listener: {lookup:?}");
+        };
+        assert_eq!(listener.owner.process.identity.pid, 321);
+        assert_eq!(listener.owner.process.name, "target-api");
+        assert_eq!(listener.observed.socket_inode, 424_242);
+        Ok(())
+    }
+
+    #[test]
+    fn endpoint_listener_lookup_prefers_exact_listener_over_unattributed_wildcard()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[
+            tcp_line(0, "0100007F:1F90", "00000000:0000", "0A", 424_242),
+            tcp_line(1, "00000000:1F90", "00000000:0000", "0A", 535_353),
+        ])?;
+        proc.write_process_with_socket(321, "target-api", 424_242)?;
+        let mut resolver = ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path());
+
+        let lookup = resolver.resolve_tcp_listeners_by_local_endpoint(TcpEndpoint::new(
+            "127.0.0.1".parse()?,
+            8080,
+        ))?;
+
+        assert!(lookup.unattributed_listeners.is_empty());
+        let [listener] = lookup.listeners.as_slice() else {
+            panic!("expected exact listener to outrank wildcard listener: {lookup:?}");
         };
         assert_eq!(listener.owner.process.identity.pid, 321);
         assert_eq!(listener.owner.process.name, "target-api");
@@ -1464,6 +1597,58 @@ mod tests {
     }
 
     #[test]
+    fn docker_proxy_listener_resolution_keeps_proxy_owner_when_target_has_unattributed_listener()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[tcp_line(0, "00000000:1F91", "00000000:0000", "0A", 909_090)])?;
+        proc.write_process_with_socket_and_cmdline(
+            123,
+            "docker-proxy",
+            909_090,
+            &[
+                "/usr/bin/docker-proxy",
+                "-proto",
+                "tcp",
+                "-host-ip",
+                "0.0.0.0",
+                "-host-port",
+                "8081",
+                "-container-ip",
+                "172.19.0.3",
+                "-container-port",
+                "8080",
+                "-use-listen-fd",
+            ],
+        )?;
+        proc.write_process_with_socket(321, "sssa-backend", 424_242)?;
+        proc.write_process_tcp_table(
+            321,
+            "net:[4026532661]",
+            &[
+                tcp_line(0, "030013AC:1F90", "00000000:0000", "0A", 424_242),
+                tcp_line(1, "030013AC:1F90", "00000000:0000", "0A", 535_353),
+            ],
+        )?;
+        let mut resolver = ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path());
+
+        let lookup = resolver.resolve_tcp_listeners_by_local_endpoint(TcpEndpoint::new(
+            "10.10.0.170".parse()?,
+            8081,
+        ))?;
+
+        let [listener] = lookup.listeners.as_slice() else {
+            panic!("expected docker-proxy listener: {lookup:?}");
+        };
+        assert!(lookup.unattributed_listeners.is_empty());
+        assert_eq!(listener.observed.process.identity.pid, 123);
+        assert_eq!(listener.observed.process.name, "docker-proxy");
+        assert_eq!(listener.owner.process.identity.pid, 123);
+        assert_eq!(listener.owner.process.name, "docker-proxy");
+        assert_eq!(listener.owner.source, TcpListenerOwnerSource::SocketHolder);
+        Ok(())
+    }
+
+    #[test]
     fn endpoint_listener_lookup_rejects_ambiguous_wildcard_listeners()
     -> Result<(), Box<dyn std::error::Error>> {
         let proc = FakeProc::new()?;
@@ -1498,7 +1683,10 @@ mod tests {
 
         let lookup = resolver.resolve_tcp_listeners()?;
 
-        assert_eq!(lookup.unattributed_socket_inodes, vec![646_464]);
+        assert_eq!(
+            lookup.unattributed_listeners,
+            vec![unattributed_listener("127.0.0.1".parse()?, 11003, 646_464)]
+        );
         let mut listeners = lookup
             .listeners
             .iter()
@@ -1649,6 +1837,17 @@ mod tests {
         format!(
             "{index:4}: {local} {remote} {state} 00000000:00000000 00:00000000 00000000 1000 0 {inode} 1 0000000000000000\n"
         )
+    }
+
+    fn unattributed_listener(
+        address: IpAddr,
+        port: u16,
+        socket_inode: u64,
+    ) -> TcpUnattributedListener {
+        TcpUnattributedListener {
+            socket_inode,
+            local: TcpEndpoint::new(address, port),
+        }
     }
 
     fn stat(pid: u32, name: &str, start_time_ticks: u64) -> String {

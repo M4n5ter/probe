@@ -7,7 +7,6 @@ use interception::TransparentInterceptionFlowClassifierScope;
 use probe_core::{
     AddressPort, CapabilityKind, CapabilityState, CompiledSelector, Direction, FlowContext,
     FlowIdentity, Selector, TcpConnection, TcpEndpoint, TransportProtocol,
-    socket_addr_points_to_listener,
 };
 
 use crate::transparent_interception::TransparentInterceptionError;
@@ -80,37 +79,24 @@ impl TransparentInterceptionFlowClassifier {
         connection: TcpConnection,
     ) -> Result<(), String> {
         let mut resolver = self.resolver_factory.create();
+        let target_endpoint = TcpEndpoint::new(target.ip(), target.port());
         let lookup = resolver
-            .resolve_tcp_listeners_by_local_port(target.port())
+            .resolve_tcp_listeners_by_local_endpoint(target_endpoint)
             .map_err(|error| format!("procfs listener owner lookup failed: {error}"))?;
-        if !lookup.unattributed_socket_inodes.is_empty() {
+        if !lookup.unattributed_listeners.is_empty() {
             return Err(format!(
-                "procfs listener owner lookup found unattributed socket inodes for local port {}: {:?}",
-                target.port(),
-                lookup.unattributed_socket_inodes
+                "procfs listener owner lookup found unattributed listeners for target {target}: {:?}",
+                lookup.unattributed_listeners
             ));
         }
 
-        let relevant_listeners = lookup
-            .listeners
-            .into_iter()
-            .filter(|listener| {
-                socket_addr_points_to_listener(
-                    target,
-                    SocketAddr::new(
-                        listener.observed.local.address,
-                        listener.observed.local.port,
-                    ),
-                )
-            })
-            .collect::<Vec<_>>();
-        if relevant_listeners.is_empty() {
+        if lookup.listeners.is_empty() {
             return Err(format!(
                 "procfs listener owner lookup found no attributed listener for target {target}"
             ));
         }
 
-        for listener in relevant_listeners {
+        for listener in lookup.listeners {
             let flow = flow_context(
                 listener.observed.process,
                 listener.observed.confidence,
@@ -166,9 +152,9 @@ trait FlowOwnerResolver: Send {
         connection: TcpConnection,
     ) -> Result<Option<SocketProcessContext>, AttributionError>;
 
-    fn resolve_tcp_listeners_by_local_port(
+    fn resolve_tcp_listeners_by_local_endpoint(
         &mut self,
-        local_port: u16,
+        local_endpoint: TcpEndpoint,
     ) -> Result<TcpListenerProcessLookup, AttributionError>;
 }
 
@@ -193,12 +179,12 @@ impl FlowOwnerResolver for ProcfsFlowOwnerResolver {
         self.resolver.resolve_tcp_connection(connection)
     }
 
-    fn resolve_tcp_listeners_by_local_port(
+    fn resolve_tcp_listeners_by_local_endpoint(
         &mut self,
-        local_port: u16,
+        local_endpoint: TcpEndpoint,
     ) -> Result<TcpListenerProcessLookup, AttributionError> {
         self.resolver
-            .resolve_tcp_listeners_by_local_port(local_port)
+            .resolve_tcp_listeners_by_local_endpoint(local_endpoint)
     }
 }
 
@@ -370,7 +356,10 @@ mod tests {
             .classify_proxy_flow(peer, target, Direction::Inbound)
             .expect("matching listener should be allowed");
 
-        assert_eq!(resolver.listener_requests(), vec![8443]);
+        assert_eq!(
+            resolver.listener_requests(),
+            vec![TcpEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8443)]
+        );
     }
 
     #[test]
@@ -460,7 +449,7 @@ mod tests {
 
     struct FakeFlowOwnerResolverState {
         requests: Vec<TcpConnection>,
-        listener_requests: Vec<u16>,
+        listener_requests: Vec<TcpEndpoint>,
         results: VecDeque<Result<Option<SocketProcessContext>, AttributionError>>,
         listener_results: VecDeque<Result<TcpListenerProcessLookup, AttributionError>>,
     }
@@ -500,7 +489,7 @@ mod tests {
                 .clone()
         }
 
-        fn listener_requests(&self) -> Vec<u16> {
+        fn listener_requests(&self) -> Vec<TcpEndpoint> {
             self.state
                 .lock()
                 .expect("fake resolver state poisoned")
@@ -528,12 +517,12 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing fake resolver result"))
         }
 
-        fn resolve_tcp_listeners_by_local_port(
+        fn resolve_tcp_listeners_by_local_endpoint(
             &mut self,
-            local_port: u16,
+            local_endpoint: TcpEndpoint,
         ) -> Result<TcpListenerProcessLookup, AttributionError> {
             let mut state = self.state.lock().expect("fake resolver state poisoned");
-            state.listener_requests.push(local_port);
+            state.listener_requests.push(local_endpoint);
             state
                 .listener_results
                 .pop_front()
@@ -563,7 +552,7 @@ mod tests {
     ) -> TcpListenerProcessLookup {
         TcpListenerProcessLookup {
             listeners: listeners.into_iter().collect(),
-            unattributed_socket_inodes: Vec::new(),
+            unattributed_listeners: Vec::new(),
         }
     }
 

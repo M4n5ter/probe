@@ -60,7 +60,7 @@ impl ProcessResolver for ProcfsTcpProcessResolver {
 }
 
 fn unique_listener_owner_process(lookup: TcpListenerProcessLookup) -> Option<ResolvedProcess> {
-    if !lookup.unattributed_socket_inodes.is_empty() {
+    if !lookup.unattributed_listeners.is_empty() {
         return None;
     }
 
@@ -126,7 +126,7 @@ mod tests {
 
     use attribution::{
         TcpListenerObservedSocket, TcpListenerOwnerContext, TcpListenerOwnerSource,
-        TcpListenerProcessContext,
+        TcpListenerProcessContext, TcpUnattributedListener,
     };
     use probe_core::ProcessIdentity;
 
@@ -140,7 +140,7 @@ mod tests {
                 listener(123, "docker-proxy-v4", owner.clone(), 60, 8081),
                 listener(124, "docker-proxy-v6", owner.clone(), 55, 8081),
             ],
-            unattributed_socket_inodes: Vec::new(),
+            unattributed_listeners: Vec::new(),
         };
 
         let resolved = unique_listener_owner_process(lookup).expect("owner should be unique");
@@ -163,7 +163,7 @@ mod tests {
                     8081,
                 ),
             ],
-            unattributed_socket_inodes: Vec::new(),
+            unattributed_listeners: Vec::new(),
         };
 
         assert!(unique_listener_owner_process(lookup).is_none());
@@ -177,7 +177,10 @@ mod tests {
                 listener(123, "docker-proxy-v4", owner.clone(), 60, 8081),
                 listener(124, "docker-proxy-v6", owner, 55, 8081),
             ],
-            unattributed_socket_inodes: vec![999],
+            unattributed_listeners: vec![TcpUnattributedListener {
+                socket_inode: 999,
+                local: TcpEndpoint::new(Ipv4Addr::UNSPECIFIED.into(), 8081),
+            }],
         };
 
         assert!(unique_listener_owner_process(lookup).is_none());

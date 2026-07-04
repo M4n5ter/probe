@@ -4,5 +4,5 @@ pub use procfs::{
     AttributionError, ProcessAttributor, ProcfsAttributor, ProcfsSocketResolver,
     SocketFdConnectionContext, SocketFdLookup, SocketProcessContext, SocketProcessHint,
     TcpListenerObservedSocket, TcpListenerOwnerContext, TcpListenerOwnerSource,
-    TcpListenerProcessContext, TcpListenerProcessLookup,
+    TcpListenerProcessContext, TcpListenerProcessLookup, TcpUnattributedListener,
 };

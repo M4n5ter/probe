@@ -87,10 +87,10 @@ impl TransparentInterceptionProcessClassifier {
                 "transparent process classifier failed to inspect TCP listeners: {error}",
             ))
         })?;
-        if !lookup.unattributed_socket_inodes.is_empty() {
+        if !lookup.unattributed_listeners.is_empty() {
             return Err(setup_error(format!(
-                "transparent process classifier cannot derive process-scoped host rules while unattributed TCP listener socket inodes are visible: {:?}",
-                lookup.unattributed_socket_inodes
+                "transparent process classifier cannot derive process-scoped host rules while unattributed TCP listeners are visible: {:?}",
+                lookup.unattributed_listeners
             )));
         }
 
@@ -169,10 +169,10 @@ impl TransparentInterceptionProcessClassifier {
                     "transparent process classifier failed to inspect TCP listeners for local port {local_port}: {error}",
                 ))
             })?;
-        if !lookup.unattributed_socket_inodes.is_empty() {
+        if !lookup.unattributed_listeners.is_empty() {
             return Err(setup_error(format!(
-                "transparent process classifier cannot attribute every TCP listener for local port {local_port}; unattributed socket inodes: {:?}",
-                lookup.unattributed_socket_inodes
+                "transparent process classifier cannot attribute every TCP listener for local port {local_port}; unattributed listeners: {:?}",
+                lookup.unattributed_listeners
             )));
         }
         if lookup.listeners.is_empty() {
