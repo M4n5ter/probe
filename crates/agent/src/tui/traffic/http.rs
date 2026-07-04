@@ -17,6 +17,8 @@ pub(crate) struct HttpExchangeRow {
     pub(crate) method: String,
     pub(crate) target: String,
     pub(crate) status: String,
+    pub(crate) request_body: String,
+    pub(crate) response_body: String,
     pub(crate) direction: String,
     pub(crate) endpoint: String,
     pub(crate) summary: String,
@@ -145,6 +147,12 @@ impl HttpMessage {
         let bytes = self.body_len();
         let status = self.body_payload_status();
         format!("{} bytes ({})", bytes, status.preview_label())
+    }
+
+    fn body_table_label(&self) -> String {
+        let bytes = self.body_len();
+        let status = self.body_payload_status();
+        format!("{bytes}B {}", status.preview_label())
     }
 
     fn body_payload_status(&self) -> BodyPayloadStatus {
@@ -570,6 +578,8 @@ impl HttpExchangeBuilder {
             self.request.body_len(),
             self.response.body_len()
         );
+        let request_body = self.request.body_table_label();
+        let response_body = self.response.body_table_label();
         HttpExchangeRow {
             sequence: self.first_sequence,
             process: self.process,
@@ -577,6 +587,8 @@ impl HttpExchangeBuilder {
             method,
             target,
             status,
+            request_body,
+            response_body,
             direction,
             endpoint: self.endpoint,
             summary,
@@ -727,6 +739,8 @@ mod tests {
             exchange.summary,
             "POST /api/tasks -> 201 Created (req 5 B, resp 2 B)"
         );
+        assert_eq!(exchange.request_body, "5B loaded");
+        assert_eq!(exchange.response_body, "2B loaded");
         let details = exchange.detail_lines();
         assert_section_order(
             &details,
@@ -752,23 +766,27 @@ mod tests {
     }
 
     #[test]
-    fn preview_summarizes_body_payload_state() {
+    fn body_payload_state_feeds_preview_and_table_label() {
         let cases = [
-            BodyPreviewCase::loaded("Request body: 5 bytes (loaded)"),
-            BodyPreviewCase::none("Request body: 0 bytes (none)"),
-            BodyPreviewCase::not_loaded("Request body: 5 bytes (not loaded)"),
-            BodyPreviewCase::partial("Request body: 10 bytes (partial)"),
-            BodyPreviewCase::incomplete("Request body: 5 bytes (incomplete)"),
+            BodyPreviewCase::loaded("Request body: 5 bytes (loaded)", "5B loaded"),
+            BodyPreviewCase::none("Request body: 0 bytes (none)", "0B none"),
+            BodyPreviewCase::not_loaded("Request body: 5 bytes (not loaded)", "5B not loaded"),
+            BodyPreviewCase::partial("Request body: 10 bytes (partial)", "10B partial"),
+            BodyPreviewCase::incomplete("Request body: 5 bytes (incomplete)", "5B incomplete"),
         ];
 
         for case in cases {
-            let expected = case.expected;
-            let preview = single_exchange_preview(case.rows());
+            let expected_preview = case.expected_preview;
+            let expected_payload = case.expected_payload;
+            let exchange = single_exchange(case.rows());
+            let preview = exchange.preview_lines(16);
 
             assert!(
-                preview.iter().any(|line| line == expected),
-                "missing {expected} in {preview:?}"
+                preview.iter().any(|line| line == expected_preview),
+                "missing {expected_preview} in {preview:?}"
             );
+            assert_eq!(exchange.request_body, expected_payload);
+            assert_eq!(exchange.response_body, "0B none");
         }
     }
 
@@ -1378,45 +1396,51 @@ mod tests {
 
     struct BodyPreviewCase {
         rows: Vec<TrafficRow>,
-        expected: &'static str,
+        expected_preview: &'static str,
+        expected_payload: &'static str,
     }
 
     impl BodyPreviewCase {
-        fn loaded(expected: &'static str) -> Self {
+        fn loaded(expected_preview: &'static str, expected_payload: &'static str) -> Self {
             Self {
                 rows: request_rows(vec![body_row(2, 0, b"hello", true)]),
-                expected,
+                expected_preview,
+                expected_payload,
             }
         }
 
-        fn none(expected: &'static str) -> Self {
+        fn none(expected_preview: &'static str, expected_payload: &'static str) -> Self {
             Self {
                 rows: request_rows(Vec::new()),
-                expected,
+                expected_preview,
+                expected_payload,
             }
         }
 
-        fn not_loaded(expected: &'static str) -> Self {
+        fn not_loaded(expected_preview: &'static str, expected_payload: &'static str) -> Self {
             Self {
                 rows: request_rows(vec![tail_body_row(2, 0, b"hello", true)]),
-                expected,
+                expected_preview,
+                expected_payload,
             }
         }
 
-        fn partial(expected: &'static str) -> Self {
+        fn partial(expected_preview: &'static str, expected_payload: &'static str) -> Self {
             Self {
                 rows: request_rows(vec![
                     body_row(2, 0, b"hello", false),
                     tail_body_row(3, 5, b"world", true),
                 ]),
-                expected,
+                expected_preview,
+                expected_payload,
             }
         }
 
-        fn incomplete(expected: &'static str) -> Self {
+        fn incomplete(expected_preview: &'static str, expected_payload: &'static str) -> Self {
             Self {
                 rows: request_rows(vec![body_row(2, 5, b"world", true)]),
-                expected,
+                expected_preview,
+                expected_payload,
             }
         }
 
@@ -1425,12 +1449,12 @@ mod tests {
         }
     }
 
-    fn single_exchange_preview(rows: Vec<TrafficRow>) -> Vec<String> {
+    fn single_exchange(rows: Vec<TrafficRow>) -> HttpExchangeRow {
         let exchanges = build_http_exchange_rows(&rows);
         let [exchange] = exchanges.as_slice() else {
             panic!("expected one exchange: {exchanges:?}");
         };
-        exchange.preview_lines(16)
+        exchange.clone()
     }
 
     fn request_rows(mut body_rows: Vec<TrafficRow>) -> Vec<TrafficRow> {

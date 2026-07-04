@@ -19,6 +19,13 @@ use crate::tui::{
 };
 
 const TRAFFIC_SUMMARY_WIDTH: usize = 96;
+const HTTP_SEQUENCE_WIDTH: usize = 7;
+const HTTP_PROCESS_WIDTH: usize = 12;
+const HTTP_METHOD_WIDTH: usize = 7;
+const HTTP_TARGET_WIDTH: usize = 18;
+const HTTP_STATUS_WIDTH: usize = 16;
+const HTTP_BODY_WIDTH: usize = 15;
+const HTTP_REMOTE_WIDTH: usize = 16;
 const DATA_PATH_STATUS_WIDTH: usize = 38;
 const DATA_PATH_CAPTURE_WIDTH: usize = 38;
 const DATA_PATH_NEXT_WIDTH: usize = 44;
@@ -436,18 +443,30 @@ fn render_http_exchanges(
         TrafficTableSpec {
             title: "HTTP Exchanges",
             headers: vec![
-                "", "Seq", "Process", "Method", "Target", "Status", "Dir", "Remote", "Summary",
+                "",
+                "Seq",
+                "Process",
+                "Method",
+                "Target",
+                "Status",
+                "Req Body",
+                "Resp Body",
+                "Dir",
+                "Remote",
+                "Summary",
             ],
             constraints: vec![
                 Constraint::Length(2),
-                Constraint::Length(8),
-                Constraint::Length(20),
-                Constraint::Length(8),
-                Constraint::Length(32),
-                Constraint::Length(14),
-                Constraint::Length(5),
-                Constraint::Length(22),
-                Constraint::Min(20),
+                Constraint::Length(HTTP_SEQUENCE_WIDTH as u16),
+                Constraint::Length(HTTP_PROCESS_WIDTH as u16),
+                Constraint::Length(HTTP_METHOD_WIDTH as u16),
+                Constraint::Length(HTTP_TARGET_WIDTH as u16),
+                Constraint::Length(HTTP_STATUS_WIDTH as u16),
+                Constraint::Length(HTTP_BODY_WIDTH as u16),
+                Constraint::Length(HTTP_BODY_WIDTH as u16),
+                Constraint::Length(3),
+                Constraint::Length(HTTP_REMOTE_WIDTH as u16),
+                Constraint::Min(12),
             ],
             total_len: traffic.http_exchanges().len(),
             scroll: traffic.http_scroll(),
@@ -459,13 +478,18 @@ fn render_http_exchanges(
             let exchange = &traffic.http_exchanges()[absolute_index];
             Row::new([
                 Cell::from(marker),
-                Cell::from(exchange.sequence.to_string()),
-                Cell::from(exchange.process.clone()),
-                Cell::from(exchange.method.clone()),
-                Cell::from(super::truncate(&exchange.target, 40)),
-                Cell::from(exchange.status.clone()),
-                Cell::from(exchange.direction.clone()),
-                Cell::from(exchange.endpoint.clone()),
+                Cell::from(truncate_to_width(
+                    &exchange.sequence.to_string(),
+                    HTTP_SEQUENCE_WIDTH,
+                )),
+                Cell::from(truncate_to_width(&exchange.process, HTTP_PROCESS_WIDTH)),
+                Cell::from(truncate_to_width(&exchange.method, HTTP_METHOD_WIDTH)),
+                Cell::from(truncate_to_width(&exchange.target, HTTP_TARGET_WIDTH)),
+                Cell::from(truncate_to_width(&exchange.status, HTTP_STATUS_WIDTH)),
+                Cell::from(truncate_to_width(&exchange.request_body, HTTP_BODY_WIDTH)),
+                Cell::from(truncate_to_width(&exchange.response_body, HTTP_BODY_WIDTH)),
+                Cell::from(truncate_to_width(&exchange.direction, 3)),
+                Cell::from(truncate_to_width(&exchange.endpoint, HTTP_REMOTE_WIDTH)),
                 Cell::from(super::truncate(&exchange.summary, TRAFFIC_SUMMARY_WIDTH)),
             ])
         },
@@ -793,6 +817,39 @@ mod tests {
 
         assert_eq!(value, "abcdefg...");
         assert_eq!(value.chars().count(), 10);
+    }
+
+    #[test]
+    fn http_body_column_width_fits_supported_payload_states() {
+        for label in [
+            "0B none",
+            "5B loaded",
+            "100B not loaded",
+            "10B partial",
+            "100B incomplete",
+        ] {
+            assert!(
+                label.chars().count() <= HTTP_BODY_WIDTH,
+                "{label} should fit in the HTTP body column"
+            );
+        }
+    }
+
+    #[test]
+    fn http_status_column_width_fits_common_statuses() {
+        for status in [
+            "200 OK",
+            "201 Created",
+            "204 No Content",
+            "304 Not Modified",
+            "400 Bad Request",
+            "404 Not Found",
+        ] {
+            assert!(
+                status.chars().count() <= HTTP_STATUS_WIDTH,
+                "{status} should fit in the HTTP status column"
+            );
+        }
     }
 
     #[test]
