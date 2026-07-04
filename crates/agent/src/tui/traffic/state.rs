@@ -23,7 +23,7 @@ use crate::{
     },
 };
 
-const MAX_ROWS: usize = 256;
+const MAX_TRAFFIC_EVENT_ROWS: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrafficDetailLoadRequest {
@@ -915,8 +915,8 @@ impl TrafficState {
         self.rows.sort_by_key(|row| row.sequence);
         self.rows.dedup_by_key(|row| row.sequence);
         self.rebuild_protocol_views();
-        if self.rows.len() > MAX_ROWS {
-            let overflow = self.rows.len() - MAX_ROWS;
+        if self.rows.len() > MAX_TRAFFIC_EVENT_ROWS {
+            let overflow = self.rows.len() - MAX_TRAFFIC_EVENT_ROWS;
             self.rows.drain(0..overflow);
             self.rebuild_protocol_views();
         }
@@ -1913,6 +1913,27 @@ mod tests {
     }
 
     #[test]
+    fn http_exchange_context_survives_large_live_event_window() {
+        let mut traffic = TrafficState::default();
+        let mut records = vec![
+            (
+                1,
+                request_event_with_flow("flow-long-lived", 1, "GET", "/long-lived"),
+            ),
+            (2, response_event_with_flow("flow-long-lived", 2, 200, "OK")),
+        ];
+        records.extend((3..=300).map(|sequence| (sequence, gap_event(sequence))));
+
+        traffic.apply_snapshot(tail_snapshot_from_records(records));
+
+        assert_eq!(traffic.rows().len(), 300);
+        assert!(traffic.showing_http_exchanges());
+        assert_eq!(traffic.http_exchanges().len(), 1);
+        assert_eq!(traffic.http_exchanges()[0].target, "/long-lived");
+        assert_eq!(traffic.http_exchanges()[0].status, "200 OK");
+    }
+
+    #[test]
     fn http_view_label_reports_events_when_no_http_exchanges_are_visible() {
         let mut traffic = TrafficState::default();
 
@@ -2039,7 +2060,9 @@ mod tests {
     fn paused_websocket_selection_moves_to_nearest_surviving_session_after_window_rolls() {
         let mut traffic = TrafficState::default();
         traffic.set_viewport_rows(10);
-        traffic.apply_snapshot(tail_snapshot_with_websocket_handoffs(1..=MAX_ROWS as u64));
+        traffic.apply_snapshot(tail_snapshot_with_websocket_handoffs(
+            1..=MAX_TRAFFIC_EVENT_ROWS as u64,
+        ));
 
         let old_session_index = 5;
         traffic.select_row(old_session_index, 10);
@@ -2047,7 +2070,7 @@ mod tests {
         assert_eq!(traffic.websocket_sessions()[old_session_index].sequence, 6);
 
         traffic.apply_snapshot(tail_snapshot_with_websocket_handoffs(
-            (MAX_ROWS as u64 + 1)..=(MAX_ROWS as u64 + 10),
+            (MAX_TRAFFIC_EVENT_ROWS as u64 + 1)..=(MAX_TRAFFIC_EVENT_ROWS as u64 + 10),
         ));
 
         let selected = traffic.selected_websocket_session_index();
@@ -2196,9 +2219,9 @@ mod tests {
         traffic.select_row(0, 10);
         assert!(!traffic.following_tail());
 
-        let long_late_sequence = MAX_ROWS as u64 + 40;
-        let other_late_sequence = MAX_ROWS as u64 + 10;
-        let records = (31..=(MAX_ROWS as u64 + 50))
+        let long_late_sequence = MAX_TRAFFIC_EVENT_ROWS as u64 + 40;
+        let other_late_sequence = MAX_TRAFFIC_EVENT_ROWS as u64 + 10;
+        let records = (31..=(MAX_TRAFFIC_EVENT_ROWS as u64 + 50))
             .map(|sequence| {
                 let event = if sequence == long_late_sequence {
                     response_event_with_flow("flow-long", sequence, 204, "No Content")

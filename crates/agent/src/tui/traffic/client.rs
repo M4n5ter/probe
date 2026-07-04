@@ -9,9 +9,9 @@ use crate::admin::{
     EventTailSnapshot, send_admin_json_request_with_timeout,
 };
 
-const TAIL_TIMEOUT: Duration = Duration::from_secs(1);
+const TAIL_TIMEOUT: Duration = Duration::from_secs(2);
 const DETAIL_TIMEOUT: Duration = Duration::from_secs(2);
-const TAIL_LIMIT: usize = 256;
+const TAIL_LIMIT: usize = 1_024;
 const TAIL_RETRY_DIVISOR: usize = 4;
 
 pub(super) async fn request_tail_events(
@@ -206,6 +206,9 @@ mod tests {
 
     use super::*;
 
+    const TAIL_FIXTURE_MAX_EVENT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+    const TAIL_FIXTURE_MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
+
     #[tokio::test]
     async fn tail_events_retries_with_smaller_limit_after_oversized_admin_response()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -243,7 +246,7 @@ mod tests {
         let socket_path = temp.path().join("admin.sock");
         let listener = UnixListener::bind(&socket_path)?;
         let server = tokio::spawn(async move {
-            for expected_limit in [256, 64, 16, 4, 1] {
+            for expected_limit in [1_024, 256, 64, 16, 4, 1] {
                 let mut stream = accept_request(&listener).await?;
                 let request = read_request(&mut stream).await?;
                 assert_eq!(request["limit"], json!(expected_limit));
@@ -295,8 +298,8 @@ mod tests {
                 "limit": limit,
                 "scanned": 0,
                 "budget": {
-                    "max_event_payload_bytes": 524288,
-                    "max_record_bytes": 2097152,
+                    "max_event_payload_bytes": TAIL_FIXTURE_MAX_EVENT_PAYLOAD_BYTES,
+                    "max_record_bytes": TAIL_FIXTURE_MAX_RECORD_BYTES,
                     "included_record_bytes": 0,
                     "truncated": false
                 },

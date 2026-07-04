@@ -15,11 +15,11 @@ use super::{
     },
 };
 
-const MAX_TAIL_LIMIT: usize = 256;
-const MAX_TAIL_LIVE_SCAN: usize = 4_096;
-const MAX_TAIL_LATEST_SCAN: usize = 16_384;
+const MAX_TAIL_LIMIT: usize = 1_024;
+const MAX_TAIL_LIVE_SCAN: usize = 16_384;
+const MAX_TAIL_LATEST_SCAN: usize = 65_536;
 const MAX_TAIL_EVENT_PAYLOAD_BYTES: usize = MAX_EVENT_DETAIL_PAYLOAD_BYTES;
-const MAX_TAIL_RECORD_BYTES: usize = 2 * 1024 * 1024;
+const MAX_TAIL_RECORD_BYTES: usize = 4 * 1024 * 1024;
 const MAX_EVENT_DETAIL_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const LIVE_SELECTOR_SCAN_MULTIPLIER: usize = 16;
 const LATEST_SELECTOR_SCAN_MULTIPLIER: usize = 64;
