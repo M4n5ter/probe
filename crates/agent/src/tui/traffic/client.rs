@@ -35,6 +35,7 @@ pub(super) async fn request_tail_events(
         match result {
             Ok(snapshot) => return Ok(snapshot),
             Err(TrafficClientError::AdminClient(AdminClientError::ResponseTooLarge {
+                command: _,
                 limit: response_limit_bytes,
             })) => {
                 if let Some(next_limit) = next_tail_retry_limit(limit) {

@@ -1187,19 +1187,19 @@ mod tests {
         assert_eq!(
             response["dump"]["protocol"]["commands"],
             json!([
-                { "name": "ping", "mutating": false },
-                { "name": "status", "mutating": false },
-                { "name": "traffic_status", "mutating": false },
-                { "name": "metrics", "mutating": false },
-                { "name": "prometheus_metrics", "mutating": false },
-                { "name": "debug_dump", "mutating": false },
-                { "name": "tail_events", "mutating": false },
-                { "name": "event_detail", "mutating": false },
-                { "name": "plan_config_reload", "mutating": false },
-                { "name": "apply_config_reload", "mutating": true },
-                { "name": "reload_runtime_actions", "mutating": true },
-                { "name": "reload_policies", "mutating": true },
-                { "name": "reload_enforcement_policy", "mutating": true },
+                { "name": "ping", "mutating": false, "response_max_bytes": 16777216 },
+                { "name": "status", "mutating": false, "response_max_bytes": 16777216 },
+                { "name": "traffic_status", "mutating": false, "response_max_bytes": 16777216 },
+                { "name": "metrics", "mutating": false, "response_max_bytes": 16777216 },
+                { "name": "prometheus_metrics", "mutating": false, "response_max_bytes": 16777216 },
+                { "name": "debug_dump", "mutating": false, "response_max_bytes": 16777216 },
+                { "name": "tail_events", "mutating": false, "response_max_bytes": 16777216 },
+                { "name": "event_detail", "mutating": false, "response_max_bytes": 67108864 },
+                { "name": "plan_config_reload", "mutating": false, "response_max_bytes": 16777216 },
+                { "name": "apply_config_reload", "mutating": true, "response_max_bytes": 16777216 },
+                { "name": "reload_runtime_actions", "mutating": true, "response_max_bytes": 16777216 },
+                { "name": "reload_policies", "mutating": true, "response_max_bytes": 16777216 },
+                { "name": "reload_enforcement_policy", "mutating": true, "response_max_bytes": 16777216 },
             ])
         );
         assert_eq!(

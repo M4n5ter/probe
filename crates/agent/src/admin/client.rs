@@ -12,7 +12,6 @@ use tokio::{
 
 use super::protocol::AdminRequest;
 
-const ADMIN_RESPONSE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const ADMIN_CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) async fn send_admin_json_request(
@@ -27,6 +26,18 @@ pub(crate) async fn send_admin_json_request_with_timeout(
     request: AdminRequest,
     timeout: Duration,
 ) -> Result<serde_json::Value, AdminClientError> {
+    let max_response_bytes = request.response_budget().max_bytes();
+    send_admin_json_request_with_response_limit(socket_path, request, timeout, max_response_bytes)
+        .await
+}
+
+async fn send_admin_json_request_with_response_limit(
+    socket_path: &Path,
+    request: AdminRequest,
+    timeout: Duration,
+    max_response_bytes: usize,
+) -> Result<serde_json::Value, AdminClientError> {
+    let command = request.command_name();
     let mut stream = tokio::time::timeout(timeout, UnixStream::connect(socket_path))
         .await
         .map_err(|_| AdminClientError::Timeout)?
@@ -38,24 +49,27 @@ pub(crate) async fn send_admin_json_request_with_timeout(
     request.push(b'\n');
     with_timeout(stream.write_all(&request), timeout).await?;
     with_timeout(stream.shutdown(), timeout).await?;
-    let response = read_bounded_response(&mut stream, timeout).await?;
+    let response = read_bounded_response(&mut stream, timeout, command, max_response_bytes).await?;
     serde_json::from_slice(&response).map_err(AdminClientError::Json)
 }
 
 async fn read_bounded_response(
     stream: &mut UnixStream,
     timeout: Duration,
+    command: &'static str,
+    max_response_bytes: usize,
 ) -> Result<Vec<u8>, AdminClientError> {
     let reader = BufReader::new(stream);
-    let mut limited = reader.take((ADMIN_RESPONSE_MAX_BYTES + 1) as u64);
+    let mut limited = reader.take((max_response_bytes + 1) as u64);
     let mut response = Vec::new();
     let read = with_timeout(limited.read_until(b'\n', &mut response), timeout).await?;
     if read == 0 {
         return Err(AdminClientError::EmptyResponse);
     }
-    if response.len() > ADMIN_RESPONSE_MAX_BYTES {
+    if response.len() > max_response_bytes {
         return Err(AdminClientError::ResponseTooLarge {
-            limit: ADMIN_RESPONSE_MAX_BYTES,
+            command,
+            limit: max_response_bytes,
         });
     }
     Ok(response)
@@ -84,8 +98,8 @@ pub(crate) enum AdminClientError {
     RequestJson(#[from] serde_json::Error),
     #[error("admin response is empty")]
     EmptyResponse,
-    #[error("admin response exceeds {limit} bytes")]
-    ResponseTooLarge { limit: usize },
+    #[error("admin {command} response exceeds {limit} bytes")]
+    ResponseTooLarge { command: &'static str, limit: usize },
     #[error("admin request timed out")]
     Timeout,
     #[error("failed to parse admin response JSON: {0}")]
@@ -123,14 +137,26 @@ mod tests {
 
     #[tokio::test]
     async fn client_rejects_oversized_response_line() -> Result<(), Box<dyn std::error::Error>> {
-        let response = vec![b'a'; ADMIN_RESPONSE_MAX_BYTES + 1];
+        let response_limit = 1024;
+        let response = vec![b'a'; response_limit + 1];
         let (_temp, socket, handle) = spawn_admin_client_test_server(response, false)?;
 
-        let error = send_admin_json_request(&socket, AdminRequest::Status)
-            .await
-            .expect_err("oversized response should fail");
+        let error = send_admin_json_request_with_response_limit(
+            &socket,
+            AdminRequest::Status,
+            ADMIN_CLIENT_TIMEOUT,
+            response_limit,
+        )
+        .await
+        .expect_err("oversized response should fail");
 
-        assert!(matches!(error, AdminClientError::ResponseTooLarge { .. }));
+        assert!(matches!(
+            error,
+            AdminClientError::ResponseTooLarge {
+                command: "status",
+                limit: 1024
+            }
+        ));
         handle.abort();
         Ok(())
     }
