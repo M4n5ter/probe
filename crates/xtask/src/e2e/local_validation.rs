@@ -13,7 +13,7 @@ use probe_config::{
     CaptureSelection, CompressionCodecName, ExportFailureBackoffConfig, ExportWorkerScheduleConfig,
     ExporterConfig, ExporterTransportConfig,
 };
-use probe_core::{EventEnvelope, ProcessSelector, Selector, TrafficSelector};
+use probe_core::{ProcessSelector, Selector, TrafficSelector};
 
 use super::{
     agent_admin::{send_admin_request, wait_for_agent_pipeline_progress},
@@ -219,15 +219,7 @@ fn assert_admin_tail(
         },
         TrafficSelector::default(),
     );
-    let response = send_admin_request(
-        admin_socket_path,
-        serde_json::json!({
-            "command": "tail_events",
-            "after_sequence": 0,
-            "limit": 16,
-            "selector": selector,
-        }),
-    )?;
+    let response = send_admin_request(admin_socket_path, tail_events_request(selector))?;
     if response["kind"] != serde_json::json!("event_tail") {
         return Err(e2e_error(format!(
             "admin tail returned unexpected response: {response}"
@@ -240,11 +232,7 @@ fn assert_admin_tail(
             "admin tail omitted event array in response: {response}"
         ))
     })?;
-    let envelopes = records
-        .iter()
-        .map(|record| serde_json::from_value::<EventEnvelope>(record["event"].clone()))
-        .collect::<Result<Vec<_>, _>>()?;
-    assert_expected_export_set(&envelopes, scenario, "local validation admin tail")?;
+    assert_expected_compact_tail_set(records, scenario)?;
     let next_after_sequence = tail["next_after_sequence"].as_u64().ok_or_else(|| {
         e2e_error(format!(
             "admin tail omitted next_after_sequence in response: {response}"
@@ -256,7 +244,100 @@ fn assert_admin_tail(
         ))
         .into());
     }
-    Ok(envelopes.len())
+    Ok(records.len())
+}
+
+fn assert_expected_compact_tail_set(
+    records: &[serde_json::Value],
+    scenario: &PlaintextFeedScenario,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if records.len() != PLAINTEXT_FEED_EXPORT_EVENT_COUNT {
+        return Err(e2e_error(format!(
+            "local validation admin tail expected {PLAINTEXT_FEED_EXPORT_EVENT_COUNT} compact events, got {}",
+            records.len()
+        ))
+        .into());
+    }
+    let mut request_count = 0;
+    let mut policy_alert_count = 0;
+    let mut opened_count = 0;
+    let mut closed_count = 0;
+    let expected_policy_version = scenario.expected_policy_version();
+    let expected_alert_message = scenario.expected_policy_alert_message();
+    for record in records {
+        let event = &record["event"];
+        assert_compact_tail_event_scope(event, scenario)?;
+        let kind = event.get("kind").ok_or_else(|| {
+            e2e_error(format!(
+                "local validation admin tail event omitted kind: {record}"
+            ))
+        })?;
+        match kind["type"].as_str() {
+            Some("http_request_headers")
+                if kind["method"].as_str() == Some("GET")
+                    && kind["target"].as_str() == Some(scenario.request_target()) =>
+            {
+                request_count += 1;
+            }
+            Some("policy_alert")
+                if event["policy_version"].as_str() == Some(expected_policy_version.as_str())
+                    && kind["message"].as_str() == Some(expected_alert_message.as_str()) =>
+            {
+                policy_alert_count += 1;
+            }
+            Some("connection_opened") => opened_count += 1,
+            Some("connection_closed") => closed_count += 1,
+            _ => {}
+        }
+    }
+    if (
+        request_count,
+        policy_alert_count,
+        opened_count,
+        closed_count,
+    ) != (1, 1, 1, 1)
+    {
+        return Err(e2e_error(format!(
+            "local validation admin tail unexpected compact event set: request={request_count}, policy_alert={policy_alert_count}, opened={opened_count}, closed={closed_count}"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn assert_compact_tail_event_scope(
+    event: &serde_json::Value,
+    scenario: &PlaintextFeedScenario,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let expected_flow_id = scenario.expected_flow_id();
+    if event.get("subject").is_some() {
+        return Err(e2e_error(format!(
+            "local validation admin tail returned legacy subject field: {event}"
+        ))
+        .into());
+    }
+    if event["origin"]["source"].as_str() != Some("external_plaintext_feed")
+        || event["origin"]["provider"].as_str() != Some("plaintext")
+    {
+        return Err(e2e_error(format!(
+            "local validation admin tail carried an unexpected source or provider: {event}"
+        ))
+        .into());
+    }
+    let flow = event.get("flow").ok_or_else(|| {
+        e2e_error(format!(
+            "local validation admin tail omitted compact flow projection: {event}"
+        ))
+    })?;
+    if flow["id"].as_str() != Some(expected_flow_id.as_str())
+        || flow["process"]["identity"]["exe_path"].as_str() != Some(scenario.process_exe_path())
+    {
+        return Err(e2e_error(format!(
+            "local validation admin tail carried an unexpected compact flow projection: {event}"
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 fn assert_admin_tail_selector_miss(
@@ -269,15 +350,7 @@ fn assert_admin_tail_selector_miss(
         },
         TrafficSelector::default(),
     );
-    let response = send_admin_request(
-        admin_socket_path,
-        serde_json::json!({
-            "command": "tail_events",
-            "after_sequence": 0,
-            "limit": 16,
-            "selector": selector,
-        }),
-    )?;
+    let response = send_admin_request(admin_socket_path, tail_events_request(selector))?;
     if response["kind"] != serde_json::json!("event_tail") {
         return Err(e2e_error(format!(
             "admin tail selector miss returned unexpected response: {response}"
@@ -309,6 +382,17 @@ fn assert_admin_tail_selector_miss(
         .into());
     }
     Ok(())
+}
+
+fn tail_events_request(selector: Selector) -> serde_json::Value {
+    serde_json::json!({
+        "command": "tail_events",
+        "after_sequence": 0,
+        "latest": false,
+        "limit": 16,
+        "selector": selector,
+        "event_types": [],
+    })
 }
 
 fn wait_for_file_export(
