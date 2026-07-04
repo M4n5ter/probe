@@ -280,6 +280,10 @@ mod tests {
             CaptureProviderRuntimeSnapshot,
         },
         configured_enforcement::ActiveEnforcementPolicy,
+        l7_mitm::{
+            L7MitmBackendHealthSnapshot, L7MitmClientTrustSnapshot, L7MitmPlaintextBridgeMode,
+            L7MitmPlaintextBridgeSnapshot, L7MitmRuntimeSnapshot,
+        },
         tls_plaintext::{
             TlsPlaintextProviderActivityRuntimeSnapshot, TlsPlaintextProviderSignalRuntimeSnapshot,
             TlsPlaintextRuntimeMode, TlsPlaintextRuntimeSnapshot,
@@ -415,6 +419,99 @@ mod tests {
         assert!(
             bytes.len() < 64 * 1024,
             "traffic status projection should stay lightweight, got {} bytes",
+            bytes.len()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_status_projection_stays_lightweight_with_runtime_diagnostics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = runtime_plan_with_managed_transparent_proxy()?;
+        let mut runtime_generation = RuntimeGenerationSnapshot::default();
+        runtime_generation.active.generation = 7;
+        runtime_generation.active.config_version = "runtime".to_string();
+        let projection = build_traffic_status_projection_with_runtime(
+            &plan,
+            TrafficRuntimeStatusInput {
+                capture: Some(CaptureProviderRuntimeSnapshot {
+                    selected_backend: CaptureBackend::Libpcap,
+                    selected_input_source: runtime::CaptureInputSource::LiveHost,
+                    plan_mode: CapturePlanMode::Live,
+                    provider_runtime_mode: RuntimeMode::Available,
+                    evidence_mode: CaptureEvidenceMode::BestEffort,
+                    evidence_reason: Some("libpcap stream assembly is best-effort".to_string()),
+                    reason: None,
+                    open_failures: Vec::new(),
+                    provider: None,
+                }),
+                capture_input: Some(CaptureInputActivityRuntimeSnapshot {
+                    polls: CaptureInputPollActivityRuntimeSnapshot {
+                        total: 9,
+                        events: 4,
+                        progress: 2,
+                        idle: 2,
+                        finished: 1,
+                    },
+                    capture_events: 4,
+                    output_loss_events: 1,
+                    lost_events: 11,
+                    providers: vec![CaptureInputProviderActivityRuntimeSnapshot {
+                        provider: probe_core::CaptureProviderKind::Libpcap,
+                        capture_events: 4,
+                        output_loss_events: 1,
+                        lost_events: 11,
+                    }],
+                    last_signal: Some(CaptureInputSignalRuntimeSnapshot::Progress {
+                        sequence: 42,
+                        observed_unix_ns: 99,
+                    }),
+                }),
+                l7_mitm: Some(L7MitmRuntimeSnapshot {
+                    backend_health: L7MitmBackendHealthSnapshot::initial_success(),
+                    client_trust: L7MitmClientTrustSnapshot::disabled(),
+                    plaintext_bridge: L7MitmPlaintextBridgeSnapshot {
+                        mode: L7MitmPlaintextBridgeMode::Active,
+                        disable_reason: None,
+                    },
+                }),
+                runtime_generation: Some(runtime_generation),
+                transparent_proxy: Some(
+                    TransparentProxyRuntimeSnapshot::for_test(TransparentProxyRuntimeMode::Running)
+                        .with_relay_counts(2, 3, 5, 7, 11)
+                        .with_upstream_connects(13, 17, Some("connection refused"))
+                        .with_health_probe(
+                            TransparentProxyHealthProbeMode::Healthy,
+                            19,
+                            23,
+                            0,
+                            None,
+                        ),
+                ),
+            },
+        );
+        let value = serde_json::to_value(&projection)?;
+        let bytes = serde_json::to_vec(&projection)?;
+
+        assert_eq!(
+            value["runtime_generation"]["active"]["generation"],
+            json!(7)
+        );
+        assert_eq!(
+            value["capture"]["input_activity"]["capture_events"],
+            json!(4)
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["runtime_l7_mitm"]["plaintext_bridge"]["mode"],
+            json!("active")
+        );
+        assert_eq!(
+            value["enforcement"]["interception"]["runtime_proxy"]["mode"],
+            json!("running")
+        );
+        assert!(
+            bytes.len() < 64 * 1024,
+            "traffic status projection should stay lightweight with runtime diagnostics, got {} bytes",
             bytes.len()
         );
         Ok(())

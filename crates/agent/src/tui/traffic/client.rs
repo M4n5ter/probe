@@ -11,7 +11,8 @@ use crate::admin::{
 
 const TAIL_TIMEOUT: Duration = Duration::from_secs(2);
 const DETAIL_TIMEOUT: Duration = Duration::from_secs(2);
-const TAIL_LIMIT: usize = 1_024;
+const INITIAL_TAIL_LIMIT: usize = 1_024;
+const LIVE_TAIL_LIMIT: usize = 128;
 const TAIL_RETRY_DIVISOR: usize = 4;
 
 pub(super) async fn request_tail_events(
@@ -21,7 +22,7 @@ pub(super) async fn request_tail_events(
     selector: Selector,
     event_types: &[EventType],
 ) -> Result<EventTailSnapshot, TrafficClientError> {
-    let mut limit = TAIL_LIMIT;
+    let mut limit = tail_limit(latest);
     loop {
         let result = request_tail_events_with_limit(
             socket_path,
@@ -49,6 +50,14 @@ pub(super) async fn request_tail_events(
             }
             Err(error) => return Err(error),
         }
+    }
+}
+
+fn tail_limit(latest: bool) -> usize {
+    if latest {
+        INITIAL_TAIL_LIMIT
+    } else {
+        LIVE_TAIL_LIMIT
     }
 }
 
@@ -218,7 +227,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut first = accept_request(&listener).await?;
             let first_request = read_request(&mut first).await?;
-            assert_eq!(first_request["limit"], json!(TAIL_LIMIT));
+            assert_eq!(first_request["limit"], json!(LIVE_TAIL_LIMIT));
             first.write_all(&vec![b'a'; 16 * 1024 * 1024 + 1]).await?;
             first.shutdown().await?;
 
@@ -226,15 +235,67 @@ mod tests {
             let second_request = read_request(&mut second).await?;
             assert_eq!(
                 second_request["limit"],
-                json!(TAIL_LIMIT / TAIL_RETRY_DIVISOR)
+                json!(LIVE_TAIL_LIMIT / TAIL_RETRY_DIVISOR)
             );
-            write_tail_response(&mut second, TAIL_LIMIT / TAIL_RETRY_DIVISOR).await?;
+            write_tail_response(&mut second, LIVE_TAIL_LIMIT / TAIL_RETRY_DIVISOR).await?;
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
 
         let tail = request_tail_events(&socket_path, 0, false, Selector::default(), &[]).await?;
 
-        assert_eq!(tail.limit, TAIL_LIMIT / TAIL_RETRY_DIVISOR);
+        assert_eq!(tail.limit, LIVE_TAIL_LIMIT / TAIL_RETRY_DIVISOR);
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn latest_tail_events_start_with_initial_window_limit()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp = tempdir()?;
+        let socket_path = temp.path().join("admin.sock");
+        let listener = UnixListener::bind(&socket_path)?;
+        let server = tokio::spawn(async move {
+            let mut stream = accept_request(&listener).await?;
+            let request = read_request(&mut stream).await?;
+            assert_eq!(request["latest"], json!(true));
+            assert_eq!(request["limit"], json!(INITIAL_TAIL_LIMIT));
+            write_tail_response(&mut stream, INITIAL_TAIL_LIMIT).await?;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+
+        let tail = request_tail_events(&socket_path, 0, true, Selector::default(), &[]).await?;
+
+        assert_eq!(tail.limit, INITIAL_TAIL_LIMIT);
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn latest_tail_events_preserve_filtered_backfill_scan_depth()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp = tempdir()?;
+        let socket_path = temp.path().join("admin.sock");
+        let listener = UnixListener::bind(&socket_path)?;
+        let server = tokio::spawn(async move {
+            let mut stream = accept_request(&listener).await?;
+            let request = read_request(&mut stream).await?;
+            assert_eq!(request["latest"], json!(true));
+            assert_eq!(request["event_types"], json!(["http_request_headers"]));
+            assert_eq!(request["limit"], json!(1_024));
+            write_tail_response(&mut stream, 1_024).await?;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+
+        let tail = request_tail_events(
+            &socket_path,
+            0,
+            true,
+            Selector::default(),
+            &[EventType::HttpRequestHeaders],
+        )
+        .await?;
+
+        assert_eq!(tail.limit, 1_024);
         server.await??;
         Ok(())
     }
@@ -246,7 +307,7 @@ mod tests {
         let socket_path = temp.path().join("admin.sock");
         let listener = UnixListener::bind(&socket_path)?;
         let server = tokio::spawn(async move {
-            for expected_limit in [1_024, 256, 64, 16, 4, 1] {
+            for expected_limit in [128, 32, 8, 2, 1] {
                 let mut stream = accept_request(&listener).await?;
                 let request = read_request(&mut stream).await?;
                 assert_eq!(request["limit"], json!(expected_limit));
