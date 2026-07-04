@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use probe_core::{Direction, WebSocketHandoff, WebSocketMessageOpcode, WebSocketOpcode};
 
+use super::attribution::TrafficAttribution;
 use super::text::{bytes_detail, direction_label, fit_preview_lines, hex_or_dash};
 use super::{event_ref::TrafficEventRef, rows::TrafficRow};
 
@@ -23,6 +24,7 @@ pub(crate) struct WebSocketSessionRow {
     raw_sequences: Vec<u64>,
     latest_sequence: u64,
     identity: WebSocketSessionIdentity,
+    attribution: TrafficAttribution,
 }
 
 impl WebSocketSessionRow {
@@ -43,12 +45,15 @@ impl WebSocketSessionRow {
             format!("Sequence: {}", self.sequence),
             "View: WebSocket session".to_string(),
             format!("Process: {}", self.process),
+        ];
+        lines.extend(self.attribution.detail_lines());
+        lines.extend([
             format!("Capture path: {}", self.capture_path),
             format!("Direction: {}", self.direction),
             format!("Remote: {}", self.endpoint),
             format!("Target: {}", self.target),
             format!("Summary: {}", self.summary),
-        ];
+        ]);
         lines.extend(self.handoff_detail_lines());
         lines.extend(self.message_detail_lines());
         lines.extend(self.frame_detail_lines());
@@ -241,6 +246,7 @@ struct WebSocketSessionBuilder {
     process: String,
     capture_path: &'static str,
     endpoint: String,
+    attribution: TrafficAttribution,
     handoff: Option<WebSocketHandoff>,
     frame_events: Vec<WebSocketFrameEvent>,
     message_events: Vec<WebSocketMessageEvent>,
@@ -256,6 +262,7 @@ impl WebSocketSessionBuilder {
             process: row.process.clone(),
             capture_path: row.capture_path,
             endpoint: row.endpoint.clone(),
+            attribution: row.attribution.clone(),
             handoff: None,
             frame_events: Vec::new(),
             message_events: Vec::new(),
@@ -346,6 +353,7 @@ impl WebSocketSessionBuilder {
             raw_sequences: self.raw_sequences,
             latest_sequence: self.latest_sequence,
             identity: self.identity,
+            attribution: self.attribution,
         }
     }
 }
@@ -414,8 +422,8 @@ fn frame_opcode_label(opcode: WebSocketOpcode) -> String {
 mod tests {
     use probe_core::{
         AddressPort, CaptureOrigin, CaptureSource, EventEnvelope, EventKind, FlowContext,
-        FlowIdentity, ProcessContext, ProcessIdentity, Timestamp, TransportProtocol,
-        WebSocketFrame, WebSocketMessage,
+        FlowIdentity, LIBPCAP_FALLBACK_RUNTIME_HINT, ProcessContext, ProcessIdentity, Timestamp,
+        TransportProtocol, UNKNOWN_PROCESS_LABEL, WebSocketFrame, WebSocketMessage,
     };
 
     use crate::admin::{EventTailEvent, EventTailRecord};
@@ -485,6 +493,33 @@ mod tests {
             details
                 .iter()
                 .any(|line| line.contains("#1 text fin=true payload=5"))
+        );
+    }
+
+    #[test]
+    fn websocket_session_detail_preserves_libpcap_candidate_attribution() {
+        let rows = vec![TrafficRow::from_event(
+            1,
+            libpcap_unknown_process_event(EventKind::WebSocketHandoff(WebSocketHandoff {
+                direction: Direction::Outbound,
+                stream_sequence: 3,
+                target: Some("/ws".to_string()),
+                subprotocol: None,
+                extensions: Vec::new(),
+            })),
+        )];
+
+        let sessions = build_websocket_session_rows(&rows);
+
+        let [session] = sessions.as_slice() else {
+            panic!("expected one websocket session: {sessions:?}");
+        };
+        assert_eq!(session.process, "unknown candidate");
+        assert!(
+            session
+                .detail_lines()
+                .iter()
+                .any(|line| line == "Process match: libpcap unknown-process candidate")
         );
     }
 
@@ -615,6 +650,28 @@ mod tests {
             },
             flow,
             CaptureOrigin::from_source(CaptureSource::Replay),
+            "test",
+            kind,
+        )
+    }
+
+    fn libpcap_unknown_process_event(kind: EventKind) -> EventEnvelope {
+        let mut flow = flow();
+        flow.id = FlowIdentity("flow-libpcap".to_string());
+        flow.process.identity.pid = 0;
+        flow.process.identity.tgid = 0;
+        flow.process.identity.exe_path = UNKNOWN_PROCESS_LABEL.to_string();
+        flow.process.identity.runtime_hint = Some(LIBPCAP_FALLBACK_RUNTIME_HINT.to_string());
+        flow.process.name = UNKNOWN_PROCESS_LABEL.to_string();
+        flow.process.cmdline.clear();
+        flow.attribution_confidence = 0;
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            flow,
+            CaptureOrigin::from_source(CaptureSource::Libpcap),
             "test",
             kind,
         )

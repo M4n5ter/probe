@@ -1,3 +1,4 @@
+mod attribution;
 mod client;
 mod event_display;
 mod event_ref;

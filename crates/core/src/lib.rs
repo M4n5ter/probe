@@ -1,3 +1,4 @@
+mod attribution;
 mod capability;
 mod cgroup;
 mod event;
@@ -12,6 +13,9 @@ mod webhook;
 
 pub const DEFAULT_POLICY_RUNTIME_ERROR_DISABLE_THRESHOLD: u64 = 3;
 
+pub use attribution::{
+    LIBPCAP_FALLBACK_RUNTIME_HINT, UNKNOWN_PROCESS_LABEL, is_libpcap_unknown_process_candidate,
+};
 pub use capability::{
     CapabilityKind, CapabilityMatrix, CapabilityRequirement, CapabilityState, RuntimeMode,
 };

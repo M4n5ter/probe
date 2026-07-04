@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use probe_core::{Direction, HttpHeaders};
 
 use super::{
+    attribution::TrafficAttribution,
     event_ref::TrafficEventRef,
     rows::TrafficRow,
     text::{bytes_detail, direction_label, escape_text, fit_preview_lines},
@@ -24,6 +25,7 @@ pub(crate) struct HttpExchangeRow {
     raw_sequences: Vec<u64>,
     latest_sequence: u64,
     identity: HttpExchangeIdentity,
+    attribution: TrafficAttribution,
 }
 
 impl HttpExchangeRow {
@@ -45,11 +47,14 @@ impl HttpExchangeRow {
             format!("Latest event sequence: {}", self.latest_sequence),
             "View: HTTP exchange".to_string(),
             format!("Process: {}", self.process),
+        ];
+        lines.extend(self.attribution.detail_lines());
+        lines.extend([
             format!("Capture path: {}", self.capture_path),
             format!("Direction: {}", self.direction),
             format!("Remote: {}", self.endpoint),
             format!("Summary: {}", self.summary),
-        ];
+        ]);
         lines.extend(self.request.detail_lines("Request"));
         lines.extend(self.response.detail_lines("Response"));
         lines.push(format!(
@@ -350,6 +355,7 @@ struct HttpExchangeBuilder {
     process: String,
     capture_path: &'static str,
     endpoint: String,
+    attribution: TrafficAttribution,
     request: HttpMessage,
     response: HttpMessage,
     raw_sequences: Vec<u64>,
@@ -364,6 +370,7 @@ impl HttpExchangeBuilder {
             process: row.process.clone(),
             capture_path: row.capture_path,
             endpoint: row.endpoint.clone(),
+            attribution: row.attribution.clone(),
             request: HttpMessage::default(),
             response: HttpMessage::default(),
             raw_sequences: Vec::new(),
@@ -454,6 +461,7 @@ impl HttpExchangeBuilder {
             raw_sequences: self.raw_sequences,
             latest_sequence: self.latest_sequence,
             identity: self.identity,
+            attribution: self.attribution,
         }
     }
 }
@@ -523,8 +531,8 @@ fn body_direction_is_response(
 mod tests {
     use probe_core::{
         AddressPort, BodyChunk, CaptureOrigin, CaptureSource, EventEnvelope, EventKind,
-        FlowContext, FlowIdentity, HttpHeaders, ProcessContext, ProcessIdentity, Timestamp,
-        TransportProtocol,
+        FlowContext, FlowIdentity, HttpHeaders, LIBPCAP_FALLBACK_RUNTIME_HINT, ProcessContext,
+        ProcessIdentity, Timestamp, TransportProtocol, UNKNOWN_PROCESS_LABEL,
     };
 
     use crate::admin::{EventTailEvent, EventTailRecord};
@@ -616,6 +624,36 @@ mod tests {
             details
                 .iter()
                 .any(|line| line == "  Body chunk offset=0 end_stream=true: ok")
+        );
+    }
+
+    #[test]
+    fn exchange_detail_preserves_libpcap_candidate_attribution() {
+        let rows = vec![TrafficRow::from_event(
+            1,
+            libpcap_unknown_process_event(EventKind::HttpRequestHeaders(HttpHeaders {
+                direction: Direction::Outbound,
+                stream_sequence: 1,
+                method: Some("GET".to_string()),
+                target: Some("/candidate".to_string()),
+                status: None,
+                reason: None,
+                version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+            })),
+        )];
+
+        let exchanges = build_http_exchange_rows(&rows);
+
+        let [exchange] = exchanges.as_slice() else {
+            panic!("expected one exchange: {exchanges:?}");
+        };
+        assert_eq!(exchange.process, "unknown candidate");
+        assert!(
+            exchange
+                .detail_lines()
+                .iter()
+                .any(|line| line == "Process match: libpcap unknown-process candidate")
         );
     }
 
@@ -1207,6 +1245,28 @@ mod tests {
             },
             flow,
             CaptureOrigin::from_source(CaptureSource::Replay),
+            "test",
+            kind,
+        )
+    }
+
+    fn libpcap_unknown_process_event(kind: EventKind) -> EventEnvelope {
+        let mut flow = test_flow();
+        flow.id = FlowIdentity("flow-libpcap".to_string());
+        flow.process.identity.pid = 0;
+        flow.process.identity.tgid = 0;
+        flow.process.identity.exe_path = UNKNOWN_PROCESS_LABEL.to_string();
+        flow.process.identity.runtime_hint = Some(LIBPCAP_FALLBACK_RUNTIME_HINT.to_string());
+        flow.process.name = UNKNOWN_PROCESS_LABEL.to_string();
+        flow.process.cmdline.clear();
+        flow.attribution_confidence = 0;
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            flow,
+            CaptureOrigin::from_source(CaptureSource::Libpcap),
             "test",
             kind,
         )

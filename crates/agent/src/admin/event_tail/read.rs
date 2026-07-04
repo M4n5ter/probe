@@ -1,6 +1,9 @@
 use std::collections::VecDeque;
 
-use probe_core::{CaptureSource, CompiledSelector, Direction, EventType, FlowContext, Selector};
+use probe_core::{
+    CompiledSelector, Direction, EventType, FlowContext, Selector,
+    is_libpcap_unknown_process_candidate,
+};
 use storage::{FjallSpool, StoredEvent};
 
 use super::{
@@ -224,13 +227,10 @@ fn selector_matches_tail_flow(
 }
 
 fn is_libpcap_unknown_process_event(event: &EventTailEvent) -> bool {
-    event.origin.source() == CaptureSource::Libpcap
-        && event.flow.as_ref().is_some_and(|flow| {
-            flow.attribution_confidence == 0
-                && flow.process.identity.pid == 0
-                && flow.process.identity.exe_path == "unknown"
-                && flow.process.identity.runtime_hint.as_deref() == Some("libpcap_fallback")
-        })
+    event
+        .flow
+        .as_ref()
+        .is_some_and(|flow| is_libpcap_unknown_process_candidate(event.origin.source(), flow))
 }
 
 fn effective_after_sequence(
@@ -317,8 +317,9 @@ mod tests {
     use pipeline::ExportEventWriter;
     use probe_core::{
         AddressPort, CaptureOrigin, CaptureSource, Direction, EventEnvelope, EventKind,
-        FlowContext, FlowIdentity, HttpHeaders, ProcessContext, ProcessIdentity, ProcessSelector,
-        SelectorTerm, SpoolPayloadSchema, Timestamp, TrafficSelector, TransportProtocol,
+        FlowContext, FlowIdentity, HttpHeaders, LIBPCAP_FALLBACK_RUNTIME_HINT, ProcessContext,
+        ProcessIdentity, ProcessSelector, SelectorTerm, SpoolPayloadSchema, Timestamp,
+        TrafficSelector, TransportProtocol, UNKNOWN_PROCESS_LABEL,
     };
     use storage::SpoolPayload;
     use tempfile::tempdir;
@@ -790,14 +791,14 @@ mod tests {
     }
 
     fn libpcap_unknown_process_event() -> EventEnvelope {
-        let mut flow = flow_for_exe("unknown");
+        let mut flow = flow_for_exe(UNKNOWN_PROCESS_LABEL);
         flow.process.identity.pid = 0;
         flow.process.identity.tgid = 0;
         flow.process.identity.start_time_ticks = 0;
         flow.process.identity.boot_id = "libpcap".to_string();
-        flow.process.identity.cmdline_hash = "unknown".to_string();
-        flow.process.identity.runtime_hint = Some("libpcap_fallback".to_string());
-        flow.process.name = "unknown".to_string();
+        flow.process.identity.cmdline_hash = UNKNOWN_PROCESS_LABEL.to_string();
+        flow.process.identity.runtime_hint = Some(LIBPCAP_FALLBACK_RUNTIME_HINT.to_string());
+        flow.process.name = UNKNOWN_PROCESS_LABEL.to_string();
         flow.process.cmdline.clear();
         flow.attribution_confidence = 0;
         EventEnvelope::from_flow(

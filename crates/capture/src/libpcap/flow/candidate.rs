@@ -1,6 +1,7 @@
 use probe_core::{
-    AddressPort, Direction, FlowContext, FlowIdentity, ProcessContext, ProcessIdentity,
-    TcpConnection, TcpEndpoint, TransportProtocol,
+    AddressPort, Direction, FlowContext, FlowIdentity, LIBPCAP_FALLBACK_RUNTIME_HINT,
+    ProcessContext, ProcessIdentity, TcpConnection, TcpEndpoint, TransportProtocol,
+    UNKNOWN_PROCESS_LABEL,
 };
 
 use crate::{CaptureError, ProcessResolver, ResolvedProcess};
@@ -173,18 +174,18 @@ pub(super) fn synthetic_libpcap_process() -> ProcessContext {
         tgid: 0,
         start_time_ticks: 0,
         boot_id: "libpcap".to_string(),
-        exe_path: "unknown".to_string(),
-        cmdline_hash: "unknown".to_string(),
+        exe_path: UNKNOWN_PROCESS_LABEL.to_string(),
+        cmdline_hash: UNKNOWN_PROCESS_LABEL.to_string(),
         uid: 0,
         gid: 0,
         cgroup: None,
         systemd_service: None,
         container_id: None,
-        runtime_hint: Some("libpcap_fallback".to_string()),
+        runtime_hint: Some(LIBPCAP_FALLBACK_RUNTIME_HINT.to_string()),
     };
     ProcessContext {
         identity,
-        name: "unknown".to_string(),
+        name: UNKNOWN_PROCESS_LABEL.to_string(),
         cmdline: Vec::new(),
     }
 }

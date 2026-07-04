@@ -8,6 +8,7 @@ use crate::admin::{
 };
 
 use super::{
+    attribution::TrafficAttribution,
     event_display::{capture_path_short_label, event_detail_lines, event_kind_display},
     event_ref::TrafficEventRef,
     text::{direction_label, fit_preview_lines},
@@ -22,6 +23,7 @@ pub(crate) struct TrafficRow {
     pub(crate) direction: String,
     pub(crate) endpoint: String,
     pub(crate) summary: String,
+    pub(crate) attribution: TrafficAttribution,
     payload: TrafficRowPayload,
 }
 
@@ -49,6 +51,7 @@ impl TrafficRow {
             direction: "-".to_string(),
             endpoint: "-".to_string(),
             summary: format!("{reason}, payload {payload_bytes} bytes"),
+            attribution: TrafficAttribution::from_eventless_provider(),
             payload: TrafficRowPayload::Omission(TrafficOmissionRow {
                 omission,
                 scanned,
@@ -71,11 +74,8 @@ impl TrafficRow {
 
     pub(crate) fn preview_lines(&self, max_lines: usize) -> Vec<String> {
         match &self.payload {
-            TrafficRowPayload::FullEvent(event) => {
-                event_preview_lines(self, TrafficEventRef::Full(event), max_lines)
-            }
-            TrafficRowPayload::TailEvent(event) => {
-                event_preview_lines(self, TrafficEventRef::Tail(event), max_lines)
+            TrafficRowPayload::FullEvent(_) | TrafficRowPayload::TailEvent(_) => {
+                event_preview_lines(self, max_lines)
             }
             TrafficRowPayload::Omission(omission) => {
                 omission_preview_lines(self.sequence, omission, max_lines)
@@ -103,11 +103,10 @@ impl TrafficRow {
         let event_ref = TrafficEventRef::Full(&event);
         let flow = event_ref.flow();
         let event_kind = event_kind_display(event_ref.kind(), false);
+        let attribution = TrafficAttribution::from_event(event_ref);
         Self {
             sequence,
-            process: flow
-                .map(|flow| format!("{} ({})", flow.process.name, flow.process.identity.pid))
-                .unwrap_or_else(|| "provider".to_string()),
+            process: attribution.process_label(),
             capture_path: capture_path_short_label(event_ref.origin()),
             event_type: event_ref.event_type().as_str().to_string(),
             direction: event_ref
@@ -119,6 +118,7 @@ impl TrafficRow {
                 .map(|flow| format!("{}:{}", flow.remote.address, flow.remote.port))
                 .unwrap_or_else(|| "-".to_string()),
             summary: event_kind.summary,
+            attribution,
             payload: TrafficRowPayload::FullEvent(Box::new(event)),
         }
     }
@@ -127,11 +127,10 @@ impl TrafficRow {
         let event_ref = TrafficEventRef::Tail(&event);
         let flow = event_ref.flow();
         let event_kind = event_kind_display(event_ref.kind(), false);
+        let attribution = TrafficAttribution::from_event(event_ref);
         Self {
             sequence,
-            process: flow
-                .map(|flow| format!("{} ({})", flow.process.name, flow.process.identity.pid))
-                .unwrap_or_else(|| "provider".to_string()),
+            process: attribution.process_label(),
             capture_path: capture_path_short_label(event_ref.origin()),
             event_type: event_ref.event_type().as_str().to_string(),
             direction: event_ref
@@ -143,6 +142,7 @@ impl TrafficRow {
                 .map(|flow| format!("{}:{}", flow.remote.address, flow.remote.port))
                 .unwrap_or_else(|| "-".to_string()),
             summary: event_kind.summary,
+            attribution,
             payload: TrafficRowPayload::TailEvent(Box::new(event)),
         }
     }
@@ -162,11 +162,7 @@ struct TrafficOmissionRow {
     budget: EventTailBudgetSnapshot,
 }
 
-fn event_preview_lines(
-    row: &TrafficRow,
-    event: TrafficEventRef<'_>,
-    max_lines: usize,
-) -> Vec<String> {
+fn event_preview_lines(row: &TrafficRow, max_lines: usize) -> Vec<String> {
     let mut lines = vec![
         format!("Sequence: {}", row.sequence),
         format!("Event type: {} via {}", row.event_type, row.capture_path),
@@ -174,15 +170,7 @@ fn event_preview_lines(
         format!("Remote: {}", row.endpoint),
         format!("Summary: {}", row.summary),
     ];
-    if let Some(flow) = event.flow() {
-        lines.insert(
-            2,
-            format!(
-                "Process: {} pid={}",
-                flow.process.name, flow.process.identity.pid
-            ),
-        );
-    }
+    lines.splice(2..2, row.attribution.preview_lines());
     lines.push("Open detail for full payload".to_string());
     fit_preview_lines(lines, max_lines)
 }
@@ -248,8 +236,8 @@ fn omission_detail_lines(sequence: u64, row: &TrafficOmissionRow) -> Vec<String>
 mod tests {
     use probe_core::{
         AddressPort, BodyChunk, CaptureOrigin, CaptureSource, CaptureTrafficSecurity, Direction,
-        EventKind, FlowContext, FlowIdentity, HttpHeaders, ProcessContext, ProcessIdentity,
-        Timestamp, TransportProtocol,
+        EventKind, FlowContext, FlowIdentity, HttpHeaders, LIBPCAP_FALLBACK_RUNTIME_HINT,
+        ProcessContext, ProcessIdentity, Timestamp, TransportProtocol, UNKNOWN_PROCESS_LABEL,
     };
 
     use super::*;
@@ -403,6 +391,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn libpcap_unknown_process_candidate_is_explicit() {
+        let event = EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            libpcap_unknown_process_flow(),
+            CaptureOrigin::from_source(CaptureSource::Libpcap),
+            "test",
+            EventKind::HttpRequestHeaders(HttpHeaders {
+                direction: Direction::Outbound,
+                stream_sequence: 1,
+                method: Some("GET".to_string()),
+                target: Some("/candidate".to_string()),
+                status: None,
+                reason: None,
+                version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+            }),
+        );
+
+        let row = TrafficRow::from_event(7, event);
+
+        assert_eq!(row.process, "unknown candidate");
+        assert!(
+            row.preview_lines(8)
+                .iter()
+                .any(|line| line == "Process: unknown libpcap candidate")
+        );
+        assert!(
+            row.detail_lines()
+                .iter()
+                .any(|line| line == "Process match: libpcap unknown-process candidate")
+        );
+    }
+
     fn flow_with_raw_argv() -> FlowContext {
         let process = ProcessContext {
             identity: ProcessIdentity {
@@ -447,6 +472,18 @@ mod tests {
             socket_cookie: None,
             attribution_confidence: 100,
         }
+    }
+
+    fn libpcap_unknown_process_flow() -> FlowContext {
+        let mut flow = flow_with_raw_argv();
+        flow.process.identity.pid = 0;
+        flow.process.identity.tgid = 0;
+        flow.process.identity.exe_path = UNKNOWN_PROCESS_LABEL.to_string();
+        flow.process.identity.runtime_hint = Some(LIBPCAP_FALLBACK_RUNTIME_HINT.to_string());
+        flow.process.name = UNKNOWN_PROCESS_LABEL.to_string();
+        flow.process.cmdline.clear();
+        flow.attribution_confidence = 0;
+        flow
     }
 
     fn mitm_request_event(traffic_security: CaptureTrafficSecurity, target: &str) -> EventEnvelope {

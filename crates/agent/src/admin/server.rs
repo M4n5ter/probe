@@ -583,9 +583,10 @@ mod tests {
     use probe_core::{
         Action, AddressPort, BodyChunk, CapabilityKind, CapabilityState, CaptureOrigin,
         CaptureSource, Direction, EnforcementDecision, EnforcementMode, EnforcementOutcome,
-        EventEnvelope, EventKind, FlowContext, FlowIdentity, HttpHeaders, ProcessContext,
-        ProcessIdentity, ProcessSelector, ProtectiveActionProfile, RuntimeMode, Selector,
-        SpoolPayloadSchema, Timestamp, TrafficSelector, TransportProtocol, Verdict, VerdictScope,
+        EventEnvelope, EventKind, FlowContext, FlowIdentity, HttpHeaders,
+        LIBPCAP_FALLBACK_RUNTIME_HINT, ProcessContext, ProcessIdentity, ProcessSelector,
+        ProtectiveActionProfile, RuntimeMode, Selector, SpoolPayloadSchema, Timestamp,
+        TrafficSelector, TransportProtocol, UNKNOWN_PROCESS_LABEL, Verdict, VerdictScope,
         WebSocketMessage, WebSocketMessageOpcode,
     };
     use runtime::{
@@ -2415,15 +2416,15 @@ end
     }
 
     fn libpcap_unknown_process_request_event(remote_port: u16) -> EventEnvelope {
-        let mut flow = demo_flow_with_remote_port_and_process(remote_port, "unknown");
+        let mut flow = demo_flow_with_remote_port_and_process(remote_port, UNKNOWN_PROCESS_LABEL);
         flow.process.identity.pid = 0;
         flow.process.identity.tgid = 0;
         flow.process.identity.start_time_ticks = 0;
         flow.process.identity.boot_id = "libpcap".to_string();
-        flow.process.identity.exe_path = "unknown".to_string();
-        flow.process.identity.cmdline_hash = "unknown".to_string();
-        flow.process.identity.runtime_hint = Some("libpcap_fallback".to_string());
-        flow.process.name = "unknown".to_string();
+        flow.process.identity.exe_path = UNKNOWN_PROCESS_LABEL.to_string();
+        flow.process.identity.cmdline_hash = UNKNOWN_PROCESS_LABEL.to_string();
+        flow.process.identity.runtime_hint = Some(LIBPCAP_FALLBACK_RUNTIME_HINT.to_string());
+        flow.process.name = UNKNOWN_PROCESS_LABEL.to_string();
         flow.process.cmdline.clear();
         EventEnvelope::from_flow(
             Timestamp {

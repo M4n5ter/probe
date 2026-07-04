@@ -3,6 +3,7 @@ use probe_core::{CaptureOrigin, CaptureSource, CaptureTrafficSecurity, HttpHeade
 use crate::tui::copy::{MITM_HTTP_PATH_LABEL, MITM_TLS_PATH_LABEL};
 
 use super::{
+    attribution::TrafficAttribution,
     event_ref::{
         TrafficEventKindRef, TrafficEventRef, TrafficHttpBodyChunk, TrafficSseEvent,
         TrafficWebSocketMessage,
@@ -229,6 +230,7 @@ pub(super) fn event_detail_lines(sequence: u64, event: TrafficEventRef<'_>) -> V
             format!("Protocol: {:?}", flow.protocol),
             format!("Attribution confidence: {}", flow.attribution_confidence),
         ]);
+        lines.extend(TrafficAttribution::from_event(event).detail_lines());
     }
     lines.extend(event_kind_display(event.kind(), true).details);
     if event.is_tail() {
