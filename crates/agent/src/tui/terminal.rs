@@ -84,8 +84,11 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
                     ));
                 }
             }
-            if let Some(result) = take_finished_traffic_detail(&mut pending_traffic_detail).await {
-                app.apply_traffic_detail_result(result);
+            if let Some(result) = take_finished_traffic_detail(&mut pending_traffic_detail).await
+                && let Some(TuiEffect::LoadTrafficDetail { sequence }) =
+                    app.apply_traffic_detail_result(result)
+            {
+                start_traffic_detail_load(&mut app, &mut pending_traffic_detail, sequence);
             }
             if let Some(result) = take_finished_traffic_refresh(&mut pending_traffic_refresh).await
             {
@@ -179,16 +182,7 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
                     },
                     TuiEffect::ReloadRuntimeActions => reload_runtime_actions(&mut app).await,
                     TuiEffect::LoadTrafficDetail { sequence } => {
-                        if let Some(request) = app.begin_traffic_detail_load(sequence) {
-                            if let Some(pending) = pending_traffic_detail.take() {
-                                pending.task.abort();
-                            }
-                            pending_traffic_detail = Some(PendingTrafficDetail {
-                                sequence: request.sequence,
-                                request_id: request.request_id,
-                                task: tokio::spawn(load_traffic_detail(request)),
-                            });
-                        }
+                        start_traffic_detail_load(&mut app, &mut pending_traffic_detail, sequence)
                     }
                 }
             }
@@ -209,6 +203,24 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
         supervisor.stop().await;
     }
     result
+}
+
+fn start_traffic_detail_load(
+    app: &mut TuiApp,
+    pending_traffic_detail: &mut Option<PendingTrafficDetail>,
+    sequence: u64,
+) {
+    let Some(request) = app.begin_traffic_detail_load(sequence) else {
+        return;
+    };
+    if let Some(pending) = pending_traffic_detail.take() {
+        pending.task.abort();
+    }
+    *pending_traffic_detail = Some(PendingTrafficDetail {
+        sequence: request.sequence,
+        request_id: request.request_id,
+        task: tokio::spawn(load_traffic_detail(request)),
+    });
 }
 
 struct PendingTrafficDetail {

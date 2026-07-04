@@ -394,8 +394,15 @@ impl TrafficState {
         match self.active_view().active {
             TrafficViewMode::Http => {
                 let exchange = self.http_exchanges.get(self.http_view.selected_index())?;
-                let mut lines = exchange.detail_lines();
-                self.append_group_detail_state(&mut lines, &exchange.detail_fetch_sequences());
+                let fetch_sequences = exchange.detail_fetch_sequences();
+                let loaded_rows = self.loaded_detail_rows(&fetch_sequences);
+                let mut lines = exchange.detail_lines_with_loaded_rows(loaded_rows);
+                self.append_detail_load_state(
+                    &mut lines,
+                    &fetch_sequences,
+                    LoadedDetailPresentation::Consume,
+                    DetailLoadLabels::payload(),
+                );
                 return Some(lines);
             }
             TrafficViewMode::WebSocket => {
@@ -403,7 +410,12 @@ impl TrafficState {
                     .websocket_sessions
                     .get(self.websocket_view.selected_index())?;
                 let mut lines = session.detail_lines();
-                self.append_group_detail_state(&mut lines, &session.detail_fetch_sequences());
+                self.append_detail_load_state(
+                    &mut lines,
+                    &session.detail_fetch_sequences(),
+                    LoadedDetailPresentation::AppendRawEvent,
+                    DetailLoadLabels::raw_event(),
+                );
                 return Some(lines);
             }
             TrafficViewMode::Events => {}
@@ -433,7 +445,31 @@ impl TrafficState {
         Some(lines)
     }
 
-    pub(crate) fn selected_detail_fetch_sequence(&self) -> Option<u64> {
+    fn loaded_detail_rows<'a>(&'a self, sequences: &[u64]) -> Vec<&'a TrafficRow> {
+        sequences
+            .iter()
+            .filter_map(|sequence| self.detail_state.loaded(*sequence))
+            .collect()
+    }
+
+    pub(crate) fn selected_detail_auto_fetch_sequence(&self) -> Option<u64> {
+        self.selected_detail_fetch_sequence(DetailFetchMode::Auto)
+    }
+
+    pub(crate) fn selected_detail_manual_fetch_sequence(&self) -> Option<u64> {
+        self.selected_detail_fetch_sequence(DetailFetchMode::Manual)
+    }
+
+    fn selected_detail_fetch_sequence(&self, mode: DetailFetchMode) -> Option<u64> {
+        self.selected_detail_fetch_sequences()?
+            .into_iter()
+            .find(|sequence| match mode {
+                DetailFetchMode::Auto => self.detail_state.should_auto_fetch(*sequence),
+                DetailFetchMode::Manual => self.detail_state.should_manual_fetch(*sequence),
+            })
+    }
+
+    fn selected_detail_fetch_sequences(&self) -> Option<Vec<u64>> {
         let sequences = match self.active_view().active {
             TrafficViewMode::Http => self
                 .http_exchanges
@@ -449,29 +485,36 @@ impl TrafficState {
                 .into_iter()
                 .collect(),
         };
-        sequences
-            .into_iter()
-            .find(|sequence| self.detail_state.should_fetch(*sequence))
+        Some(sequences)
     }
 
-    fn append_group_detail_state(&self, lines: &mut Vec<String>, sequences: &[u64]) {
+    fn append_detail_load_state(
+        &self,
+        lines: &mut Vec<String>,
+        sequences: &[u64],
+        loaded_presentation: LoadedDetailPresentation,
+        labels: DetailLoadLabels,
+    ) {
         if sequences.is_empty() {
             return;
         }
         let mut pending = Vec::new();
         for row_sequence in sequences {
             if let Some(detail) = self.detail_state.loaded(*row_sequence) {
-                lines.push(String::new());
-                lines.push(format!("Raw event detail for sequence {row_sequence}"));
-                lines.extend(detail.detail_lines());
+                if loaded_presentation == LoadedDetailPresentation::AppendRawEvent {
+                    lines.push(String::new());
+                    lines.push(format!("{} for sequence {row_sequence}", labels.item));
+                    lines.extend(detail.detail_lines());
+                }
             } else if self.detail_state.is_loading(*row_sequence) {
                 lines.push(String::new());
                 lines.push(format!(
-                    "Raw event detail {row_sequence}: loading from admin event_detail"
+                    "{} {row_sequence}: loading from admin event_detail",
+                    labels.item
                 ));
             } else if let Some(message) = self.detail_state.failure(*row_sequence) {
                 lines.push(String::new());
-                lines.push(format!("Raw event detail {row_sequence} fetch failed"));
+                lines.push(format!("{} {row_sequence} fetch failed", labels.item));
                 lines.push(format!("Reason: {message}"));
             } else {
                 pending.push(row_sequence.to_string());
@@ -479,7 +522,7 @@ impl TrafficState {
         }
         if !pending.is_empty() {
             lines.push(String::new());
-            lines.push(format!("Raw event details pending: {}", pending.join(", ")));
+            lines.push(format!("{}: {}", labels.pending, pending.join(", ")));
         }
     }
 
@@ -1174,6 +1217,40 @@ fn should_probe_empty_filter(
     event_filter.is_filtered() && snapshot.events.is_empty() && snapshot.omissions.is_empty()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailFetchMode {
+    Auto,
+    Manual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadedDetailPresentation {
+    Consume,
+    AppendRawEvent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DetailLoadLabels {
+    item: &'static str,
+    pending: &'static str,
+}
+
+impl DetailLoadLabels {
+    fn payload() -> Self {
+        Self {
+            item: "Payload detail",
+            pending: "Payload details pending",
+        }
+    }
+
+    fn raw_event() -> Self {
+        Self {
+            item: "Raw event detail",
+            pending: "Raw event details pending",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct TrafficDetailState {
     loading: Option<TrafficDetailLoading>,
@@ -1227,7 +1304,13 @@ impl TrafficDetailState {
         self.failures.get(&sequence)
     }
 
-    fn should_fetch(&self, sequence: u64) -> bool {
+    fn should_auto_fetch(&self, sequence: u64) -> bool {
+        !self.loaded.contains_key(&sequence)
+            && !self.is_loading(sequence)
+            && !self.failures.contains_key(&sequence)
+    }
+
+    fn should_manual_fetch(&self, sequence: u64) -> bool {
         !self.loaded.contains_key(&sequence) && !self.is_loading(sequence)
     }
 
@@ -1641,23 +1724,23 @@ mod tests {
                 .selected_detail_lines()
                 .expect("HTTP exchange detail")
                 .iter()
-                .any(|line| line == "  Body chunk offset=0 len=5 end_stream=true")
+                .any(|line| line == "  Body chunk offset=0 len=5 end_stream=true not_loaded=true")
         );
         assert!(
             traffic
                 .selected_detail_lines()
                 .expect("HTTP exchange detail")
                 .iter()
-                .any(|line| line == "  Body payload: open raw event detail")
+                .any(|line| line == "  Body payload: not loaded in tail response")
         );
-        assert_eq!(traffic.selected_detail_fetch_sequence(), Some(2));
+        assert_eq!(traffic.selected_detail_auto_fetch_sequence(), Some(2));
         traffic.mark_detail_loading(2, 41);
         assert!(
             traffic
                 .selected_detail_lines()
                 .expect("HTTP exchange detail")
                 .iter()
-                .any(|line| line == "Raw event detail 2: loading from admin event_detail")
+                .any(|line| line == "Payload detail 2: loading from admin event_detail")
         );
         traffic.apply_detail_load_result(TrafficDetailLoadResult {
             sequence: 2,
@@ -1670,13 +1753,13 @@ mod tests {
                 event: body_event(b"hello"),
             }),
         });
-        assert_eq!(traffic.selected_detail_fetch_sequence(), Some(4));
+        assert_eq!(traffic.selected_detail_auto_fetch_sequence(), Some(4));
         assert!(
             traffic
                 .selected_detail_lines()
                 .expect("HTTP exchange detail")
                 .iter()
-                .any(|line| line == "Body payload: hello")
+                .any(|line| line == "  Body payload: hello")
         );
         traffic.mark_detail_loading(4, 42);
         traffic.apply_detail_load_result(TrafficDetailLoadResult {
@@ -1690,14 +1773,12 @@ mod tests {
                 event: response_body_event(b"ok"),
             }),
         });
-        assert_eq!(traffic.selected_detail_fetch_sequence(), None);
-        assert!(
-            traffic
-                .selected_detail_lines()
-                .expect("HTTP exchange detail")
-                .iter()
-                .any(|line| line == "Body payload: ok")
-        );
+        assert_eq!(traffic.selected_detail_auto_fetch_sequence(), None);
+        let details = traffic
+            .selected_detail_lines()
+            .expect("HTTP exchange detail");
+        assert!(details.iter().any(|line| line == "  Body payload: ok"));
+        assert!(!details.iter().any(|line| line.contains("Raw event detail")));
     }
 
     #[test]
@@ -1754,7 +1835,7 @@ mod tests {
                 .iter()
                 .any(|line| line == "    Payload: open raw event detail")
         );
-        assert_eq!(traffic.selected_detail_fetch_sequence(), Some(2));
+        assert_eq!(traffic.selected_detail_auto_fetch_sequence(), Some(2));
         traffic.mark_detail_loading(2, 42);
         traffic.apply_detail_load_result(TrafficDetailLoadResult {
             sequence: 2,
@@ -2160,7 +2241,7 @@ mod tests {
         let mut traffic = TrafficState::default();
         traffic.apply_snapshot(tail_snapshot_with_response_budget_omission());
 
-        assert_eq!(traffic.selected_detail_fetch_sequence(), Some(2));
+        assert_eq!(traffic.selected_detail_auto_fetch_sequence(), Some(2));
         traffic.mark_detail_loading(2, 11);
         assert!(
             traffic
@@ -2183,7 +2264,7 @@ mod tests {
             }),
         });
 
-        assert_eq!(traffic.selected_detail_fetch_sequence(), None);
+        assert_eq!(traffic.selected_detail_auto_fetch_sequence(), None);
         assert!(
             traffic
                 .selected_detail_lines()
@@ -2218,6 +2299,8 @@ mod tests {
                 .iter()
                 .any(|line| line == "Reason: admin socket is unavailable")
         );
+        assert_eq!(traffic.selected_detail_auto_fetch_sequence(), None);
+        assert_eq!(traffic.selected_detail_manual_fetch_sequence(), Some(2));
     }
 
     #[test]

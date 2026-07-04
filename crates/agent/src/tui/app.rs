@@ -905,9 +905,12 @@ impl TuiApp {
         })
     }
 
-    pub(crate) fn apply_traffic_detail_result(&mut self, result: TrafficDetailLoadResult) {
+    pub(crate) fn apply_traffic_detail_result(
+        &mut self,
+        result: TrafficDetailLoadResult,
+    ) -> Option<TuiEffect> {
         if !self.traffic.apply_detail_load_result(result) {
-            return;
+            return None;
         }
         match self.traffic.status().kind {
             super::traffic::TrafficStatusKind::Error
@@ -918,6 +921,19 @@ impl TuiApp {
                 self.status = StatusMessage::info(self.traffic.status().text.clone());
             }
         }
+        self.next_open_traffic_detail_load()
+    }
+
+    fn next_open_traffic_detail_load(&self) -> Option<TuiEffect> {
+        if !matches!(
+            self.traffic_popup.map(|popup| popup.kind),
+            Some(TrafficPopup::RowDetail)
+        ) {
+            return None;
+        }
+        self.traffic
+            .selected_detail_auto_fetch_sequence()
+            .map(|sequence| TuiEffect::LoadTrafficDetail { sequence })
     }
 
     fn next_traffic_detail_request_id(&mut self) -> u64 {
@@ -1237,7 +1253,7 @@ impl TuiApp {
             self.open_traffic_popup(TrafficPopup::RowDetail);
         }
         self.traffic
-            .selected_detail_fetch_sequence()
+            .selected_detail_manual_fetch_sequence()
             .map(|sequence| TuiEffect::LoadTrafficDetail { sequence })
     }
 

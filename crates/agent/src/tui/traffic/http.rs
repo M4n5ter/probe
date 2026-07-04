@@ -73,9 +73,20 @@ impl HttpExchangeRow {
             format!("Response: {}", self.status),
             format!("Request body: {} bytes", self.request.body_len()),
             format!("Response body: {} bytes", self.response.body_len()),
-            "Open detail for headers and full payloads".to_string(),
+            "Headers and payloads: detail view".to_string(),
         ];
         fit_preview_lines(lines, max_lines)
+    }
+
+    pub(crate) fn detail_lines_with_loaded_rows<'a>(
+        &self,
+        loaded_rows: impl IntoIterator<Item = &'a TrafficRow>,
+    ) -> Vec<String> {
+        let mut hydrated = self.clone();
+        for row in loaded_rows {
+            hydrated.apply_loaded_row(row);
+        }
+        hydrated.detail_lines()
     }
 
     pub(crate) fn detail_fetch_sequences(&self) -> Vec<u64> {
@@ -84,6 +95,33 @@ impl HttpExchangeRow {
             .into_iter()
             .chain(self.response.detail_fetch_sequences())
             .collect()
+    }
+
+    fn apply_loaded_row(&mut self, row: &TrafficRow) {
+        let Some(event) = row.event_ref() else {
+            return;
+        };
+        if http_exchange_key(event).as_ref() != Some(&self.identity) {
+            return;
+        }
+        let Some(chunk) = event.http_body_chunk() else {
+            return;
+        };
+        let body = if body_direction_is_response(&self.request, &self.response, chunk.direction) {
+            &mut self.response.body
+        } else {
+            &mut self.request.body
+        };
+        let Some(existing) = body
+            .iter_mut()
+            .find(|existing| existing.sequence == row.sequence)
+        else {
+            return;
+        };
+        existing.offset = chunk.offset;
+        existing.data_len = chunk.data_len;
+        existing.data = chunk.data.map(<[u8]>::to_vec);
+        existing.end_stream = chunk.end_stream;
     }
 }
 
@@ -100,7 +138,7 @@ impl HttpMessage {
 
     fn detail_lines(&self, label: &str) -> Vec<String> {
         let mut lines = Vec::new();
-        lines.push(label.to_string());
+        lines.push(format!("{label} headers"));
         match &self.headers {
             Some(headers) => {
                 lines.push(format!(
@@ -131,17 +169,26 @@ impl HttpMessage {
             }
             None => lines.push("  Headers: not observed in current window".to_string()),
         }
+        lines.push(format!("{label} body"));
         lines.push(format!("  Body bytes: {}", self.body_len()));
         if self.body.is_empty() {
             lines.push("  Body payload: -".to_string());
         } else if self.body.iter().any(|chunk| chunk.data.is_none()) {
-            lines.push("  Body payload: open raw event detail".to_string());
+            lines.extend(self.partial_body_payload_lines());
             lines.push(format!("  Body chunks: {}", self.body.len()));
             for chunk in sorted_body_chunks(&self.body) {
-                lines.push(format!(
-                    "  Body chunk offset={} len={} end_stream={}",
-                    chunk.offset, chunk.data_len, chunk.end_stream
-                ));
+                match &chunk.data {
+                    Some(data) => lines.push(format!(
+                        "  Body chunk offset={} end_stream={}: {}",
+                        chunk.offset,
+                        chunk.end_stream,
+                        bytes_detail(data)
+                    )),
+                    None => lines.push(format!(
+                        "  Body chunk offset={} len={} end_stream={} not_loaded=true",
+                        chunk.offset, chunk.data_len, chunk.end_stream
+                    )),
+                }
             }
         } else {
             lines.extend(self.body_payload_lines());
@@ -160,6 +207,30 @@ impl HttpMessage {
             }
         }
         lines
+    }
+
+    fn partial_body_payload_lines(&self) -> Vec<String> {
+        let loaded = sorted_body_chunks(&self.body)
+            .into_iter()
+            .filter_map(|chunk| chunk.data.as_ref())
+            .flat_map(|data| data.iter().copied())
+            .collect::<Vec<_>>();
+        let missing_chunks = self
+            .body
+            .iter()
+            .filter(|chunk| chunk.data.is_none())
+            .count();
+        if loaded.is_empty() {
+            return vec![
+                "  Body payload: not loaded in tail response".to_string(),
+                format!("  Missing body chunks: {missing_chunks}"),
+            ];
+        }
+        vec![
+            "  Body payload: partially loaded".to_string(),
+            format!("  Observed loaded body bytes: {}", bytes_detail(&loaded)),
+            format!("  Missing body chunks: {missing_chunks}"),
+        ]
     }
 
     fn detail_fetch_sequences(&self) -> Vec<u64> {
@@ -315,22 +386,12 @@ impl HttpExchangeBuilder {
                 data: chunk.data.map(<[u8]>::to_vec),
                 end_stream: chunk.end_stream,
             };
-            if self.body_direction_is_response(chunk.direction) {
+            if body_direction_is_response(&self.request, &self.response, chunk.direction) {
                 self.response.body.push(body);
             } else {
                 self.request.body.push(body);
             }
         }
-    }
-
-    fn body_direction_is_response(&self, direction: Direction) -> bool {
-        if let Some(headers) = &self.response.headers {
-            return headers.direction == direction;
-        }
-        self.request
-            .headers
-            .as_ref()
-            .is_some_and(|headers| headers.direction != direction)
     }
 
     fn into_row(mut self) -> HttpExchangeRow {
@@ -444,6 +505,20 @@ fn sorted_body_chunks(chunks: &[BodyChunk]) -> Vec<&BodyChunk> {
     chunks
 }
 
+fn body_direction_is_response(
+    request: &HttpMessage,
+    response: &HttpMessage,
+    direction: Direction,
+) -> bool {
+    if let Some(headers) = &response.headers {
+        return headers.direction == direction;
+    }
+    request
+        .headers
+        .as_ref()
+        .is_some_and(|headers| headers.direction != direction)
+}
+
 #[cfg(test)]
 mod tests {
     use probe_core::{
@@ -451,6 +526,8 @@ mod tests {
         FlowContext, FlowIdentity, HttpHeaders, ProcessContext, ProcessIdentity, Timestamp,
         TransportProtocol,
     };
+
+    use crate::admin::{EventTailEvent, EventTailRecord};
 
     use super::*;
 
@@ -519,6 +596,15 @@ mod tests {
             "POST /api/tasks -> 201 Created (req 5 B, resp 2 B)"
         );
         let details = exchange.detail_lines();
+        assert_section_order(
+            &details,
+            &[
+                "Request headers",
+                "Request body",
+                "Response headers",
+                "Response body",
+            ],
+        );
         assert!(details.iter().any(|line| line == "  Body payload: hello"));
         assert!(details.iter().any(|line| line == "  Body payload: ok"));
         assert!(
@@ -601,6 +687,82 @@ mod tests {
             details
                 .iter()
                 .any(|line| line == "  Body chunk offset=8 end_stream=true: world")
+        );
+    }
+
+    #[test]
+    fn http_body_detail_keeps_loaded_chunks_visible_when_other_chunks_are_missing() {
+        let loaded_body_chunk = event(EventKind::HttpBodyChunk(BodyChunk {
+            direction: Direction::Outbound,
+            stream_sequence: 1,
+            offset: 0,
+            data: b"hello".to_vec().into(),
+            end_stream: false,
+        }));
+        let missing_body_chunk = event(EventKind::HttpBodyChunk(BodyChunk {
+            direction: Direction::Outbound,
+            stream_sequence: 1,
+            offset: 5,
+            data: b"world".to_vec().into(),
+            end_stream: true,
+        }));
+        let rows = vec![
+            TrafficRow::from_event(
+                1,
+                event(EventKind::HttpRequestHeaders(HttpHeaders {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    method: Some("POST".to_string()),
+                    target: Some("/upload".to_string()),
+                    status: None,
+                    reason: None,
+                    version: "HTTP/1.1".to_string(),
+                    headers: Vec::new(),
+                })),
+            ),
+            TrafficRow::from_record(EventTailRecord {
+                sequence: 2,
+                stored_at_unix_ns: 2,
+                event: EventTailEvent::from_envelope(&loaded_body_chunk),
+            }),
+            TrafficRow::from_record(EventTailRecord {
+                sequence: 3,
+                stored_at_unix_ns: 3,
+                event: EventTailEvent::from_envelope(&missing_body_chunk),
+            }),
+        ];
+        let loaded_rows = [TrafficRow::from_event(2, loaded_body_chunk)];
+
+        let exchanges = build_http_exchange_rows(&rows);
+        let [exchange] = exchanges.as_slice() else {
+            panic!("expected one exchange");
+        };
+        let details = exchange.detail_lines_with_loaded_rows(loaded_rows.iter());
+
+        assert!(
+            details
+                .iter()
+                .any(|line| line == "  Body payload: partially loaded")
+        );
+        assert!(
+            details
+                .iter()
+                .any(|line| line == "  Observed loaded body bytes: hello")
+        );
+        assert!(
+            details
+                .iter()
+                .any(|line| line == "  Missing body chunks: 1")
+        );
+        assert!(
+            details
+                .iter()
+                .any(|line| line == "  Body chunk offset=0 end_stream=false: hello")
+        );
+        assert!(
+            details
+                .iter()
+                .any(|line| line == "  Body chunk offset=5 len=5 end_stream=true not_loaded=true")
         );
     }
 
@@ -1013,6 +1175,22 @@ mod tests {
         );
         assert_eq!(exchanges[0].sequence, 10);
         assert_eq!(exchanges[0].order_sequence(), 40);
+    }
+
+    fn assert_section_order(details: &[String], sections: &[&str]) {
+        let positions = sections
+            .iter()
+            .map(|section| {
+                details
+                    .iter()
+                    .position(|line| line == section)
+                    .unwrap_or_else(|| panic!("missing section {section} in {details:?}"))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            positions.windows(2).all(|window| window[0] < window[1]),
+            "sections should appear in request/response order: {positions:?}"
+        );
     }
 
     fn event(kind: EventKind) -> EventEnvelope {
