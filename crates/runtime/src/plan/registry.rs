@@ -158,7 +158,7 @@ fn default_platform_capabilities(
         ),
         CapabilityState::degraded(
             CapabilityKind::PolicyRuntime,
-            "policy runtime is wired into replay and live capture, including multiple active bundles, runtime error audit, manual admin policy bundle reload, explicit local policy bundle watcher reload, and explicit remote policy bundle polling, but main config reload and policy state migration are not implemented",
+            "policy runtime is wired into replay and live capture, including multiple active bundles, runtime error audit, manual admin policy bundle reload, explicit local policy bundle watcher reload, explicit remote policy bundle polling, and main config online reload with prepare-before-commit semantics for combined policy/enforcement updates, but policy runtime state is not serialized across ingress recovery",
         ),
         CapabilityState::degraded(
             CapabilityKind::DurableSpool,

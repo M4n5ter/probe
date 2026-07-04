@@ -1,4 +1,5 @@
 pub(crate) mod config_reload;
+mod online_actions;
 
 use std::sync::Arc;
 

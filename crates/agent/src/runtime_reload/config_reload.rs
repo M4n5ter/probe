@@ -18,11 +18,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::artifacts::normalize_embedded_artifact_paths_for_comparison;
 use crate::configured_enforcement::EnforcementRuntimeState;
-use crate::control_plane_http::policy_source_load_context_from_plan;
-use crate::enforcement_reload::{EnforcementReloadGate, reload_enforcement_policy};
-use crate::policy_reload::{PolicyReloadGate, reload_policies_from_config};
+use crate::enforcement_reload::EnforcementReloadGate;
+use crate::policy_reload::PolicyReloadGate;
 use crate::runtime_generation::{RuntimeGenerationReloadRequestInput, RuntimeGenerationState};
 use crate::runtime_plan::RuntimePlanHandle;
+
+use super::online_actions::{commit_online_reload_actions, prepare_online_reload_actions};
 
 use super::RuntimeReloadGate;
 
@@ -87,6 +88,14 @@ pub(crate) struct ConfigReloadPlanSnapshot {
     pub decision: ConfigReloadDecision,
     pub changed_sections: Vec<ConfigReloadSectionChange>,
     pub reloadable_runtime_actions: Vec<ConfigReloadRuntimeAction>,
+}
+
+impl ConfigReloadPlanSnapshot {
+    pub(super) fn includes_section(&self, section: ConfigReloadSection) -> bool {
+        self.changed_sections
+            .iter()
+            .any(|change| change.section == section)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -375,67 +384,34 @@ pub(crate) async fn apply_config_reload(
     };
     let applied_plan = online_applied_plan(current_plan, online_update);
 
-    let mut actions = Vec::new();
-    if plan
-        .changed_sections
-        .iter()
-        .any(|change| change.section == ConfigReloadSection::Policies)
+    let prepared_actions = match prepare_online_reload_actions(
+        &plan,
+        &candidate,
+        current_plan,
+        &applied_plan,
+        enforcement_runtime_state,
+    )
+    .await
     {
-        actions.push(
-            match reload_policies_from_config(
-                &candidate,
-                policy_source_load_context_from_plan(current_plan),
-                policy_set,
-                policy_reload_gate,
-            )
-            .await
-            {
-                Ok(summary) => ConfigReloadApplyAction::ReloadPolicies(
-                    ConfigReloadApplyActionOutcome::Succeeded {
-                        detail: format!(
-                            "loaded {} policy bundle(s), active set updated: {}",
-                            summary.loaded_count, summary.active_set_updated
-                        ),
-                    },
-                ),
-                Err(error) => ConfigReloadApplyAction::ReloadPolicies(
-                    ConfigReloadApplyActionOutcome::Failed {
-                        message: error.to_string(),
-                    },
-                ),
-            },
-        );
-    }
-    if plan
-        .changed_sections
-        .iter()
-        .any(|change| change.section == ConfigReloadSection::Enforcement)
-    {
-        actions.push(
-            match reload_enforcement_policy(
-                &applied_plan,
-                enforcement_runtime_state,
-                enforcement_reload_gate,
-            )
-            .await
-            {
-                Ok(summary) => ConfigReloadApplyAction::ReloadEnforcementPolicy(
-                    ConfigReloadApplyActionOutcome::Succeeded {
-                        detail: format!(
-                            "active enforcement policy reloaded, effective selector configured: {}, protective actions: {:?}",
-                            summary.active_policy.effective_selector_configured(),
-                            summary.active_policy.protective_actions()
-                        ),
-                    },
-                ),
-                Err(error) => ConfigReloadApplyAction::ReloadEnforcementPolicy(
-                    ConfigReloadApplyActionOutcome::Failed {
-                        message: error.to_string(),
-                    },
-                ),
-            },
-        );
-    }
+        Ok(prepared) => prepared,
+        Err(action) => {
+            return ConfigReloadApplyOutcome {
+                snapshot: ConfigReloadApplySnapshot {
+                    plan,
+                    actions: vec![action],
+                    active_plan_updated: false,
+                },
+                completion: ConfigReloadApplyCompletion::None,
+            };
+        }
+    };
+    let actions = commit_online_reload_actions(
+        prepared_actions,
+        policy_set,
+        policy_reload_gate,
+        enforcement_reload_gate,
+    )
+    .await;
 
     if actions.iter().any(|action| {
         matches!(
@@ -704,17 +680,9 @@ fn changed_sections_can_apply_online(changed_sections: &[ConfigReloadSectionChan
     if changed_sections.is_empty() {
         return false;
     }
-    let mut action_gated_count = 0;
-    for change in changed_sections {
-        match online_reload_owner(change) {
-            Some(ConfigReloadOnlineOwner::PlanOnly) => {}
-            Some(ConfigReloadOnlineOwner::ActionGated) => {
-                action_gated_count += 1;
-            }
-            None => return false,
-        }
-    }
-    action_gated_count <= 1
+    changed_sections
+        .iter()
+        .all(|change| online_reload_owner(change).is_some())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1100,23 +1068,28 @@ fn section_name(section: ConfigReloadSection) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, net::TcpListener, path::PathBuf, sync::Arc};
+    use std::{
+        fs,
+        net::TcpListener,
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
 
     use probe_config::{
         AgentConfig, CaptureBackend, CaptureSelection, EnforcementConfig,
-        EnforcementInterceptionConfig, EnforcementPolicyConfig, EnforcementPolicySourceConfig,
-        ExporterConfig, ExporterTransportConfig, IngressJournalRetentionConfig, LiveCaptureBackend,
-        ObservationDataPathMode, PolicyConfig, PolicySourceConfig, ProcessObservationConfig,
-        StorageConfig, StorageRetentionConfig, TlsConfig, TlsMaterialConfig, TlsMaterialKind,
-        TransparentInterceptionMitmBackendConfig,
+        EnforcementInterceptionConfig, EnforcementPolicyConfig, EnforcementPolicyManifest,
+        EnforcementPolicySourceConfig, ExporterConfig, ExporterTransportConfig,
+        IngressJournalRetentionConfig, LiveCaptureBackend, ObservationDataPathMode, PolicyConfig,
+        PolicySourceConfig, ProcessObservationConfig, StorageConfig, StorageRetentionConfig,
+        TlsConfig, TlsMaterialConfig, TlsMaterialKind, TransparentInterceptionMitmBackendConfig,
         TransparentInterceptionMitmBackendReadinessProbeConfig,
         TransparentInterceptionMitmClientTrustConfig,
         TransparentInterceptionMitmClientTrustModeConfig, TransparentInterceptionMitmConfig,
         TransparentInterceptionProxyConfig, TransparentInterceptionStrategyConfig,
     };
     use probe_core::{
-        CapabilityKind, CapabilityState, Direction, EnforcementMode, ProcessSelector, Selector,
-        SelectorRegistry, TrafficSelector,
+        Action, CapabilityKind, CapabilityState, Direction, EnforcementMode, ProcessSelector,
+        ProtectiveActionProfile, Selector, SelectorRegistry, TrafficSelector,
     };
     use runtime::{
         CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry, RuntimePlan,
@@ -1766,6 +1739,149 @@ mod tests {
         assert_eq!(active.config.exporters, candidate.exporters);
         assert_eq!(active.export.sinks[0].id(), "collector");
         assert_eq!(active.storage.retention.ingress.max_records, Some(100_000));
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn complete_config_reload_apply_commits_policy_and_enforcement_together()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-policy-enforcement-apply")?;
+        let current = runtime_plan(base_config(temp.join("spool")))?;
+        let configured = crate::configured_enforcement::build_configured_enforcement_with_backend(
+            &current,
+            None,
+            crate::configured_enforcement::EnforcementPolicySourceLoadContext::default(),
+        )
+        .await?;
+        let (_, enforcement_runtime) =
+            crate::configured_enforcement::EnforcementRuntimeState::from_planner(
+                configured.planner,
+                configured.active_policy,
+            );
+        let policy_path = temp.join("guard.bundle");
+        let enforcement_path = temp.join("enforcement.toml");
+        write_policy_bundle(&policy_path, "candidate")?;
+        write_enforcement_manifest(&enforcement_path, "candidate", Action::Deny)?;
+        let mut candidate = current.config.clone();
+        candidate.policies.push(PolicyConfig {
+            id: "guard".to_string(),
+            source: PolicySourceConfig::LocalDirectory {
+                path: policy_path.clone(),
+            },
+            ..PolicyConfig::default()
+        });
+        candidate.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: enforcement_path.clone(),
+        };
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+        let plan_handle = RuntimePlanHandle::new(Arc::new(current.clone()));
+        let policy_set = PipelinePolicySet::default();
+
+        let outcome = apply_config_reload(
+            &current,
+            &policy_set,
+            &PolicyReloadGate::default(),
+            Some(&enforcement_runtime),
+            &EnforcementReloadGate::default(),
+            &candidate_path,
+        )
+        .await;
+        let snapshot = complete_config_reload_apply(outcome, &plan_handle, None);
+
+        assert!(snapshot.active_plan_updated);
+        assert!(matches!(
+            snapshot.actions.as_slice(),
+            [
+                ConfigReloadApplyAction::ReloadPolicies(
+                    ConfigReloadApplyActionOutcome::Succeeded { .. },
+                ),
+                ConfigReloadApplyAction::ReloadEnforcementPolicy(
+                    ConfigReloadApplyActionOutcome::Succeeded { .. },
+                ),
+            ]
+        ));
+        assert_eq!(policy_set.runtime_snapshot().len(), 1);
+        assert!(
+            enforcement_runtime
+                .active_policy()
+                .policy_source()
+                .is_some()
+        );
+        let active = plan_handle.snapshot();
+        assert_eq!(active.config.policies, candidate.policies);
+        assert_eq!(
+            active.config.enforcement.policy.source,
+            candidate.enforcement.policy.source
+        );
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn complete_config_reload_apply_does_not_commit_policy_when_enforcement_prepare_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("config-reload-policy-enforcement-atomic-fail")?;
+        let current = runtime_plan(base_config(temp.join("spool")))?;
+        let configured = crate::configured_enforcement::build_configured_enforcement_with_backend(
+            &current,
+            None,
+            crate::configured_enforcement::EnforcementPolicySourceLoadContext::default(),
+        )
+        .await?;
+        let (_, enforcement_runtime) =
+            crate::configured_enforcement::EnforcementRuntimeState::from_planner(
+                configured.planner,
+                configured.active_policy,
+            );
+        let policy_path = temp.join("guard.bundle");
+        let enforcement_path = temp.join("invalid-enforcement.toml");
+        write_policy_bundle(&policy_path, "candidate")?;
+        fs::write(&enforcement_path, "id = ")?;
+        let mut candidate = current.config.clone();
+        candidate.policies.push(PolicyConfig {
+            id: "guard".to_string(),
+            source: PolicySourceConfig::LocalDirectory { path: policy_path },
+            ..PolicyConfig::default()
+        });
+        candidate.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: enforcement_path,
+        };
+        let candidate_path = temp.join("agent.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+        let plan_handle = RuntimePlanHandle::new(Arc::new(current.clone()));
+        let policy_set = PipelinePolicySet::default();
+
+        let outcome = apply_config_reload(
+            &current,
+            &policy_set,
+            &PolicyReloadGate::default(),
+            Some(&enforcement_runtime),
+            &EnforcementReloadGate::default(),
+            &candidate_path,
+        )
+        .await;
+        let snapshot = complete_config_reload_apply(outcome, &plan_handle, None);
+
+        assert!(!snapshot.active_plan_updated);
+        assert!(matches!(
+            snapshot.actions.as_slice(),
+            [ConfigReloadApplyAction::ReloadEnforcementPolicy(
+                ConfigReloadApplyActionOutcome::Failed { .. },
+            )]
+        ));
+        assert!(policy_set.runtime_snapshot().is_empty());
+        assert!(
+            enforcement_runtime
+                .active_policy()
+                .policy_source()
+                .is_none()
+        );
+        assert_eq!(
+            plan_handle.snapshot().config.policies,
+            current.config.policies
+        );
         fs::remove_dir_all(temp)?;
         Ok(())
     }
@@ -2759,7 +2875,7 @@ mod tests {
     }
 
     #[test]
-    fn config_reload_plan_keeps_multiple_action_gated_online_owner_changes_restart_required()
+    fn config_reload_plan_can_apply_multiple_action_gated_owner_changes_online()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = test_dir("config-reload-mixed-online-owners")?;
         let current = runtime_plan(base_config(temp.join("spool")))?;
@@ -2780,18 +2896,24 @@ mod tests {
         let plan = plan_config_reload(&current.config, &candidate_path);
 
         assert!(
-            matches!(plan.decision, ConfigReloadDecision::RestartRequired { .. }),
+            matches!(plan.decision, ConfigReloadDecision::ApplyOnline { .. }),
             "{:?}",
             plan.decision
         );
         assert_eq!(
             plan.changed_sections
                 .iter()
-                .map(|change| change.section)
+                .map(|change| (change.section, change.reload_mode))
                 .collect::<Vec<_>>(),
             vec![
-                ConfigReloadSection::Policies,
-                ConfigReloadSection::Enforcement
+                (
+                    ConfigReloadSection::Policies,
+                    ConfigReloadSectionReloadMode::ApplyOnline,
+                ),
+                (
+                    ConfigReloadSection::Enforcement,
+                    ConfigReloadSectionReloadMode::ApplyOnline,
+                ),
             ]
         );
         fs::remove_dir_all(temp)?;
@@ -3053,6 +3175,50 @@ mod tests {
             },
             ..ExporterConfig::default()
         }
+    }
+
+    fn write_policy_bundle(path: &Path, version: &str) -> Result<(), std::io::Error> {
+        fs::create_dir_all(path)?;
+        fs::write(
+            path.join("manifest.toml"),
+            format!(
+                r#"id = "guard"
+version = "{version}"
+hooks = ["on_http_request_headers"]
+"#
+            ),
+        )?;
+        fs::write(
+            path.join("main.lua"),
+            r#"
+function on_http_request_headers(event)
+  return probe.emit_alert("guard " .. event.kind.target)
+end
+"#,
+        )
+    }
+
+    fn write_enforcement_manifest(
+        path: &Path,
+        version: &str,
+        action: Action,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = EnforcementPolicyManifest {
+            id: "managed-apps".to_string(),
+            version: version.to_string(),
+            selectors: Default::default(),
+            selector: Some(Selector::term(
+                ProcessSelector::default(),
+                TrafficSelector {
+                    remote_ports: vec![443],
+                    directions: vec![Direction::Outbound],
+                    ..TrafficSelector::default()
+                },
+            )),
+            protective_actions: ProtectiveActionProfile::new([action])?,
+        };
+        fs::write(path, toml::to_string(&manifest)?)?;
+        Ok(())
     }
 
     fn process_observation(

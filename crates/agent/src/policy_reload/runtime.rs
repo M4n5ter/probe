@@ -69,6 +69,21 @@ pub(crate) struct PolicyReloadSummary {
     pub active_set_updated: bool,
 }
 
+pub(crate) struct PreparedPolicyReload {
+    loaded: LoadedPipelinePolicies,
+}
+
+impl PreparedPolicyReload {
+    pub(crate) async fn commit(
+        self,
+        policy_set: &PipelinePolicySet,
+        gate: &PolicyReloadGate,
+    ) -> PolicyReloadSummary {
+        let mut state = gate.inner.lock().await;
+        commit_prepared_policies(self.loaded, policy_set, &mut state)
+    }
+}
+
 pub(crate) async fn reload_policies(
     plan: &RuntimePlan,
     policy_set: &PipelinePolicySet,
@@ -90,7 +105,27 @@ pub(crate) async fn reload_policies_from_config(
     gate: &PolicyReloadGate,
 ) -> Result<PolicyReloadSummary, ConfiguredPolicyError> {
     let mut state = gate.inner.lock().await;
+    let prepared = prepare_policies_from_config(config, load_context).await?;
+    Ok(commit_prepared_policies(
+        prepared.loaded,
+        policy_set,
+        &mut state,
+    ))
+}
+
+pub(crate) async fn prepare_policies_from_config(
+    config: &AgentConfig,
+    load_context: PolicySourceLoadContext,
+) -> Result<PreparedPolicyReload, ConfiguredPolicyError> {
     let loaded = load_configured_pipeline_policies_with_context(config, load_context).await?;
+    Ok(PreparedPolicyReload { loaded })
+}
+
+fn commit_prepared_policies(
+    loaded: LoadedPipelinePolicies,
+    policy_set: &PipelinePolicySet,
+    state: &mut PolicyReloadState,
+) -> PolicyReloadSummary {
     let loaded_count = loaded.policies.len() as u64;
     let policies = loaded.sources;
     let active_set_updated = state
@@ -101,11 +136,11 @@ pub(crate) async fn reload_policies_from_config(
         policy_set.replace(loaded.policies);
         state.active_content = Some(loaded.content);
     }
-    Ok(PolicyReloadSummary {
+    PolicyReloadSummary {
         loaded_count,
         policies,
         active_set_updated,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -145,6 +180,45 @@ mod tests {
         PolicySourceLoadContext, load_configured_pipeline_policies_with_context,
     };
     use crate::runtime_plan::RuntimePlanHandle;
+
+    #[tokio::test]
+    async fn standalone_reload_reads_bundle_after_reload_gate_opens()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("policy-reload-gate-read-order")?;
+        let policy_path = temp.join("guard.bundle");
+        write_policy_bundle(&policy_path, "old", "old")?;
+        let mut config = config_with_storage_path(temp.join("spool"));
+        config.policies.push(PolicyConfig {
+            id: "guard".to_string(),
+            source: probe_config::PolicySourceConfig::LocalDirectory {
+                path: policy_path.clone(),
+            },
+            ..PolicyConfig::default()
+        });
+        let policy_set = PipelinePolicySet::default();
+        let gate = super::PolicyReloadGate::default();
+        let gate_guard = gate.inner.lock().await;
+
+        let reload = super::reload_policies_from_config(
+            &config,
+            PolicySourceLoadContext::default(),
+            &policy_set,
+            &gate,
+        );
+        tokio::pin!(reload);
+        tokio::select! {
+            _ = &mut reload => panic!("reload should wait for the reload gate"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+        write_policy_bundle(&policy_path, "new", "new")?;
+        drop(gate_guard);
+
+        reload.await?;
+
+        assert_eq!(policy_set.runtime_snapshot()[0].version, "new");
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn admin_reload_policies_swaps_active_pipeline_policy_set()

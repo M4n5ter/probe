@@ -20,6 +20,31 @@ pub(crate) struct EnforcementReloadSummary {
     pub active_policy: ActiveEnforcementPolicy,
 }
 
+pub(crate) struct PreparedEnforcementPolicyReload {
+    active_policy: ActiveEnforcementPolicy,
+}
+
+impl PreparedEnforcementPolicyReload {
+    pub(crate) async fn commit(
+        self,
+        runtime_state: &EnforcementRuntimeState,
+        gate: &EnforcementReloadGate,
+    ) -> EnforcementReloadSummary {
+        let _reload_guard = gate.inner.lock().await;
+        self.commit_with_gate_held(runtime_state)
+    }
+
+    fn commit_with_gate_held(
+        self,
+        runtime_state: &EnforcementRuntimeState,
+    ) -> EnforcementReloadSummary {
+        runtime_state.replace(self.active_policy.clone());
+        EnforcementReloadSummary {
+            active_policy: self.active_policy,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum EnforcementReloadError {
     #[error("enforcement runtime state is not available")]
@@ -54,20 +79,24 @@ pub(crate) async fn reload_enforcement_policy(
     runtime_state: Option<&EnforcementRuntimeState>,
     gate: &EnforcementReloadGate,
 ) -> Result<EnforcementReloadSummary, EnforcementReloadError> {
-    validate_enforcement_policy_reload_plan(plan)?;
     let runtime_state = runtime_state.ok_or(EnforcementReloadError::RuntimeStateUnavailable)?;
     let _reload_guard = gate.inner.lock().await;
-    let loaded = load_configured_enforcement_policy_runtime(
+    let prepared = prepare_enforcement_policy_reload(plan).await?;
+    Ok(prepared.commit_with_gate_held(runtime_state))
+}
+
+pub(crate) async fn prepare_enforcement_policy_reload(
+    plan: &RuntimePlan,
+) -> Result<PreparedEnforcementPolicyReload, EnforcementReloadError> {
+    validate_enforcement_policy_reload_plan(plan)?;
+    let active_policy = load_configured_enforcement_policy_runtime(
         plan.config.enforcement.selector.clone(),
         &plan.config.selectors,
         &plan.enforcement.policy_source,
         enforcement_policy_source_load_context_from_plan(plan),
     )
     .await?;
-    runtime_state.replace(loaded.clone());
-    Ok(EnforcementReloadSummary {
-        active_policy: loaded,
-    })
+    Ok(PreparedEnforcementPolicyReload { active_policy })
 }
 
 fn reject_setup_time_interception_reload(plan: &RuntimePlan) -> Result<(), EnforcementReloadError> {
@@ -161,6 +190,52 @@ mod tests {
         let decision = enforcement_decision(&mut planner_view, Action::Deny, 80)?;
         assert_eq!(decision.outcome, EnforcementOutcome::DryRun);
         assert!(decision.selector_matched);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn standalone_reload_reads_manifest_after_reload_gate_opens()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let manifest_path = temp.path().join("enforcement.toml");
+        write_enforcement_manifest(&manifest_path, "old", 80, Action::Deny)?;
+        let mut config = config_with_storage_path(temp.path().join("spool"));
+        config.enforcement.mode = EnforcementMode::DryRun;
+        config.enforcement.policy.source = EnforcementPolicySourceConfig::File {
+            path: manifest_path.clone(),
+        };
+        let plan = RuntimePlan::build(config, &replay_registry())?;
+        let configured = crate::configured_enforcement::build_configured_enforcement_with_backend(
+            &plan,
+            None,
+            crate::configured_enforcement::EnforcementPolicySourceLoadContext::default(),
+        )
+        .await?;
+        let (_, runtime_state) =
+            EnforcementRuntimeState::from_planner(configured.planner, configured.active_policy);
+        let gate = EnforcementReloadGate::default();
+        let gate_guard = gate.inner.lock().await;
+
+        let reload = reload_enforcement_policy(&plan, Some(&runtime_state), &gate);
+        tokio::pin!(reload);
+        tokio::select! {
+            _ = &mut reload => panic!("reload should wait for the reload gate"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+        write_enforcement_manifest(&manifest_path, "new", 443, Action::Deny)?;
+        drop(gate_guard);
+
+        let summary = reload.await?;
+
+        assert_eq!(
+            summary
+                .active_policy
+                .policy_source()
+                .expect("reloaded policy should keep source details")
+                .manifest
+                .version,
+            "new"
+        );
         Ok(())
     }
 
