@@ -351,6 +351,42 @@ impl TrafficState {
         &self.rows
     }
 
+    #[cfg(test)]
+    pub(crate) fn seed_capture_loss_row_for_test(&mut self) {
+        let event = probe_core::EventEnvelope::from_provider(
+            probe_core::Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            probe_core::CaptureOrigin::from_source(probe_core::CaptureSource::Replay),
+            "test",
+            probe_core::EventKind::CaptureLoss(probe_core::CaptureLoss {
+                lost_events: 1,
+                reason: "seeded traffic row".to_string(),
+            }),
+        );
+        self.apply_snapshot(EventTailSnapshot {
+            after_sequence: 0,
+            next_after_sequence: 1,
+            last_export_sequence: 1,
+            attribution_mode: EventTailAttributionMode::Strict,
+            limit: 1,
+            scanned: 1,
+            budget: crate::admin::EventTailBudgetSnapshot {
+                max_event_payload_bytes: 512,
+                max_record_bytes: 4096,
+                included_record_bytes: 0,
+                truncated: false,
+            },
+            events: vec![crate::admin::EventTailRecord {
+                sequence: 1,
+                stored_at_unix_ns: 1,
+                event: crate::admin::EventTailEvent::from_envelope(&event),
+            }],
+            omissions: Vec::new(),
+        });
+    }
+
     pub(crate) fn selected_index(&self) -> usize {
         self.event_view.selected_index()
     }
@@ -682,6 +718,10 @@ impl TrafficState {
     pub(crate) fn mark_admin_unavailable(&mut self, message: impl Into<String>) {
         self.clear_detail_state();
         self.status = TrafficStatus::error(message);
+    }
+
+    pub(crate) fn mark_refresh_paused(&mut self, message: impl Into<String>) {
+        self.status = TrafficStatus::warning(message);
     }
 
     pub(crate) fn cycle_event_filter(&mut self) {
@@ -1685,6 +1725,18 @@ mod tests {
 
         assert_eq!(traffic.status().kind, TrafficStatusKind::Error);
         assert_eq!(traffic.status().text, "tail_events failed");
+    }
+
+    #[test]
+    fn refresh_pause_preserves_existing_traffic_rows() {
+        let mut traffic = TrafficState::default();
+        traffic.apply_snapshot(tail_snapshot_with_http_exchange());
+
+        traffic.mark_refresh_paused("No readable process entries are available");
+
+        assert_eq!(traffic.status().kind, TrafficStatusKind::Warning);
+        assert_eq!(traffic.rows().len(), 4);
+        assert_eq!(traffic.http_exchanges().len(), 1);
     }
 
     #[test]

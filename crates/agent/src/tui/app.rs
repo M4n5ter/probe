@@ -141,6 +141,14 @@ struct TrafficRefreshIdentity {
     selector_key: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrafficFilterSelector {
+    Ready(probe_core::Selector),
+    NoProcessCatalogEntries,
+    NoSelectedProcess,
+    UnavailableSelectedProcess,
+}
+
 #[derive(Debug)]
 pub(crate) struct TrafficRefreshLoadRequest {
     identity: TrafficRefreshIdentity,
@@ -784,14 +792,20 @@ impl TuiApp {
             return None;
         };
         let selector = match self.traffic_filter_selector() {
-            Some(selector) => selector,
-            None if self.processes.entries().is_empty() => {
-                let message = "No readable process is selected; traffic filter was not changed";
+            TrafficFilterSelector::Ready(selector) => selector,
+            TrafficFilterSelector::NoProcessCatalogEntries => {
+                let message = "No readable process entries are available; keeping the current traffic view unchanged";
+                self.traffic.mark_refresh_paused(message);
+                self.status = StatusMessage::warning(message);
+                return None;
+            }
+            TrafficFilterSelector::NoSelectedProcess => {
+                let message = "No process is selected; traffic filter was not changed";
                 self.traffic.mark_filter_unavailable(message);
                 self.status = StatusMessage::warning(message);
                 return None;
             }
-            None => {
+            TrafficFilterSelector::UnavailableSelectedProcess => {
                 let message = "Selected process has no readable executable path; traffic filter was not changed";
                 self.traffic.mark_filter_unavailable(message);
                 self.status = StatusMessage::warning(message);
@@ -866,9 +880,11 @@ impl TuiApp {
     fn is_current_traffic_refresh_identity(&self, identity: &TrafficRefreshIdentity) -> bool {
         self.runtime_epoch == identity.runtime_epoch
             && self.runtime_attachment.active_socket_path() == Some(identity.socket_path.as_path())
-            && self
-                .traffic_filter_selector()
-                .is_some_and(|selector| traffic_selector_key(&selector) == identity.selector_key)
+            && matches!(
+                self.traffic_filter_selector(),
+                TrafficFilterSelector::Ready(selector)
+                    if traffic_selector_key(&selector) == identity.selector_key
+            )
     }
 
     fn bump_runtime_epoch(&mut self) {
@@ -1233,8 +1249,8 @@ impl TuiApp {
             .get(self.process_view.selected_index()?)
     }
 
-    fn traffic_filter_selector(&self) -> Option<probe_core::Selector> {
-        let selectors = self
+    fn traffic_filter_selector(&self) -> TrafficFilterSelector {
+        let mut selectors = self
             .process_view
             .monitored_exe_paths()
             .iter()
@@ -1242,9 +1258,37 @@ impl TuiApp {
             .map(selector_for_exe_path)
             .collect::<Vec<_>>();
         match selectors.len() {
-            0 => self.selected_process_selector(),
-            1 => selectors.into_iter().next(),
-            _ => Some(probe_core::Selector::Any { selectors }),
+            1 => {
+                return TrafficFilterSelector::Ready(
+                    selectors
+                        .pop()
+                        .expect("selector vector has one element after length check"),
+                );
+            }
+            count if count > 1 => {
+                return TrafficFilterSelector::Ready(probe_core::Selector::Any { selectors });
+            }
+            _ => {}
+        }
+        if self.processes.entries().is_empty() {
+            return TrafficFilterSelector::NoProcessCatalogEntries;
+        }
+        let Some(process) = self.selected_process() else {
+            return TrafficFilterSelector::NoSelectedProcess;
+        };
+        process
+            .selector()
+            .map(TrafficFilterSelector::Ready)
+            .unwrap_or(TrafficFilterSelector::UnavailableSelectedProcess)
+    }
+
+    #[cfg(test)]
+    fn ready_traffic_filter_selector(&self) -> Option<probe_core::Selector> {
+        match self.traffic_filter_selector() {
+            TrafficFilterSelector::Ready(selector) => Some(selector),
+            TrafficFilterSelector::NoProcessCatalogEntries
+            | TrafficFilterSelector::NoSelectedProcess
+            | TrafficFilterSelector::UnavailableSelectedProcess => None,
         }
     }
 
@@ -1908,7 +1952,8 @@ mod tests {
         assert!(app.process_is_monitored(1));
         assert_eq!(app.config.observations.len(), 2);
         assert_eq!(app.traffic_filter_label(), "2 watched processes");
-        let Some(probe_core::Selector::Any { selectors }) = app.traffic_filter_selector() else {
+        let Some(probe_core::Selector::Any { selectors }) = app.ready_traffic_filter_selector()
+        else {
             panic!("multiple watched processes should use any selector");
         };
         assert_eq!(selectors.len(), 2);
@@ -2031,7 +2076,7 @@ mod tests {
 
         assert!(!app.process_is_monitored(0));
         assert_eq!(app.traffic_filter_label(), "focused process: python");
-        let Some(probe_core::Selector::Match { term }) = app.traffic_filter_selector() else {
+        let Some(probe_core::Selector::Match { term }) = app.ready_traffic_filter_selector() else {
             panic!("traffic selector should fall back to the focused process");
         };
         assert_eq!(
@@ -2090,12 +2135,20 @@ mod tests {
     }
 
     #[test]
-    fn traffic_view_fails_closed_when_no_process_selector_is_available() {
+    fn traffic_view_fails_closed_when_selected_process_has_no_selector() {
         let config = AgentConfig::default();
         let mut app = TuiApp::new(
             PathBuf::from("/tmp/agent.toml"),
             config,
-            ProcessCatalog::default(),
+            ProcessCatalog::from_entries([ProcessEntry {
+                pid: 42,
+                name: "python".to_string(),
+                exe_path: None,
+                argv: vec!["python".to_string()],
+                uid: 1000,
+                gid: 1000,
+                cgroup_path: None,
+            }]),
         );
         app.attach_agent(RuntimeAttachment::existing(PathBuf::from(
             "/tmp/missing-admin.sock",
@@ -2110,7 +2163,38 @@ mod tests {
         assert!(
             app.status()
                 .text
-                .contains("No readable process is selected")
+                .contains("Selected process has no readable executable path")
+        );
+    }
+
+    #[test]
+    fn traffic_selector_resolution_distinguishes_empty_catalog_from_unavailable_process() {
+        let empty_catalog = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::default(),
+        );
+        assert_eq!(
+            empty_catalog.traffic_filter_selector(),
+            TrafficFilterSelector::NoProcessCatalogEntries
+        );
+
+        let unavailable = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::from_entries([ProcessEntry {
+                pid: 42,
+                name: "python".to_string(),
+                exe_path: None,
+                argv: vec!["python".to_string()],
+                uid: 1000,
+                gid: 1000,
+                cgroup_path: None,
+            }]),
+        );
+        assert_eq!(
+            unavailable.traffic_filter_selector(),
+            TrafficFilterSelector::UnavailableSelectedProcess
         );
     }
 
@@ -2324,6 +2408,30 @@ mod tests {
             .traffic_popup_view()
             .expect("data path popup should be open");
         assert!(popup.lines.iter().any(|line| line == "selected: replay"));
+    }
+
+    #[test]
+    fn traffic_refresh_without_process_catalog_preserves_current_view() {
+        let mut app = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::default(),
+        );
+        app.attach_agent(RuntimeAttachment::existing(PathBuf::from(
+            "/tmp/admin.sock",
+        )));
+        app.traffic.seed_capture_loss_row_for_test();
+        assert_eq!(app.traffic().rows().len(), 1);
+
+        let request = app.begin_traffic_refresh();
+
+        assert!(request.is_none());
+        assert_eq!(app.traffic().rows().len(), 1);
+        assert_eq!(app.status().kind, StatusKind::Warning);
+        assert_eq!(
+            app.status().text,
+            "No readable process entries are available; keeping the current traffic view unchanged"
+        );
     }
 
     fn test_app() -> TuiApp {

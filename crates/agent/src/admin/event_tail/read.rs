@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use probe_core::{CaptureSource, CompiledSelector, Direction, EventType, FlowContext, Selector};
 use storage::{FjallSpool, StoredEvent};
 
@@ -11,11 +13,13 @@ use super::{
 };
 
 const MAX_TAIL_LIMIT: usize = 256;
-const MAX_TAIL_SCAN: usize = 2_048;
+const MAX_TAIL_LIVE_SCAN: usize = 4_096;
+const MAX_TAIL_LATEST_SCAN: usize = 16_384;
 const MAX_TAIL_EVENT_PAYLOAD_BYTES: usize = MAX_EVENT_DETAIL_PAYLOAD_BYTES;
 const MAX_TAIL_RECORD_BYTES: usize = 2 * 1024 * 1024;
 const MAX_EVENT_DETAIL_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
-const SELECTOR_SCAN_MULTIPLIER: usize = 8;
+const LIVE_SELECTOR_SCAN_MULTIPLIER: usize = 16;
+const LATEST_SELECTOR_SCAN_MULTIPLIER: usize = 64;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::admin) struct EventTailRequest {
     pub(in crate::admin) after_sequence: u64,
@@ -31,7 +35,7 @@ pub(in crate::admin) fn read_event_tail(
 ) -> Result<EventTailSnapshot, EventTailError> {
     let limit = normalize_limit(request.limit);
     let filtered = request.selector.is_some() || !request.event_types.is_empty();
-    let scan_limit = scan_limit(limit, filtered);
+    let scan_limit = scan_limit(limit, filtered, request.latest);
     let selector = request
         .selector
         .as_ref()
@@ -43,19 +47,15 @@ pub(in crate::admin) fn read_event_tail(
     let after_sequence = effective_after_sequence(&request, scan_limit, last_export_sequence);
     let stored = spool.read_export_batch_after(after_sequence, scan_limit)?;
     let mut next_after_sequence = after_sequence;
-    let mut events = Vec::new();
-    let mut omissions = Vec::new();
-    let mut included_record_bytes = 0_usize;
-    let mut truncated = false;
-    let mut scanned = 0;
+    let mut tail = TailRecordAccumulator::new(limit, request.latest && filtered);
 
     for stored_event in stored {
-        scanned += 1;
+        tail.observe_scanned();
         next_after_sequence = stored_event.sequence;
         let payload_bytes = stored_event.payload.bytes().len();
         if payload_bytes > MAX_TAIL_EVENT_PAYLOAD_BYTES {
             if !filtered {
-                omissions.push(omission_for(
+                tail.push_omission(omission_for(
                     &stored_event,
                     EventTailOmissionReason::EventTooLarge,
                 ));
@@ -68,25 +68,14 @@ pub(in crate::admin) fn read_event_tail(
             && selector.as_ref().is_none_or(|selector| {
                 selector_matches_event(selector, &record.event, request.attribution_mode)
             })
+            && tail.push_record(record, payload_schema, payload_bytes)?
         {
-            let record_bytes = tail_record_budget_bytes(&record)?;
-            if included_record_bytes.saturating_add(record_bytes) > MAX_TAIL_RECORD_BYTES {
-                omissions.push(EventTailOmission {
-                    sequence: record.sequence,
-                    stored_at_unix_ns: record.stored_at_unix_ns,
-                    payload_schema,
-                    payload_bytes,
-                    reason: EventTailOmissionReason::ResponseBudgetExceeded,
-                });
-                truncated = true;
-                break;
-            }
-            included_record_bytes = included_record_bytes.saturating_add(record_bytes);
-            events.push(record);
-        }
-        if events.len() >= limit {
             break;
         }
+    }
+    let tail = tail.into_response()?;
+    if let Some(sequence) = tail.truncated_at_sequence {
+        next_after_sequence = sequence;
     }
 
     Ok(EventTailSnapshot {
@@ -95,20 +84,117 @@ pub(in crate::admin) fn read_event_tail(
         last_export_sequence,
         attribution_mode: request.attribution_mode,
         limit,
-        scanned,
+        scanned: tail.scanned,
         budget: EventTailBudgetSnapshot {
             max_event_payload_bytes: MAX_TAIL_EVENT_PAYLOAD_BYTES,
             max_record_bytes: MAX_TAIL_RECORD_BYTES,
-            included_record_bytes,
-            truncated,
+            included_record_bytes: tail.included_record_bytes,
+            truncated: tail.truncated,
         },
-        events,
-        omissions,
+        events: tail.events,
+        omissions: tail.omissions,
     })
 }
 
 fn tail_record_budget_bytes(record: &EventTailRecord) -> Result<usize, EventTailError> {
     Ok(serde_json::to_vec(record)?.len())
+}
+
+struct TailRecordAccumulator {
+    limit: usize,
+    latest_filtered: bool,
+    scanned: usize,
+    included_record_bytes: usize,
+    truncated: bool,
+    truncated_at_sequence: Option<u64>,
+    events: Vec<EventTailRecord>,
+    latest_candidates: VecDeque<TailRecordCandidate>,
+    omissions: Vec<EventTailOmission>,
+}
+
+impl TailRecordAccumulator {
+    fn new(limit: usize, latest_filtered: bool) -> Self {
+        Self {
+            limit,
+            latest_filtered,
+            scanned: 0,
+            included_record_bytes: 0,
+            truncated: false,
+            truncated_at_sequence: None,
+            events: Vec::new(),
+            latest_candidates: VecDeque::new(),
+            omissions: Vec::new(),
+        }
+    }
+
+    fn observe_scanned(&mut self) {
+        self.scanned = self.scanned.saturating_add(1);
+    }
+
+    fn push_omission(&mut self, omission: EventTailOmission) {
+        self.omissions.push(omission);
+    }
+
+    fn push_record(
+        &mut self,
+        record: EventTailRecord,
+        payload_schema: String,
+        payload_bytes: usize,
+    ) -> Result<bool, EventTailError> {
+        let candidate = TailRecordCandidate {
+            record,
+            payload_schema,
+            payload_bytes,
+        };
+        if self.latest_filtered {
+            if self.latest_candidates.len() >= self.limit {
+                self.latest_candidates.pop_front();
+            }
+            self.latest_candidates.push_back(candidate);
+            return Ok(false);
+        }
+        self.push_response_candidate(candidate)
+    }
+
+    fn into_response(mut self) -> Result<Self, EventTailError> {
+        if self.latest_filtered {
+            let latest_candidates = std::mem::take(&mut self.latest_candidates);
+            for candidate in latest_candidates {
+                if self.push_response_candidate(candidate)? {
+                    break;
+                }
+            }
+        }
+        Ok(self)
+    }
+
+    fn push_response_candidate(
+        &mut self,
+        candidate: TailRecordCandidate,
+    ) -> Result<bool, EventTailError> {
+        let record_bytes = tail_record_budget_bytes(&candidate.record)?;
+        if self.included_record_bytes.saturating_add(record_bytes) > MAX_TAIL_RECORD_BYTES {
+            self.omissions.push(EventTailOmission {
+                sequence: candidate.record.sequence,
+                stored_at_unix_ns: candidate.record.stored_at_unix_ns,
+                payload_schema: candidate.payload_schema,
+                payload_bytes: candidate.payload_bytes,
+                reason: EventTailOmissionReason::ResponseBudgetExceeded,
+            });
+            self.truncated = true;
+            self.truncated_at_sequence = Some(candidate.record.sequence);
+            return Ok(true);
+        }
+        self.included_record_bytes = self.included_record_bytes.saturating_add(record_bytes);
+        self.events.push(candidate.record);
+        Ok(self.events.len() >= self.limit)
+    }
+}
+
+struct TailRecordCandidate {
+    record: EventTailRecord,
+    payload_schema: String,
+    payload_bytes: usize,
 }
 
 fn selector_matches_event(
@@ -205,14 +291,16 @@ fn normalize_limit(limit: usize) -> usize {
     limit.clamp(1, MAX_TAIL_LIMIT)
 }
 
-fn scan_limit(limit: usize, filtered: bool) -> usize {
-    if filtered {
-        limit
-            .saturating_mul(SELECTOR_SCAN_MULTIPLIER)
-            .clamp(limit, MAX_TAIL_SCAN)
-    } else {
-        limit
+fn scan_limit(limit: usize, filtered: bool, latest: bool) -> usize {
+    if !filtered {
+        return limit;
     }
+    let (multiplier, max_scan) = if latest {
+        (LATEST_SELECTOR_SCAN_MULTIPLIER, MAX_TAIL_LATEST_SCAN)
+    } else {
+        (LIVE_SELECTOR_SCAN_MULTIPLIER, MAX_TAIL_LIVE_SCAN)
+    };
+    limit.saturating_mul(multiplier).clamp(limit, max_scan)
 }
 
 fn omission_for(stored: &StoredEvent, reason: EventTailOmissionReason) -> EventTailOmission {
@@ -392,16 +480,22 @@ mod tests {
     }
 
     #[test]
-    fn latest_tail_starts_from_recent_export_window() -> Result<(), Box<dyn std::error::Error>> {
+    fn latest_filtered_tail_uses_wider_backfill_window() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
         let spool = FjallSpool::open(temp.path())?;
-        for _ in 0..32 {
+        for _ in 0..79 {
             ExportEventWriter::new(&spool).append_occurrence(&event_with_kind(
                 "/usr/bin/curl",
                 EventKind::ConnectionOpened,
             ))?;
         }
         ExportEventWriter::new(&spool).append_occurrence(&event_for_exe("/usr/bin/curl"))?;
+        for _ in 0..220 {
+            ExportEventWriter::new(&spool).append_occurrence(&event_with_kind(
+                "/usr/bin/curl",
+                EventKind::ConnectionOpened,
+            ))?;
+        }
 
         let tail = read_event_tail(
             &spool,
@@ -415,11 +509,87 @@ mod tests {
             },
         )?;
 
-        assert_eq!(tail.after_sequence, 1);
-        assert_eq!(tail.next_after_sequence, 33);
-        assert_eq!(tail.last_export_sequence, 33);
+        assert_eq!(tail.after_sequence, 44);
+        assert_eq!(tail.next_after_sequence, 300);
+        assert_eq!(tail.last_export_sequence, 300);
+        assert_eq!(tail.scanned, 256);
         assert_eq!(tail.events.len(), 1);
-        assert_eq!(tail.events[0].sequence, 33);
+        assert_eq!(tail.events[0].sequence, 80);
+        Ok(())
+    }
+
+    #[test]
+    fn latest_filtered_tail_returns_newest_matches_from_backfill_window()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        for _ in 0..300 {
+            ExportEventWriter::new(&spool).append_occurrence(&event_for_exe("/usr/bin/curl"))?;
+        }
+
+        let tail = read_event_tail(
+            &spool,
+            EventTailRequest {
+                after_sequence: 0,
+                latest: true,
+                limit: 4,
+                selector: None,
+                attribution_mode: EventTailAttributionMode::Strict,
+                event_types: vec![EventType::HttpRequestHeaders],
+            },
+        )?;
+
+        assert_eq!(tail.after_sequence, 44);
+        assert_eq!(tail.next_after_sequence, 300);
+        assert_eq!(tail.scanned, 256);
+        assert_eq!(
+            tail.events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![297, 298, 299, 300]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn latest_filtered_tail_budget_truncation_advances_to_omitted_candidate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        for _ in 0..296 {
+            ExportEventWriter::new(&spool).append_occurrence(&event_for_exe("/usr/bin/curl"))?;
+        }
+        ExportEventWriter::new(&spool).append_occurrence(&large_header_event_for_exe(
+            "/usr/bin/curl",
+            MAX_TAIL_RECORD_BYTES + 1024,
+        ))?;
+        for _ in 0..3 {
+            ExportEventWriter::new(&spool).append_occurrence(&event_for_exe("/usr/bin/curl"))?;
+        }
+
+        let tail = read_event_tail(
+            &spool,
+            EventTailRequest {
+                after_sequence: 0,
+                latest: true,
+                limit: 4,
+                selector: None,
+                attribution_mode: EventTailAttributionMode::Strict,
+                event_types: vec![EventType::HttpRequestHeaders],
+            },
+        )?;
+
+        assert_eq!(tail.after_sequence, 44);
+        assert_eq!(tail.next_after_sequence, 297);
+        assert!(tail.events.is_empty());
+        assert!(tail.budget.truncated);
+        assert_eq!(tail.omissions.len(), 1);
+        assert_eq!(tail.omissions[0].sequence, 297);
+        assert_eq!(
+            tail.omissions[0].reason,
+            EventTailOmissionReason::ResponseBudgetExceeded
+        );
         Ok(())
     }
 
@@ -599,6 +769,22 @@ mod tests {
                 reason: None,
                 version: "HTTP/1.1".to_string(),
                 headers: Vec::new(),
+            }),
+        )
+    }
+
+    fn large_header_event_for_exe(exe_path: &str, header_value_len: usize) -> EventEnvelope {
+        event_with_kind(
+            exe_path,
+            EventKind::HttpRequestHeaders(HttpHeaders {
+                direction: Direction::Outbound,
+                stream_sequence: 1,
+                method: Some("GET".to_string()),
+                target: Some("/large".to_string()),
+                status: None,
+                reason: None,
+                version: "HTTP/1.1".to_string(),
+                headers: vec![("x-large".to_string(), "a".repeat(header_value_len))],
             }),
         )
     }
