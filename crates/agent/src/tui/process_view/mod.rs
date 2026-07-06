@@ -66,6 +66,15 @@ impl ProcessViewState {
             .into_iter()
             .filter(|exe_path| live_keys.contains(exe_path))
             .collect();
+        if self.filter.is_empty()
+            && let Some(index) = catalog
+                .entries()
+                .iter()
+                .position(|entry| self.monitors_process(entry.selector_key().as_deref()))
+        {
+            self.selected_index = Some(index);
+            self.keep_selected_visible(catalog);
+        }
     }
 
     pub(crate) fn set_viewport_rows(&mut self, rows: usize, catalog: &ProcessCatalog) {
@@ -194,4 +203,42 @@ fn offset_index(index: usize, len: usize, delta: isize) -> usize {
     }
     let raw = index as isize + delta;
     raw.clamp(0, len.saturating_sub(1) as isize) as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::tui::processes::ProcessEntry;
+
+    #[test]
+    fn replace_monitors_selects_and_reveals_configured_process() {
+        let catalog = ProcessCatalog::from_entries([
+            process(1, "alpha", "/usr/bin/alpha"),
+            process(2, "beta", "/usr/bin/beta"),
+            process(3, "gamma", "/usr/bin/gamma"),
+            process(4, "backend", "/app/backend"),
+        ]);
+        let mut view = ProcessViewState::default();
+        view.set_viewport_rows(2, &catalog);
+
+        view.replace_monitors(["/app/backend".to_string()], &catalog);
+
+        assert_eq!(view.selected_index(), Some(3));
+        assert_eq!(view.scroll(), 2);
+        assert!(view.monitors_process(Some("/app/backend")));
+    }
+
+    fn process(pid: u32, name: &str, exe_path: &str) -> ProcessEntry {
+        ProcessEntry {
+            pid,
+            name: name.to_string(),
+            exe_path: Some(PathBuf::from(exe_path)),
+            argv: Vec::new(),
+            uid: 1000,
+            gid: 1000,
+            cgroup_path: None,
+        }
+    }
 }

@@ -707,7 +707,7 @@ impl TuiApp {
         };
     }
 
-    fn select_tab(&mut self, tab: TuiTab) {
+    pub(crate) fn select_tab(&mut self, tab: TuiTab) {
         self.active_tab = tab;
         self.selected_field_index = 0;
         self.clamp_selection();
@@ -2253,6 +2253,7 @@ mod tests {
 
         assert!(!app.process_is_monitored(0));
         assert!(app.process_is_monitored(1));
+        assert_eq!(app.selected_process_index(), Some(1));
         assert_eq!(app.traffic_filter_label(), "1 watched processes");
     }
 
@@ -2267,6 +2268,7 @@ mod tests {
 
         assert!(!app.process_is_monitored(0));
         assert!(app.process_is_monitored(1));
+        assert_eq!(app.selected_process_index(), Some(1));
         assert_eq!(app.traffic_filter_label(), "1 watched processes");
     }
 

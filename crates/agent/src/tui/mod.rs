@@ -20,11 +20,14 @@ mod runtime_actions;
 mod runtime_attachment;
 mod runtime_reconcile;
 mod runtime_status;
+mod snapshot;
 mod terminal;
 mod text;
 mod traffic;
 mod traffic_detail_task;
 mod wire;
 
+pub(crate) use app::TuiTab;
 pub(crate) use config_edit::TuiError;
+pub(crate) use snapshot::{TuiSnapshotOptions, run_tui_snapshot};
 pub(crate) use terminal::{TuiOptions, run_tui};

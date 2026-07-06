@@ -32,7 +32,7 @@ use crate::{
         capability_matrix_for_config,
     },
     status::{build_status_snapshot, collect_spool_status},
-    tui::{TuiOptions, run_tui},
+    tui::{TuiOptions, TuiSnapshotOptions, TuiTab, run_tui, run_tui_snapshot},
 };
 
 use super::admin::{AdminCliCommand, run_admin_command};
@@ -72,6 +72,14 @@ enum Command {
     Tui {
         #[arg(long)]
         config: Option<PathBuf>,
+        #[arg(long)]
+        snapshot: bool,
+        #[arg(long, default_value_t = 120, requires = "snapshot")]
+        width: u16,
+        #[arg(long, default_value_t = 36, requires = "snapshot")]
+        height: u16,
+        #[arg(long, default_value = "traffic", requires = "snapshot")]
+        tab: CliTuiTab,
     },
     Admin {
         #[arg(
@@ -114,6 +122,35 @@ impl From<CliDirection> for Direction {
         match value {
             CliDirection::Inbound => Self::Inbound,
             CliDirection::Outbound => Self::Outbound,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliTuiTab {
+    Overview,
+    Traffic,
+    Capture,
+    Processes,
+    Runtime,
+    Export,
+    Storage,
+    Enforcement,
+    Tls,
+}
+
+impl From<CliTuiTab> for TuiTab {
+    fn from(value: CliTuiTab) -> Self {
+        match value {
+            CliTuiTab::Overview => Self::Overview,
+            CliTuiTab::Traffic => Self::Traffic,
+            CliTuiTab::Capture => Self::Capture,
+            CliTuiTab::Processes => Self::Processes,
+            CliTuiTab::Runtime => Self::Runtime,
+            CliTuiTab::Export => Self::Export,
+            CliTuiTab::Storage => Self::Storage,
+            CliTuiTab::Enforcement => Self::Enforcement,
+            CliTuiTab::Tls => Self::Tls,
         }
     }
 }
@@ -212,8 +249,24 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             let snapshot = build_status_snapshot(&plan, spool_status);
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
         }
-        Command::Tui { config } => {
-            run_tui(TuiOptions { config }).await?;
+        Command::Tui {
+            config,
+            snapshot,
+            width,
+            height,
+            tab,
+        } => {
+            if snapshot {
+                run_tui_snapshot(TuiSnapshotOptions {
+                    config,
+                    width,
+                    height,
+                    tab: tab.into(),
+                })
+                .await?;
+            } else {
+                run_tui(TuiOptions { config }).await?;
+            }
         }
         Command::Admin { socket, command } => {
             let socket = resolve_admin_socket(socket);
@@ -565,7 +618,50 @@ mod tests {
     fn tui_cli_accepts_missing_config_path() {
         let cli = Cli::try_parse_from(["traffic-probe", "tui"]).expect("TUI config is optional");
 
-        assert!(matches!(cli.command, Command::Tui { config: None }));
+        assert!(matches!(cli.command, Command::Tui { config: None, .. }));
+    }
+
+    #[test]
+    fn tui_cli_accepts_snapshot_render_options() {
+        let cli = Cli::try_parse_from([
+            "traffic-probe",
+            "tui",
+            "--snapshot",
+            "--tab",
+            "traffic",
+            "--width",
+            "157",
+            "--height",
+            "45",
+        ])
+        .expect("TUI snapshot options should parse");
+
+        let Command::Tui {
+            snapshot,
+            width,
+            height,
+            tab,
+            ..
+        } = cli.command
+        else {
+            panic!("expected TUI command");
+        };
+
+        assert!(snapshot);
+        assert_eq!(width, 157);
+        assert_eq!(height, 45);
+        assert_eq!(tab, CliTuiTab::Traffic);
+    }
+
+    #[test]
+    fn tui_cli_rejects_snapshot_options_without_snapshot_mode() {
+        for args in [
+            ["traffic-probe", "tui", "--tab", "traffic"],
+            ["traffic-probe", "tui", "--width", "157"],
+            ["traffic-probe", "tui", "--height", "45"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
     }
 
     #[test]
