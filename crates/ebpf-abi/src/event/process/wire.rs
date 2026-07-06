@@ -1,8 +1,8 @@
 use super::super::common::{
-    EBPF_EVENT_HEADER_BYTES, EbpfEventDecodeError, EbpfEventHeader, EbpfEventKind,
-    decode_event_header, encode_event_header, read_i32, read_u16, read_u32, read_u64,
-    validate_event_header, validate_expected_event_kind, validate_record_len, write_i32, write_u16,
-    write_u32, write_u64,
+    EBPF_EVENT_HEADER_BYTES, EBPF_PAYLOAD_SAMPLE_BYTES, EbpfEventDecodeError, EbpfEventHeader,
+    EbpfEventKind, decode_event_header, encode_event_header, read_i32, read_u16, read_u32,
+    read_u64, validate_event_header, validate_expected_event_kind, validate_record_len, write_i32,
+    write_u16, write_u32, write_u64,
 };
 
 pub const EBPF_PROCESS_PROBE_MAX_RECORD_BYTES: usize = max_record_bytes([
@@ -26,7 +26,7 @@ pub const EBPF_PROCESS_LIFECYCLE_RECORD_BYTES: usize =
     core::mem::size_of::<EbpfProcessLifecycleRecord>();
 pub const EBPF_SOCKET_WRITE_SAMPLE_RECORD_BYTES: usize =
     core::mem::size_of::<EbpfSocketWriteSampleRecord>();
-pub const EBPF_SOCKET_WRITE_SAMPLE_BYTES: usize = 16 * 1024;
+pub const EBPF_SOCKET_WRITE_SAMPLE_BYTES: usize = EBPF_PAYLOAD_SAMPLE_BYTES;
 pub const EBPF_SOCKET_READ_SAMPLE_RECORD_BYTES: usize =
     core::mem::size_of::<EbpfSocketReadSampleRecord>();
 pub const EBPF_SOCKET_READ_SAMPLE_BYTES: usize = EBPF_SOCKET_WRITE_SAMPLE_BYTES;

@@ -1,11 +1,11 @@
 use super::super::common::{
-    EBPF_EVENT_HEADER_BYTES, EbpfEventDecodeError, EbpfEventHeader, EbpfEventKind,
-    decode_record_header, encode_event_header, read_i32, read_u16, read_u32, read_u64,
-    validate_event_header, validate_expected_event_kind, validate_record_len, write_i32, write_u16,
-    write_u32, write_u64,
+    EBPF_EVENT_HEADER_BYTES, EBPF_PAYLOAD_SAMPLE_BYTES, EbpfEventDecodeError, EbpfEventHeader,
+    EbpfEventKind, decode_record_header, encode_event_header, read_i32, read_u16, read_u32,
+    read_u64, validate_event_header, validate_expected_event_kind, validate_record_len, write_i32,
+    write_u16, write_u32, write_u64,
 };
 
-pub const EBPF_TLS_PLAINTEXT_SAMPLE_BYTES: usize = 256;
+pub const EBPF_TLS_PLAINTEXT_SAMPLE_BYTES: usize = EBPF_PAYLOAD_SAMPLE_BYTES;
 pub const EBPF_TLS_PLAINTEXT_EVENT_BYTES: usize = core::mem::size_of::<EbpfTlsPlaintextEvent>();
 pub const EBPF_TLS_PLAINTEXT_FD_VALID: u16 = 1 << 0;
 pub const EBPF_TLS_PLAINTEXT_TRUNCATED: u16 = 1 << 1;
@@ -276,17 +276,31 @@ fn encode_tls_plaintext_observation(bytes: &mut [u8], observation: EbpfTlsPlaint
 mod tests {
     use core::mem::{align_of, offset_of, size_of};
 
-    use crate::event::{EBPF_ABI_REVISION, EBPF_MAGIC};
+    use crate::event::{EBPF_ABI_REVISION, EBPF_MAGIC, EBPF_SOCKET_WRITE_SAMPLE_BYTES};
 
     use super::*;
 
     #[test]
     fn tls_plaintext_event_layout_fits_ringbuf_alignment() {
-        assert_eq!(size_of::<EbpfTlsPlaintextObservation>(), 288);
+        assert_eq!(
+            size_of::<EbpfTlsPlaintextObservation>(),
+            OBSERVATION_PAYLOAD_OFFSET + EBPF_TLS_PLAINTEXT_SAMPLE_BYTES
+        );
         assert_eq!(align_of::<EbpfTlsPlaintextObservation>(), 8);
-        assert_eq!(size_of::<EbpfTlsPlaintextEvent>(), 336);
+        assert_eq!(
+            size_of::<EbpfTlsPlaintextEvent>(),
+            OBSERVATION_OFFSET + size_of::<EbpfTlsPlaintextObservation>()
+        );
         assert_eq!(align_of::<EbpfTlsPlaintextEvent>(), 8);
         assert_eq!(8 % align_of::<EbpfTlsPlaintextEvent>(), 0);
+    }
+
+    #[test]
+    fn tls_plaintext_sample_uses_process_payload_window() {
+        assert_eq!(
+            EBPF_TLS_PLAINTEXT_SAMPLE_BYTES,
+            EBPF_SOCKET_WRITE_SAMPLE_BYTES
+        );
     }
 
     #[test]
