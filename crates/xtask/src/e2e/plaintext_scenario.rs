@@ -128,8 +128,8 @@ impl PlaintextFeedCase {
         format!("external_plaintext_feed:{}", self.connection_id)
     }
 
-    pub(crate) fn process_exe_path(&self) -> &'static str {
-        self.flow.process.exe_path
+    pub(crate) fn process_exe_path(&self) -> &str {
+        &self.flow.process.exe_path
     }
 
     pub(crate) fn matches_export_flow(&self, envelope: &EventEnvelope) -> bool {
@@ -243,8 +243,8 @@ impl PlaintextFeedCase {
                 tgid: self.flow.process.pid,
                 start_time_ticks: self.flow.process.start_time_ticks,
                 boot_id: "boot".to_string(),
-                exe_path: self.flow.process.exe_path.to_string(),
-                cmdline_hash: self.flow.process.cmdline_hash.to_string(),
+                exe_path: self.flow.process.exe_path.clone(),
+                cmdline_hash: self.flow.process.cmdline_hash.clone(),
                 uid: 1000,
                 gid: 1000,
                 cgroup: None,
@@ -252,8 +252,8 @@ impl PlaintextFeedCase {
                 container_id: None,
                 runtime_hint: None,
             },
-            name: self.flow.process.name.to_string(),
-            cmdline: vec![self.flow.process.name.to_string()],
+            name: self.flow.process.name.clone(),
+            cmdline: vec![self.flow.process.name.clone()],
         };
         FlowContext {
             id: FlowIdentity(self.expected_flow_id()),
@@ -418,7 +418,7 @@ end
         ])
     }
 
-    pub(crate) fn process_exe_path(&self) -> &'static str {
+    pub(crate) fn process_exe_path(&self) -> &str {
         self.feed.process_exe_path()
     }
 }
@@ -535,25 +535,25 @@ impl Default for PlaintextFlow {
 pub(crate) struct PlaintextProcess {
     pid: u32,
     start_time_ticks: u64,
-    name: &'static str,
-    exe_path: &'static str,
-    cmdline_hash: &'static str,
+    name: String,
+    exe_path: String,
+    cmdline_hash: String,
 }
 
 impl PlaintextProcess {
     pub(crate) fn new(
         pid: u32,
         start_time_ticks: u64,
-        name: &'static str,
-        exe_path: &'static str,
-        cmdline_hash: &'static str,
+        name: impl Into<String>,
+        exe_path: impl Into<String>,
+        cmdline_hash: impl Into<String>,
     ) -> Self {
         Self {
             pid,
             start_time_ticks,
-            name,
-            exe_path,
-            cmdline_hash,
+            name: name.into(),
+            exe_path: exe_path.into(),
+            cmdline_hash: cmdline_hash.into(),
         }
     }
 }
@@ -563,9 +563,9 @@ impl Default for PlaintextProcess {
         Self {
             pid: 123,
             start_time_ticks: 456,
-            name: "traffic-probe-e2e",
-            exe_path: "/usr/bin/traffic-probe-e2e",
-            cmdline_hash: "hash",
+            name: "traffic-probe-e2e".to_string(),
+            exe_path: "/usr/bin/traffic-probe-e2e".to_string(),
+            cmdline_hash: "hash".to_string(),
         }
     }
 }

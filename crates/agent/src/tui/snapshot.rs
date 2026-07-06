@@ -13,8 +13,9 @@ use ratatui::{
 
 use super::{
     agent::TuiAgentSupervisor,
-    app::{TuiApp, TuiTab, load_traffic_refresh_with_diagnostics},
+    app::{TuiAction, TuiApp, TuiTab, load_traffic_refresh_with_diagnostics},
     config_edit::{TuiError, load_or_create_config},
+    hit::ScrollTarget,
     processes::ProcessCatalog,
     render::draw,
     traffic::load_traffic_detail,
@@ -32,6 +33,7 @@ pub(crate) struct TuiSnapshotOptions {
     pub(crate) height: u16,
     pub(crate) tab: TuiTab,
     pub(crate) open_detail: bool,
+    pub(crate) detail_scroll: usize,
 }
 
 pub(crate) async fn run_tui_snapshot(options: TuiSnapshotOptions) -> Result<(), TuiError> {
@@ -63,7 +65,13 @@ pub(crate) async fn run_tui_snapshot(options: TuiSnapshotOptions) -> Result<(), 
         open_selected_traffic_detail(&mut app).await;
     }
 
-    let output = render_snapshot_text(&mut app, width, height);
+    let output = if options.detail_scroll > 0 {
+        let _ = render_snapshot_text(&mut app, width, height);
+        scroll_open_detail(&mut app, options.detail_scroll);
+        render_snapshot_text(&mut app, width, height)
+    } else {
+        render_snapshot_text(&mut app, width, height)
+    };
     if let Some(supervisor) = supervisor.take() {
         supervisor.stop().await;
     }
@@ -97,6 +105,14 @@ async fn open_selected_traffic_detail(app: &mut TuiApp) {
         let result = load_traffic_detail(request).await;
         app.apply_traffic_detail_result(result);
     }
+}
+
+fn scroll_open_detail(app: &mut TuiApp, lines: usize) {
+    let delta = isize::try_from(lines).unwrap_or(isize::MAX);
+    app.handle_action(TuiAction::Scroll {
+        delta,
+        target: Some(ScrollTarget::TrafficPopup),
+    });
 }
 
 fn render_snapshot_text(app: &mut TuiApp, width: u16, height: u16) -> String {
@@ -167,6 +183,7 @@ mod tests {
             height: 1,
             tab: TuiTab::Traffic,
             open_detail: false,
+            detail_scroll: 0,
         };
 
         assert_eq!(options.size(), (MIN_SNAPSHOT_WIDTH, MIN_SNAPSHOT_HEIGHT));
@@ -180,6 +197,7 @@ mod tests {
             height: u16::MAX,
             tab: TuiTab::Traffic,
             open_detail: false,
+            detail_scroll: 0,
         };
 
         assert_eq!(options.size(), (MAX_SNAPSHOT_WIDTH, MAX_SNAPSHOT_HEIGHT));

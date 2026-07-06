@@ -83,6 +83,8 @@ enum Command {
         tab: CliTuiTab,
         #[arg(long, requires = "snapshot")]
         open_detail: bool,
+        #[arg(long, default_value_t = 0, requires = "open_detail")]
+        detail_scroll: usize,
     },
     Admin {
         #[arg(
@@ -259,6 +261,7 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             height,
             tab,
             open_detail,
+            detail_scroll,
         } => {
             if snapshot {
                 run_tui_snapshot(TuiSnapshotOptions {
@@ -267,6 +270,7 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
                     height,
                     tab: tab.into(),
                     open_detail,
+                    detail_scroll,
                 })
                 .await?;
             } else {
@@ -644,6 +648,8 @@ mod tests {
             "--height",
             "45",
             "--open-detail",
+            "--detail-scroll",
+            "12",
         ])
         .expect("TUI snapshot options should parse");
 
@@ -653,6 +659,7 @@ mod tests {
             height,
             tab,
             open_detail,
+            detail_scroll,
             ..
         } = cli.command
         else {
@@ -664,6 +671,7 @@ mod tests {
         assert_eq!(height, 45);
         assert_eq!(tab, CliTuiTab::Traffic);
         assert!(open_detail);
+        assert_eq!(detail_scroll, 12);
     }
 
     #[test]
@@ -685,6 +693,7 @@ mod tests {
             &["traffic-probe", "tui", "--width", "157"][..],
             &["traffic-probe", "tui", "--height", "45"][..],
             &["traffic-probe", "tui", "--open-detail"][..],
+            &["traffic-probe", "tui", "--detail-scroll", "12"][..],
         ] {
             assert!(Cli::try_parse_from(args).is_err());
         }

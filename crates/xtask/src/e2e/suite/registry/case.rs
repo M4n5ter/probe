@@ -73,6 +73,7 @@ use crate::e2e::{
         run_process_derived as run_transparent_tproxy_process_derived_loopback,
         run_process_scoped as run_transparent_tproxy_process_loopback,
     },
+    tui_plaintext_snapshot::run as run_tui_plaintext_snapshot,
     unix_http_exporter::run as run_unix_http_exporter,
     webhook_exporter::run as run_webhook_exporter,
     websocket_plaintext_feed::run as run_websocket_plaintext_feed,
@@ -241,6 +242,19 @@ pub(super) const E2E_CASES: &[E2eCase] = &[
             E2eCapability::AdminTail,
         ],
         run: E2eCaseRun::ExitCode(run_local_validation),
+    },
+    E2eCase {
+        name: "e2e-tui-plaintext-snapshot",
+        requirement: E2eRequirement::User,
+        capabilities: &[
+            E2eCapability::CaptureEventFeed,
+            E2eCapability::HttpParsing,
+            E2eCapability::LuaPolicyBundle,
+            E2eCapability::DurableSpoolExport,
+            E2eCapability::AdminTail,
+            E2eCapability::TuiTrafficView,
+        ],
+        run: E2eCaseRun::ExitCode(run_tui_plaintext_snapshot),
     },
     E2eCase {
         name: "e2e-product-mitm-proxy-local",
