@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 use probe_config::AgentConfig;
 
 use super::controls::{ControlId, FocusTarget, focus_targets_for_tab};
-use super::data_path::{DataPathCompactSummary, DataPathDiagnosticsView, DataPathOverviewLine};
+use super::data_path::{
+    DataPathCompactSummary, DataPathDiagnosticsView, DataPathOverviewLine,
+    classify_runtime_detach_message,
+};
 use super::fields::{
     FieldApplyOutcome, FieldId, apply_field, apply_text_field, editable_text_value,
 };
@@ -538,13 +541,19 @@ impl TuiApp {
     }
 
     pub(crate) fn detach_agent(&mut self, message: impl Into<String>) {
-        let status = StatusMessage::error(message);
+        let raw_message = message.into();
+        let failure_kind = classify_runtime_detach_message(&raw_message);
+        let status = StatusMessage::error(raw_message);
+        let reason = status.text.clone();
         self.runtime_attachment = RuntimeAttachment::lost(status.text.clone());
         self.runtime_generation_identity = None;
         self.runtime_generation_reload_pending = None;
         self.invalidate_runtime_reads();
+        self.data_path_diagnostics = match failure_kind {
+            Some(kind) => DataPathDiagnosticsView::unavailable_with_kind(kind, reason),
+            None => DataPathDiagnosticsView::unavailable(reason),
+        };
         self.status = status;
-        self.refresh_local_runtime_diagnostics();
     }
 
     pub(crate) fn note_runtime_config_reloaded(&mut self) {
@@ -818,7 +827,6 @@ impl TuiApp {
                 "No active agent admin socket is attached; {}",
                 self.runtime_agent_status()
             );
-            self.refresh_local_runtime_diagnostics();
             self.traffic.mark_admin_unavailable(message);
             self.status = StatusMessage::warning(self.traffic.status().text.clone());
             return None;
@@ -3022,6 +3030,44 @@ mod tests {
             .traffic_popup_view()
             .expect("data path popup should be open");
         assert!(popup.lines.iter().any(|line| line == "selected: replay"));
+    }
+
+    #[test]
+    fn traffic_refresh_after_runtime_failure_keeps_unavailable_data_path_diagnostics() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut config = AgentConfig::default();
+        config.storage.path = temp.path().join("spool");
+        let mut app = TuiApp::new(
+            temp.path().join("agent.toml"),
+            config,
+            ProcessCatalog::default(),
+        );
+
+        app.detach_agent(format!(
+            "managed agent failed: {}; libpcap socket: Operation not permitted",
+            "startup log ".repeat(80)
+        ));
+        let request = app.begin_traffic_refresh();
+
+        assert!(request.is_none());
+        assert_eq!(app.status().kind, StatusKind::Warning);
+        app.open_traffic_diagnostics();
+        let popup = app
+            .traffic_popup_view()
+            .expect("data path popup should be open");
+        assert!(
+            popup
+                .lines
+                .iter()
+                .any(|line| line == "Data path source: unavailable")
+        );
+        assert!(
+            popup
+                .lines
+                .iter()
+                .any(|line| line == "failure: kernel capture privileges are missing")
+        );
+        assert!(popup.lines.iter().any(|line| line.contains("CAP_NET_RAW")));
     }
 
     #[test]

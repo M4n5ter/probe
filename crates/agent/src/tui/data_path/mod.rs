@@ -6,22 +6,10 @@ use crate::tui::{
     text::terminal_safe_inline_text,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DataPathDiagnosticsSource {
-    RunningAgent,
-    LocalConfig,
-    Unavailable,
-}
+mod failure;
 
-impl DataPathDiagnosticsSource {
-    fn label(self) -> &'static str {
-        match self {
-            Self::RunningAgent => "running agent",
-            Self::LocalConfig => "local config",
-            Self::Unavailable => "unavailable",
-        }
-    }
-}
+use failure::DataPathFailureHint;
+pub(crate) use failure::{DataPathFailureKind, classify_runtime_detach_message};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DataPathOverviewLineKind {
@@ -75,25 +63,28 @@ impl DataPathCompactSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DataPathDiagnosticsView {
-    source: DataPathDiagnosticsSource,
-    diagnostics: Option<TrafficRuntimeDiagnostics>,
-    reason: Option<String>,
+pub(crate) enum DataPathDiagnosticsView {
+    RunningAgent {
+        diagnostics: TrafficRuntimeDiagnostics,
+    },
+    LocalConfig {
+        diagnostics: TrafficRuntimeDiagnostics,
+        reason: Option<String>,
+    },
+    Unavailable {
+        reason: String,
+        failure: Option<DataPathFailureKind>,
+    },
 }
 
 impl DataPathDiagnosticsView {
     pub(crate) fn from_running_agent(diagnostics: TrafficRuntimeDiagnostics) -> Self {
-        Self {
-            source: DataPathDiagnosticsSource::RunningAgent,
-            diagnostics: Some(diagnostics),
-            reason: None,
-        }
+        Self::RunningAgent { diagnostics }
     }
 
     pub(crate) fn from_local_config(diagnostics: TrafficRuntimeDiagnostics) -> Self {
-        Self {
-            source: DataPathDiagnosticsSource::LocalConfig,
-            diagnostics: Some(diagnostics),
+        Self::LocalConfig {
+            diagnostics,
             reason: None,
         }
     }
@@ -102,18 +93,26 @@ impl DataPathDiagnosticsView {
         diagnostics: TrafficRuntimeDiagnostics,
         reason: impl Into<String>,
     ) -> Self {
-        Self {
-            source: DataPathDiagnosticsSource::LocalConfig,
-            diagnostics: Some(diagnostics),
+        Self::LocalConfig {
+            diagnostics,
             reason: Some(reason.into()),
         }
     }
 
     pub(crate) fn unavailable(reason: impl Into<String>) -> Self {
-        Self {
-            source: DataPathDiagnosticsSource::Unavailable,
-            diagnostics: None,
-            reason: Some(reason.into()),
+        Self::Unavailable {
+            reason: reason.into(),
+            failure: None,
+        }
+    }
+
+    pub(crate) fn unavailable_with_kind(
+        failure: DataPathFailureKind,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::Unavailable {
+            reason: reason.into(),
+            failure: Some(failure),
         }
     }
 
@@ -122,7 +121,7 @@ impl DataPathDiagnosticsView {
         let mut lines = vec![DataPathOverviewLine::new(
             DataPathOverviewLineKind::Source,
             "Data path source",
-            self.source.label(),
+            self.source_label(),
         )];
         lines.extend([
             DataPathOverviewLine::new(
@@ -139,61 +138,66 @@ impl DataPathDiagnosticsView {
             DataPathOverviewLine::new(DataPathOverviewLineKind::Mitm, "MITM", summary.mitm),
         ]);
 
-        if let Some(reason) = &self.reason {
+        if let Some(reason) = self.reason() {
             lines.push(DataPathOverviewLine::new(
                 DataPathOverviewLineKind::Reason,
                 "Reason",
-                reason.clone(),
+                reason,
             ));
         }
         lines
     }
 
     pub(crate) fn compact_summary(&self, traffic_empty: bool) -> DataPathCompactSummary {
-        match (&self.source, &self.diagnostics) {
-            (DataPathDiagnosticsSource::RunningAgent, Some(diagnostics)) => {
-                DataPathCompactSummary::new(
-                    diagnostics.running_status_text(traffic_empty),
-                    diagnostics.capture_overview_line(),
-                    diagnostics.mitm_overview_line(),
-                    diagnostics.mitm_next_step(),
-                )
-            }
-            (DataPathDiagnosticsSource::LocalConfig, Some(diagnostics)) => {
-                DataPathCompactSummary::new(
-                    diagnostics.local_status_text(),
-                    diagnostics.capture_overview_line(),
-                    diagnostics.mitm_overview_line(),
-                    diagnostics.mitm_next_step(),
-                )
-            }
-            _ => DataPathCompactSummary::new(
-                "cannot evaluate capture or MITM readiness",
-                "not evaluated",
+        match self {
+            Self::RunningAgent { diagnostics } => DataPathCompactSummary::new(
+                diagnostics.running_status_text(traffic_empty),
+                diagnostics.capture_overview_line(),
+                diagnostics.mitm_overview_line(),
+                diagnostics.mitm_next_step(),
+            ),
+            Self::LocalConfig { diagnostics, .. } => DataPathCompactSummary::new(
+                diagnostics.local_status_text(),
+                diagnostics.capture_overview_line(),
+                diagnostics.mitm_overview_line(),
+                diagnostics.mitm_next_step(),
+            ),
+            Self::Unavailable { .. } => DataPathCompactSummary::new(
+                self.failure_hint()
+                    .map_or("cannot evaluate capture or MITM readiness", |hint| {
+                        hint.summary
+                    }),
+                self.failure_hint()
+                    .map_or("not evaluated", |hint| hint.capture),
                 format!(
                     "not evaluated; {MITM_PROXY_DATA_PATH_LABEL} can capture {MITM_PLAINTEXT_COVERAGE}"
                 ),
-                "fix runtime config; use Data Path",
+                self.failure_hint()
+                    .map_or("fix runtime config; use Data Path", |hint| hint.next),
             ),
         }
     }
 
     pub(crate) fn detail_lines(&self) -> Vec<String> {
-        let mut lines = vec![format!("Data path source: {}", self.source.label())];
-        match (&self.source, &self.diagnostics) {
-            (DataPathDiagnosticsSource::RunningAgent, Some(diagnostics)) => {
+        let mut lines = vec![format!("Data path source: {}", self.source_label())];
+        match self {
+            Self::RunningAgent { diagnostics } => {
                 lines.push("state: live runtime diagnostics from the attached agent".to_string());
                 lines.extend(diagnostics.detail_lines());
             }
-            (DataPathDiagnosticsSource::LocalConfig, Some(diagnostics)) => {
+            Self::LocalConfig { diagnostics, .. } => {
                 lines.push(
                     "state: local config readiness projection, not live traffic activity"
                         .to_string(),
                 );
                 lines.extend(diagnostics.detail_lines());
             }
-            _ => {
+            Self::Unavailable { .. } => {
                 lines.push("state: diagnostics unavailable".to_string());
+                if let Some(hint) = self.failure_hint() {
+                    lines.push(format!("failure: {}", hint.summary));
+                    lines.push(format!("action: {}", hint.next));
+                }
                 lines.push("capture: not evaluated".to_string());
                 lines.push(format!(
                     "MITM: not evaluated; {MITM_PROXY_DATA_PATH_LABEL} can capture {MITM_PLAINTEXT_COVERAGE}"
@@ -205,10 +209,36 @@ impl DataPathDiagnosticsView {
                 ));
             }
         }
-        if let Some(reason) = &self.reason {
+        if let Some(reason) = self.reason() {
             lines.push(format!("reason: {reason}"));
         }
         lines.into_iter().map(terminal_safe_inline_text).collect()
+    }
+
+    fn source_label(&self) -> &'static str {
+        match self {
+            Self::RunningAgent { .. } => "running agent",
+            Self::LocalConfig { .. } => "local config",
+            Self::Unavailable { .. } => "unavailable",
+        }
+    }
+
+    fn reason(&self) -> Option<&str> {
+        match self {
+            Self::RunningAgent { .. } => None,
+            Self::LocalConfig { reason, .. } => reason.as_deref(),
+            Self::Unavailable { reason, .. } => Some(reason),
+        }
+    }
+
+    fn failure_hint(&self) -> Option<DataPathFailureHint> {
+        match self {
+            Self::Unavailable {
+                failure: Some(failure),
+                ..
+            } => Some(failure.hint()),
+            _ => None,
+        }
     }
 }
 
@@ -226,6 +256,33 @@ mod tests {
             "reliable MITM proxy data path can capture plain HTTP and TLS-decrypted HTTP"
         ));
         assert!(summary.next.contains("fix runtime config"));
+    }
+
+    #[test]
+    fn unavailable_compact_summary_explains_kernel_capture_permissions() {
+        let summary = DataPathDiagnosticsView::unavailable_with_kind(
+            DataPathFailureKind::CapturePrivilegesMissing,
+            "capture startup failed",
+        )
+        .compact_summary(true);
+
+        assert_eq!(summary.status, "kernel capture privileges are missing");
+        assert_eq!(
+            summary.capture,
+            "live capture needs root or Linux capabilities"
+        );
+        assert!(summary.next.contains("CAP_BPF"));
+        assert!(summary.next.contains("CAP_NET_RAW"));
+    }
+
+    #[test]
+    fn unavailable_reason_text_does_not_create_failure_hint_without_kind() {
+        let summary = DataPathDiagnosticsView::unavailable("TLS material permission denied")
+            .compact_summary(true);
+
+        assert_eq!(summary.status, "cannot evaluate capture or MITM readiness");
+        assert_eq!(summary.capture, "not evaluated");
+        assert_eq!(summary.next, "fix runtime config; use Data Path");
     }
 
     #[test]
@@ -273,5 +330,21 @@ mod tests {
         for expected in mitm_visibility_lines() {
             assert!(lines.contains(&expected), "missing {expected}");
         }
+    }
+
+    #[test]
+    fn unavailable_details_include_permission_action_when_capture_lacks_privileges() {
+        let lines = DataPathDiagnosticsView::unavailable_with_kind(
+            DataPathFailureKind::CapturePrivilegesMissing,
+            "capture startup failed",
+        )
+        .detail_lines();
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "failure: kernel capture privileges are missing")
+        );
+        assert!(lines.iter().any(|line| line.contains("CAP_NET_ADMIN")));
     }
 }
