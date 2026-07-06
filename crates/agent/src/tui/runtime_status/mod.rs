@@ -657,8 +657,8 @@ fn parse_mitm_diagnostics(
 #[cfg(test)]
 mod tests {
     use probe_config::{
-        AgentConfig, CaptureSelection, EnforcementPolicySourceConfig, TlsMaterialConfig,
-        TlsMaterialKind, TransparentInterceptionMitmBackendConfig,
+        AgentConfig, CaptureBackend, CaptureSelection, EnforcementPolicySourceConfig,
+        TlsMaterialConfig, TlsMaterialKind, TransparentInterceptionMitmBackendConfig,
         TransparentInterceptionMitmBackendReadinessProbeConfig,
         TransparentInterceptionMitmPlaintextBridgeModeConfig,
         TransparentInterceptionStrategyConfig,
@@ -1642,6 +1642,91 @@ mod tests {
     }
 
     #[test]
+    fn traffic_diagnostics_prioritize_disabled_mitm_strategy_before_selector()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "kind": "traffic_status",
+                "projection": {
+                "capture": {
+                    "selection": "auto",
+                    "selected_backend": "ebpf",
+                    "selected_input_source": "live_host",
+                    "mode": "live",
+                    "reason": null,
+                    "candidates": [],
+                    "open_failures": []
+                },
+                "enforcement": disabled_mitm_enforcement_status_json()?
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+        let lines = diagnostics.detail_lines();
+
+        assert_detail_line(
+            &lines,
+            "path labels: disabled until transparent MITM interception is enabled",
+        );
+        assert_detail_line(
+            &lines,
+            "plain HTTP: unavailable until transparent MITM interception is enabled",
+        );
+        assert_detail_line(
+            &lines,
+            "next action: configure transparent MITM interception in Enforcement",
+        );
+        assert!(!lines.iter().any(|line| {
+            line.contains("MITM path is configured but has no scoped interception selector")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_prioritize_missing_mitm_selector_before_event_feed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut enforcement = configured_mitm_enforcement_status_json()?;
+        enforcement["interception"]["selector_configured"] = json!(false);
+        enforcement["interception"]["mitm"]["plaintext_bridge"] = json!({ "mode": "disabled" });
+        let response = json!({
+            "kind": "traffic_status",
+                "projection": {
+                "capture": {
+                    "selection": "auto",
+                    "selected_backend": "ebpf",
+                    "selected_input_source": "live_host",
+                    "mode": "live",
+                    "reason": null,
+                    "candidates": [],
+                    "open_failures": []
+                },
+                "enforcement": enforcement
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+        let lines = diagnostics.detail_lines();
+
+        assert_detail_line(
+            &lines,
+            "path labels: disabled until scoped MITM interception selector is configured",
+        );
+        assert_detail_line(
+            &lines,
+            "plain HTTP: unavailable until scoped MITM interception selector is configured",
+        );
+        assert_detail_line(
+            &lines,
+            "next action: MITM path is configured but has no scoped interception selector",
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| { line.contains("MITM path needs an event feed") })
+        );
+        Ok(())
+    }
+
+    #[test]
     fn traffic_diagnostics_report_disabled_mitm_bridge_runtime()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut enforcement = configured_mitm_enforcement_status_json()?;
@@ -2271,6 +2356,47 @@ mod tests {
             },
             plaintext_bridge: L7MitmPlaintextBridgeSnapshot {
                 mode: L7MitmPlaintextBridgeMode::Active,
+                disable_reason: None,
+            },
+        };
+        Ok(serde_json::to_value(
+            enforcement_status_with_transparent_proxy_for_test(&plan, Some(l7_mitm), None),
+        )?)
+    }
+
+    fn disabled_mitm_enforcement_status_json() -> Result<Value, Box<dyn std::error::Error>> {
+        let config = AgentConfig::default();
+        let plan = RuntimePlan::build(
+            config,
+            &ProviderRegistry::new(
+                vec![
+                    CaptureProviderDescriptor::available(
+                        CaptureBackend::Ebpf,
+                        CaptureProviderBuilder::Ebpf,
+                    ),
+                    CaptureProviderDescriptor::available(
+                        CaptureBackend::Libpcap,
+                        CaptureProviderBuilder::Libpcap,
+                    ),
+                ],
+                vec![],
+            ),
+        )?;
+        let l7_mitm = L7MitmRuntimeSnapshot {
+            backend_health: L7MitmBackendHealthSnapshot {
+                mode: TcpHealthMode::Healthy,
+                check_successes: 0,
+                check_failures: 0,
+                consecutive_failures: 0,
+                last_failure_reason: None,
+            },
+            client_trust: L7MitmClientTrustSnapshot {
+                mode: L7MitmClientTrustMode::Disabled,
+                material: L7MitmClientTrustMaterialMode::None,
+                reason: None,
+            },
+            plaintext_bridge: L7MitmPlaintextBridgeSnapshot {
+                mode: L7MitmPlaintextBridgeMode::NotConfigured,
                 disable_reason: None,
             },
         };

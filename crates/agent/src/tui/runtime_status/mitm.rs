@@ -211,6 +211,31 @@ impl MitmDiagnostics {
     }
 
     fn data_path_diagnosis(&self) -> MitmDataPathDiagnosis {
+        if !self.strategy.is_mitm() {
+            return MitmDataPathDiagnosis::disabled(
+                "path labels: disabled until transparent MITM interception is enabled",
+                "plain HTTP: unavailable until transparent MITM interception is enabled",
+                "TLS-decrypted HTTP: unavailable until transparent MITM interception is enabled",
+                MitmPathStatus::Unavailable,
+                MitmPathStatus::Unavailable,
+                "configure transparent MITM interception in Enforcement",
+            );
+        }
+
+        if matches!(
+            self.backend,
+            TransparentInterceptionMitmBackendPlan::Disabled
+        ) {
+            return MitmDataPathDiagnosis::disabled(
+                "path labels: disabled until a MITM backend is configured",
+                "plain HTTP: unavailable until a MITM backend is configured",
+                "TLS-decrypted HTTP: unavailable until a MITM backend is configured",
+                MitmPathStatus::Unavailable,
+                MitmPathStatus::Unavailable,
+                "configure a MITM backend in Enforcement",
+            );
+        }
+
         if !self.selector_configured {
             return MitmDataPathDiagnosis::disabled(
                 "path labels: disabled until scoped MITM interception selector is configured",

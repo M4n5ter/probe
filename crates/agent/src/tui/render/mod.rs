@@ -8,6 +8,7 @@ use ratatui::{
         ScrollbarState, Table, Wrap,
     },
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 mod process_picker;
 mod traffic;
@@ -59,23 +60,19 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &mut TuiApp) -> HitMap {
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, hits: &mut Vec<HitArea>) {
-    let title = format!(
-        "Probe TUI  {}{}",
-        app.config_path().display(),
-        if app.dirty() { "  modified" } else { "" }
-    );
-    frame.render_widget(
-        Paragraph::new(title)
-            .block(Block::bordered().border_style(Style::default().fg(Color::Gray))),
-        area,
-    );
-    let button_y = area.y + 1;
     let buttons = [
         ("Agent", HitTarget::Agent, 8),
         ("Save", HitTarget::Save, 7),
         ("Reload", HitTarget::Reload, 9),
         ("Quit", HitTarget::Quit, 6),
     ];
+    let title = header_title(app, header_title_available_width(area, &buttons));
+    frame.render_widget(
+        Paragraph::new(title)
+            .block(Block::bordered().border_style(Style::default().fg(Color::Gray))),
+        area,
+    );
+    let button_y = area.y + 1;
     let mut right_edge = area.x.saturating_add(area.width.saturating_sub(2));
     for (label, target, width) in buttons.into_iter().rev() {
         right_edge = right_edge.saturating_sub(width);
@@ -89,6 +86,48 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, hits: &mut Vec
         );
         right_edge = right_edge.saturating_sub(2);
     }
+}
+
+fn header_title(app: &TuiApp, max_width: usize) -> String {
+    let title = format!(
+        "Probe TUI  {}{}",
+        app.config_path().display(),
+        if app.dirty() { "  modified" } else { "" }
+    );
+    truncate_header_title(&title, max_width)
+}
+
+fn header_title_available_width(area: Rect, buttons: &[(&'static str, HitTarget, u16)]) -> usize {
+    let button_width = buttons
+        .iter()
+        .map(|(_, _, width)| *width as usize)
+        .sum::<usize>();
+    let button_spacing = buttons.len().saturating_mul(2);
+    area.width
+        .saturating_sub(2)
+        .saturating_sub((button_width + button_spacing) as u16) as usize
+}
+
+fn truncate_header_title(title: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(title) <= max_width {
+        return title.to_string();
+    }
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+    let keep_width = max_width - 3;
+    let mut width = 0;
+    let mut truncated = String::new();
+    for character in title.chars() {
+        let character_width = character.width().unwrap_or(0);
+        if width + character_width > keep_width {
+            break;
+        }
+        truncated.push(character);
+        width += character_width;
+    }
+    truncated.push_str("...");
+    truncated
 }
 
 fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, hits: &mut Vec<HitArea>) {
@@ -504,6 +543,39 @@ mod tests {
         assert!(output.contains("Data path"));
         assert!(output.contains("MITM"));
         assert!(output.contains("Next"));
+        Ok(())
+    }
+
+    #[test]
+    fn render_header_truncates_config_path_before_action_buttons()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut app = TuiApp::new(
+            PathBuf::from(
+                "/home/operator/.local/state/traffic-probe/config/配置路径非常非常长-agent.toml",
+            ),
+            AgentConfig::default(),
+            ProcessCatalog::default(),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 24))?;
+        let mut hit_map = HitMap::default();
+        let title = header_title(&app, 58);
+        assert!(UnicodeWidthStr::width(title.as_str()) <= 58);
+
+        terminal.draw(|frame| {
+            hit_map = draw(frame, &mut app);
+        })?;
+
+        let output = terminal.backend().to_string();
+        let header_line = output
+            .lines()
+            .find(|line| line.contains("[Agent]"))
+            .expect("header should contain agent action");
+        assert!(output.contains("Probe TUI"));
+        assert!(output.contains("..."));
+        assert!(output.contains("[Agent]"));
+        assert!(header_line.contains("... [Agent]"));
+        assert!(!output.contains("path.toml[Agent]"));
+        assert!(hit_exists(&hit_map, Some(HitTarget::Agent), 100, 24));
         Ok(())
     }
 
