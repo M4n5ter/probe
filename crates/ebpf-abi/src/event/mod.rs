@@ -3,8 +3,9 @@ mod process;
 mod tls_plaintext;
 
 pub use common::{
-    EBPF_ABI_REVISION, EBPF_EVENT_HEADER_BYTES, EBPF_MAGIC, EBPF_RING_BUFFER_BYTES,
-    EbpfEventDecodeError, EbpfEventHeader, EbpfEventKind, decode_event_header,
+    EBPF_ABI_REVISION, EBPF_EVENT_HEADER_BYTES, EBPF_MAGIC, EBPF_PAYLOAD_SAMPLE_BYTES,
+    EBPF_RING_BUFFER_BYTES, EbpfEventDecodeError, EbpfEventHeader, EbpfEventKind,
+    decode_event_header,
 };
 pub use process::{
     EBPF_ACCEPT_REMOTE_ENDPOINT_VALID, EBPF_ACCEPT_SOCKADDR_READ_FAILED,

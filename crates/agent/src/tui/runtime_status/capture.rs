@@ -4,6 +4,7 @@ use runtime::{CaptureEvidenceMode, CaptureInputSource, CapturePlanMode};
 use crate::{
     status::{
         CaptureCandidateStatusSnapshot, CaptureOpenFailureStatusSnapshot, CaptureStatusSnapshot,
+        EbpfExpectedContractStatusSnapshot,
     },
     tui::{
         copy::{MITM_PLAINTEXT_COVERAGE, MITM_PROXY_DATA_PATH_LABEL},
@@ -18,6 +19,13 @@ pub(super) struct CaptureDiagnostics {
     snapshot: CaptureStatusSnapshot,
     provider_reported: bool,
     input_activity_reported: bool,
+    source: CaptureDiagnosticsSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureDiagnosticsSource {
+    LocalProjection,
+    AdminStatus,
 }
 
 impl CaptureDiagnostics {
@@ -28,6 +36,7 @@ impl CaptureDiagnostics {
             snapshot,
             provider_reported,
             input_activity_reported,
+            source: CaptureDiagnosticsSource::LocalProjection,
         }
     }
 
@@ -40,6 +49,7 @@ impl CaptureDiagnostics {
             snapshot,
             provider_reported,
             input_activity_reported,
+            source: CaptureDiagnosticsSource::AdminStatus,
         }
     }
 
@@ -125,6 +135,22 @@ impl CaptureDiagnostics {
         None
     }
 
+    fn ebpf_expected_contract_line(&self) -> String {
+        match self.snapshot.ebpf_expected_contract {
+            Some(contract) => {
+                format_ebpf_expected_contract_line(self.ebpf_expected_contract_label(), contract)
+            }
+            None => format!("{}: not reported", self.ebpf_expected_contract_label()),
+        }
+    }
+
+    fn ebpf_expected_contract_label(&self) -> &'static str {
+        match self.source {
+            CaptureDiagnosticsSource::LocalProjection => "local eBPF expected contract",
+            CaptureDiagnosticsSource::AdminStatus => "agent eBPF expected contract",
+        }
+    }
+
     pub(super) fn detail_lines(&self) -> Vec<String> {
         let mut lines = vec![
             "Capture diagnostics".to_string(),
@@ -134,6 +160,7 @@ impl CaptureDiagnostics {
             ),
             format!("selected: {}", self.selected_backend_label()),
             format!("mode: {}", capture_plan_mode_name(self.snapshot.mode)),
+            self.ebpf_expected_contract_line(),
         ];
         if self.using_mitm_plaintext_bridge() {
             if let Some(backend) = self.snapshot.selected_backend {
@@ -458,4 +485,29 @@ fn evidence_mode_name(mode: CaptureEvidenceMode) -> &'static str {
         CaptureEvidenceMode::Nominal => "nominal",
         CaptureEvidenceMode::BestEffort => "best_effort",
     }
+}
+
+pub(crate) fn local_tui_ebpf_expected_contract_line() -> String {
+    format_ebpf_expected_contract_line(
+        "local TUI eBPF expected contract",
+        EbpfExpectedContractStatusSnapshot::current_agent(),
+    )
+}
+
+fn format_ebpf_expected_contract_line(
+    label: &str,
+    contract: EbpfExpectedContractStatusSnapshot,
+) -> String {
+    format!(
+        "{label}: ABI revision {}, process payload sample window {}",
+        contract.abi_revision,
+        format_bytes(contract.payload_sample_bytes)
+    )
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 && bytes.is_multiple_of(1024) {
+        return format!("{} KiB", bytes / 1024);
+    }
+    format!("{bytes} bytes")
 }

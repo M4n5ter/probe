@@ -16,6 +16,8 @@ pub struct CaptureStatusSnapshot {
     pub selected_backend: Option<CaptureBackend>,
     #[serde(default)]
     pub selected_input_source: Option<CaptureInputSource>,
+    #[serde(default)]
+    pub ebpf_expected_contract: Option<EbpfExpectedContractStatusSnapshot>,
     pub provider_runtime_mode: Option<RuntimeMode>,
     pub mode: CapturePlanMode,
     pub reason: Option<String>,
@@ -31,6 +33,21 @@ pub struct CaptureStatusSnapshot {
     pub provider: Option<CaptureProviderRuntimeDetailsSnapshot>,
     #[serde(default)]
     pub input_activity: Option<CaptureInputActivityRuntimeSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EbpfExpectedContractStatusSnapshot {
+    pub abi_revision: u16,
+    pub payload_sample_bytes: u64,
+}
+
+impl EbpfExpectedContractStatusSnapshot {
+    pub(crate) fn current_agent() -> Self {
+        Self {
+            abi_revision: capture::EBPF_ABI_REVISION,
+            payload_sample_bytes: capture::EBPF_PAYLOAD_SAMPLE_BYTES as u64,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +81,7 @@ pub(in crate::status) fn capture_status(
                 selection: plan.capture.selection,
                 selected_backend: Some(runtime.selected_backend),
                 selected_input_source: Some(runtime.selected_input_source),
+                ebpf_expected_contract: Some(EbpfExpectedContractStatusSnapshot::current_agent()),
                 provider_runtime_mode: Some(runtime.provider_runtime_mode),
                 mode: runtime.plan_mode,
                 reason: runtime.reason.clone(),
@@ -87,6 +105,7 @@ pub(in crate::status) fn capture_status(
             selection: plan.capture.selection,
             selected_backend: plan.capture.selected_backend,
             selected_input_source: plan.capture.selected_input_source,
+            ebpf_expected_contract: Some(EbpfExpectedContractStatusSnapshot::current_agent()),
             provider_runtime_mode: plan.capture.selected_provider_runtime_mode,
             mode: plan.capture.mode,
             reason: plan.capture.reason.clone(),
@@ -216,6 +235,10 @@ mod tests {
             status.evidence_reason.as_deref(),
             Some("eBPF provider is best-effort")
         );
+        assert_eq!(
+            status.ebpf_expected_contract,
+            Some(EbpfExpectedContractStatusSnapshot::current_agent())
+        );
         assert_eq!(status.candidates.len(), 2);
         assert_eq!(status.candidates[0].backend, CaptureBackend::Ebpf);
         assert_eq!(status.candidates[1].backend, CaptureBackend::Libpcap);
@@ -249,6 +272,10 @@ mod tests {
         assert_eq!(status.selected_backend, Some(CaptureBackend::Libpcap));
         assert_eq!(status.provider_runtime_mode, Some(RuntimeMode::Available));
         assert_eq!(status.evidence_mode, Some(CaptureEvidenceMode::BestEffort));
+        assert_eq!(
+            status.ebpf_expected_contract,
+            Some(EbpfExpectedContractStatusSnapshot::current_agent())
+        );
         assert_eq!(status.reason, None);
         assert_eq!(status.open_failures.len(), 1);
         assert_eq!(status.open_failures[0].backend, CaptureBackend::Ebpf);

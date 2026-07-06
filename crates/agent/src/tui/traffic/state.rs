@@ -1920,7 +1920,8 @@ mod tests {
             EventTailRecord, EventTailSnapshot,
         },
         status::{
-            CaptureCandidateStatusSnapshot, CaptureOpenFailureStatusSnapshot, CaptureStatusSnapshot,
+            CaptureCandidateStatusSnapshot, CaptureOpenFailureStatusSnapshot,
+            CaptureStatusSnapshot, EbpfExpectedContractStatusSnapshot,
         },
         tui::{runtime_status::TrafficRuntimeDiagnostics, text::INLINE_TEXT_MAX_CHARS},
     };
@@ -3185,6 +3186,7 @@ mod tests {
             selection: CaptureSelection::Auto,
             selected_backend: Some(CaptureBackend::Libpcap),
             selected_input_source: None,
+            ebpf_expected_contract: Some(EbpfExpectedContractStatusSnapshot::current_agent()),
             provider_runtime_mode: Some(RuntimeMode::Available),
             mode: CapturePlanMode::Live,
             reason: None,
@@ -3223,6 +3225,7 @@ mod tests {
             selection: CaptureSelection::Auto,
             selected_backend: Some(CaptureBackend::CaptureEventFeed),
             selected_input_source: Some(CaptureInputSource::MitmPlaintextBridge),
+            ebpf_expected_contract: Some(EbpfExpectedContractStatusSnapshot::current_agent()),
             provider_runtime_mode: Some(RuntimeMode::Available),
             mode: CapturePlanMode::CaptureEventFeed,
             reason: None,

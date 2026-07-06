@@ -1,7 +1,8 @@
 use crate::tui::{
     copy::{MITM_PLAINTEXT_COVERAGE, MITM_PROXY_DATA_PATH_LABEL},
     runtime_status::{
-        TrafficRuntimeDiagnostics, missing_mitm_configuration_action, mitm_visibility_lines,
+        TrafficRuntimeDiagnostics, local_tui_ebpf_expected_contract_line,
+        missing_mitm_configuration_action, mitm_visibility_lines,
     },
     text::terminal_safe_inline_text,
 };
@@ -202,6 +203,7 @@ impl DataPathDiagnosticsView {
                         .to_string(),
                 );
                 lines.push("capture: live status not available".to_string());
+                lines.push(local_tui_ebpf_expected_contract_line());
                 lines.push(format!(
                     "MITM: live status not available; {MITM_PROXY_DATA_PATH_LABEL} can capture {MITM_PLAINTEXT_COVERAGE}"
                 ));
@@ -220,6 +222,7 @@ impl DataPathDiagnosticsView {
                     lines.push(format!("action: {}", hint.next));
                 }
                 lines.push("capture: not evaluated".to_string());
+                lines.push(local_tui_ebpf_expected_contract_line());
                 lines.push(format!(
                     "MITM: not evaluated; {MITM_PROXY_DATA_PATH_LABEL} can capture {MITM_PLAINTEXT_COVERAGE}"
                 ));
@@ -317,6 +320,12 @@ mod tests {
         assert!(lines.iter().any(|line| {
             line == "traffic: see the Traffic status line for the latest tail-events result"
         }));
+        assert!(lines.iter().any(|line| line
+            == &format!(
+                "local TUI eBPF expected contract: ABI revision {}, process payload sample window {} KiB",
+                ::capture::EBPF_ABI_REVISION,
+                ::capture::EBPF_PAYLOAD_SAMPLE_BYTES / 1024
+            )));
         assert!(lines.iter().any(|line| {
             line == "reason: admin traffic_status response exceeds 16777216 bytes"
         }));
@@ -330,6 +339,15 @@ mod tests {
         assert_eq!(summary.status, "cannot evaluate capture or MITM readiness");
         assert_eq!(summary.capture, "not evaluated");
         assert_eq!(summary.next, "fix runtime config; use Data Path");
+
+        let lines =
+            DataPathDiagnosticsView::unavailable("TLS material permission denied").detail_lines();
+        assert!(lines.iter().any(|line| line
+            == &format!(
+                "local TUI eBPF expected contract: ABI revision {}, process payload sample window {} KiB",
+                ::capture::EBPF_ABI_REVISION,
+                ::capture::EBPF_PAYLOAD_SAMPLE_BYTES / 1024
+            )));
     }
 
     #[test]

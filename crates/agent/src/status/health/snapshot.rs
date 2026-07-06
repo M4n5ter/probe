@@ -357,6 +357,7 @@ mod tests {
     use runtime::CapturePlanMode;
 
     use super::*;
+    use crate::status::EbpfExpectedContractStatusSnapshot;
     use crate::tls_plaintext::{
         TlsPlaintextReconcileHealthRuntimeSnapshot, TlsPlaintextRuntimeMode,
         TlsPlaintextRuntimeSnapshot,
@@ -368,6 +369,7 @@ mod tests {
             selection: CaptureSelection::Auto,
             selected_backend: Some(CaptureBackend::Ebpf),
             selected_input_source: None,
+            ebpf_expected_contract: Some(EbpfExpectedContractStatusSnapshot::current_agent()),
             provider_runtime_mode: Some(RuntimeMode::Available),
             mode: CapturePlanMode::Live,
             reason: None,
@@ -392,6 +394,7 @@ mod tests {
             selection: CaptureSelection::Auto,
             selected_backend: Some(CaptureBackend::Libpcap),
             selected_input_source: None,
+            ebpf_expected_contract: Some(EbpfExpectedContractStatusSnapshot::current_agent()),
             provider_runtime_mode: Some(RuntimeMode::Available),
             mode: CapturePlanMode::Live,
             reason: None,

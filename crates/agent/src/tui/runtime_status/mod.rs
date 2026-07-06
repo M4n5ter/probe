@@ -8,6 +8,8 @@ mod capture;
 mod mitm;
 mod mitm_data_path;
 
+pub(crate) use capture::local_tui_ebpf_expected_contract_line;
+
 #[cfg(test)]
 use crate::status::AgentStatusSnapshot;
 use crate::{
@@ -710,6 +712,10 @@ mod tests {
                 "capture": {
                     "selection": "auto",
                     "selected_backend": null,
+                    "ebpf_expected_contract": {
+                        "abi_revision": ::capture::EBPF_ABI_REVISION,
+                        "payload_sample_bytes": ::capture::EBPF_PAYLOAD_SAMPLE_BYTES
+                    },
                     "mode": "unavailable",
                     "reason": "no live capture provider is available in this build/runtime",
                     "candidates": [
@@ -743,6 +749,14 @@ mod tests {
             )))
         );
         let lines = diagnostics.detail_lines();
+        assert_detail_line(
+            &lines,
+            format!(
+                "agent eBPF expected contract: ABI revision {}, process payload sample window {} KiB",
+                ::capture::EBPF_ABI_REVISION,
+                ::capture::EBPF_PAYLOAD_SAMPLE_BYTES / 1024
+            ),
+        );
         assert!(lines.iter().any(|line| line == "strategy: disabled"));
         assert_detail_line(
             &lines,
@@ -765,6 +779,31 @@ mod tests {
         assert_detail_line(
             &lines,
             format!("configuration: {}", missing_mitm_configuration_action()),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_marks_missing_agent_ebpf_contract_as_unreported()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "kind": "traffic_status",
+            "projection": {
+                "capture": {
+                    "selection": "auto",
+                    "selected_backend": "ebpf",
+                    "mode": "live",
+                    "candidates": [],
+                    "open_failures": []
+                }
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+
+        assert_detail_line(
+            &diagnostics.detail_lines(),
+            "agent eBPF expected contract: not reported",
         );
         Ok(())
     }

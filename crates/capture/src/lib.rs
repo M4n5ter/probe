@@ -10,10 +10,11 @@ mod replay;
 mod tls;
 
 pub use ebpf::{
-    EBPF_PROCESS_OPTIONAL_TRACEPOINT_PAIR_SPECS, EbpfAcceptTracepointObservation,
-    EbpfCloseRangeTracepointObservation, EbpfCloseTracepointObservation,
-    EbpfConnectTracepointObservation, EbpfHostProbe, EbpfHostProbeConfig, EbpfHostProbeReport,
-    EbpfObservedProcess, EbpfProcessObservation, EbpfProcessObservationActiveTracepointLiveness,
+    EBPF_ABI_REVISION, EBPF_PAYLOAD_SAMPLE_BYTES, EBPF_PROCESS_OPTIONAL_TRACEPOINT_PAIR_SPECS,
+    EbpfAcceptTracepointObservation, EbpfCloseRangeTracepointObservation,
+    EbpfCloseTracepointObservation, EbpfConnectTracepointObservation, EbpfHostProbe,
+    EbpfHostProbeConfig, EbpfHostProbeReport, EbpfObservedProcess, EbpfProcessObservation,
+    EbpfProcessObservationActiveTracepointLiveness,
     EbpfProcessObservationActiveTracepointLivenessProgram,
     EbpfProcessObservationActiveTracepointLivenessState,
     EbpfProcessObservationLinkOwnershipSnapshot,
