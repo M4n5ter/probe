@@ -11,6 +11,8 @@ use super::processes::selector_for_exe_path;
 pub(crate) struct ProcessTrafficSelector {
     pub(crate) selector: Option<Selector>,
     pub(crate) unknown_process_candidate_selector: Option<UnknownProcessCandidateSelector>,
+    pub(crate) unknown_process_candidate_scope: Option<String>,
+    pub(crate) unknown_process_candidate_exe_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -30,9 +32,17 @@ impl ProcessTrafficScope {
     }
 
     pub(crate) fn selector_for_exe_path(&self, exe_path: String) -> ProcessTrafficSelector {
+        let unknown_process_candidate_selector = self.unknown_process_candidate_selector(&exe_path);
+        let unknown_process_candidate_exe_paths = unknown_process_candidate_selector
+            .is_some()
+            .then_some(exe_path.clone())
+            .into_iter()
+            .collect();
         ProcessTrafficSelector {
-            selector: Some(selector_for_exe_path(exe_path.clone())),
-            unknown_process_candidate_selector: self.unknown_process_candidate_selector(&exe_path),
+            selector: Some(selector_for_exe_path(exe_path)),
+            unknown_process_candidate_selector,
+            unknown_process_candidate_scope: None,
+            unknown_process_candidate_exe_paths,
         }
     }
 
@@ -93,6 +103,8 @@ impl ProcessTrafficSelector {
         Self {
             selector: None,
             unknown_process_candidate_selector: None,
+            unknown_process_candidate_scope: None,
+            unknown_process_candidate_exe_paths: Vec::new(),
         }
     }
 }
@@ -121,6 +133,7 @@ fn listener_ports_by_exe_path(lookup: TcpListenerProcessLookup) -> BTreeMap<Stri
 fn merge_selector_sets(selector_sets: Vec<ProcessTrafficSelector>) -> ProcessTrafficSelector {
     let mut selectors = Vec::with_capacity(selector_sets.len());
     let mut unknown_process_candidate_selectors = Vec::new();
+    let mut unknown_process_candidate_exe_paths = Vec::new();
     for selector_set in selector_sets {
         selectors.push(selector_set.selector);
         if let Some(unknown_process_candidate_selector) =
@@ -128,12 +141,19 @@ fn merge_selector_sets(selector_sets: Vec<ProcessTrafficSelector>) -> ProcessTra
         {
             unknown_process_candidate_selectors.push(unknown_process_candidate_selector);
         }
+        unknown_process_candidate_exe_paths
+            .extend(selector_set.unknown_process_candidate_exe_paths);
+    }
+    let unknown_process_candidate_selector =
+        merge_unknown_process_candidate_selectors(unknown_process_candidate_selectors);
+    if unknown_process_candidate_selector.is_none() {
+        unknown_process_candidate_exe_paths.clear();
     }
     ProcessTrafficSelector {
         selector: merge_optional_selectors(selectors),
-        unknown_process_candidate_selector: merge_unknown_process_candidate_selectors(
-            unknown_process_candidate_selectors,
-        ),
+        unknown_process_candidate_selector,
+        unknown_process_candidate_scope: None,
+        unknown_process_candidate_exe_paths,
     }
 }
 
@@ -274,6 +294,7 @@ mod tests {
             .expect("watched processes should produce strong selector");
 
         assert!(selector.unknown_process_candidate_selector.is_none());
+        assert!(selector.unknown_process_candidate_exe_paths.is_empty());
     }
 
     fn process_context(pid: u32, name: &str, exe_path: &str) -> probe_core::ProcessContext {

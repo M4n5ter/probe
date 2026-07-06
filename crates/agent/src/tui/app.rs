@@ -898,6 +898,7 @@ impl TuiApp {
             socket_path.clone(),
             selector_set.selector,
             selector_set.unknown_process_candidate_selector,
+            selector_set.unknown_process_candidate_scope,
         );
         Some(TrafficRefreshLoadRequest {
             identity: TrafficRefreshIdentity {
@@ -1502,6 +1503,12 @@ impl TuiApp {
     ) -> Option<crate::admin::UnknownProcessCandidateSelector> {
         self.traffic_filter_selector()
             .unknown_process_candidate_selector
+    }
+
+    #[cfg(test)]
+    fn ready_unknown_process_candidate_scope_label(&self) -> Option<String> {
+        self.traffic_filter_selector()
+            .unknown_process_candidate_scope
     }
 
     fn open_traffic_detail(&mut self) -> Option<TuiEffect> {
@@ -2456,6 +2463,35 @@ mod tests {
             .expect("listener ports should produce a weak candidate selector");
 
         assert_eq!(candidate.listener_ports(), &[8080, 8081]);
+        assert_eq!(
+            app.ready_unknown_process_candidate_scope_label().as_deref(),
+            Some("backend")
+        );
+    }
+
+    #[test]
+    fn traffic_filter_candidate_scope_only_names_listener_port_processes() {
+        let mut app = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::from_entries([
+                process(42, "backend", "/app/backend"),
+                process(43, "worker", "/app/worker"),
+            ])
+            .with_listener_ports("/app/backend", [8080]),
+        );
+
+        app.handle_action(TuiAction::Click(HitTarget::ProcessMonitor(0)));
+        app.handle_action(TuiAction::Click(HitTarget::ProcessMonitor(1)));
+
+        let candidate = app
+            .ready_unknown_process_candidate_selector()
+            .expect("backend listener port should produce a weak candidate selector");
+        assert_eq!(candidate.listener_ports(), &[8080]);
+        assert_eq!(
+            app.ready_unknown_process_candidate_scope_label().as_deref(),
+            Some("backend")
+        );
     }
 
     #[test]

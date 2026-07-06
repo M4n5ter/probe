@@ -1,4 +1,8 @@
-use std::{fmt, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    fmt,
+    path::{Path, PathBuf},
+};
 
 use attribution::{ProcessAttributor, ProcfsAttributor};
 use probe_core::ProcessContext;
@@ -211,7 +215,15 @@ impl ProcessCatalog {
         &self,
         exe_paths: impl IntoIterator<Item = String>,
     ) -> Option<ProcessTrafficSelector> {
-        self.traffic_scope.selector_for_exe_paths(exe_paths)
+        let exe_paths = exe_paths.into_iter().collect::<Vec<_>>();
+        let mut selector = self
+            .traffic_scope
+            .selector_for_exe_paths(exe_paths.iter().cloned())?;
+        selector.unknown_process_candidate_scope = candidate_scope_label_for_exe_paths(
+            &self.entries,
+            &selector.unknown_process_candidate_exe_paths,
+        );
+        Some(selector)
     }
 
     #[cfg(test)]
@@ -260,6 +272,42 @@ impl ProcessCatalog {
             }
         }
     }
+}
+
+fn candidate_scope_label_for_exe_paths(
+    entries: &[ProcessEntry],
+    exe_paths: &[String],
+) -> Option<String> {
+    if exe_paths.is_empty() {
+        return None;
+    }
+    let requested = exe_paths.iter().cloned().collect::<BTreeSet<_>>();
+    let mut matched = BTreeSet::new();
+    let mut labels = BTreeSet::new();
+    for process in entries {
+        let Some(exe_path) = process.selector_key() else {
+            continue;
+        };
+        if requested.contains(&exe_path) {
+            matched.insert(exe_path);
+            labels.insert(process.name.clone());
+        }
+    }
+    for exe_path in exe_paths {
+        if !matched.contains(exe_path) {
+            labels.insert(candidate_label_from_exe_path(exe_path));
+        }
+    }
+    (!labels.is_empty()).then(|| labels.into_iter().collect::<Vec<_>>().join(", "))
+}
+
+fn candidate_label_from_exe_path(exe_path: &str) -> String {
+    Path::new(exe_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| exe_path.to_string())
 }
 
 #[cfg(test)]

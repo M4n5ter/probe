@@ -62,12 +62,16 @@ impl TrafficRow {
 
     pub(crate) fn detail_lines(&self) -> Vec<String> {
         match &self.payload {
-            TrafficRowPayload::FullEvent(event) => {
-                event_detail_lines(self.sequence, TrafficEventRef::Full(event))
-            }
-            TrafficRowPayload::TailEvent(event) => {
-                event_detail_lines(self.sequence, TrafficEventRef::Tail(event))
-            }
+            TrafficRowPayload::FullEvent(event) => event_detail_lines(
+                self.sequence,
+                TrafficEventRef::Full(event),
+                Some(&self.attribution),
+            ),
+            TrafficRowPayload::TailEvent(event) => event_detail_lines(
+                self.sequence,
+                TrafficEventRef::Tail(event),
+                Some(&self.attribution),
+            ),
             TrafficRowPayload::Omission(omission) => omission_detail_lines(self.sequence, omission),
         }
     }
@@ -97,6 +101,12 @@ impl TrafficRow {
             TrafficRowPayload::TailEvent(event) => Some(TrafficEventRef::Tail(event)),
             TrafficRowPayload::Omission(_) => None,
         }
+    }
+
+    pub(super) fn apply_unknown_process_candidate_scope(&mut self, selected_scope: Option<&str>) {
+        self.attribution
+            .apply_unknown_process_candidate_scope(selected_scope);
+        self.process = self.attribution.process_label();
     }
 
     pub(super) fn from_event(sequence: u64, event: EventEnvelope) -> Self {

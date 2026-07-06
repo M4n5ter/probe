@@ -190,6 +190,7 @@ pub(crate) struct TrafficState {
     view_mode: TrafficViewMode,
     search_query: String,
     attribution_mode: EventTailAttributionMode,
+    unknown_process_candidate_scope: Option<String>,
     empty_filter_diagnostics: Option<EmptyFilterDiagnostics>,
 }
 
@@ -518,6 +519,7 @@ impl Default for TrafficState {
             view_mode: TrafficViewMode::Http,
             search_query: String::new(),
             attribution_mode: EventTailAttributionMode::Strict,
+            unknown_process_candidate_scope: None,
             empty_filter_diagnostics: None,
         }
     }
@@ -852,6 +854,7 @@ impl TrafficState {
 
     pub(crate) fn diagnostic_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
+        lines.extend(self.empty_projection_diagnostic_lines());
         if let Some(diagnostics) = &self.empty_filter_diagnostics {
             lines.extend(diagnostics.lines());
             lines.push(String::new());
@@ -867,6 +870,25 @@ impl TrafficState {
             missing_mitm_configuration_action()
         ));
         lines
+    }
+
+    fn empty_projection_diagnostic_lines(&self) -> Vec<String> {
+        let active = self.active_view().active;
+        let visible = self.projection_len(active);
+        let unfiltered = self.unfiltered_projection_len(active);
+        if visible > 0 {
+            return Vec::new();
+        }
+        if unfiltered > 0 && !self.search_query.is_empty() {
+            return vec![
+                format!("Current search hides all {} rows", active.description()),
+                format!("Search: {}", self.search_query),
+                format!("Rows before search: {unfiltered}"),
+                "Clear Search to inspect the retained traffic rows".to_string(),
+                String::new(),
+            ];
+        }
+        Vec::new()
     }
 
     pub(crate) fn detail_preview_lines(&self, max_lines: usize) -> Vec<String> {
@@ -911,7 +933,9 @@ impl TrafficState {
         socket_path: PathBuf,
         selector: Option<Selector>,
         unknown_process_candidate_selector: Option<UnknownProcessCandidateSelector>,
+        unknown_process_candidate_scope: Option<String>,
     ) -> TrafficRefreshRequest {
+        self.set_unknown_process_candidate_scope(unknown_process_candidate_scope);
         let selector_key = traffic_refresh_selector_key(
             selector.as_ref(),
             unknown_process_candidate_selector.as_ref(),
@@ -1224,6 +1248,7 @@ impl TrafficState {
         self.rows.extend(traffic_rows_for_snapshot(snapshot));
         self.rows.sort_by_key(|row| row.sequence);
         self.rows.dedup_by_key(|row| row.sequence);
+        self.apply_unknown_process_candidate_scope_to_rows();
         self.rebuild_protocol_views();
         if self.rows.len() > MAX_TRAFFIC_EVENT_ROWS {
             let overflow = self.rows.len() - MAX_TRAFFIC_EVENT_ROWS;
@@ -1251,7 +1276,8 @@ impl TrafficState {
     }
 
     fn apply_detail(&mut self, detail: EventDetailSnapshot) {
-        let row = TrafficRow::from_detail(detail);
+        let mut row = TrafficRow::from_detail(detail);
+        row.apply_unknown_process_candidate_scope(self.unknown_process_candidate_scope.as_deref());
         self.status = TrafficStatus::active(format!("Loaded full event detail {}", row.sequence));
         self.detail_state.insert_loaded(row);
     }
@@ -1306,6 +1332,25 @@ impl TrafficState {
         self.websocket_sessions = build_websocket_session_rows(&self.rows);
         self.rebuild_visible_projection();
         self.clamp_selection();
+    }
+
+    fn set_unknown_process_candidate_scope(&mut self, selected_scope: Option<String>) {
+        let selected_scope = selected_scope.filter(|scope| !scope.is_empty());
+        if self.unknown_process_candidate_scope == selected_scope {
+            return;
+        }
+        self.unknown_process_candidate_scope = selected_scope;
+        self.apply_unknown_process_candidate_scope_to_rows();
+        self.detail_state
+            .apply_unknown_process_candidate_scope(self.unknown_process_candidate_scope.as_deref());
+        self.rebuild_protocol_views();
+    }
+
+    fn apply_unknown_process_candidate_scope_to_rows(&mut self) {
+        let selected_scope = self.unknown_process_candidate_scope.as_deref();
+        for row in &mut self.rows {
+            row.apply_unknown_process_candidate_scope(selected_scope);
+        }
     }
 
     fn rebuild_visible_projection(&mut self) {
@@ -1812,6 +1857,12 @@ impl TrafficDetailState {
         self.loaded.clear();
         self.failures.clear();
     }
+
+    fn apply_unknown_process_candidate_scope(&mut self, selected_scope: Option<&str>) {
+        for row in self.loaded.values_mut() {
+            row.apply_unknown_process_candidate_scope(selected_scope);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1986,9 +2037,9 @@ mod tests {
     use probe_config::{CaptureBackend, CaptureSelection};
     use probe_core::{
         AddressPort, BodyChunk, CaptureOrigin, CaptureSource, EventEnvelope, EventKind,
-        FlowContext, FlowIdentity, Gap, ProcessContext, ProcessIdentity, RuntimeMode,
-        SpoolPayloadSchema, Timestamp, TransportProtocol, WebSocketHandoff, WebSocketMessage,
-        WebSocketMessageOpcode,
+        FlowContext, FlowIdentity, Gap, LIBPCAP_FALLBACK_RUNTIME_HINT, ProcessContext,
+        ProcessIdentity, RuntimeMode, SpoolPayloadSchema, Timestamp, TransportProtocol,
+        UNKNOWN_PROCESS_LABEL, WebSocketHandoff, WebSocketMessage, WebSocketMessageOpcode,
     };
     use runtime::{CaptureEvidenceMode, CaptureInputSource, CapturePlanMode};
 
@@ -2195,7 +2246,7 @@ mod tests {
     #[test]
     fn stale_refresh_result_is_ignored_after_event_filter_changes() {
         let mut traffic = TrafficState::default();
-        let request = traffic.begin_refresh(PathBuf::from("/tmp/admin.sock"), None, None);
+        let request = traffic.begin_refresh(PathBuf::from("/tmp/admin.sock"), None, None, None);
 
         traffic.cycle_event_filter();
         let applied = traffic.apply_refresh_result(TrafficRefreshResult {
@@ -2429,6 +2480,81 @@ mod tests {
         assert!(traffic.clear_search_query());
         assert_eq!(traffic.active_row_count(), 2);
         assert_eq!(traffic.visible_http_exchanges().len(), 2);
+    }
+
+    #[test]
+    fn traffic_search_empty_projection_explains_hidden_rows() {
+        let mut traffic = TrafficState::default();
+        traffic.apply_snapshot(tail_snapshot_with_mixed_projection_events());
+
+        traffic.set_search_query("does-not-exist".to_string());
+
+        let preview = traffic.detail_preview_lines(8);
+        assert!(
+            preview
+                .iter()
+                .any(|line| line == "Current search hides all HTTP exchanges rows")
+        );
+        assert!(preview.iter().any(|line| line == "Rows before search: 2"));
+        assert!(
+            preview
+                .iter()
+                .any(|line| line == "Clear Search to inspect the retained traffic rows")
+        );
+    }
+
+    #[test]
+    fn traffic_search_matches_libpcap_unknown_candidate_scope_label() {
+        let mut traffic = TrafficState::default();
+        traffic.begin_refresh(
+            PathBuf::from("/tmp/admin.sock"),
+            None,
+            None,
+            Some("sssa-backend".to_string()),
+        );
+        traffic.apply_snapshot(tail_snapshot_from_records(vec![(
+            1,
+            libpcap_unknown_request_event("GET", "/candidate"),
+        )]));
+
+        traffic.set_search_query("sssa".to_string());
+
+        assert!(traffic.showing_http_exchanges());
+        assert_eq!(traffic.visible_http_exchanges().len(), 1);
+        let exchange = &traffic.visible_http_exchanges()[0];
+        assert_eq!(exchange.process, "sssa-backend candidate");
+        assert!(
+            exchange
+                .detail_lines()
+                .iter()
+                .any(|line| line == "  Process candidate scope: sssa-backend")
+        );
+    }
+
+    #[test]
+    fn raw_event_detail_uses_libpcap_unknown_candidate_scope_label() {
+        let mut traffic = TrafficState::default();
+        traffic.begin_refresh(
+            PathBuf::from("/tmp/admin.sock"),
+            None,
+            None,
+            Some("sssa-backend".to_string()),
+        );
+        traffic.apply_snapshot(tail_snapshot_from_records(vec![(
+            1,
+            libpcap_unknown_request_event("GET", "/candidate"),
+        )]));
+        traffic.set_view_mode(TrafficViewMode::Events);
+
+        let details = traffic
+            .selected_detail_lines()
+            .expect("raw traffic detail should be available");
+
+        assert!(
+            details
+                .iter()
+                .any(|line| line == "Process candidate scope: sssa-backend")
+        );
     }
 
     #[test]
@@ -3309,6 +3435,7 @@ mod tests {
             PathBuf::from("/tmp/admin.sock"),
             Some(Selector::default()),
             None,
+            None,
         );
 
         assert!(!traffic.apply_detail_load_result(TrafficDetailLoadResult {
@@ -3629,6 +3756,37 @@ mod tests {
             },
             flow,
             CaptureOrigin::from_source(CaptureSource::Replay),
+            "test",
+            EventKind::HttpRequestHeaders(probe_core::HttpHeaders {
+                direction: probe_core::Direction::Outbound,
+                stream_sequence: 1,
+                method: Some(method.to_string()),
+                target: Some(target.to_string()),
+                status: None,
+                reason: None,
+                version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+            }),
+        )
+    }
+
+    fn libpcap_unknown_request_event(method: &str, target: &str) -> EventEnvelope {
+        let mut flow = test_flow();
+        flow.id = FlowIdentity("libpcap-unknown-flow".to_string());
+        flow.process.identity.pid = 0;
+        flow.process.identity.tgid = 0;
+        flow.process.identity.exe_path = UNKNOWN_PROCESS_LABEL.to_string();
+        flow.process.identity.runtime_hint = Some(LIBPCAP_FALLBACK_RUNTIME_HINT.to_string());
+        flow.process.name = UNKNOWN_PROCESS_LABEL.to_string();
+        flow.process.cmdline.clear();
+        flow.attribution_confidence = 0;
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            flow,
+            CaptureOrigin::from_source(CaptureSource::Libpcap),
             "test",
             EventKind::HttpRequestHeaders(probe_core::HttpHeaders {
                 direction: probe_core::Direction::Outbound,

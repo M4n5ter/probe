@@ -193,7 +193,11 @@ pub(super) fn event_kind_display(
     }
 }
 
-pub(super) fn event_detail_lines(sequence: u64, event: TrafficEventRef<'_>) -> Vec<String> {
+pub(super) fn event_detail_lines(
+    sequence: u64,
+    event: TrafficEventRef<'_>,
+    attribution: Option<&TrafficAttribution>,
+) -> Vec<String> {
     let mut lines = vec![
         format!("Sequence: {sequence}"),
         format!("Event id: {}", event.event_id()),
@@ -230,7 +234,10 @@ pub(super) fn event_detail_lines(sequence: u64, event: TrafficEventRef<'_>) -> V
             format!("Protocol: {:?}", flow.protocol),
             format!("Attribution confidence: {}", flow.attribution_confidence),
         ]);
-        lines.extend(TrafficAttribution::from_event(event).detail_lines());
+        let attribution = attribution
+            .cloned()
+            .unwrap_or_else(|| TrafficAttribution::from_event(event));
+        lines.extend(attribution.detail_lines());
     }
     lines.extend(event_kind_display(event.kind(), true).details);
     if event.is_tail() {
