@@ -22,9 +22,10 @@ use crate::{
     runtime_reload::{
         RuntimeReloadGate,
         config_reload::{
-            ConfigReloadApplyAction, ConfigReloadApplyActionOutcome, ConfigReloadApplyRuntime,
-            ConfigReloadApplySnapshot, ConfigReloadDecision,
-            ConfigReloadRuntimeGenerationActionOutcome, apply_config_reload_to_runtime,
+            ConfigReloadApplyAction, ConfigReloadApplyActionOutcome, ConfigReloadApplyRestriction,
+            ConfigReloadApplyRuntime, ConfigReloadApplySnapshot, ConfigReloadDecision,
+            ConfigReloadRuntimeGenerationActionOutcome, RuntimeConfigReloadOwner,
+            apply_config_reload_to_runtime,
         },
     },
 };
@@ -76,11 +77,10 @@ pub(crate) fn spawn_watcher(
     context: RuntimeConfigWatcherContext,
 ) -> Result<Option<RuntimeConfigWatcherHandle>, RuntimeConfigWatcherError> {
     let initial_plan = context.plan.snapshot();
-    if !initial_plan.config.runtime_reload.watch_config {
-        return Ok(None);
-    }
     let Some(config_path) = config_path else {
-        warn!("runtime config reload watcher is enabled, but no config path was provided");
+        if initial_plan.config.runtime_reload.watch_config {
+            warn!("runtime config reload watcher is enabled, but no config path was provided");
+        }
         return Ok(None);
     };
     let target = runtime_config_watch_target(&config_path)?;
@@ -126,17 +126,9 @@ fn reload_after_quiet_period<'a>(
     context: &'a WatcherReloadContext,
 ) -> ReloadFuture<'a> {
     Box::pin(async move {
-        if !runtime_config_reload_enabled(&context.context) {
-            info!("runtime config reload watcher ignored config change while disabled");
-            return;
-        }
         refresh_config_watches(watcher, &context.target);
         reload_after_config_change(&context.context, &context.target.config_path).await;
     })
-}
-
-fn runtime_config_reload_enabled(context: &RuntimeConfigWatcherContext) -> bool {
-    context.plan.snapshot().config.runtime_reload.watch_config
 }
 
 fn notify_event_requests_reload(event: notify::Result<Event>, config_path: &Path) -> bool {
@@ -215,13 +207,30 @@ async fn reload_after_config_change(
     config_path: &Path,
 ) -> ConfigReloadApplySnapshot {
     let snapshot = apply_config_reload_once(context, config_path).await;
-    log_config_reload_apply_outcome(config_path, &snapshot);
+    if reload_outcome_was_ignored_by_disabled_runtime_reload(&snapshot) {
+        info!("runtime config reload watcher ignored config change while disabled");
+    } else {
+        log_config_reload_apply_outcome(config_path, &snapshot);
+    }
     snapshot
 }
 
 async fn apply_config_reload_once(
     context: &RuntimeConfigWatcherContext,
     config_path: &Path,
+) -> ConfigReloadApplySnapshot {
+    apply_config_reload_once_with_restriction(
+        context,
+        config_path,
+        ConfigReloadApplyRestriction::RespectActiveRuntimeReload,
+    )
+    .await
+}
+
+async fn apply_config_reload_once_with_restriction(
+    context: &RuntimeConfigWatcherContext,
+    config_path: &Path,
+    apply_restriction: ConfigReloadApplyRestriction,
 ) -> ConfigReloadApplySnapshot {
     apply_config_reload_to_runtime(
         ConfigReloadApplyRuntime {
@@ -232,6 +241,8 @@ async fn apply_config_reload_once(
             enforcement_runtime_state: context.enforcement_runtime.as_ref(),
             enforcement_reload_gate: &context.enforcement_reload_gate,
             runtime_generation: Some(&context.runtime_generation),
+            runtime_config_reload_owner: RuntimeConfigReloadOwner::Attached,
+            apply_restriction,
         },
         config_path,
     )
@@ -266,6 +277,17 @@ fn reload_outcome_needs_operator_attention(snapshot: &ConfigReloadApplySnapshot)
         .actions
         .iter()
         .any(config_reload_apply_action_failed)
+}
+
+fn reload_outcome_was_ignored_by_disabled_runtime_reload(
+    snapshot: &ConfigReloadApplySnapshot,
+) -> bool {
+    matches!(
+        snapshot.plan.decision,
+        ConfigReloadDecision::ApplyOnline { .. }
+    ) && !snapshot.plan.only_updates_runtime_reload_online()
+        && !snapshot.active_plan_updated
+        && snapshot.actions.is_empty()
 }
 
 fn config_reload_apply_action_failed(action: &ConfigReloadApplyAction) -> bool {
@@ -445,25 +467,32 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn runtime_config_reload_enabled_follows_active_plan() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let mut config = base_config(PathBuf::from("/tmp/probe-spool"));
+    #[tokio::test]
+    async fn spawn_watcher_creates_dormant_watcher_when_runtime_reload_is_disabled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let mut config = base_config(temp.path().join("spool"));
         config.runtime_reload.watch_config = false;
+        let config_path = temp.path().join("agent.toml");
+        fs::write(&config_path, toml::to_string(&config)?)?;
         let context = watcher_context(runtime_plan(config)?);
 
-        assert!(!runtime_config_reload_enabled(&context));
+        let watcher = spawn_watcher(Some(config_path), context)?;
+
+        let watcher = watcher.expect("config path should create a dormant runtime config watcher");
+        watcher.stop().await;
         Ok(())
     }
 
     #[tokio::test]
-    async fn disabled_runtime_config_reload_watcher_ignores_candidate_file()
+    async fn disabled_runtime_config_reload_watcher_ignores_mixed_candidate_file()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
         let mut current_config = base_config(temp.path().join("spool"));
         current_config.runtime_reload.watch_config = false;
         let current = runtime_plan(current_config)?;
         let mut candidate = current.config.clone();
+        candidate.runtime_reload.watch_config = true;
         candidate.storage.retention = StorageRetentionConfig {
             ingress: IngressJournalRetentionConfig {
                 max_age_ms: None,
@@ -493,6 +522,128 @@ mod tests {
                 .ingress
                 .max_records,
             None
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disabled_runtime_config_reload_watcher_applies_runtime_reload_config()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let mut current_config = base_config(temp.path().join("spool"));
+        current_config.runtime_reload.watch_config = false;
+        current_config.runtime_reload.debounce_ms = 500;
+        let current = runtime_plan(current_config)?;
+        let mut candidate = current.config.clone();
+        candidate.runtime_reload.watch_config = true;
+        candidate.runtime_reload.debounce_ms = 1_000;
+        let config_path = temp.path().join("agent.toml");
+        fs::write(&config_path, toml::to_string(&candidate)?)?;
+        let context = watcher_context(current);
+        let target = runtime_config_watch_target(&config_path)?;
+        let watch_context = WatcherReloadContext { context, target };
+        let mut watcher = RecommendedWatcher::new(|_| {}, Config::default())?;
+
+        reload_after_quiet_period(&mut watcher, &watch_context).await;
+
+        let active_config = &watch_context.context.plan.snapshot().config;
+        assert!(active_config.runtime_reload.watch_config);
+        assert_eq!(active_config.runtime_reload.debounce_ms, 1_000);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_config_reload_watcher_rechecks_disabled_plan_after_apply_gate_wait()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let mut current_config = base_config(temp.path().join("spool"));
+        current_config.runtime_reload.watch_config = true;
+        let current = runtime_plan(current_config)?;
+        let mut candidate = current.config.clone();
+        candidate.storage.retention = StorageRetentionConfig {
+            ingress: IngressJournalRetentionConfig {
+                max_age_ms: None,
+                max_records: Some(100_000),
+                sweep_interval_ms: 5_000,
+                prune_batch_limit: 128,
+            },
+            ..StorageRetentionConfig::default()
+        };
+        let config_path = temp.path().join("agent.toml");
+        fs::write(&config_path, toml::to_string(&candidate)?)?;
+        let context = watcher_context(current);
+        let target = runtime_config_watch_target(&config_path)?;
+        let watch_context = WatcherReloadContext { context, target };
+        let mut watcher = RecommendedWatcher::new(|_| {}, Config::default())?;
+        let apply_guard = watch_context.context.config_apply_gate.lock().await;
+        let mut reload = reload_after_quiet_period(&mut watcher, &watch_context);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut reload)
+                .await
+                .is_err()
+        );
+        let mut disabled_config = watch_context.context.plan.snapshot().config.clone();
+        disabled_config.runtime_reload.watch_config = false;
+        watch_context
+            .context
+            .plan
+            .replace(runtime_plan(disabled_config)?);
+        drop(apply_guard);
+        reload.await;
+
+        let active_config = &watch_context.context.plan.snapshot().config;
+        assert!(!active_config.runtime_reload.watch_config);
+        assert_eq!(active_config.storage.retention.ingress.max_records, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_config_reload_watcher_rechecks_enabled_plan_after_apply_gate_wait()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let mut current_config = base_config(temp.path().join("spool"));
+        current_config.runtime_reload.watch_config = false;
+        let current = runtime_plan(current_config)?;
+        let mut candidate = current.config.clone();
+        candidate.runtime_reload.watch_config = true;
+        candidate.storage.retention = StorageRetentionConfig {
+            ingress: IngressJournalRetentionConfig {
+                max_age_ms: None,
+                max_records: Some(100_000),
+                sweep_interval_ms: 5_000,
+                prune_batch_limit: 128,
+            },
+            ..StorageRetentionConfig::default()
+        };
+        let config_path = temp.path().join("agent.toml");
+        fs::write(&config_path, toml::to_string(&candidate)?)?;
+        let context = watcher_context(current);
+        let target = runtime_config_watch_target(&config_path)?;
+        let watch_context = WatcherReloadContext { context, target };
+        let mut watcher = RecommendedWatcher::new(|_| {}, Config::default())?;
+        let apply_guard = watch_context.context.config_apply_gate.lock().await;
+        let mut reload = reload_after_quiet_period(&mut watcher, &watch_context);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut reload)
+                .await
+                .is_err()
+        );
+        let mut enabled_config = watch_context.context.plan.snapshot().config.clone();
+        enabled_config.runtime_reload.watch_config = true;
+        watch_context
+            .context
+            .plan
+            .replace(runtime_plan(enabled_config)?);
+        drop(apply_guard);
+        reload.await;
+
+        let active_config = &watch_context.context.plan.snapshot().config;
+        assert!(active_config.runtime_reload.watch_config);
+        assert_eq!(
+            active_config.storage.retention.ingress.max_records,
+            Some(100_000)
         );
         Ok(())
     }

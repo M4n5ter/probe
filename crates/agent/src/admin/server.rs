@@ -40,7 +40,10 @@ use crate::runtime_generation::RuntimeGenerationState;
 use crate::runtime_plan::RuntimePlanHandle;
 use crate::runtime_reload::{
     RuntimeReloadGate,
-    config_reload::{ConfigReloadApplyRuntime, apply_config_reload_to_runtime, plan_config_reload},
+    config_reload::{
+        ConfigReloadApplyRestriction, ConfigReloadApplyRuntime, RuntimeConfigReloadOwner,
+        apply_config_reload_to_runtime, plan_config_reload_for_runtime,
+    },
 };
 use crate::status::{
     AgentStatusSnapshot, EnforcementRuntimeStatusInput, PROMETHEUS_TEXT_CONTENT_TYPE,
@@ -68,6 +71,7 @@ pub struct AdminRuntimeState {
     pub tls_plaintext: Option<TlsPlaintextRuntimeState>,
     pub l7_mitm: Option<L7MitmRuntimeHandle>,
     pub runtime_generation: Option<RuntimeGenerationState>,
+    pub runtime_config_reload_owner: RuntimeConfigReloadOwner,
     pub transparent_proxy: Option<TransparentProxyRuntimeHandle>,
 }
 
@@ -393,7 +397,12 @@ async fn handle_admin_request(
         },
         AdminRequest::PlanConfigReload { path } => {
             let plan = plan_handle.snapshot();
-            plan_config_reload_response(plan.as_ref(), path).await
+            plan_config_reload_response(
+                plan.as_ref(),
+                runtime_state.runtime_config_reload_owner,
+                path,
+            )
+            .await
         }
         AdminRequest::ApplyConfigReload { path } => {
             apply_config_reload_response(plan_handle, runtime_state, path).await
@@ -401,9 +410,17 @@ async fn handle_admin_request(
     }
 }
 
-async fn plan_config_reload_response(plan: &RuntimePlan, path: PathBuf) -> AdminResponse {
+async fn plan_config_reload_response(
+    plan: &RuntimePlan,
+    runtime_config_reload_owner: RuntimeConfigReloadOwner,
+    path: PathBuf,
+) -> AdminResponse {
     let current_config = plan.config.clone();
-    match tokio::task::spawn_blocking(move || plan_config_reload(&current_config, &path)).await {
+    match tokio::task::spawn_blocking(move || {
+        plan_config_reload_for_runtime(&current_config, &path, runtime_config_reload_owner)
+    })
+    .await
+    {
         Ok(plan) => AdminResponse::ConfigReloadPlan {
             plan: Box::new(plan),
         },
@@ -427,6 +444,8 @@ async fn apply_config_reload_response(
             enforcement_runtime_state: runtime_state.enforcement.as_ref(),
             enforcement_reload_gate: &runtime_state.enforcement_reload_gate,
             runtime_generation: runtime_state.runtime_generation.as_ref(),
+            runtime_config_reload_owner: runtime_state.runtime_config_reload_owner,
+            apply_restriction: ConfigReloadApplyRestriction::Full,
         },
         &path,
     )
@@ -1301,6 +1320,56 @@ mod tests {
                     change["section"] == json!("export")
                         && change["reload_mode"] == json!("apply_online")
                 })
+        );
+
+        server.stop().await;
+        drop(spool);
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_plan_config_reload_requires_restart_for_runtime_reload_without_owner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-config-reload-runtime-reload-no-owner")?;
+        let socket_path = temp.join("admin.sock");
+        let spool_path = temp.join("spool");
+        let spool = Arc::new(FjallSpool::open(&spool_path)?);
+        let mut config = config_with_storage_path(spool_path.clone());
+        config.runtime_reload.watch_config = false;
+        let plan = Arc::new(runtime_plan_from_config(config.clone())?);
+        let server = spawn_admin_server(
+            RuntimePlanHandle::new(Arc::clone(&plan)),
+            Arc::clone(&spool),
+            AdminServerConfig::unix_socket(socket_path.clone()),
+            AdminRuntimeState::default(),
+        )?;
+        let mut candidate = config;
+        candidate.runtime_reload.watch_config = true;
+        let candidate_path = temp.join("candidate.toml");
+        fs::write(&candidate_path, toml::to_string(&candidate)?)?;
+
+        let response = send_admin_request(
+            &socket_path,
+            json!({
+                "command": "plan_config_reload",
+                "path": candidate_path,
+            }),
+        )
+        .await?;
+
+        assert_eq!(response["kind"], json!("config_reload_plan"));
+        assert_eq!(
+            response["plan"]["decision"]["kind"],
+            json!("restart_required")
+        );
+        assert_eq!(
+            response["plan"]["changed_sections"][0]["section"],
+            json!("runtime_reload")
+        );
+        assert_eq!(
+            response["plan"]["changed_sections"][0]["reload_mode"],
+            json!("process_restart")
         );
 
         server.stop().await;

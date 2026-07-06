@@ -42,7 +42,7 @@ use crate::{
         RuntimeGenerationExecutor, RuntimeGenerationHandoffOutcomeSnapshot, RuntimeGenerationState,
     },
     runtime_plan::RuntimePlanHandle,
-    runtime_reload::RuntimeReloadGate,
+    runtime_reload::{RuntimeReloadGate, config_reload::RuntimeConfigReloadOwner},
     shutdown,
     storage_retention::{StorageRetentionWorkerHandle, spawn_storage_retention_workers},
     tls_plaintext::{TlsDecryptHintRuntimeState, TlsPlaintextRuntimeState},
@@ -114,6 +114,8 @@ pub(crate) async fn run_live_agent(
     let runtime_generation =
         RuntimeGenerationState::for_config_version(plan.config.config_version.clone());
     let config_apply_gate = RuntimeReloadGate::default();
+    let runtime_config_reload_owner =
+        RuntimeConfigReloadOwner::for_config_path(config_path.as_deref());
     let transparent_proxy_runtime = transparent_interception.proxy_runtime_handle();
     let plan_handle = RuntimePlanHandle::new(Arc::new(plan.clone()));
     let export_worker = ExportWorker::new(plan_handle.clone(), webhook_connection);
@@ -129,6 +131,7 @@ pub(crate) async fn run_live_agent(
         tls_plaintext: Some(tls_plaintext_runtime.clone()),
         l7_mitm: Some(l7_mitm_runtime.clone()),
         runtime_generation: Some(runtime_generation.clone()),
+        runtime_config_reload_owner,
         transparent_proxy: Some(transparent_proxy_runtime.clone()),
         ..AdminRuntimeState::default()
     };
