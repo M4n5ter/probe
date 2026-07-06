@@ -84,7 +84,11 @@ impl HttpExchangeRow {
         lines
     }
 
-    pub(crate) fn preview_lines(&self, max_lines: usize) -> Vec<String> {
+    pub(crate) fn preview_lines_with_loaded_sequences(
+        &self,
+        loaded_sequences: &[u64],
+        max_lines: usize,
+    ) -> Vec<String> {
         let lines = vec![
             format!("Sequence: {}", self.sequence),
             "View: HTTP exchange".to_string(),
@@ -92,8 +96,16 @@ impl HttpExchangeRow {
             format!("Remote: {}", self.endpoint),
             format!("Request: {} {}", self.method, self.target),
             format!("Response: {}", self.status),
-            format!("Request body: {}", self.request.body_preview()),
-            format!("Response body: {}", self.response.body_preview()),
+            format!(
+                "Request body: {}",
+                self.request
+                    .body_preview_with_loaded_sequences(loaded_sequences)
+            ),
+            format!(
+                "Response body: {}",
+                self.response
+                    .body_preview_with_loaded_sequences(loaded_sequences)
+            ),
             "Full detail: request, response, headers, payloads".to_string(),
         ];
         fit_preview_lines(lines, max_lines)
@@ -157,9 +169,9 @@ impl HttpMessage {
         self.body.iter().map(|chunk| chunk.data_len).sum()
     }
 
-    fn body_preview(&self) -> String {
+    fn body_preview_with_loaded_sequences(&self, loaded_sequences: &[u64]) -> String {
         let bytes = self.body_len();
-        let status = self.body_payload_status();
+        let status = self.body_payload_status_with_loaded_sequences(loaded_sequences);
         format!("{} bytes ({})", bytes, status.preview_label())
     }
 
@@ -170,13 +182,20 @@ impl HttpMessage {
     }
 
     fn body_payload_status(&self) -> BodyPayloadStatus {
+        self.body_payload_status_with_loaded_sequences(&[])
+    }
+
+    fn body_payload_status_with_loaded_sequences(
+        &self,
+        loaded_sequences: &[u64],
+    ) -> BodyPayloadStatus {
         if self.body.is_empty() {
             return BodyPayloadStatus::None;
         }
         let missing_chunks = self
             .body
             .iter()
-            .filter(|chunk| chunk.data.is_none())
+            .filter(|chunk| !chunk.is_payload_loaded(loaded_sequences))
             .count();
         if missing_chunks == self.body.len() {
             return BodyPayloadStatus::NotLoaded { missing_chunks };
@@ -184,9 +203,8 @@ impl HttpMessage {
         if missing_chunks > 0 {
             return BodyPayloadStatus::Partial { missing_chunks };
         }
-        match BodyPayloadScan::scan(&self.body, false)
-            .expect("non-empty loaded body chunks must classify")
-            .coverage
+        match BodyPayloadCoverage::from_chunk_metadata(&self.body)
+            .expect("non-empty body chunks must classify")
         {
             BodyPayloadCoverage::Complete => BodyPayloadStatus::Loaded,
             BodyPayloadCoverage::Incomplete { .. } => BodyPayloadStatus::Incomplete,
@@ -444,6 +462,12 @@ struct BodyChunk {
     end_stream: bool,
 }
 
+impl BodyChunk {
+    fn is_payload_loaded(&self, loaded_sequences: &[u64]) -> bool {
+        self.data.is_some() || loaded_sequences.contains(&self.sequence)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BodyPayloadScan {
     coverage: BodyPayloadCoverage,
@@ -452,45 +476,60 @@ struct BodyPayloadScan {
 
 impl BodyPayloadScan {
     fn scan(chunks: &[BodyChunk], collect_bytes: bool) -> Option<Self> {
-        let chunks = sorted_body_chunks(chunks);
-        let first = chunks.first()?;
-        let start_offset = first.offset;
-        let mut next_offset = start_offset;
-        let mut observed_bytes = Vec::new();
-        let mut has_gap = false;
-        let mut has_end_stream = false;
-        for chunk in chunks {
-            has_end_stream |= chunk.end_stream;
-            if chunk.offset > next_offset {
-                has_gap = true;
-                next_offset = chunk.offset;
-            }
-            let Some(data) = &chunk.data else {
-                return None;
-            };
-            let overlap = next_offset.saturating_sub(chunk.offset) as usize;
-            if overlap >= data.len() {
-                continue;
-            }
-            let new_bytes = &data[overlap..];
-            if collect_bytes {
-                observed_bytes.extend_from_slice(new_bytes);
-            }
-            next_offset = next_offset.saturating_add(new_bytes.len() as u64);
-        }
-        let coverage = if start_offset == 0 && !has_gap && has_end_stream {
-            BodyPayloadCoverage::Complete
-        } else {
-            BodyPayloadCoverage::Incomplete {
-                start_offset,
-                reason: incomplete_body_reason(start_offset, has_gap),
-            }
-        };
-        Some(Self {
-            coverage,
-            observed_bytes,
-        })
+        scan_body_payload(chunks, BodyPayloadScanMode::RequireBytes { collect_bytes })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyPayloadScanMode {
+    RequireBytes { collect_bytes: bool },
+    MetadataOnly,
+}
+
+fn scan_body_payload(chunks: &[BodyChunk], mode: BodyPayloadScanMode) -> Option<BodyPayloadScan> {
+    let chunks = sorted_body_chunks(chunks);
+    let first = chunks.first()?;
+    let start_offset = first.offset;
+    let mut next_offset = start_offset;
+    let mut observed_bytes = Vec::new();
+    let mut has_gap = false;
+    let mut has_end_stream = false;
+    for chunk in chunks {
+        has_end_stream |= chunk.end_stream;
+        if chunk.offset > next_offset {
+            has_gap = true;
+            next_offset = chunk.offset;
+        }
+        let payload_len = match mode {
+            BodyPayloadScanMode::RequireBytes { .. } => chunk.data.as_ref()?.len(),
+            BodyPayloadScanMode::MetadataOnly => chunk.data_len,
+        };
+        let overlap = next_offset.saturating_sub(chunk.offset) as usize;
+        if overlap >= payload_len {
+            continue;
+        }
+        let new_len = payload_len - overlap;
+        if let BodyPayloadScanMode::RequireBytes {
+            collect_bytes: true,
+        } = mode
+        {
+            let data = chunk.data.as_ref()?;
+            observed_bytes.extend_from_slice(&data[overlap..]);
+        }
+        next_offset = next_offset.saturating_add(new_len as u64);
+    }
+    let coverage = if start_offset == 0 && !has_gap && has_end_stream {
+        BodyPayloadCoverage::Complete
+    } else {
+        BodyPayloadCoverage::Incomplete {
+            start_offset,
+            reason: incomplete_body_reason(start_offset, has_gap),
+        }
+    };
+    Some(BodyPayloadScan {
+        coverage,
+        observed_bytes,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -500,6 +539,12 @@ enum BodyPayloadCoverage {
         start_offset: u64,
         reason: &'static str,
     },
+}
+
+impl BodyPayloadCoverage {
+    fn from_chunk_metadata(chunks: &[BodyChunk]) -> Option<Self> {
+        scan_body_payload(chunks, BodyPayloadScanMode::MetadataOnly).map(|scan| scan.coverage)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -855,7 +900,7 @@ mod tests {
             let expected_preview = case.expected_preview;
             let expected_payload = case.expected_payload;
             let exchange = single_exchange(case.rows());
-            let preview = exchange.preview_lines(16);
+            let preview = exchange.preview_lines_with_loaded_sequences(&[], 16);
 
             assert!(
                 preview.iter().any(|line| line == expected_preview),

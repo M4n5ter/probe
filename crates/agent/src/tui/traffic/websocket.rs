@@ -79,7 +79,11 @@ impl WebSocketSessionRow {
         hydrated.detail_lines()
     }
 
-    pub(crate) fn preview_lines(&self, max_lines: usize) -> Vec<String> {
+    pub(crate) fn preview_lines_with_loaded_sequences(
+        &self,
+        loaded_sequences: &[u64],
+        max_lines: usize,
+    ) -> Vec<String> {
         let lines = vec![
             format!("Sequence: {}", self.sequence),
             "View: WebSocket session".to_string(),
@@ -88,7 +92,11 @@ impl WebSocketSessionRow {
             format!("Target: {}", self.target),
             format!("Frames: {}", self.frames),
             format!("Messages: {}", self.messages),
-            format!("Message payload: {} bytes", self.payload_bytes),
+            format!(
+                "Message payload: {} bytes ({})",
+                self.payload_bytes,
+                self.payload_status_label_with_loaded_sequences(loaded_sequences)
+            ),
             "Open detail for handoff, frames, messages, and payloads".to_string(),
         ];
         fit_preview_lines(lines, max_lines)
@@ -122,6 +130,24 @@ impl WebSocketSessionRow {
         existing.payload_len = message.payload_len;
         existing.payload = message.payload.map(<[u8]>::to_vec);
         existing.payload_fingerprint = message.payload_fingerprint.to_vec();
+    }
+
+    fn payload_status_label_with_loaded_sequences(&self, loaded_sequences: &[u64]) -> &'static str {
+        if self.message_events.is_empty() {
+            return "none";
+        }
+        let loaded_messages = self
+            .message_events
+            .iter()
+            .filter(|message| message.is_payload_loaded(loaded_sequences))
+            .count();
+        if loaded_messages == self.message_events.len() {
+            "loaded"
+        } else if loaded_messages == 0 {
+            "not loaded"
+        } else {
+            "partial"
+        }
     }
 
     fn handoff_detail_lines(&self) -> Vec<String> {
@@ -237,6 +263,12 @@ struct WebSocketMessageEvent {
     payload_len: u64,
     payload: Option<Vec<u8>>,
     payload_fingerprint: Vec<u8>,
+}
+
+impl WebSocketMessageEvent {
+    fn is_payload_loaded(&self, loaded_sequences: &[u64]) -> bool {
+        self.payload.is_some() || loaded_sequences.contains(&self.sequence)
+    }
 }
 
 #[derive(Debug, Clone)]

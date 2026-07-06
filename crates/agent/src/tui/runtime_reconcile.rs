@@ -184,6 +184,7 @@ async fn saved_runtime_reconcile(
         active_socket_path.as_deref(),
         &config,
         &config_path,
+        &cancellation,
     )
     .await;
     if let (Some(_running), Some(note)) = (&supervisor, &plan_note)
@@ -267,8 +268,22 @@ async fn runtime_apply_plan_note(
     active_socket_path: Option<&Path>,
     config: &AgentConfig,
     config_path: &Path,
+    cancellation: &CancellationToken,
 ) -> Option<RuntimeApplyPlanNote> {
     let socket_path = active_socket_path?;
+    let _config_apply_lock = match supervisor {
+        Some(running) => match running.acquire_config_apply_lock(cancellation).await {
+            Ok(lock) => lock,
+            Err(error) => {
+                return Some(RuntimeApplyPlanNote {
+                    status_kind: StatusKind::Warning,
+                    effect: RuntimeApplyEffect::RestartToApply,
+                    text: format!("runtime config apply unavailable: {error}"),
+                });
+            }
+        },
+        None => None,
+    };
     let candidate_path = match supervisor {
         Some(running) => match running.prepare_config_reload_candidate(config) {
             Ok(path) => path,
@@ -286,6 +301,18 @@ async fn runtime_apply_plan_note(
         match request_config_reload_apply(socket_path, &candidate_path).await {
             Ok(summary) => {
                 let disposition = summary.disposition();
+                if should_promote_runtime_config(&disposition)
+                    && let Some(running) = supervisor
+                    && let Err(error) = running.promote_config_reload_candidate(&candidate_path)
+                {
+                    return Some(RuntimeApplyPlanNote {
+                        status_kind: StatusKind::Warning,
+                        effect: RuntimeApplyEffect::RestartToApply,
+                        text: format!(
+                            "runtime config apply succeeded but boot config promotion failed: {error}"
+                        ),
+                    });
+                }
                 RuntimeApplyPlanNote {
                     status_kind: runtime_apply_status_kind(&disposition),
                     effect: runtime_apply_effect(&disposition),
@@ -298,6 +325,13 @@ async fn runtime_apply_plan_note(
                 text: format!("runtime config apply unavailable: {error}"),
             },
         },
+    )
+}
+
+fn should_promote_runtime_config(disposition: &ConfigReloadApplyDisposition) -> bool {
+    matches!(
+        disposition,
+        ConfigReloadApplyDisposition::AppliedOnline | ConfigReloadApplyDisposition::NoChange
     )
 }
 

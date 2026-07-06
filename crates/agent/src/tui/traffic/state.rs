@@ -519,6 +519,14 @@ impl TrafficState {
             .collect()
     }
 
+    fn loaded_detail_sequences(&self, sequences: &[u64]) -> Vec<u64> {
+        sequences
+            .iter()
+            .copied()
+            .filter(|sequence| self.detail_state.loaded(*sequence).is_some())
+            .collect()
+    }
+
     pub(crate) fn selected_detail_auto_fetch_sequence(&self) -> Option<u64> {
         self.selected_detail_fetch_sequence(DetailFetchMode::Auto)
     }
@@ -664,14 +672,28 @@ impl TrafficState {
                 return self
                     .http_exchanges
                     .get(self.http_view.selected_index)
-                    .map(|exchange| exchange.preview_lines(max_lines.max(1)))
+                    .map(|exchange| {
+                        let fetch_sequences = exchange.detail_fetch_sequences();
+                        let loaded_sequences = self.loaded_detail_sequences(&fetch_sequences);
+                        exchange.preview_lines_with_loaded_sequences(
+                            &loaded_sequences,
+                            max_lines.max(1),
+                        )
+                    })
                     .unwrap_or_else(|| self.diagnostic_lines());
             }
             TrafficViewMode::WebSocket => {
                 return self
                     .websocket_sessions
                     .get(self.websocket_view.selected_index)
-                    .map(|session| session.preview_lines(max_lines.max(1)))
+                    .map(|session| {
+                        let fetch_sequences = session.detail_fetch_sequences();
+                        let loaded_sequences = self.loaded_detail_sequences(&fetch_sequences);
+                        session.preview_lines_with_loaded_sequences(
+                            &loaded_sequences,
+                            max_lines.max(1),
+                        )
+                    })
                     .unwrap_or_else(|| self.diagnostic_lines());
             }
             TrafficViewMode::Events => {}
@@ -1995,6 +2017,18 @@ mod tests {
                 .iter()
                 .any(|line| line == "  Body payload: hello")
         );
+        assert!(
+            traffic
+                .detail_preview_lines(9)
+                .iter()
+                .any(|line| line == "Request body: 5 bytes (loaded)")
+        );
+        assert!(
+            traffic
+                .detail_preview_lines(9)
+                .iter()
+                .any(|line| line == "Response body: 2 bytes (not loaded)")
+        );
         traffic.mark_detail_loading(4, 42);
         traffic.apply_detail_load_result(TrafficDetailLoadResult {
             sequence: 4,
@@ -2012,6 +2046,12 @@ mod tests {
             .selected_detail_lines()
             .expect("HTTP exchange detail");
         assert!(details.iter().any(|line| line == "  Body payload: ok"));
+        assert!(
+            traffic
+                .detail_preview_lines(9)
+                .iter()
+                .any(|line| line == "Response body: 2 bytes (loaded)")
+        );
         assert!(!details.iter().any(|line| line.contains("Raw event detail")));
     }
 
@@ -2081,7 +2121,7 @@ mod tests {
             traffic
                 .detail_preview_lines(9)
                 .iter()
-                .any(|line| line == "Message payload: 5 bytes")
+                .any(|line| line == "Message payload: 5 bytes (not loaded)")
         );
         assert!(
             traffic
@@ -2109,6 +2149,12 @@ mod tests {
                 .expect("WebSocket session detail")
                 .iter()
                 .any(|line| line == "    Payload: hello")
+        );
+        assert!(
+            traffic
+                .detail_preview_lines(9)
+                .iter()
+                .any(|line| line == "Message payload: 5 bytes (loaded)")
         );
         assert!(
             !traffic

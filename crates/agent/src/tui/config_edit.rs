@@ -75,6 +75,10 @@ pub(crate) enum TuiError {
         log_path: PathBuf,
         log_tail: String,
     },
+    #[error("timed out waiting for TUI managed agent admin socket {socket_path} to stop")]
+    ManagedAgentShutdownTimeout { socket_path: String },
+    #[error("TUI managed agent admin socket {socket_path} exists but did not respond")]
+    ManagedAgentAdminUnresponsive { socket_path: String },
     #[error("TUI managed agent startup cancelled")]
     ManagedAgentStartupCancelled,
 }

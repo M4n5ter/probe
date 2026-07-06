@@ -62,12 +62,18 @@ impl RuntimeAttachment {
                 socket_path,
                 pid,
                 log_path,
-            } => format!(
-                "TUI managed agent pid {} at {}; log {}",
-                pid.unwrap_or_default(),
-                socket_path.display(),
-                log_path.display()
-            ),
+            } => match pid {
+                Some(pid) => format!(
+                    "TUI managed agent pid {pid} at {}; log {}",
+                    socket_path.display(),
+                    log_path.display()
+                ),
+                None => format!(
+                    "TUI managed agent at {}; log {}",
+                    socket_path.display(),
+                    log_path.display()
+                ),
+            },
         }
     }
 }
