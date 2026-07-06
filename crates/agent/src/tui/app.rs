@@ -11,6 +11,7 @@ use super::fields::{
     FieldApplyOutcome, FieldId, apply_field, apply_text_field, editable_text_value,
 };
 use super::hit::{HitTarget, ScrollTarget};
+use super::log_tail::{DEFAULT_TAIL_BYTES, last_non_empty_lines, read_text_tail};
 use super::observation_setup::{
     ProcessObservationMode, process_observation_exe_paths, remove_process_observation,
     replace_process_observations_with, upsert_process_observation,
@@ -273,15 +274,38 @@ enum TrafficPopup {
     Diagnostics,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TrafficPopupState {
-    kind: TrafficPopup,
-    scroll: usize,
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrafficPopupState {
+    RowDetail { scroll: usize },
+    Diagnostics { scroll: usize, lines: Vec<String> },
 }
 
 impl TrafficPopupState {
-    fn new(kind: TrafficPopup) -> Self {
-        Self { kind, scroll: 0 }
+    fn row_detail() -> Self {
+        Self::RowDetail { scroll: 0 }
+    }
+
+    fn diagnostics(lines: Vec<String>) -> Self {
+        Self::Diagnostics { scroll: 0, lines }
+    }
+
+    fn kind(&self) -> TrafficPopup {
+        match self {
+            Self::RowDetail { .. } => TrafficPopup::RowDetail,
+            Self::Diagnostics { .. } => TrafficPopup::Diagnostics,
+        }
+    }
+
+    fn scroll(&self) -> usize {
+        match self {
+            Self::RowDetail { scroll } | Self::Diagnostics { scroll, .. } => *scroll,
+        }
+    }
+
+    fn set_scroll(&mut self, next: usize) {
+        match self {
+            Self::RowDetail { scroll } | Self::Diagnostics { scroll, .. } => *scroll = next,
+        }
     }
 }
 
@@ -429,18 +453,18 @@ impl TuiApp {
         self.traffic_popup_viewport_rows = viewport_rows.max(1);
         let max_scroll = self.traffic_popup_max_scroll();
         if let Some(popup) = &mut self.traffic_popup {
-            popup.scroll = popup.scroll.min(max_scroll);
-            return Some(popup.scroll);
+            popup.set_scroll(popup.scroll().min(max_scroll));
+            return Some(popup.scroll());
         }
         None
     }
 
     pub(crate) fn traffic_popup_view(&self) -> Option<TrafficPopupView> {
-        let state = self.traffic_popup?;
+        let state = self.traffic_popup.as_ref()?;
         Some(TrafficPopupView {
-            title: self.traffic_popup_title_for(state.kind),
-            lines: self.traffic_popup_lines(state.kind),
-            scroll: state.scroll,
+            title: self.traffic_popup_title_for(state.kind()),
+            lines: self.traffic_popup_lines(state),
+            scroll: state.scroll(),
         })
     }
 
@@ -546,11 +570,26 @@ impl TuiApp {
     }
 
     pub(crate) fn detach_agent(&mut self, message: impl Into<String>) {
+        let log_path = self
+            .runtime_attachment
+            .managed_log_path()
+            .map(Path::to_path_buf);
+        self.detach_agent_with_log(message, log_path);
+    }
+
+    pub(crate) fn detach_agent_with_log(
+        &mut self,
+        message: impl Into<String>,
+        log_path: Option<PathBuf>,
+    ) {
         let raw_message = message.into();
         let failure_kind = classify_runtime_detach_message(&raw_message);
         let status = StatusMessage::error(raw_message);
         let reason = status.text.clone();
-        self.runtime_attachment = RuntimeAttachment::lost(status.text.clone());
+        self.runtime_attachment = match log_path {
+            Some(log_path) => RuntimeAttachment::lost_managed(status.text.clone(), log_path),
+            None => RuntimeAttachment::lost(status.text.clone()),
+        };
         self.runtime_generation_identity = None;
         self.runtime_generation_reload_pending = None;
         self.invalidate_runtime_reads();
@@ -1104,7 +1143,7 @@ impl TuiApp {
 
     fn next_open_traffic_detail_sequence(&self) -> Option<u64> {
         if !matches!(
-            self.traffic_popup.map(|popup| popup.kind),
+            self.traffic_popup.as_ref().map(TrafficPopupState::kind),
             Some(TrafficPopup::RowDetail)
         ) {
             return None;
@@ -1507,11 +1546,17 @@ impl TuiApp {
         self.clear_hover();
         self.traffic_popup_content_rows = 0;
         self.traffic_popup_viewport_rows = 1;
-        self.traffic_popup = Some(TrafficPopupState::new(kind));
+        let popup = match kind {
+            TrafficPopup::Diagnostics => {
+                TrafficPopupState::diagnostics(self.data_path_diagnostics_lines())
+            }
+            TrafficPopup::RowDetail => TrafficPopupState::row_detail(),
+        };
+        self.traffic_popup = Some(popup);
     }
 
     fn close_traffic_popup(&mut self) {
-        let status = match self.traffic_popup.map(|popup| popup.kind) {
+        let status = match self.traffic_popup.as_ref().map(TrafficPopupState::kind) {
             Some(TrafficPopup::Diagnostics) => "Data path diagnostics closed",
             _ => "Traffic detail closed",
         };
@@ -1564,7 +1609,7 @@ impl TuiApp {
         }
         let max_scroll = self.traffic_popup_max_scroll();
         if let Some(popup) = &mut self.traffic_popup {
-            popup.scroll = apply_scroll_delta(popup.scroll, delta).min(max_scroll);
+            popup.set_scroll(apply_scroll_delta(popup.scroll(), delta).min(max_scroll));
         }
     }
 
@@ -1576,18 +1621,52 @@ impl TuiApp {
         let max_scroll = self.traffic_popup_max_scroll();
         let scroll = drag_position_to_scroll(offset, height, max_scroll);
         if let Some(popup) = &mut self.traffic_popup {
-            popup.scroll = scroll;
+            popup.set_scroll(scroll);
         }
     }
 
-    fn traffic_popup_lines(&self, kind: TrafficPopup) -> Vec<String> {
-        match kind {
-            TrafficPopup::RowDetail => self
+    fn traffic_popup_lines(&self, state: &TrafficPopupState) -> Vec<String> {
+        match state {
+            TrafficPopupState::RowDetail { .. } => self
                 .traffic
                 .selected_detail_lines()
                 .unwrap_or_else(|| vec!["No selected traffic row".to_string()]),
-            TrafficPopup::Diagnostics => self.data_path_diagnostics.detail_lines(),
+            TrafficPopupState::Diagnostics { lines, .. } => lines.clone(),
         }
+    }
+
+    fn data_path_diagnostics_lines(&self) -> Vec<String> {
+        let mut lines = self.data_path_diagnostics.detail_lines();
+        lines.extend(self.managed_agent_log_lines());
+        lines
+    }
+
+    fn managed_agent_log_lines(&self) -> Vec<String> {
+        let Some(log_path) = self.runtime_attachment.managed_log_path() else {
+            return Vec::new();
+        };
+        let mut lines = vec![
+            String::new(),
+            "Managed agent log".to_string(),
+            format!("Path: {}", log_path.display()),
+        ];
+        match read_text_tail(log_path, DEFAULT_TAIL_BYTES) {
+            Ok(tail) if tail.trim().is_empty() => {
+                lines.push("Tail: <empty>".to_string());
+            }
+            Ok(tail) => {
+                lines.push(format!("Tail: last {DEFAULT_TAIL_BYTES} bytes"));
+                lines.extend(
+                    last_non_empty_lines(&tail, 80)
+                        .into_iter()
+                        .map(str::to_string),
+                );
+            }
+            Err(error) => {
+                lines.push(format!("Tail unavailable: {error}"));
+            }
+        }
+        lines.into_iter().map(terminal_safe_inline_text).collect()
     }
 
     fn traffic_popup_title_for(&self, kind: TrafficPopup) -> &'static str {
@@ -2148,6 +2227,69 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("Select a traffic row"))
         );
+    }
+
+    #[test]
+    fn traffic_data_path_popup_includes_managed_agent_log_tail()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let log_path = temp.path().join("agent.log");
+        std::fs::write(
+            &log_path,
+            "startup\ncapture backend selected\nhttp parser ready\n",
+        )?;
+        let mut app = test_app();
+        app.attach_agent(RuntimeAttachment::managed(
+            temp.path().join("admin.sock"),
+            Some(42),
+            log_path.clone(),
+        ));
+        app.select_tab(TuiTab::Traffic);
+
+        app.handle_action(TuiAction::OpenTrafficDiagnostics);
+
+        let popup = app
+            .traffic_popup_view()
+            .expect("data path popup should be open");
+        assert!(popup.lines.iter().any(|line| line == "Managed agent log"));
+        assert!(
+            popup
+                .lines
+                .iter()
+                .any(|line| line == &format!("Path: {}", log_path.display()))
+        );
+        assert!(popup.lines.iter().any(|line| line == "http parser ready"));
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_data_path_popup_keeps_managed_agent_log_after_detach()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let log_path = temp.path().join("agent.log");
+        std::fs::write(&log_path, "startup failed\n")?;
+        let mut app = test_app();
+        app.attach_agent(RuntimeAttachment::managed(
+            temp.path().join("admin.sock"),
+            Some(42),
+            log_path.clone(),
+        ));
+
+        app.detach_agent("TUI managed agent exited during startup");
+        app.select_tab(TuiTab::Traffic);
+        app.handle_action(TuiAction::OpenTrafficDiagnostics);
+
+        let popup = app
+            .traffic_popup_view()
+            .expect("data path popup should be open");
+        assert!(
+            popup
+                .lines
+                .iter()
+                .any(|line| line == &format!("Path: {}", log_path.display()))
+        );
+        assert!(popup.lines.iter().any(|line| line == "startup failed"));
+        Ok(())
     }
 
     #[test]

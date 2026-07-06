@@ -83,6 +83,16 @@ pub(crate) enum TuiError {
     ManagedAgentStartupCancelled,
 }
 
+impl TuiError {
+    pub(crate) fn managed_agent_log_path(&self) -> Option<&Path> {
+        match self {
+            Self::ManagedAgentExited { log_path, .. }
+            | Self::ManagedAgentStartupTimeout { log_path, .. } => Some(log_path.as_path()),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedTuiConfig {
     pub(crate) source: String,

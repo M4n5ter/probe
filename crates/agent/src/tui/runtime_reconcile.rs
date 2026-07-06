@@ -59,6 +59,7 @@ enum RuntimeReconcileCompletion {
     },
     StartupUnavailable {
         message: String,
+        log_path: Option<PathBuf>,
     },
     SavedAttached {
         attachment: RuntimeAttachment,
@@ -173,12 +174,16 @@ async fn startup_runtime_reconcile(
                 completion: RuntimeReconcileCompletion::StartupAttached { attachment },
             }
         }
-        Err(error) => RuntimeReconcileResult {
-            supervisor: None,
-            completion: RuntimeReconcileCompletion::StartupUnavailable {
-                message: error.to_string(),
-            },
-        },
+        Err(error) => {
+            let log_path = error.managed_agent_log_path().map(Path::to_path_buf);
+            RuntimeReconcileResult {
+                supervisor: None,
+                completion: RuntimeReconcileCompletion::StartupUnavailable {
+                    message: error.to_string(),
+                    log_path,
+                },
+            }
+        }
     }
 }
 
@@ -528,6 +533,7 @@ fn completed_runtime_reconcile_for_test_with_context(
                 supervisor: None,
                 completion: RuntimeReconcileCompletion::StartupUnavailable {
                     message: message.to_string(),
+                    log_path: None,
                 },
             }
         }),
@@ -540,7 +546,10 @@ impl RuntimeReconcileOrigin {
     fn task_failed(self, error: tokio::task::JoinError) -> RuntimeReconcileCompletion {
         let message = format!("TUI runtime task failed: {error}");
         match self {
-            Self::Startup => RuntimeReconcileCompletion::StartupUnavailable { message },
+            Self::Startup => RuntimeReconcileCompletion::StartupUnavailable {
+                message,
+                log_path: None,
+            },
             Self::Saved(saved_status) => RuntimeReconcileCompletion::SavedUnavailable {
                 saved_status,
                 message,
@@ -562,8 +571,8 @@ pub(super) fn apply_runtime_reconcile_result(
         RuntimeReconcileCompletion::StartupAttached { attachment } => {
             app.attach_agent(attachment);
         }
-        RuntimeReconcileCompletion::StartupUnavailable { message } => {
-            app.detach_agent(format!("TUI agent unavailable: {message}"));
+        RuntimeReconcileCompletion::StartupUnavailable { message, log_path } => {
+            app.detach_agent_with_log(format!("TUI agent unavailable: {message}"), log_path);
         }
         RuntimeReconcileCompletion::SavedAttached {
             attachment,
@@ -869,6 +878,7 @@ mod tests {
                 supervisor: None,
                 completion: RuntimeReconcileCompletion::StartupUnavailable {
                     message: "libpcap is unavailable".to_string(),
+                    log_path: None,
                 },
             },
         );

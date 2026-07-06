@@ -11,6 +11,7 @@ mod fields;
 mod generated_resources;
 mod hit;
 mod local_profile;
+mod log_tail;
 mod observation_setup;
 mod process_catalog_task;
 mod process_traffic_scope;

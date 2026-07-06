@@ -1,6 +1,5 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom},
     os::unix::{fs::OpenOptionsExt, net::UnixListener as StdUnixListener},
     path::{Path, PathBuf},
     process::Stdio,
@@ -19,7 +18,9 @@ use rustix::{
 use tokio::{process::Command, time::Instant};
 
 use super::{
-    config_edit::TuiError, generated_resources::ensure_private_directory,
+    config_edit::TuiError,
+    generated_resources::ensure_private_directory,
+    log_tail::{DEFAULT_TAIL_BYTES, one_line_tail, read_text_tail},
     runtime_attachment::RuntimeAttachment,
 };
 use crate::admin::{AdminClientError, AdminRequest, send_admin_json_request_with_timeout};
@@ -32,7 +33,6 @@ const ADMIN_SHUTDOWN_GRACE_TIMEOUT: Duration = Duration::from_secs(5);
 const SHARED_MANAGED_HEALTH_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const MANAGED_AGENT_BASE_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const MANAGED_AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(5);
-const LOG_TAIL_BYTES: u64 = 8 * 1024;
 const DATA_READY_SOCKET_ENV: &str = "TRAFFIC_PROBE_READY_SOCKET";
 const CONTROL_READY_SOCKET_ENV: &str = "TRAFFIC_PROBE_CONTROL_READY_SOCKET";
 
@@ -1047,38 +1047,9 @@ async fn probe_admin_socket_once(socket_path: &Path) -> AdminSocketProbe {
 }
 
 fn managed_startup_log_tail(log_path: &Path) -> String {
-    one_line_log_tail(&read_log_tail(log_path))
-}
-
-fn read_log_tail(path: &Path) -> String {
-    let Ok(mut file) = File::open(path) else {
-        return String::new();
-    };
-    let Ok(len) = file.metadata().map(|metadata| metadata.len()) else {
-        return String::new();
-    };
-    let start = len.saturating_sub(LOG_TAIL_BYTES);
-    if file.seek(SeekFrom::Start(start)).is_err() {
-        return String::new();
-    }
-    let mut bytes = Vec::new();
-    if file.read_to_end(&mut bytes).is_err() {
-        return String::new();
-    }
-    String::from_utf8_lossy(&bytes).trim().to_string()
-}
-
-fn one_line_log_tail(log_tail: &str) -> String {
-    log_tail
-        .lines()
-        .rev()
-        .filter(|line| !line.trim().is_empty())
-        .take(4)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join(" | ")
+    read_text_tail(log_path, DEFAULT_TAIL_BYTES)
+        .map(|tail| one_line_tail(&tail, 4))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1385,14 +1356,6 @@ mod tests {
             Err(TuiError::ManagedAgentStartupCancelled)
         ));
         Ok(())
-    }
-
-    #[test]
-    fn one_line_log_tail_keeps_recent_lines() {
-        assert_eq!(
-            one_line_log_tail("one\ntwo\nthree\nfour\nfive\n"),
-            "two | three | four | five"
-        );
     }
 
     #[test]
