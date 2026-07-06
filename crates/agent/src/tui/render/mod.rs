@@ -70,45 +70,25 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, hits: &mut Vec
         area,
     );
     let button_y = area.y + 1;
-    render_button(
-        frame,
-        hits,
-        Rect::new(
-            area.x.saturating_add(area.width.saturating_sub(28)),
-            button_y,
-            7,
-            1,
-        ),
-        "Save",
-        HitTarget::Save,
-        app.is_hovered(HitTarget::Save),
-    );
-    render_button(
-        frame,
-        hits,
-        Rect::new(
-            area.x.saturating_add(area.width.saturating_sub(19)),
-            button_y,
-            9,
-            1,
-        ),
-        "Reload",
-        HitTarget::Reload,
-        app.is_hovered(HitTarget::Reload),
-    );
-    render_button(
-        frame,
-        hits,
-        Rect::new(
-            area.x.saturating_add(area.width.saturating_sub(8)),
-            button_y,
-            6,
-            1,
-        ),
-        "Quit",
-        HitTarget::Quit,
-        app.is_hovered(HitTarget::Quit),
-    );
+    let buttons = [
+        ("Agent", HitTarget::Agent, 8),
+        ("Save", HitTarget::Save, 7),
+        ("Reload", HitTarget::Reload, 9),
+        ("Quit", HitTarget::Quit, 6),
+    ];
+    let mut right_edge = area.x.saturating_add(area.width.saturating_sub(2));
+    for (label, target, width) in buttons.into_iter().rev() {
+        right_edge = right_edge.saturating_sub(width);
+        render_button(
+            frame,
+            hits,
+            Rect::new(right_edge, button_y, width, 1),
+            label,
+            target,
+            app.is_hovered(target),
+        );
+        right_edge = right_edge.saturating_sub(2);
+    }
 }
 
 fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, hits: &mut Vec<HitArea>) {
@@ -290,6 +270,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         ]);
     }
     spans.extend([
+        Span::styled("Ctrl-A", Style::default().fg(Color::Gray)),
+        Span::raw(" agent  "),
         Span::styled("Ctrl-S", Style::default().fg(Color::Gray)),
         Span::raw(" save  "),
         Span::styled("q", Style::default().fg(Color::Gray)),
@@ -525,8 +507,10 @@ mod tests {
         })?;
 
         let output = terminal.backend().to_string();
+        assert!(output.contains("Agent"));
         assert!(output.contains("filter"));
         assert!(output.contains("matches"));
+        assert!(hit_exists(&hit_map, Some(HitTarget::Agent), 100, 24));
         assert_eq!(hit_map.hit(23, 4), Some(HitTarget::Tab(TuiTab::Capture)));
         assert!(scroll_target_exists(
             &hit_map,

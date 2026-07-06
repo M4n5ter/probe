@@ -129,7 +129,100 @@ pub(crate) struct EbpfProcessObservationOptionalTracepointPairRuntimeSnapshot {
     pub(crate) reason: Option<String>,
 }
 
+impl CaptureProviderRuntimeSnapshot {
+    pub(crate) fn compact(&self, reason_max_chars: usize) -> Self {
+        Self {
+            selected_backend: self.selected_backend,
+            selected_input_source: self.selected_input_source,
+            plan_mode: self.plan_mode,
+            provider_runtime_mode: self.provider_runtime_mode,
+            evidence_mode: self.evidence_mode,
+            evidence_reason: compact_optional_runtime_reason(
+                self.evidence_reason.as_deref(),
+                reason_max_chars,
+            ),
+            reason: compact_optional_runtime_reason(self.reason.as_deref(), reason_max_chars),
+            open_failures: self
+                .open_failures
+                .iter()
+                .map(|failure| CaptureProviderOpenFailureSnapshot {
+                    backend: failure.backend,
+                    reason: compact_runtime_reason(&failure.reason, reason_max_chars),
+                })
+                .collect(),
+            provider: self
+                .provider
+                .as_ref()
+                .map(|provider| provider.compact(reason_max_chars)),
+        }
+    }
+}
+
 impl CaptureProviderRuntimeDetailsSnapshot {
+    pub(crate) fn compact(&self, reason_max_chars: usize) -> Self {
+        match self {
+            Self::EbpfProcessObservation {
+                link_ownership,
+                tracepoint_firings,
+                tracepoint_liveness,
+                kernel_liveness,
+                optional_tracepoint_pairs,
+            } => Self::EbpfProcessObservation {
+                link_ownership: EbpfProcessObservationLinkOwnershipRuntimeSnapshot {
+                    mode: link_ownership.mode,
+                    owned_link_count: link_ownership.owned_link_count,
+                    programs: Vec::new(),
+                    reason: compact_optional_runtime_reason(
+                        link_ownership.reason.as_deref(),
+                        reason_max_chars,
+                    ),
+                },
+                tracepoint_firings: EbpfProcessObservationTracepointFiringRuntimeSnapshot {
+                    mode: tracepoint_firings.mode,
+                    total_firing_count: tracepoint_firings.total_firing_count,
+                    programs: Vec::new(),
+                    reason: compact_optional_runtime_reason(
+                        tracepoint_firings.reason.as_deref(),
+                        reason_max_chars,
+                    ),
+                },
+                tracepoint_liveness: EbpfProcessObservationTracepointLivenessRuntimeSnapshot {
+                    diagnostics_available: tracepoint_liveness.diagnostics_available,
+                    mode: tracepoint_liveness.mode,
+                    advanced_program_count: tracepoint_liveness.advanced_program_count,
+                    not_advanced_program_count: tracepoint_liveness.not_advanced_program_count,
+                    unsupported_program_count: tracepoint_liveness.unsupported_program_count,
+                    programs: Vec::new(),
+                    reason: compact_optional_runtime_reason(
+                        tracepoint_liveness.reason.as_deref(),
+                        reason_max_chars,
+                    ),
+                },
+                kernel_liveness: EbpfProcessObservationKernelLivenessRuntimeSnapshot {
+                    mode: kernel_liveness.mode,
+                    reason: compact_runtime_reason(&kernel_liveness.reason, reason_max_chars),
+                },
+                optional_tracepoint_pairs: optional_tracepoint_pairs
+                    .iter()
+                    .map(
+                        |pair| EbpfProcessObservationOptionalTracepointPairRuntimeSnapshot {
+                            family_name: pair.family_name,
+                            mode: pair.mode,
+                            enter_category: pair.enter_category,
+                            enter_tracepoint_name: pair.enter_tracepoint_name,
+                            exit_category: pair.exit_category,
+                            exit_tracepoint_name: pair.exit_tracepoint_name,
+                            reason: compact_optional_runtime_reason(
+                                pair.reason.as_deref(),
+                                reason_max_chars,
+                            ),
+                        },
+                    )
+                    .collect(),
+            },
+        }
+    }
+
     pub(crate) fn ebpf_process_observation(probe: EbpfProcessObservationProbeSnapshot) -> Self {
         let (link_ownership, optional_tracepoint_pairs) = probe.into_parts();
         let tracepoint_firings =
@@ -195,6 +288,24 @@ impl CaptureProviderRuntimeDetailsSnapshot {
             tracepoint_liveness,
         );
     }
+}
+
+fn compact_optional_runtime_reason(reason: Option<&str>, max_chars: usize) -> Option<String> {
+    reason.map(|reason| compact_runtime_reason(reason, max_chars))
+}
+
+fn compact_runtime_reason(reason: &str, max_chars: usize) -> String {
+    truncate_str(reason, max_chars)
+}
+
+fn truncate_str(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let mut truncated = value.chars().take(keep).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 impl EbpfProcessObservationKernelLivenessRuntimeSnapshot {
@@ -586,6 +697,18 @@ impl CaptureProviderRuntimeState {
             .clone()
     }
 
+    pub(crate) fn compact_snapshot(
+        &self,
+        reason_max_chars: usize,
+    ) -> Option<CaptureProviderRuntimeSnapshot> {
+        self.inner
+            .snapshot
+            .read()
+            .expect("capture runtime lock poisoned")
+            .as_ref()
+            .map(|snapshot| snapshot.compact(reason_max_chars))
+    }
+
     pub(crate) fn input_activity_snapshot(&self) -> Option<CaptureInputActivityRuntimeSnapshot> {
         self.inner
             .snapshot
@@ -753,6 +876,124 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn compact_snapshot_drops_high_cardinality_ebpf_program_details() {
+        const REASON_MAX_CHARS: usize = 2048;
+        let details = CaptureProviderRuntimeDetailsSnapshot::EbpfProcessObservation {
+            link_ownership: EbpfProcessObservationLinkOwnershipRuntimeSnapshot {
+                mode: RuntimeMode::Available,
+                owned_link_count: 10_000,
+                programs: repeated_link_programs(10_000),
+                reason: Some("owned links".repeat(1_000)),
+            },
+            tracepoint_firings: EbpfProcessObservationTracepointFiringRuntimeSnapshot {
+                mode: RuntimeMode::Available,
+                total_firing_count: 20_000,
+                programs: repeated_firing_programs(10_000),
+                reason: Some("firing counters".repeat(1_000)),
+            },
+            tracepoint_liveness: EbpfProcessObservationTracepointLivenessRuntimeSnapshot {
+                diagnostics_available: true,
+                mode: RuntimeMode::Degraded,
+                advanced_program_count: 1,
+                not_advanced_program_count: 9_999,
+                unsupported_program_count: 0,
+                programs: repeated_liveness_programs(10_000),
+                reason: Some("liveness details".repeat(1_000)),
+            },
+            kernel_liveness: EbpfProcessObservationKernelLivenessRuntimeSnapshot {
+                mode: RuntimeMode::Degraded,
+                reason: "kernel liveness".repeat(1_000),
+            },
+            optional_tracepoint_pairs: vec![
+                EbpfProcessObservationOptionalTracepointPairRuntimeSnapshot {
+                    family_name: "tcp_retransmit",
+                    mode: RuntimeMode::Degraded,
+                    enter_category: "tcp",
+                    enter_tracepoint_name: "tcp_retransmit_skb",
+                    exit_category: "tcp",
+                    exit_tracepoint_name: "tcp_retransmit_skb_ret",
+                    reason: Some("optional pair reason".repeat(1_000)),
+                },
+            ],
+        };
+
+        let runtime = CaptureProviderRuntimeState::default();
+        runtime.record(CaptureProviderRuntimeSnapshot {
+            selected_backend: CaptureBackend::Ebpf,
+            selected_input_source: CaptureInputSource::LiveHost,
+            plan_mode: CapturePlanMode::Live,
+            provider_runtime_mode: RuntimeMode::Degraded,
+            evidence_mode: CaptureEvidenceMode::BestEffort,
+            evidence_reason: Some("evidence reason".repeat(1_000)),
+            reason: Some("runtime reason".repeat(1_000)),
+            open_failures: vec![CaptureProviderOpenFailureSnapshot {
+                backend: CaptureBackend::Libpcap,
+                reason: "open failure".repeat(1_000),
+            }],
+            provider: Some(details),
+        });
+
+        let compact = runtime
+            .compact_snapshot(REASON_MAX_CHARS)
+            .expect("compact runtime snapshot should be recorded");
+        let CaptureProviderRuntimeDetailsSnapshot::EbpfProcessObservation {
+            link_ownership,
+            tracepoint_firings,
+            tracepoint_liveness,
+            kernel_liveness,
+            optional_tracepoint_pairs,
+            ..
+        } = compact
+            .provider
+            .expect("compact snapshot should preserve provider summary");
+
+        assert!(
+            compact
+                .reason
+                .expect("runtime reason should be preserved")
+                .len()
+                <= REASON_MAX_CHARS
+        );
+        assert!(compact.open_failures[0].reason.len() <= REASON_MAX_CHARS);
+        assert_eq!(link_ownership.owned_link_count, 10_000);
+        assert!(link_ownership.programs.is_empty());
+        assert_eq!(tracepoint_firings.total_firing_count, 20_000);
+        assert!(tracepoint_firings.programs.is_empty());
+        assert_eq!(tracepoint_liveness.not_advanced_program_count, 9_999);
+        assert!(tracepoint_liveness.programs.is_empty());
+        assert!(
+            link_ownership
+                .reason
+                .expect("link ownership reason should be preserved")
+                .len()
+                <= REASON_MAX_CHARS
+        );
+        assert!(
+            tracepoint_firings
+                .reason
+                .expect("tracepoint firing reason should be preserved")
+                .len()
+                <= REASON_MAX_CHARS
+        );
+        assert!(
+            tracepoint_liveness
+                .reason
+                .expect("tracepoint liveness reason should be preserved")
+                .len()
+                <= REASON_MAX_CHARS
+        );
+        assert!(kernel_liveness.reason.len() <= REASON_MAX_CHARS);
+        assert!(
+            optional_tracepoint_pairs[0]
+                .reason
+                .as_ref()
+                .expect("optional tracepoint pair reason should be preserved")
+                .len()
+                <= REASON_MAX_CHARS
+        );
+    }
+
     struct ProgressProvider;
 
     impl CaptureProvider for ProgressProvider {
@@ -860,5 +1101,51 @@ mod tests {
             )),
             ..runtime_snapshot(CaptureBackend::Ebpf)
         }
+    }
+
+    fn repeated_link_programs(
+        count: usize,
+    ) -> Vec<EbpfProcessObservationLinkProgramRuntimeSnapshot> {
+        (0..count)
+            .map(|_| EbpfProcessObservationLinkProgramRuntimeSnapshot {
+                program_name: "read_enter",
+                category: "syscalls",
+                tracepoint_name: "sys_enter_read",
+                owned_link_count: 1,
+            })
+            .collect()
+    }
+
+    fn repeated_firing_programs(
+        count: usize,
+    ) -> Vec<EbpfProcessObservationTracepointFiringProgramRuntimeSnapshot> {
+        (0..count)
+            .map(
+                |_| EbpfProcessObservationTracepointFiringProgramRuntimeSnapshot {
+                    program_name: "read_enter",
+                    category: "syscalls",
+                    tracepoint_name: "sys_enter_read",
+                    firing_count: 2,
+                },
+            )
+            .collect()
+    }
+
+    fn repeated_liveness_programs(
+        count: usize,
+    ) -> Vec<EbpfProcessObservationTracepointLivenessProgramRuntimeSnapshot> {
+        (0..count)
+            .map(
+                |_| EbpfProcessObservationTracepointLivenessProgramRuntimeSnapshot {
+                    program_name: "read_enter",
+                    category: "syscalls",
+                    tracepoint_name: "sys_enter_read",
+                    state: EbpfProcessObservationTracepointLivenessProgramState::NotAdvanced,
+                    before_firing_count: 0,
+                    after_firing_count: 0,
+                    reason: "not advanced",
+                },
+            )
+            .collect()
     }
 }

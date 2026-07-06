@@ -17,6 +17,7 @@ pub(crate) enum HitTarget {
     TrafficPopupClose,
     TextEditSubmit,
     TextEditCancel,
+    Agent,
     Save,
     Reload,
     Quit,

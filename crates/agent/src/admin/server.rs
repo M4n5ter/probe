@@ -48,9 +48,10 @@ use crate::runtime_reload::{
 };
 use crate::status::{
     AgentStatusSnapshot, EnforcementRuntimeStatusInput, PROMETHEUS_TEXT_CONTENT_TYPE,
-    RuntimeStatusInput, TrafficRuntimeStatusInput, TrafficStatusProjection,
-    build_status_snapshot_with_runtime, build_traffic_status_projection_with_runtime,
-    collect_running_spool_status, render_prometheus_metrics,
+    RuntimeStatusInput, TRAFFIC_STATUS_REASON_MAX_CHARS, TrafficRuntimeStatusInput,
+    TrafficStatusProjection, build_status_snapshot_with_runtime,
+    build_traffic_status_projection_with_runtime, collect_running_spool_status,
+    render_prometheus_metrics,
 };
 use crate::tls_plaintext::{TlsDecryptHintRuntimeState, TlsPlaintextRuntimeState};
 use crate::transparent_interception::TransparentProxyRuntimeHandle;
@@ -561,7 +562,9 @@ fn runtime_status_input(runtime_state: &AdminRuntimeState) -> RuntimeStatusInput
 
 fn traffic_runtime_status_input(runtime_state: &AdminRuntimeState) -> TrafficRuntimeStatusInput {
     TrafficRuntimeStatusInput {
-        capture: runtime_state.capture.snapshot(),
+        capture: runtime_state
+            .capture
+            .compact_snapshot(TRAFFIC_STATUS_REASON_MAX_CHARS),
         capture_input: runtime_state.capture.input_activity_snapshot(),
         l7_mitm: runtime_state
             .l7_mitm
@@ -789,6 +792,68 @@ mod tests {
             bytes.len() < 64 * 1024,
             "traffic_status should stay lightweight, got {} bytes",
             bytes.len()
+        );
+        server.stop().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_traffic_status_compacts_large_capture_runtime_reasons()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-traffic-status-compact-capture")?;
+        let socket_path = temp.join("admin.sock");
+        let spool_path = temp.join("spool");
+        let spool = Arc::new(FjallSpool::open(&spool_path)?);
+        let plan = Arc::new(runtime_plan(spool_path)?);
+        let capture_runtime = CaptureProviderRuntimeState::default();
+        capture_runtime.record(crate::capture_provider::CaptureProviderRuntimeSnapshot {
+            selected_backend: CaptureBackend::Libpcap,
+            selected_input_source: runtime::CaptureInputSource::LiveHost,
+            plan_mode: CapturePlanMode::Live,
+            provider_runtime_mode: RuntimeMode::Degraded,
+            evidence_mode: CaptureEvidenceMode::BestEffort,
+            evidence_reason: Some("libpcap stream assembly is best-effort".to_string()),
+            reason: Some("runtime reason ".repeat(2 * 1024 * 1024)),
+            open_failures: vec![
+                crate::capture_provider::CaptureProviderOpenFailureSnapshot {
+                    backend: CaptureBackend::Ebpf,
+                    reason: "eBPF open failure ".repeat(2 * 1024 * 1024),
+                },
+            ],
+            provider: None,
+        });
+        let server = spawn_admin_server(
+            RuntimePlanHandle::new(Arc::clone(&plan)),
+            Arc::clone(&spool),
+            AdminServerConfig::unix_socket(socket_path.clone()),
+            AdminRuntimeState {
+                capture: capture_runtime,
+                ..AdminRuntimeState::default()
+            },
+        )?;
+
+        let response = crate::admin::send_admin_json_request(
+            &socket_path,
+            crate::admin::AdminRequest::TrafficStatus,
+        )
+        .await?;
+        let bytes = serde_json::to_vec(&response)?;
+
+        assert_eq!(response["kind"], json!("traffic_status"));
+        assert!(
+            bytes.len() < 64 * 1024,
+            "traffic_status should stay compact, got {} bytes",
+            bytes.len()
+        );
+        assert!(
+            response["projection"]["capture"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.len() <= TRAFFIC_STATUS_REASON_MAX_CHARS)
+        );
+        assert!(
+            response["projection"]["capture"]["open_failures"][0]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.len() <= TRAFFIC_STATUS_REASON_MAX_CHARS)
         );
         server.stop().await;
         Ok(())

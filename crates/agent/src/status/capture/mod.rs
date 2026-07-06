@@ -8,6 +8,8 @@ use crate::capture_provider::{
     CaptureProviderRuntimeSnapshot,
 };
 
+use super::TRAFFIC_STATUS_REASON_MAX_CHARS;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureStatusSnapshot {
     pub selection: CaptureSelection,
@@ -49,13 +51,14 @@ pub struct CaptureOpenFailureStatusSnapshot {
 
 pub(in crate::status) fn capture_status(
     plan: &RuntimePlan,
-    runtime: Option<CaptureProviderRuntimeSnapshot>,
+    runtime: Option<&CaptureProviderRuntimeSnapshot>,
     input_activity: Option<CaptureInputActivityRuntimeSnapshot>,
 ) -> CaptureStatusSnapshot {
     match runtime {
         Some(runtime) => {
             let provider = runtime
                 .provider
+                .clone()
                 .map(|provider| provider.with_input_activity(input_activity.as_ref()));
             CaptureStatusSnapshot {
                 selection: plan.capture.selection,
@@ -63,17 +66,17 @@ pub(in crate::status) fn capture_status(
                 selected_input_source: Some(runtime.selected_input_source),
                 provider_runtime_mode: Some(runtime.provider_runtime_mode),
                 mode: runtime.plan_mode,
-                reason: runtime.reason,
+                reason: runtime.reason.clone(),
                 evidence_mode: Some(runtime.evidence_mode),
-                evidence_reason: runtime.evidence_reason,
+                evidence_reason: runtime.evidence_reason.clone(),
                 candidates: capture_candidates(plan),
                 auto_mitm_plaintext_bridge_candidate: auto_mitm_plaintext_bridge_candidate(plan),
                 open_failures: runtime
                     .open_failures
-                    .into_iter()
+                    .iter()
                     .map(|failure| CaptureOpenFailureStatusSnapshot {
                         backend: failure.backend,
-                        reason: failure.reason,
+                        reason: failure.reason.clone(),
                     })
                     .collect(),
                 provider,
@@ -96,6 +99,53 @@ pub(in crate::status) fn capture_status(
             input_activity: None,
         },
     }
+}
+
+pub(in crate::status) fn capture_status_for_traffic_projection(
+    plan: &RuntimePlan,
+    runtime: Option<&CaptureProviderRuntimeSnapshot>,
+    input_activity: Option<CaptureInputActivityRuntimeSnapshot>,
+) -> CaptureStatusSnapshot {
+    let compact_runtime = runtime.map(|snapshot| snapshot.compact(TRAFFIC_STATUS_REASON_MAX_CHARS));
+    let mut status = capture_status(plan, compact_runtime.as_ref(), input_activity);
+    compact_capture_status_reasons(&mut status);
+    status
+}
+
+fn compact_capture_status_reasons(status: &mut CaptureStatusSnapshot) {
+    compact_optional_status_reason(&mut status.reason);
+    compact_optional_status_reason(&mut status.evidence_reason);
+    for candidate in &mut status.candidates {
+        compact_optional_status_reason(&mut candidate.reason);
+        compact_optional_status_reason(&mut candidate.evidence_reason);
+    }
+    if let Some(candidate) = &mut status.auto_mitm_plaintext_bridge_candidate {
+        compact_optional_status_reason(&mut candidate.reason);
+        compact_optional_status_reason(&mut candidate.evidence_reason);
+    }
+    for failure in &mut status.open_failures {
+        failure.reason = compact_status_reason(std::mem::take(&mut failure.reason));
+    }
+}
+
+fn compact_optional_status_reason(reason: &mut Option<String>) {
+    if let Some(value) = reason.take() {
+        *reason = Some(compact_status_reason(value));
+    }
+}
+
+fn compact_status_reason(reason: String) -> String {
+    truncate_string(reason, TRAFFIC_STATUS_REASON_MAX_CHARS)
+}
+
+fn truncate_string(value: String, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value;
+    }
+    let keep = max_chars.saturating_sub(3);
+    let mut truncated = value.chars().take(keep).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn auto_mitm_plaintext_bridge_candidate(
@@ -194,7 +244,7 @@ mod tests {
             provider: None,
         };
 
-        let status = capture_status(&plan, Some(runtime), None);
+        let status = capture_status(&plan, Some(&runtime), None);
 
         assert_eq!(status.selected_backend, Some(CaptureBackend::Libpcap));
         assert_eq!(status.provider_runtime_mode, Some(RuntimeMode::Available));
@@ -238,7 +288,7 @@ mod tests {
             provider: Some(ebpf_process_observation_details()),
         };
 
-        let status = capture_status(&plan, Some(runtime), None);
+        let status = capture_status(&plan, Some(&runtime), None);
 
         let value = serde_json::to_value(&status)?;
         let provider = &value["provider"];
@@ -338,7 +388,7 @@ mod tests {
             }),
         };
 
-        let status = capture_status(&plan, Some(runtime), Some(input_activity));
+        let status = capture_status(&plan, Some(&runtime), Some(input_activity));
 
         let value = serde_json::to_value(&status)?;
         let kernel_liveness = &value["provider"]["kernel_liveness"];

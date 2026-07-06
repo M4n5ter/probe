@@ -113,6 +113,7 @@ pub(crate) enum TuiAction {
     ObserveAuto,
     ObserveEbpf,
     ObserveLibpcap,
+    ManageAgent,
     Scroll {
         delta: isize,
         target: Option<ScrollTarget>,
@@ -137,6 +138,7 @@ pub(crate) enum TuiAction {
 pub(crate) enum TuiEffect {
     SaveConfig { saved_status: StatusMessage },
     ReloadConfig,
+    ManageAgent,
     ReloadRuntimeActions,
     LoadTrafficDetail { sequence: u64 },
 }
@@ -608,6 +610,7 @@ impl TuiApp {
             TuiAction::StartTrafficSearch => self.begin_traffic_search(),
             TuiAction::ToggleProcessMonitor => return self.toggle_selected_process_monitor(),
             TuiAction::OpenTrafficDiagnostics => self.open_traffic_diagnostics(),
+            TuiAction::ManageAgent => return Some(TuiEffect::ManageAgent),
             TuiAction::CycleTrafficViewMode => self.cycle_traffic_view_mode(),
             TuiAction::CycleTrafficEventFilter => self.cycle_traffic_event_filter(),
             TuiAction::SetTrafficViewMode(view_mode) => self.set_traffic_view_mode(view_mode),
@@ -714,6 +717,7 @@ impl TuiApp {
             HitTarget::TrafficRow(index) => return self.select_traffic_row(index),
             HitTarget::TrafficPopupPanel | HitTarget::TextEditPanel => {}
             HitTarget::TrafficPopupClose => self.close_traffic_popup(),
+            HitTarget::Agent => return Some(TuiEffect::ManageAgent),
             HitTarget::Save => {
                 return Some(TuiEffect::save_config());
             }
@@ -3017,6 +3021,20 @@ mod tests {
         assert_eq!(keyboard_effect, Some(TuiEffect::ReloadRuntimeActions));
         assert_eq!(mouse_effect, Some(TuiEffect::ReloadRuntimeActions));
         assert_eq!(left_effect, None);
+        assert!(!keyboard_app.dirty());
+        assert!(!mouse_app.dirty());
+    }
+
+    #[test]
+    fn agent_management_shares_keyboard_and_mouse_action_path() {
+        let mut keyboard_app = test_app();
+        let keyboard_effect = keyboard_app.handle_action(TuiAction::ManageAgent);
+
+        let mut mouse_app = test_app();
+        let mouse_effect = mouse_app.handle_action(TuiAction::Click(HitTarget::Agent));
+
+        assert_eq!(keyboard_effect, Some(TuiEffect::ManageAgent));
+        assert_eq!(mouse_effect, Some(TuiEffect::ManageAgent));
         assert!(!keyboard_app.dirty());
         assert!(!mouse_app.dirty());
     }

@@ -12,6 +12,8 @@ mod snapshot;
 mod spool;
 mod tls;
 
+pub(crate) const TRAFFIC_STATUS_REASON_MAX_CHARS: usize = 2048;
+
 pub(crate) use capture::{
     CaptureCandidateStatusSnapshot, CaptureOpenFailureStatusSnapshot, CaptureStatusSnapshot,
 };

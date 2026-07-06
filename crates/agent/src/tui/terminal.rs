@@ -35,8 +35,9 @@ use super::{
     runtime_reconcile::{
         PendingRuntimeReconcile, QueuedRuntimeReconcile, apply_runtime_reconcile_result,
         cancel_pending_runtime_reconcile, mark_saved_runtime_success, reload_runtime_actions,
-        spawn_saved_runtime_reconcile, spawn_startup_runtime_reconcile,
-        take_finished_runtime_reconcile, wait_for_runtime_reconcile,
+        spawn_agent_management_runtime_reconcile, spawn_saved_runtime_reconcile,
+        spawn_startup_runtime_reconcile, take_finished_runtime_reconcile,
+        wait_for_runtime_reconcile,
     },
     traffic_detail_task::TrafficDetailTaskPool,
 };
@@ -208,6 +209,11 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
                             Err(error) => app.mark_save_failed(error.to_string()),
                         }
                     }
+                    TuiEffect::ManageAgent => queue_agent_management(
+                        &mut supervisor,
+                        &mut pending_runtime_reconcile,
+                        &mut app,
+                    ),
                     TuiEffect::ReloadRuntimeActions => reload_runtime_actions(&mut app).await,
                     TuiEffect::LoadTrafficDetail { sequence } => {
                         traffic_detail_tasks.fill(&mut app, Some(sequence));
@@ -362,6 +368,27 @@ fn queue_runtime_reconcile(
         app.config_path().clone(),
         status,
     );
+}
+
+fn queue_agent_management(
+    supervisor: &mut Option<TuiAgentSupervisor>,
+    pending_runtime_reconcile: &mut Option<PendingRuntimeReconcile>,
+    app: &mut TuiApp,
+) {
+    if app.dirty() {
+        app.mark_warning("Save or reload config before managing the agent");
+        return;
+    }
+    if pending_runtime_reconcile.is_some() {
+        app.mark_info("Agent startup or runtime apply is already in progress");
+        return;
+    }
+    *pending_runtime_reconcile = Some(spawn_agent_management_runtime_reconcile(
+        supervisor,
+        app.config().clone(),
+        StatusMessage::info("Manage agent"),
+    ));
+    app.mark_runtime_starting(STARTUP_BACKGROUND_STATUS);
 }
 
 fn queue_saved_runtime_reconcile(
@@ -552,6 +579,7 @@ fn key_to_action(key: KeyEvent, editing_text: bool, active_tab: TuiTab) -> Optio
     match (key.code, key.modifiers) {
         (KeyCode::Char('s'), KeyModifiers::CONTROL) => Some(TuiAction::Save),
         (KeyCode::Char('r'), KeyModifiers::CONTROL) => Some(TuiAction::Reload),
+        (KeyCode::Char('a'), KeyModifiers::CONTROL) => Some(TuiAction::ManageAgent),
         (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => Some(TuiAction::Quit),
         (KeyCode::Char('/'), _) if active_tab == TuiTab::Traffic => {
             Some(TuiAction::StartTrafficSearch)
@@ -681,6 +709,14 @@ mod tests {
                 TuiTab::Overview
             ),
             Some(TuiAction::Save)
+        );
+        assert_eq!(
+            key_to_action(
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+                false,
+                TuiTab::Traffic
+            ),
+            Some(TuiAction::ManageAgent)
         );
         assert_eq!(
             key_to_action(
@@ -1138,6 +1174,23 @@ mod tests {
         assert_eq!(app.status().text, STARTUP_BACKGROUND_STATUS);
         assert_eq!(app.traffic().status().kind, TrafficStatusKind::Idle);
         assert_eq!(app.traffic().status().text, STARTUP_BACKGROUND_STATUS);
+    }
+
+    #[test]
+    fn agent_management_refuses_dirty_config() {
+        let mut app = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::default(),
+        );
+        let mut supervisor = None;
+        let mut pending_runtime_reconcile = None;
+
+        app.mark_dirty("Changed capture backend");
+        queue_agent_management(&mut supervisor, &mut pending_runtime_reconcile, &mut app);
+
+        assert!(pending_runtime_reconcile.is_none());
+        assert!(app.status().text.contains("Save or reload config"));
     }
 
     fn first_hit_coordinate(

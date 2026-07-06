@@ -14,7 +14,7 @@ use crate::transparent_interception::TransparentProxyRuntimeSnapshot;
 
 use super::{
     capabilities::capabilities_with_runtime,
-    capture::{CaptureStatusSnapshot, capture_status},
+    capture::{CaptureStatusSnapshot, capture_status, capture_status_for_traffic_projection},
     enforcement::{
         EnforcementStatusSnapshot, enforcement_status_with_active_policy,
         enforcement_status_with_transparent_proxy,
@@ -110,7 +110,7 @@ pub fn build_traffic_status_projection(plan: &RuntimePlan) -> TrafficStatusProje
     let capabilities = capabilities_with_runtime(plan, None, None);
     TrafficStatusProjection {
         runtime_generation: None,
-        capture: capture_status(plan, None, None),
+        capture: capture_status_for_traffic_projection(plan, None, None),
         enforcement: enforcement_status_with_transparent_proxy(plan, None, None),
         tls: tls_status(plan, &capabilities, None, None),
     }
@@ -121,7 +121,11 @@ pub fn build_traffic_status_projection_with_runtime(
     runtime: TrafficRuntimeStatusInput,
 ) -> TrafficStatusProjection {
     let capabilities = capabilities_with_runtime(plan, runtime.capture.as_ref(), None);
-    let capture = capture_status(plan, runtime.capture.clone(), runtime.capture_input);
+    let capture = capture_status_for_traffic_projection(
+        plan,
+        runtime.capture.as_ref(),
+        runtime.capture_input,
+    );
     let transparent_proxy = runtime.transparent_proxy;
     let l7_mitm = runtime.l7_mitm;
     let enforcement = enforcement_status_with_transparent_proxy(plan, l7_mitm, transparent_proxy);
@@ -162,7 +166,11 @@ fn build_status_snapshot_at_with_runtime(
         ingress_last_sequence: spool_snapshot.map(|snapshot| snapshot.last_ingress_sequence),
         export_last_sequence: spool_snapshot.map(|snapshot| snapshot.last_export_sequence),
     };
-    let capture = capture_status(plan, runtime.capture.clone(), runtime.capture_input.clone());
+    let capture = capture_status(
+        plan,
+        runtime.capture.as_ref(),
+        runtime.capture_input.clone(),
+    );
     let policy = policy_status_with_runtime(plan, runtime.policy.as_deref());
     let transparent_proxy = runtime.transparent_proxy.clone();
     let l7_mitm = runtime.l7_mitm.clone();
@@ -277,7 +285,7 @@ mod tests {
         capture_provider::{
             CaptureInputActivityRuntimeSnapshot, CaptureInputPollActivityRuntimeSnapshot,
             CaptureInputProviderActivityRuntimeSnapshot, CaptureInputSignalRuntimeSnapshot,
-            CaptureProviderRuntimeSnapshot,
+            CaptureProviderOpenFailureSnapshot, CaptureProviderRuntimeSnapshot,
         },
         configured_enforcement::ActiveEnforcementPolicy,
         l7_mitm::{
@@ -513,6 +521,65 @@ mod tests {
             bytes.len() < 64 * 1024,
             "traffic status projection should stay lightweight with runtime diagnostics, got {} bytes",
             bytes.len()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_status_projection_compacts_large_capture_runtime_reasons()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = runtime_plan_with_managed_transparent_proxy()?;
+        let projection = build_traffic_status_projection_with_runtime(
+            &plan,
+            TrafficRuntimeStatusInput {
+                capture: Some(CaptureProviderRuntimeSnapshot {
+                    selected_backend: CaptureBackend::Libpcap,
+                    selected_input_source: runtime::CaptureInputSource::LiveHost,
+                    plan_mode: CapturePlanMode::Live,
+                    provider_runtime_mode: RuntimeMode::Degraded,
+                    evidence_mode: CaptureEvidenceMode::BestEffort,
+                    evidence_reason: Some("runtime evidence ".repeat(8_000)),
+                    reason: Some("runtime reason ".repeat(8_000)),
+                    open_failures: vec![CaptureProviderOpenFailureSnapshot {
+                        backend: CaptureBackend::Ebpf,
+                        reason: "ebpf open failure ".repeat(8_000),
+                    }],
+                    provider: None,
+                }),
+                capture_input: None,
+                l7_mitm: None,
+                runtime_generation: None,
+                transparent_proxy: None,
+            },
+        );
+        let value = serde_json::to_value(&projection)?;
+        let bytes = serde_json::to_vec(&projection)?;
+
+        assert!(
+            bytes.len() < 64 * 1024,
+            "traffic status projection should stay compact, got {} bytes",
+            bytes.len()
+        );
+        assert!(
+            value["capture"]["reason"]
+                .as_str()
+                .expect("capture reason should be preserved")
+                .len()
+                <= super::super::TRAFFIC_STATUS_REASON_MAX_CHARS
+        );
+        assert!(
+            value["capture"]["evidence_reason"]
+                .as_str()
+                .expect("capture evidence reason should be preserved")
+                .len()
+                <= super::super::TRAFFIC_STATUS_REASON_MAX_CHARS
+        );
+        assert!(
+            value["capture"]["open_failures"][0]["reason"]
+                .as_str()
+                .expect("open failure reason should be preserved")
+                .len()
+                <= super::super::TRAFFIC_STATUS_REASON_MAX_CHARS
         );
         Ok(())
     }

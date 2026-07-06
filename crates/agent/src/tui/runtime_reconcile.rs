@@ -30,7 +30,10 @@ pub(super) struct PendingRuntimeReconcile {
 
 impl PendingRuntimeReconcile {
     pub(super) fn must_finish_before_quit(&self) -> bool {
-        matches!(self.origin, RuntimeReconcileOrigin::Saved(_))
+        matches!(
+            self.origin,
+            RuntimeReconcileOrigin::Saved(_) | RuntimeReconcileOrigin::AgentManagement(_)
+        )
     }
 
     pub(super) fn blocks_initial_traffic_refresh(&self) -> bool {
@@ -41,6 +44,7 @@ impl PendingRuntimeReconcile {
 enum RuntimeReconcileOrigin {
     Startup,
     Saved(StatusMessage),
+    AgentManagement(StatusMessage),
 }
 
 pub(super) struct RuntimeReconcileResult {
@@ -80,6 +84,22 @@ enum RuntimeReconcileCompletion {
     },
     SavedManagedRestartFailed {
         saved_status: StatusMessage,
+        message: String,
+    },
+    AgentAttached {
+        attachment: RuntimeAttachment,
+        status: StatusMessage,
+    },
+    AgentRestarted {
+        attachment: RuntimeAttachment,
+        status: StatusMessage,
+    },
+    ExternalAgentAlreadyAttached {
+        attachment: RuntimeAttachment,
+        status: StatusMessage,
+    },
+    AgentUnavailable {
+        status: StatusMessage,
         message: String,
     },
     Cancelled,
@@ -123,6 +143,24 @@ pub(super) fn spawn_startup_runtime_reconcile(config: AgentConfig) -> PendingRun
     }
 }
 
+pub(super) fn spawn_agent_management_runtime_reconcile(
+    supervisor: &mut Option<TuiAgentSupervisor>,
+    config: AgentConfig,
+    status: StatusMessage,
+) -> PendingRuntimeReconcile {
+    let running = supervisor.take();
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
+    let origin_status = status.clone();
+    PendingRuntimeReconcile {
+        task: tokio::spawn(async move {
+            agent_management_runtime_reconcile(running, config, status, task_cancellation).await
+        }),
+        origin: RuntimeReconcileOrigin::AgentManagement(origin_status),
+        cancellation,
+    }
+}
+
 async fn startup_runtime_reconcile(
     config: AgentConfig,
     cancellation: CancellationToken,
@@ -141,6 +179,74 @@ async fn startup_runtime_reconcile(
                 message: error.to_string(),
             },
         },
+    }
+}
+
+async fn agent_management_runtime_reconcile(
+    supervisor: Option<TuiAgentSupervisor>,
+    config: AgentConfig,
+    status: StatusMessage,
+    cancellation: CancellationToken,
+) -> RuntimeReconcileResult {
+    if cancellation.is_cancelled() {
+        return RuntimeReconcileResult {
+            supervisor,
+            completion: RuntimeReconcileCompletion::Cancelled,
+        };
+    }
+    match supervisor {
+        None => match TuiAgentSupervisor::attach_or_spawn_with_cancellation(&config, cancellation)
+            .await
+        {
+            Ok(next) => {
+                let attachment = next.attachment(&config);
+                RuntimeReconcileResult {
+                    supervisor: Some(next),
+                    completion: RuntimeReconcileCompletion::AgentAttached { attachment, status },
+                }
+            }
+            Err(error) => RuntimeReconcileResult {
+                supervisor: None,
+                completion: RuntimeReconcileCompletion::AgentUnavailable {
+                    status,
+                    message: error.to_string(),
+                },
+            },
+        },
+        Some(running) if running.is_managed() => {
+            match running
+                .restart_with_cancellation(&config, cancellation.clone())
+                .await
+            {
+                Ok(next) => {
+                    let attachment = next.attachment(&config);
+                    RuntimeReconcileResult {
+                        supervisor: Some(next),
+                        completion: RuntimeReconcileCompletion::AgentRestarted {
+                            attachment,
+                            status,
+                        },
+                    }
+                }
+                Err(error) => RuntimeReconcileResult {
+                    supervisor: None,
+                    completion: RuntimeReconcileCompletion::AgentUnavailable {
+                        status,
+                        message: error.to_string(),
+                    },
+                },
+            }
+        }
+        Some(running) => {
+            let attachment = running.attachment(&config);
+            RuntimeReconcileResult {
+                supervisor: Some(running),
+                completion: RuntimeReconcileCompletion::ExternalAgentAlreadyAttached {
+                    attachment,
+                    status,
+                },
+            }
+        }
     }
 }
 
@@ -439,6 +545,9 @@ impl RuntimeReconcileOrigin {
                 saved_status,
                 message,
             },
+            Self::AgentManagement(status) => {
+                RuntimeReconcileCompletion::AgentUnavailable { status, message }
+            }
         }
     }
 }
@@ -534,6 +643,36 @@ pub(super) fn apply_runtime_reconcile_result(
                 &saved_status,
                 format!("failed to restart TUI managed agent: {message}"),
             );
+        }
+        RuntimeReconcileCompletion::AgentAttached { attachment, status } => {
+            app.attach_agent(attachment);
+            mark_saved_runtime_success(
+                app,
+                &status,
+                format!("attached TUI agent; {}", app.runtime_agent_status()),
+            );
+        }
+        RuntimeReconcileCompletion::AgentRestarted { attachment, status } => {
+            app.attach_agent(attachment);
+            mark_saved_runtime_success(
+                app,
+                &status,
+                format!(
+                    "restarted TUI managed agent; {}",
+                    app.runtime_agent_status()
+                ),
+            );
+        }
+        RuntimeReconcileCompletion::ExternalAgentAlreadyAttached { attachment, status } => {
+            app.attach_agent(attachment);
+            mark_saved_runtime_warning(
+                app,
+                &status,
+                "external agent is already attached; restart it outside the TUI if needed",
+            );
+        }
+        RuntimeReconcileCompletion::AgentUnavailable { status, message } => {
+            detach_saved_runtime_error(app, &status, format!("failed to manage agent: {message}"));
         }
         RuntimeReconcileCompletion::Cancelled => {}
     }
@@ -817,6 +956,92 @@ mod tests {
         assert!(app.status().text.contains("MITM proxy executable"));
         assert!(app.status().text.contains("runtime rebuild required"));
         assert!(app.status().text.contains("restarted TUI managed agent"));
+    }
+
+    #[test]
+    fn agent_management_restart_attaches_managed_agent() {
+        let mut app = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::default(),
+        );
+        let result = RuntimeReconcileResult {
+            supervisor: None,
+            completion: RuntimeReconcileCompletion::AgentRestarted {
+                attachment: RuntimeAttachment::managed(
+                    PathBuf::from("/tmp/admin.sock"),
+                    Some(42),
+                    PathBuf::from("/tmp/agent.log"),
+                ),
+                status: StatusMessage::info("Manage agent"),
+            },
+        };
+        let mut supervisor = None;
+
+        apply_runtime_reconcile_result(&mut supervisor, &mut app, result);
+
+        assert_eq!(app.status().kind, StatusKind::Info);
+        assert_eq!(
+            app.active_admin_socket_path(),
+            Some(std::path::Path::new("/tmp/admin.sock"))
+        );
+        assert!(app.status().text.contains("Manage agent"));
+        assert!(app.status().text.contains("restarted TUI managed agent"));
+    }
+
+    #[test]
+    fn agent_management_external_agent_reports_operator_restart() {
+        let mut app = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::default(),
+        );
+        let result = RuntimeReconcileResult {
+            supervisor: None,
+            completion: RuntimeReconcileCompletion::ExternalAgentAlreadyAttached {
+                attachment: RuntimeAttachment::existing(PathBuf::from("/tmp/admin.sock")),
+                status: StatusMessage::info("Manage agent"),
+            },
+        };
+        let mut supervisor = None;
+
+        apply_runtime_reconcile_result(&mut supervisor, &mut app, result);
+
+        assert_eq!(app.status().kind, StatusKind::Warning);
+        assert_eq!(
+            app.active_admin_socket_path(),
+            Some(std::path::Path::new("/tmp/admin.sock"))
+        );
+        assert!(
+            app.status()
+                .text
+                .contains("external agent is already attached")
+        );
+        assert!(app.status().text.contains("restart it outside the TUI"));
+    }
+
+    #[test]
+    fn agent_management_unavailable_detaches_with_operation_context() {
+        let mut app = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::default(),
+        );
+        let result = RuntimeReconcileResult {
+            supervisor: None,
+            completion: RuntimeReconcileCompletion::AgentUnavailable {
+                status: StatusMessage::info("Manage agent"),
+                message: "startup failed".to_string(),
+            },
+        };
+        let mut supervisor = None;
+
+        apply_runtime_reconcile_result(&mut supervisor, &mut app, result);
+
+        assert_eq!(app.status().kind, StatusKind::Error);
+        assert!(app.status().text.contains("Manage agent"));
+        assert!(app.status().text.contains("startup failed"));
+        assert!(app.active_admin_socket_path().is_none());
     }
 
     #[test]
