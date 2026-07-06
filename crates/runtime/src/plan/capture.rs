@@ -90,7 +90,7 @@ impl CapturePlan {
             CaptureSelection::Auto => self
                 .candidates
                 .iter()
-                .filter(|candidate| candidate.live() && candidate.openable())
+                .filter(|candidate| candidate.live() && candidate.auto_live_open_attemptable())
                 .cloned()
                 .collect(),
             CaptureSelection::Ebpf | CaptureSelection::Libpcap => {
@@ -169,6 +169,7 @@ pub struct CaptureProviderDescriptor {
     pub evidence_mode: CaptureEvidenceMode,
     pub evidence_reason: Option<String>,
     pub reason: Option<String>,
+    live_open_policy: LiveOpenPolicy,
 }
 
 impl CaptureProviderDescriptor {
@@ -181,6 +182,7 @@ impl CaptureProviderDescriptor {
             evidence_mode: CaptureEvidenceMode::Nominal,
             evidence_reason: None,
             reason: None,
+            live_open_policy: LiveOpenPolicy::Selectable,
         }
     }
 
@@ -197,6 +199,7 @@ impl CaptureProviderDescriptor {
             evidence_mode: CaptureEvidenceMode::BestEffort,
             evidence_reason: Some(reason.into()),
             reason: None,
+            live_open_policy: LiveOpenPolicy::Selectable,
         }
     }
 
@@ -213,12 +216,34 @@ impl CaptureProviderDescriptor {
             evidence_mode: CaptureEvidenceMode::Nominal,
             evidence_reason: None,
             reason: Some(reason.into()),
+            live_open_policy: LiveOpenPolicy::Never,
         }
     }
 
     pub fn with_best_effort_evidence(mut self, reason: impl Into<String>) -> Self {
         self.evidence_mode = CaptureEvidenceMode::BestEffort;
         self.evidence_reason = Some(reason.into());
+        self
+    }
+
+    pub fn with_auto_live_open_retry(mut self) -> Self {
+        self.live_open_policy = LiveOpenPolicy::AutoRetryOnly;
+        self
+    }
+
+    pub fn with_runtime_open_success(mut self) -> Self {
+        let preflight_reason = self.reason.take();
+        self.runtime_mode = RuntimeMode::Available;
+        if self.capability_mode == RuntimeMode::Unavailable {
+            self.capability_mode = RuntimeMode::Available;
+        }
+        if let Some(preflight_reason) = preflight_reason {
+            self.evidence_mode = CaptureEvidenceMode::BestEffort;
+            self.evidence_reason = Some(format!(
+                "provider opened successfully after static preflight reported: {preflight_reason}"
+            ));
+        }
+        self.live_open_policy = LiveOpenPolicy::Selectable;
         self
     }
 
@@ -257,6 +282,10 @@ impl CaptureProviderDescriptor {
         self.builder.supports(self.backend) && self.runtime_mode != RuntimeMode::Unavailable
     }
 
+    fn auto_live_open_attemptable(&self) -> bool {
+        self.builder.supports(self.backend) && self.live_open_policy.attemptable_in_auto()
+    }
+
     pub(super) fn unselectable_reason(&self) -> String {
         self.reason
             .clone()
@@ -278,8 +307,23 @@ impl CaptureProviderDescriptor {
                 "{:?} builder cannot construct {:?} capture provider",
                 self.builder, self.backend
             ));
+            self.live_open_policy = LiveOpenPolicy::Never;
         }
         self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LiveOpenPolicy {
+    Selectable,
+    AutoRetryOnly,
+    Never,
+}
+
+impl LiveOpenPolicy {
+    fn attemptable_in_auto(self) -> bool {
+        matches!(self, Self::Selectable | Self::AutoRetryOnly)
     }
 }
 
@@ -445,6 +489,13 @@ mod tests {
                 .map(|provider| provider.builder),
             Some(CaptureProviderBuilder::Libpcap)
         );
+        assert_eq!(
+            plan.live_provider_open_candidates()
+                .into_iter()
+                .map(|candidate| candidate.backend)
+                .collect::<Vec<_>>(),
+            vec![CaptureBackend::Libpcap]
+        );
         Ok(())
     }
 
@@ -555,6 +606,99 @@ mod tests {
         );
         assert_eq!(plan.reason, None);
         Ok(())
+    }
+
+    #[test]
+    fn auto_live_open_candidates_keep_auto_retry_unavailable_fallbacks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ProviderRegistry::new(
+            vec![
+                CaptureProviderDescriptor::degraded(
+                    CaptureBackend::Ebpf,
+                    CaptureProviderBuilder::Ebpf,
+                    "eBPF passed static preflight but may fail during attach",
+                ),
+                CaptureProviderDescriptor::unavailable(
+                    CaptureBackend::Libpcap,
+                    CaptureProviderBuilder::Libpcap,
+                    "libpcap preflight could not open a capture socket",
+                )
+                .with_auto_live_open_retry(),
+                CaptureProviderDescriptor::unavailable(
+                    CaptureBackend::Replay,
+                    CaptureProviderBuilder::Unimplemented,
+                    "replay is not a live fallback",
+                ),
+            ],
+            test_platform_capabilities(),
+        );
+
+        let config = AgentConfig::default();
+        let plan = CapturePlan::resolve(&config, &registry);
+
+        assert_eq!(plan.mode, CapturePlanMode::Live);
+        assert_eq!(plan.selected_backend, Some(CaptureBackend::Ebpf));
+        assert_eq!(
+            plan.live_provider_open_candidates()
+                .into_iter()
+                .map(|candidate| candidate.backend)
+                .collect::<Vec<_>>(),
+            vec![CaptureBackend::Ebpf, CaptureBackend::Libpcap]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn auto_live_open_candidates_skip_never_retry_unavailable_live_providers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let registry = ProviderRegistry::new(
+            vec![
+                CaptureProviderDescriptor::unavailable(
+                    CaptureBackend::Ebpf,
+                    CaptureProviderBuilder::Ebpf,
+                    "eBPF object path is not configured",
+                ),
+                CaptureProviderDescriptor::available(
+                    CaptureBackend::Libpcap,
+                    CaptureProviderBuilder::Libpcap,
+                ),
+            ],
+            test_platform_capabilities(),
+        );
+
+        let config = AgentConfig::default();
+        let plan = CapturePlan::resolve(&config, &registry);
+
+        assert_eq!(plan.selected_backend, Some(CaptureBackend::Libpcap));
+        assert_eq!(
+            plan.live_provider_open_candidates()
+                .into_iter()
+                .map(|candidate| candidate.backend)
+                .collect::<Vec<_>>(),
+            vec![CaptureBackend::Libpcap]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_open_success_clears_stale_preflight_unavailable_state() {
+        let descriptor = CaptureProviderDescriptor::unavailable(
+            CaptureBackend::Libpcap,
+            CaptureProviderBuilder::Libpcap,
+            "libpcap preflight could not open a capture socket",
+        )
+        .with_runtime_open_success();
+
+        assert_eq!(descriptor.runtime_mode, RuntimeMode::Available);
+        assert_eq!(descriptor.capability_mode, RuntimeMode::Available);
+        assert_eq!(descriptor.reason, None);
+        assert_eq!(descriptor.evidence_mode, CaptureEvidenceMode::BestEffort);
+        assert!(
+            descriptor
+                .evidence_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("preflight could not open"))
+        );
     }
 
     #[test]

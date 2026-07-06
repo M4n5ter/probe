@@ -258,7 +258,8 @@ fn libpcap_provider_descriptor(config: &LibpcapConfig) -> CaptureProviderDescrip
             CaptureBackend::Libpcap,
             CaptureProviderBuilder::Libpcap,
             error.to_string(),
-        ),
+        )
+        .with_auto_live_open_retry(),
     }
 }
 

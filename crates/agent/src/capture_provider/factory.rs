@@ -248,7 +248,7 @@ fn try_open_live_backend_with_fallback<T>(
                 log_live_backend_open_attempt(backend, backend_started, Ok(()));
                 return Ok(LiveCaptureOpenAttempt::Open(LiveCaptureOpenOutcome {
                     provider,
-                    descriptor,
+                    descriptor: descriptor.with_runtime_open_success(),
                     open_failures: failures,
                 }));
             }
@@ -457,12 +457,12 @@ mod tests {
     };
     use probe_core::{
         CapabilityKind, CapabilityState, CaptureLoss, CaptureOrigin, CaptureSource, Direction,
-        EnforcementEvidence, EnforcementMode, ProcessSelector, Selector, Timestamp,
+        EnforcementEvidence, EnforcementMode, ProcessSelector, RuntimeMode, Selector, Timestamp,
         TrafficSelector,
     };
     use runtime::{
-        CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry, RuntimePlan,
-        TransparentInterceptionMitmPlaintextBridgePlan,
+        CaptureEvidenceMode, CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry,
+        RuntimePlan, TransparentInterceptionMitmPlaintextBridgePlan,
     };
     use tempfile::NamedTempFile;
 
@@ -499,6 +499,98 @@ mod tests {
             outcome.open_failures[0]
                 .reason
                 .contains("eBPF attach failed")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn auto_capture_open_still_attempts_preflight_unavailable_libpcap_after_ebpf_open_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = plan_with_registry_and_providers(
+            AgentConfig::default(),
+            vec![
+                CaptureProviderDescriptor::degraded(
+                    CaptureBackend::Ebpf,
+                    CaptureProviderBuilder::Ebpf,
+                    "eBPF provider is best-effort",
+                ),
+                CaptureProviderDescriptor::unavailable(
+                    CaptureBackend::Libpcap,
+                    CaptureProviderBuilder::Libpcap,
+                    "libpcap preflight could not open a capture socket",
+                )
+                .with_auto_live_open_retry(),
+            ],
+        )?;
+        let mut attempted = Vec::new();
+
+        let error = open_live_backend_with_fallback(&plan, |backend| {
+            attempted.push(backend);
+            Err::<CaptureBackend, _>(AgentError::Runtime(RuntimeError::NoLiveCapture {
+                reason: match backend {
+                    CaptureBackend::Ebpf => "eBPF attach failed".to_string(),
+                    CaptureBackend::Libpcap => "libpcap open failed".to_string(),
+                    backend => format!("{backend:?} should not be attempted"),
+                },
+            }))
+        })
+        .expect_err("all live providers should fail");
+
+        assert_eq!(attempted, [CaptureBackend::Ebpf, CaptureBackend::Libpcap]);
+        let error = error.to_string();
+        assert!(error.contains("eBPF attach failed"), "{error}");
+        assert!(error.contains("libpcap open failed"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn auto_capture_open_success_normalizes_preflight_unavailable_fallback_descriptor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = plan_with_registry_and_providers(
+            AgentConfig::default(),
+            vec![
+                CaptureProviderDescriptor::degraded(
+                    CaptureBackend::Ebpf,
+                    CaptureProviderBuilder::Ebpf,
+                    "eBPF provider is best-effort",
+                ),
+                CaptureProviderDescriptor::unavailable(
+                    CaptureBackend::Libpcap,
+                    CaptureProviderBuilder::Libpcap,
+                    "libpcap preflight could not open a capture socket",
+                )
+                .with_auto_live_open_retry(),
+            ],
+        )?;
+        let mut attempted = Vec::new();
+
+        let outcome = open_live_backend_with_fallback(&plan, |backend| {
+            attempted.push(backend);
+            match backend {
+                CaptureBackend::Ebpf => Err(AgentError::Runtime(RuntimeError::NoLiveCapture {
+                    reason: "eBPF attach failed".to_string(),
+                })),
+                CaptureBackend::Libpcap => Ok(backend),
+                backend => panic!("unexpected backend {backend:?}"),
+            }
+        })?;
+
+        assert_eq!(attempted, [CaptureBackend::Ebpf, CaptureBackend::Libpcap]);
+        assert_eq!(outcome.provider, CaptureBackend::Libpcap);
+        assert_eq!(outcome.descriptor.backend, CaptureBackend::Libpcap);
+        assert_eq!(outcome.descriptor.runtime_mode, RuntimeMode::Available);
+        assert_eq!(outcome.descriptor.capability_mode, RuntimeMode::Available);
+        assert_eq!(outcome.descriptor.reason, None);
+        assert_eq!(
+            outcome.descriptor.evidence_mode,
+            CaptureEvidenceMode::BestEffort
+        );
+        assert!(
+            outcome
+                .descriptor
+                .evidence_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("preflight could not open"))
         );
         Ok(())
     }
@@ -613,22 +705,29 @@ mod tests {
     }
 
     fn plan_with_registry(config: AgentConfig) -> Result<RuntimePlan, runtime::RuntimeError> {
+        plan_with_registry_and_providers(
+            config,
+            vec![
+                CaptureProviderDescriptor::degraded(
+                    CaptureBackend::Ebpf,
+                    CaptureProviderBuilder::Ebpf,
+                    "eBPF provider is best-effort",
+                ),
+                CaptureProviderDescriptor::available(
+                    CaptureBackend::Libpcap,
+                    CaptureProviderBuilder::Libpcap,
+                ),
+            ],
+        )
+    }
+
+    fn plan_with_registry_and_providers(
+        config: AgentConfig,
+        providers: Vec<CaptureProviderDescriptor>,
+    ) -> Result<RuntimePlan, runtime::RuntimeError> {
         RuntimePlan::build(
             config,
-            &ProviderRegistry::new(
-                vec![
-                    CaptureProviderDescriptor::degraded(
-                        CaptureBackend::Ebpf,
-                        CaptureProviderBuilder::Ebpf,
-                        "eBPF provider is best-effort",
-                    ),
-                    CaptureProviderDescriptor::available(
-                        CaptureBackend::Libpcap,
-                        CaptureProviderBuilder::Libpcap,
-                    ),
-                ],
-                test_platform_capabilities(),
-            ),
+            &ProviderRegistry::new(providers, test_platform_capabilities()),
         )
     }
 
