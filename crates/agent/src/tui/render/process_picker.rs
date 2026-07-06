@@ -152,17 +152,7 @@ fn render_process_search(
             app.is_hovered(HitTarget::Control(ControlId::ClearProcessSearch)),
         );
     }
-    let text_x = if app.process_filter().is_empty() {
-        area.x.saturating_add(11)
-    } else {
-        area.x.saturating_add(20)
-    };
-    let text_area = Rect::new(
-        text_x,
-        area.y,
-        area.width.saturating_sub(text_x.saturating_sub(area.x)),
-        area.height,
-    );
+    let text_area = Rect::new(area.x, area.y.saturating_add(1), area.width, 1);
     let filter = if app.process_filter().is_empty() {
         "<none>".to_string()
     } else {

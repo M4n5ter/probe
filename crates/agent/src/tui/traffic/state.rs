@@ -152,6 +152,17 @@ impl TrafficRefreshResult {
             }),
         }
     }
+
+    pub(crate) fn failed_from_request_for_test(
+        request: &TrafficRefreshRequest,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            selector_key: request.selector_key.clone(),
+            event_filter: request.event_filter,
+            result: Err(message.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

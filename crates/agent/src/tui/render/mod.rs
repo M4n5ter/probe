@@ -966,6 +966,33 @@ mod tests {
     }
 
     #[test]
+    fn traffic_process_search_status_keeps_column_gutter() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut app = test_app();
+        app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Traffic)));
+        let mut terminal = Terminal::new(TestBackend::new(157, 45))?;
+
+        terminal.draw(|frame| {
+            let _ = draw(frame, &mut app);
+        })?;
+
+        let output = terminal.backend().to_string();
+        let filter_row = output
+            .lines()
+            .position(|line| line.contains("filter <none>"))
+            .expect("traffic process filter status should be rendered");
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((38, filter_row as u16))
+                .map(|cell| cell.symbol()),
+            Some(" ")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn render_traffic_data_path_popup_without_selected_event()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut app = test_app();

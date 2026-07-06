@@ -67,6 +67,9 @@ pub(crate) enum DataPathDiagnosticsView {
     RunningAgent {
         diagnostics: TrafficRuntimeDiagnostics,
     },
+    AttachedRuntimeDiagnosticsUnavailable {
+        reason: String,
+    },
     LocalConfig {
         diagnostics: TrafficRuntimeDiagnostics,
         reason: Option<String>,
@@ -82,20 +85,16 @@ impl DataPathDiagnosticsView {
         Self::RunningAgent { diagnostics }
     }
 
+    pub(crate) fn attached_runtime_diagnostics_unavailable(reason: impl Into<String>) -> Self {
+        Self::AttachedRuntimeDiagnosticsUnavailable {
+            reason: reason.into(),
+        }
+    }
+
     pub(crate) fn from_local_config(diagnostics: TrafficRuntimeDiagnostics) -> Self {
         Self::LocalConfig {
             diagnostics,
             reason: None,
-        }
-    }
-
-    pub(crate) fn from_local_config_with_reason(
-        diagnostics: TrafficRuntimeDiagnostics,
-        reason: impl Into<String>,
-    ) -> Self {
-        Self::LocalConfig {
-            diagnostics,
-            reason: Some(reason.into()),
         }
     }
 
@@ -156,6 +155,14 @@ impl DataPathDiagnosticsView {
                 diagnostics.mitm_overview_line(),
                 diagnostics.mitm_next_step(),
             ),
+            Self::AttachedRuntimeDiagnosticsUnavailable { .. } => DataPathCompactSummary::new(
+                "runtime diagnostics unavailable",
+                "live status not available",
+                format!(
+                    "live status not available; {MITM_PROXY_DATA_PATH_LABEL} can capture {MITM_PLAINTEXT_COVERAGE}"
+                ),
+                "check admin socket or open Data Path",
+            ),
             Self::LocalConfig { diagnostics, .. } => DataPathCompactSummary::new(
                 diagnostics.local_status_text(),
                 diagnostics.capture_overview_line(),
@@ -184,6 +191,20 @@ impl DataPathDiagnosticsView {
             Self::RunningAgent { diagnostics } => {
                 lines.push("state: live runtime diagnostics from the attached agent".to_string());
                 lines.extend(diagnostics.detail_lines());
+            }
+            Self::AttachedRuntimeDiagnosticsUnavailable { .. } => {
+                lines.push(
+                    "state: TUI has an active admin socket attachment, but runtime diagnostics could not be read"
+                        .to_string(),
+                );
+                lines.push(
+                    "traffic: see the Traffic status line for the latest tail-events result"
+                        .to_string(),
+                );
+                lines.push("capture: live status not available".to_string());
+                lines.push(format!(
+                    "MITM: live status not available; {MITM_PROXY_DATA_PATH_LABEL} can capture {MITM_PLAINTEXT_COVERAGE}"
+                ));
             }
             Self::LocalConfig { diagnostics, .. } => {
                 lines.push(
@@ -218,6 +239,7 @@ impl DataPathDiagnosticsView {
     fn source_label(&self) -> &'static str {
         match self {
             Self::RunningAgent { .. } => "running agent",
+            Self::AttachedRuntimeDiagnosticsUnavailable { .. } => "attached runtime",
             Self::LocalConfig { .. } => "local config",
             Self::Unavailable { .. } => "unavailable",
         }
@@ -226,6 +248,7 @@ impl DataPathDiagnosticsView {
     fn reason(&self) -> Option<&str> {
         match self {
             Self::RunningAgent { .. } => None,
+            Self::AttachedRuntimeDiagnosticsUnavailable { reason } => Some(reason),
             Self::LocalConfig { reason, .. } => reason.as_deref(),
             Self::Unavailable { reason, .. } => Some(reason),
         }
@@ -273,6 +296,30 @@ mod tests {
         );
         assert!(summary.next.contains("CAP_BPF"));
         assert!(summary.next.contains("CAP_NET_RAW"));
+    }
+
+    #[test]
+    fn attached_runtime_diagnostics_unavailable_keeps_neutral_tail_copy() {
+        let view = DataPathDiagnosticsView::attached_runtime_diagnostics_unavailable(
+            "admin traffic_status response exceeds 16777216 bytes",
+        );
+
+        let summary = view.compact_summary(true);
+        assert_eq!(summary.status, "runtime diagnostics unavailable");
+        assert_eq!(summary.capture, "live status not available");
+        assert!(summary.mitm.contains("live status not available"));
+
+        let lines = view.detail_lines();
+        assert!(lines.contains(&"Data path source: attached runtime".to_string()));
+        assert!(lines.iter().any(|line| {
+            line == "state: TUI has an active admin socket attachment, but runtime diagnostics could not be read"
+        }));
+        assert!(lines.iter().any(|line| {
+            line == "traffic: see the Traffic status line for the latest tail-events result"
+        }));
+        assert!(lines.iter().any(|line| {
+            line == "reason: admin traffic_status response exceeds 16777216 bytes"
+        }));
     }
 
     #[test]

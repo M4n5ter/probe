@@ -41,7 +41,9 @@ pub(super) fn render_traffic(
         Layout::vertical([Constraint::Length(5), Constraint::Min(4)]).areas(area);
     let (process_area, right_area) = if workspace.width >= 100 {
         let [process_area, right_area] =
-            Layout::horizontal([Constraint::Length(38), Constraint::Min(52)]).areas(workspace);
+            Layout::horizontal([Constraint::Length(38), Constraint::Min(52)])
+                .spacing(1)
+                .areas(workspace);
         (process_area, right_area)
     } else {
         let [process_area, right_area] =

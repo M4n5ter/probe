@@ -901,8 +901,10 @@ impl TuiApp {
                 }
             }
             Err(error) => {
-                let message = format!("running agent status unavailable: {error}");
-                self.refresh_local_runtime_diagnostics_with_reason(message.clone());
+                self.data_path_diagnostics =
+                    DataPathDiagnosticsView::attached_runtime_diagnostics_unavailable(
+                        error.clone(),
+                    );
                 if self.runtime_generation_reload_pending.is_some() {
                     let message = format!(
                         "Runtime generation reload is pending; cannot verify active generation: {error}"
@@ -1668,20 +1670,6 @@ impl TuiApp {
             Err(error) => {
                 self.data_path_diagnostics =
                     DataPathDiagnosticsView::unavailable(error.to_string());
-            }
-        }
-    }
-
-    fn refresh_local_runtime_diagnostics_with_reason(&mut self, reason: String) {
-        match local_traffic_runtime_diagnostics(self.config.clone()) {
-            Ok(diagnostics) => {
-                self.data_path_diagnostics =
-                    DataPathDiagnosticsView::from_local_config_with_reason(diagnostics, reason);
-            }
-            Err(error) => {
-                self.data_path_diagnostics = DataPathDiagnosticsView::unavailable(format!(
-                    "{reason}; local config diagnostics unavailable: {error}"
-                ));
             }
         }
     }
@@ -2864,6 +2852,108 @@ mod tests {
                 .text
                 .contains("Runtime generation changed to generation 2 (candidate)")
         );
+    }
+
+    #[test]
+    fn traffic_refresh_keeps_live_tail_when_runtime_status_is_too_large() {
+        let mut app = test_app();
+        app.attach_agent(RuntimeAttachment::existing(PathBuf::from(
+            "/tmp/admin.sock",
+        )));
+        let request = app
+            .begin_traffic_refresh()
+            .expect("selected process should produce a traffic selector");
+
+        app.apply_traffic_refresh_result(TrafficRefreshLoadResult {
+            identity: request.identity.clone(),
+            diagnostics: Err(
+                "admin client error: admin traffic_status response exceeds 16777216 bytes"
+                    .to_string(),
+            ),
+            traffic: TrafficRefreshResult::from_request_for_test(
+                &request.traffic,
+                tail_snapshot_with_capture_loss(18),
+            ),
+        });
+
+        assert_eq!(app.traffic().rows().len(), 1);
+        assert_eq!(app.status().kind, StatusKind::Warning);
+        assert!(
+            app.status()
+                .text
+                .contains("running agent status unavailable")
+        );
+        assert_eq!(overview_value(&app, "Data path source"), "attached runtime");
+        assert_eq!(
+            overview_value(&app, "Data path"),
+            "runtime diagnostics unavailable"
+        );
+
+        app.open_traffic_diagnostics();
+        let popup = app
+            .traffic_popup_view()
+            .expect("data path popup should be open");
+        assert!(
+            popup
+                .lines
+                .iter()
+                .any(|line| line == "Data path source: attached runtime")
+        );
+        assert!(popup.lines.iter().any(|line| {
+            line == "traffic: see the Traffic status line for the latest tail-events result"
+        }));
+    }
+
+    #[test]
+    fn traffic_refresh_does_not_claim_tail_availability_when_admin_requests_fail() {
+        let mut app = test_app();
+        app.attach_agent(RuntimeAttachment::existing(PathBuf::from(
+            "/tmp/admin.sock",
+        )));
+        let request = app
+            .begin_traffic_refresh()
+            .expect("selected process should produce a traffic selector");
+
+        app.apply_traffic_refresh_result(TrafficRefreshLoadResult {
+            identity: request.identity.clone(),
+            diagnostics: Err(
+                "admin client error: failed to connect to admin socket /tmp/admin.sock".to_string(),
+            ),
+            traffic: TrafficRefreshResult::failed_from_request_for_test(
+                &request.traffic,
+                "tail_events failed: failed to connect to admin socket /tmp/admin.sock",
+            ),
+        });
+
+        assert!(app.traffic().rows().is_empty());
+        assert_eq!(app.status().kind, StatusKind::Warning);
+        assert!(app.status().text.contains("tail_events failed"));
+        assert!(
+            app.status()
+                .text
+                .contains("running agent status unavailable")
+        );
+        assert_eq!(overview_value(&app, "Data path source"), "attached runtime");
+
+        app.open_traffic_diagnostics();
+        let popup = app
+            .traffic_popup_view()
+            .expect("data path popup should be open");
+        assert!(
+            popup
+                .lines
+                .iter()
+                .any(|line| line == "Data path source: attached runtime")
+        );
+        assert!(
+            !popup
+                .lines
+                .iter()
+                .any(|line| line.contains("tail-events can still refresh"))
+        );
+        assert!(popup.lines.iter().any(|line| {
+            line == "traffic: see the Traffic status line for the latest tail-events result"
+        }));
     }
 
     #[test]
