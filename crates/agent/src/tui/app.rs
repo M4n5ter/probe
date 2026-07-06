@@ -540,6 +540,15 @@ impl TuiApp {
         self.status = StatusMessage::info(status);
     }
 
+    pub(crate) fn mark_runtime_starting(&mut self, status: impl Into<String>) {
+        self.runtime_attachment = RuntimeAttachment::starting();
+        self.runtime_generation_identity = None;
+        self.runtime_generation_reload_pending = None;
+        self.invalidate_runtime_reads();
+        self.refresh_local_runtime_diagnostics();
+        self.status = StatusMessage::info(status);
+    }
+
     pub(crate) fn detach_agent(&mut self, message: impl Into<String>) {
         let raw_message = message.into();
         let failure_kind = classify_runtime_detach_message(&raw_message);
@@ -554,6 +563,11 @@ impl TuiApp {
             None => DataPathDiagnosticsView::unavailable(reason),
         };
         self.status = status;
+    }
+
+    pub(crate) fn mark_traffic_refresh_waiting_for_runtime(&mut self, message: impl Into<String>) {
+        self.traffic.mark_refresh_waiting(message);
+        self.status = StatusMessage::info(self.traffic.status().text.clone());
     }
 
     pub(crate) fn note_runtime_config_reloaded(&mut self) {
@@ -823,12 +837,20 @@ impl TuiApp {
             .active_socket_path()
             .map(PathBuf::from)
         else {
-            let message = format!(
-                "No active agent admin socket is attached; {}",
-                self.runtime_agent_status()
-            );
-            self.traffic.mark_admin_unavailable(message);
-            self.status = StatusMessage::warning(self.traffic.status().text.clone());
+            if self.runtime_attachment.is_starting() {
+                let message = format!(
+                    "Waiting for TUI agent admin socket; {}",
+                    self.runtime_agent_status()
+                );
+                self.mark_traffic_refresh_waiting_for_runtime(message);
+            } else {
+                let message = format!(
+                    "No active agent admin socket is attached; {}",
+                    self.runtime_agent_status()
+                );
+                self.traffic.mark_admin_unavailable(message);
+                self.status = StatusMessage::warning(self.traffic.status().text.clone());
+            }
             return None;
         };
         let selector = match self.traffic_filter_selector() {
@@ -1772,6 +1794,7 @@ mod tests {
             processes::{ProcessCatalog, ProcessEntry, selector_for_exe_path},
             runtime_attachment::RuntimeAttachment,
             text::INLINE_TEXT_MAX_CHARS,
+            traffic::TrafficStatusKind,
         },
         *,
     };
@@ -3008,7 +3031,7 @@ mod tests {
     }
 
     #[test]
-    fn traffic_refresh_without_admin_socket_keeps_local_data_path_diagnostics() {
+    fn traffic_refresh_while_agent_is_starting_keeps_local_data_path_diagnostics() {
         let temp = tempfile::tempdir().expect("temp dir");
         let mut config = AgentConfig::default();
         config.capture.selection = CaptureSelection::Replay;
@@ -3018,13 +3041,25 @@ mod tests {
             config,
             ProcessCatalog::default(),
         );
+        app.mark_runtime_starting("Starting TUI agent");
 
         let request = app.begin_traffic_refresh();
 
         assert!(request.is_none());
-        assert_eq!(app.status().kind, StatusKind::Warning);
-        assert!(app.status().text.contains("No active agent admin socket"));
-        assert!(app.status().text.contains("No agent runtime attached"));
+        assert_eq!(app.status().kind, StatusKind::Info);
+        assert_eq!(app.traffic().status().kind, TrafficStatusKind::Idle);
+        assert!(
+            app.traffic()
+                .status()
+                .text
+                .contains("Waiting for TUI agent admin socket")
+        );
+        assert!(
+            app.status()
+                .text
+                .contains("Waiting for TUI agent admin socket")
+        );
+        assert!(app.status().text.contains("Starting or attaching"));
         app.open_traffic_diagnostics();
         let popup = app
             .traffic_popup_view()

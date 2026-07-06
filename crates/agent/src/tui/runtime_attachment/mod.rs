@@ -5,6 +5,9 @@ pub(crate) enum RuntimeAttachment {
     Detached {
         message: String,
     },
+    Starting {
+        message: String,
+    },
     Existing {
         socket_path: PathBuf,
     },
@@ -20,13 +23,23 @@ pub(crate) enum RuntimeAttachment {
 
 impl Default for RuntimeAttachment {
     fn default() -> Self {
-        Self::Detached {
-            message: "No agent runtime attached".to_string(),
-        }
+        Self::detached()
     }
 }
 
 impl RuntimeAttachment {
+    pub(crate) fn detached() -> Self {
+        Self::Detached {
+            message: "No agent runtime attached".to_string(),
+        }
+    }
+
+    pub(crate) fn starting() -> Self {
+        Self::Starting {
+            message: "Starting or attaching TUI managed agent".to_string(),
+        }
+    }
+
     pub(crate) fn existing(socket_path: PathBuf) -> Self {
         Self::Existing { socket_path }
     }
@@ -45,16 +58,22 @@ impl RuntimeAttachment {
         }
     }
 
+    pub(crate) fn is_starting(&self) -> bool {
+        matches!(self, Self::Starting { .. })
+    }
+
     pub(crate) fn active_socket_path(&self) -> Option<&Path> {
         match self {
             Self::Existing { socket_path } | Self::Managed { socket_path, .. } => Some(socket_path),
-            Self::Detached { .. } | Self::Lost { .. } => None,
+            Self::Detached { .. } | Self::Starting { .. } | Self::Lost { .. } => None,
         }
     }
 
     pub(crate) fn status_text(&self) -> String {
         match self {
-            Self::Detached { message } | Self::Lost { message } => message.clone(),
+            Self::Detached { message } | Self::Starting { message } | Self::Lost { message } => {
+                message.clone()
+            }
             Self::Existing { socket_path } => {
                 format!("Using running agent at {}", socket_path.display())
             }

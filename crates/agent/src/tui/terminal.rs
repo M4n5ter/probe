@@ -61,7 +61,7 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
     let mut pending_process_catalog = Some(spawn_process_catalog_load());
     let mut pending_runtime_reconcile = Some(spawn_startup_runtime_reconcile(app.config().clone()));
     let mut queued_runtime_reconcile: Option<QueuedRuntimeReconcile> = None;
-    app.mark_info(STARTUP_BACKGROUND_STATUS);
+    app.mark_runtime_starting(STARTUP_BACKGROUND_STATUS);
     let result = async {
         let mut terminal = TerminalSession::enter()?;
         let mut last_traffic_refresh = Instant::now()
@@ -138,7 +138,7 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
                 if let Some(message) =
                     traffic_refresh_waiting_for_runtime(&supervisor, &pending_runtime_reconcile)
                 {
-                    app.mark_info(message);
+                    app.mark_traffic_refresh_waiting_for_runtime(message);
                 } else if let Some(request) = app.begin_traffic_refresh() {
                     pending_traffic_refresh = Some(PendingTrafficRefresh {
                         task: tokio::spawn(load_traffic_refresh_with_diagnostics(request)),
@@ -667,7 +667,7 @@ mod tests {
             runtime_reconcile::{
                 completed_runtime_reconcile_for_test, completed_startup_runtime_reconcile_for_test,
             },
-            traffic::{TrafficEventFilter, TrafficViewMode},
+            traffic::{TrafficEventFilter, TrafficStatusKind, TrafficViewMode},
         },
         *,
     };
@@ -1116,6 +1116,28 @@ mod tests {
             traffic_refresh_waiting_for_runtime(&None, &no_pending_runtime),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn startup_runtime_reconcile_wait_updates_traffic_panel_status() {
+        let mut app = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::default(),
+        );
+        let pending_runtime_reconcile = Some(completed_startup_runtime_reconcile_for_test(
+            "startup still running",
+        ));
+        app.mark_runtime_starting(STARTUP_BACKGROUND_STATUS);
+
+        let message = traffic_refresh_waiting_for_runtime(&None, &pending_runtime_reconcile)
+            .expect("startup reconcile should pause traffic refresh");
+        app.mark_traffic_refresh_waiting_for_runtime(message);
+
+        assert_eq!(app.status().kind, super::super::app::StatusKind::Info);
+        assert_eq!(app.status().text, STARTUP_BACKGROUND_STATUS);
+        assert_eq!(app.traffic().status().kind, TrafficStatusKind::Idle);
+        assert_eq!(app.traffic().status().text, STARTUP_BACKGROUND_STATUS);
     }
 
     fn first_hit_coordinate(

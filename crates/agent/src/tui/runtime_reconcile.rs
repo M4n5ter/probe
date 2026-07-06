@@ -746,7 +746,7 @@ mod tests {
                 .text
                 .contains("TUI agent unavailable: libpcap is unavailable")
         );
-        assert!(!app.status().text.contains("No agent runtime attached"));
+        assert!(!app.status().text.contains("Starting or attaching"));
     }
 
     #[test]
