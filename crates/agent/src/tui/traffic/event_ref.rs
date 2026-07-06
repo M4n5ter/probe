@@ -102,6 +102,13 @@ impl<'a> TrafficEventRef<'a> {
         }
     }
 
+    pub(super) fn gap(self) -> Option<&'a Gap> {
+        match self.kind() {
+            TrafficEventKindRef::Gap(gap) => Some(gap),
+            _ => None,
+        }
+    }
+
     pub(super) fn websocket_handoff(self) -> Option<&'a WebSocketHandoff> {
         match self.kind() {
             TrafficEventKindRef::WebSocketHandoff(handoff) => Some(handoff),

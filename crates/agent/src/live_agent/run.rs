@@ -424,7 +424,7 @@ impl BlockingCaptureRun {
         let startup_started = Instant::now();
         let summary_result = (|| {
             let mut parser_factory = Http1ParserFactory::default();
-            let pipeline = CapturePipeline::new(
+            let mut pipeline = CapturePipeline::new(
                 spool.as_ref(),
                 &mut parser_factory,
                 policy_set,
@@ -438,6 +438,16 @@ impl BlockingCaptureRun {
                 log_startup_stage(startup_started, "signaled control-plane readiness");
             }
             if shutdown::requested(&shutdown_requested) {
+                return Ok(summary);
+            }
+            let startup_recovery_caught_up = recover_startup_ingress_backlog(
+                &mut pipeline,
+                &mut ingress_recovery,
+                &shutdown_requested,
+                &mut summary,
+            )?;
+            log_startup_stage(startup_started, "recovered startup ingress backlog");
+            if !startup_recovery_caught_up {
                 return Ok(summary);
             }
             let mut pipeline = pipeline.with_enforcement_planner(&mut enforcement_planner);
@@ -477,16 +487,6 @@ impl BlockingCaptureRun {
             active_interception_guard.transparent_interception =
                 transparent_interception.activate(transparent_interception_setup_scope)?;
             log_startup_stage(startup_started, "activated transparent interception");
-            let recovered = recover_live_ingress_backlog_until_caught_up(
-                &mut pipeline,
-                &mut ingress_recovery,
-                &shutdown_requested,
-            )?;
-            summary.merge(recovered);
-            log_startup_stage(startup_started, "recovered startup ingress backlog");
-            if shutdown::requested(&shutdown_requested) || !ingress_recovery.caught_up() {
-                return Ok(summary);
-            }
             storage_retention_worker = Some(spawn_storage_retention_workers(
                 Arc::clone(&spool),
                 storage_retention_plan_handle,
@@ -617,6 +617,21 @@ fn live_capture_run_options_with_max_polls(
         .with_cancellation_token(shutdown_requested.clone());
     options.max_events = remaining_events;
     Some(options)
+}
+
+fn recover_startup_ingress_backlog<S>(
+    pipeline: &mut CapturePipeline<'_, S>,
+    backlog: &mut IngressBacklogRecovery,
+    shutdown_requested: &shutdown::ShutdownFlag,
+    summary: &mut PipelineSummary,
+) -> Result<bool, pipeline::PipelineError>
+where
+    S: storage::DurableSpool,
+{
+    let recovered =
+        recover_live_ingress_backlog_until_caught_up(pipeline, backlog, shutdown_requested)?;
+    summary.merge(recovered);
+    Ok(!shutdown::requested(shutdown_requested) && backlog.caught_up())
 }
 
 fn recover_live_ingress_backlog_until_caught_up<S>(

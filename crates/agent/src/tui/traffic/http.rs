@@ -1,10 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use probe_core::{Direction, HttpHeaders};
+use probe_core::{Direction, Gap, HttpHeaders};
 
 use super::{
     attribution::TrafficAttribution,
-    event_ref::TrafficEventRef,
+    event_ref::{TrafficEventKindRef, TrafficEventRef, TrafficHttpBodyChunk},
     rows::TrafficRow,
     text::{bytes_detail, direction_label, escape_text, fit_preview_lines},
 };
@@ -37,6 +37,10 @@ impl HttpExchangeRow {
 
     pub(crate) fn matches_identity(&self, identity: &HttpExchangeIdentity) -> bool {
         &self.identity == identity
+    }
+
+    pub(crate) fn matches_selection_fallback(&self, identity: &HttpExchangeIdentity) -> bool {
+        self.identity.matches_selection_fallback(identity)
     }
 
     pub(crate) fn order_sequence(&self) -> u64 {
@@ -134,39 +138,53 @@ impl HttpExchangeRow {
         let Some(event) = row.event_ref() else {
             return;
         };
-        if http_exchange_key(event).as_ref() != Some(&self.identity) {
+        if !self.raw_sequences.contains(&row.sequence) {
             return;
         }
         let Some(chunk) = event.http_body_chunk() else {
             return;
         };
-        let body = if body_direction_is_response(&self.request, &self.response, chunk.direction) {
-            &mut self.response.body
-        } else {
-            &mut self.request.body
-        };
-        let Some(existing) = body
+        if let Some(existing) = self
+            .request
+            .body
             .iter_mut()
             .find(|existing| existing.sequence == row.sequence)
-        else {
+        {
+            apply_loaded_body_chunk(existing, chunk);
             return;
-        };
-        existing.offset = chunk.offset;
-        existing.data_len = chunk.data_len;
-        existing.data = chunk.data.map(<[u8]>::to_vec);
-        existing.end_stream = chunk.end_stream;
+        }
+        if let Some(existing) = self
+            .response
+            .body
+            .iter_mut()
+            .find(|existing| existing.sequence == row.sequence)
+        {
+            apply_loaded_body_chunk(existing, chunk);
+        }
     }
+}
+
+fn apply_loaded_body_chunk(existing: &mut BodyChunk, chunk: TrafficHttpBodyChunk<'_>) {
+    existing.offset = chunk.offset;
+    existing.data_len = chunk.data_len;
+    existing.data = chunk.data.map(<[u8]>::to_vec);
+    existing.end_stream = chunk.end_stream;
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct HttpMessage {
     headers: Option<HttpHeaders>,
     body: Vec<BodyChunk>,
+    gaps: Vec<CaptureGapEvidence>,
 }
 
 impl HttpMessage {
     fn body_len(&self) -> usize {
         self.body.iter().map(|chunk| chunk.data_len).sum()
+    }
+
+    fn has_body_evidence(&self) -> bool {
+        !self.body.is_empty() || !self.gaps.is_empty()
     }
 
     fn body_preview_with_loaded_sequences(&self, loaded_sequences: &[u64]) -> String {
@@ -181,6 +199,17 @@ impl HttpMessage {
         format!("{bytes}B {}", status.preview_label())
     }
 
+    fn body_summary_label(&self) -> String {
+        let bytes = self.body_len();
+        match self.body_payload_status() {
+            BodyPayloadStatus::Incomplete => format!("{bytes} B incomplete"),
+            BodyPayloadStatus::None
+            | BodyPayloadStatus::NotLoaded { .. }
+            | BodyPayloadStatus::Partial { .. }
+            | BodyPayloadStatus::Loaded => format!("{bytes} B"),
+        }
+    }
+
     fn body_payload_status(&self) -> BodyPayloadStatus {
         self.body_payload_status_with_loaded_sequences(&[])
     }
@@ -189,6 +218,9 @@ impl HttpMessage {
         &self,
         loaded_sequences: &[u64],
     ) -> BodyPayloadStatus {
+        if !self.gaps.is_empty() {
+            return BodyPayloadStatus::Incomplete;
+        }
         if self.body.is_empty() {
             return BodyPayloadStatus::None;
         }
@@ -228,7 +260,7 @@ impl HttpMessage {
                     missing_chunks,
                 }
             }
-            BodyPayloadStatus::Loaded | BodyPayloadStatus::Incomplete => {
+            BodyPayloadStatus::Loaded => {
                 match BodyPayloadDetail::from_chunks(&self.body)
                     .expect("non-empty loaded body chunks must classify")
                 {
@@ -237,11 +269,22 @@ impl HttpMessage {
                         start_offset,
                         observed_bytes,
                         reason,
+                        gaps,
                     } => BodyPayloadState::Incomplete {
                         start_offset,
                         observed_bytes,
                         reason,
+                        gaps,
                     },
+                }
+            }
+            BodyPayloadStatus::Incomplete => {
+                let detail = BodyPayloadIncompleteDetail::from_parts(&self.body, &self.gaps);
+                BodyPayloadState::Incomplete {
+                    start_offset: detail.start_offset,
+                    observed_bytes: detail.observed_bytes,
+                    reason: detail.reason,
+                    gaps: detail.gaps,
                 }
             }
         }
@@ -303,7 +346,7 @@ impl HttpMessage {
         lines.push(format!("  Body bytes: {}", self.body_len()));
         let state = self.body_payload_state();
         lines.extend(state.detail_lines());
-        if state.has_chunks() {
+        if self.has_body_evidence() {
             lines.push(format!("  Body chunks: {}", self.body.len()));
             for chunk in sorted_body_chunks(&self.body) {
                 match &chunk.data {
@@ -317,6 +360,20 @@ impl HttpMessage {
                         "  Body chunk offset={} len={} end_stream={} not_loaded=true",
                         chunk.offset, chunk.data_len, chunk.end_stream
                     )),
+                }
+            }
+            if !self.gaps.is_empty() {
+                lines.push(format!("  Body capture gaps: {}", self.gaps.len()));
+                for gap in sorted_body_gaps(&self.gaps) {
+                    lines.push(format!(
+                        "  Capture gap sequence={} stream_expected_offset={} stream_next_offset={}: {}",
+                        gap.sequence,
+                        gap.expected_stream_offset,
+                        gap.next_stream_offset
+                            .map(|offset| offset.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                        escape_text(&gap.reason)
+                    ));
                 }
             }
         }
@@ -407,6 +464,7 @@ enum BodyPayloadState {
         start_offset: u64,
         observed_bytes: Vec<u8>,
         reason: &'static str,
+        gaps: Vec<CaptureGapEvidence>,
     },
 }
 
@@ -431,25 +489,26 @@ impl BodyPayloadState {
                 start_offset,
                 observed_bytes,
                 reason,
+                gaps,
             } => {
                 let label = if *start_offset == 0 {
                     "  Body payload".to_string()
                 } else {
                     format!("  Body payload from offset {start_offset}")
                 };
-                vec![
+                let mut lines = vec![
                     format!("{label}: incomplete"),
                     format!("  Observed body bytes: {}", bytes_detail(observed_bytes)),
                     format!("  Incomplete reason: {reason}"),
                     "  Body payload is incomplete; chunk offsets below show the observed ranges"
                         .to_string(),
-                ]
+                ];
+                if !gaps.is_empty() {
+                    lines.push("  Capture gaps explain missing body ranges".to_string());
+                }
+                lines
             }
         }
-    }
-
-    fn has_chunks(&self) -> bool {
-        !matches!(self, Self::None)
     }
 }
 
@@ -469,8 +528,28 @@ impl BodyChunk {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct CaptureGapEvidence {
+    sequence: u64,
+    expected_stream_offset: u64,
+    next_stream_offset: Option<u64>,
+    reason: String,
+}
+
+impl CaptureGapEvidence {
+    fn from_gap(sequence: u64, gap: &Gap) -> Self {
+        Self {
+            sequence,
+            expected_stream_offset: gap.expected_offset,
+            next_stream_offset: gap.next_offset,
+            reason: gap.reason.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct BodyPayloadScan {
     coverage: BodyPayloadCoverage,
+    start_offset: u64,
     observed_bytes: Vec<u8>,
 }
 
@@ -478,11 +557,16 @@ impl BodyPayloadScan {
     fn scan(chunks: &[BodyChunk], collect_bytes: bool) -> Option<Self> {
         scan_body_payload(chunks, BodyPayloadScanMode::RequireBytes { collect_bytes })
     }
+
+    fn scan_available(chunks: &[BodyChunk]) -> Option<Self> {
+        scan_body_payload(chunks, BodyPayloadScanMode::CollectAvailableBytes)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BodyPayloadScanMode {
     RequireBytes { collect_bytes: bool },
+    CollectAvailableBytes,
     MetadataOnly,
 }
 
@@ -502,19 +586,34 @@ fn scan_body_payload(chunks: &[BodyChunk], mode: BodyPayloadScanMode) -> Option<
         }
         let payload_len = match mode {
             BodyPayloadScanMode::RequireBytes { .. } => chunk.data.as_ref()?.len(),
-            BodyPayloadScanMode::MetadataOnly => chunk.data_len,
+            BodyPayloadScanMode::CollectAvailableBytes | BodyPayloadScanMode::MetadataOnly => {
+                chunk.data_len
+            }
         };
         let overlap = next_offset.saturating_sub(chunk.offset) as usize;
         if overlap >= payload_len {
             continue;
         }
         let new_len = payload_len - overlap;
-        if let BodyPayloadScanMode::RequireBytes {
-            collect_bytes: true,
-        } = mode
-        {
-            let data = chunk.data.as_ref()?;
-            observed_bytes.extend_from_slice(&data[overlap..]);
+        match mode {
+            BodyPayloadScanMode::RequireBytes {
+                collect_bytes: true,
+            } => {
+                let data = chunk.data.as_ref()?;
+                observed_bytes.extend_from_slice(&data[overlap..]);
+            }
+            BodyPayloadScanMode::CollectAvailableBytes => {
+                if let Some(data) = &chunk.data {
+                    let data_overlap = overlap.min(data.len());
+                    if data_overlap < data.len() {
+                        observed_bytes.extend_from_slice(&data[data_overlap..]);
+                    }
+                }
+            }
+            BodyPayloadScanMode::RequireBytes {
+                collect_bytes: false,
+            }
+            | BodyPayloadScanMode::MetadataOnly => {}
         }
         next_offset = next_offset.saturating_add(new_len as u64);
     }
@@ -528,6 +627,7 @@ fn scan_body_payload(chunks: &[BodyChunk], mode: BodyPayloadScanMode) -> Option<
     };
     Some(BodyPayloadScan {
         coverage,
+        start_offset,
         observed_bytes,
     })
 }
@@ -556,6 +656,7 @@ enum BodyPayloadDetail {
         start_offset: u64,
         observed_bytes: Vec<u8>,
         reason: &'static str,
+        gaps: Vec<CaptureGapEvidence>,
     },
 }
 
@@ -573,7 +674,51 @@ impl BodyPayloadDetail {
                 start_offset,
                 observed_bytes: scan.observed_bytes,
                 reason,
+                gaps: Vec::new(),
             }),
+        }
+    }
+}
+
+struct BodyPayloadIncompleteDetail {
+    start_offset: u64,
+    observed_bytes: Vec<u8>,
+    reason: &'static str,
+    gaps: Vec<CaptureGapEvidence>,
+}
+
+impl BodyPayloadIncompleteDetail {
+    fn from_parts(chunks: &[BodyChunk], gaps: &[CaptureGapEvidence]) -> Self {
+        let Some(scan) = BodyPayloadScan::scan_available(chunks) else {
+            return Self::from_gaps(gaps);
+        };
+        let (start_offset, chunk_reason) = match scan.coverage {
+            BodyPayloadCoverage::Complete => {
+                (scan.start_offset, "capture gap interrupted body payload")
+            }
+            BodyPayloadCoverage::Incomplete {
+                start_offset,
+                reason,
+            } => (start_offset, reason),
+        };
+        Self {
+            start_offset,
+            observed_bytes: scan.observed_bytes,
+            reason: if gaps.is_empty() {
+                chunk_reason
+            } else {
+                "capture gap interrupted body payload"
+            },
+            gaps: gaps.to_vec(),
+        }
+    }
+
+    fn from_gaps(gaps: &[CaptureGapEvidence]) -> Self {
+        Self {
+            start_offset: 0,
+            observed_bytes: Vec::new(),
+            reason: "capture gap interrupted body payload",
+            gaps: gaps.to_vec(),
         }
     }
 }
@@ -592,6 +737,64 @@ fn incomplete_body_reason(start_offset: u64, has_gap: bool) -> &'static str {
 pub(crate) struct HttpExchangeIdentity {
     flow_id: String,
     stream_sequence: u64,
+    discriminator: HttpExchangeDiscriminator,
+}
+
+impl HttpExchangeIdentity {
+    fn request_stream(flow_id: String, stream_sequence: u64) -> Self {
+        Self {
+            flow_id,
+            stream_sequence,
+            discriminator: HttpExchangeDiscriminator::RequestStream,
+        }
+    }
+
+    fn orphan_response(flow_id: String, stream_sequence: u64, sequence: u64) -> Self {
+        Self {
+            flow_id,
+            stream_sequence,
+            discriminator: HttpExchangeDiscriminator::OrphanResponse { sequence },
+        }
+    }
+
+    fn matches_selection_fallback(&self, other: &Self) -> bool {
+        self == other
+            || (self.flow_id == other.flow_id && self.stream_sequence == other.stream_sequence)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum HttpExchangeDiscriminator {
+    RequestStream,
+    OrphanResponse { sequence: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FlowDirectionKey {
+    flow_id: String,
+    direction: Direction,
+}
+
+impl FlowDirectionKey {
+    fn from_event(event: TrafficEventRef<'_>, direction: Direction) -> Option<Self> {
+        Some(Self {
+            flow_id: event.flow()?.id.0.clone(),
+            direction,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyRole {
+    Request,
+    Response,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveBodyTarget {
+    exchange: HttpExchangeIdentity,
+    role: BodyRole,
+    accepts_gap: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -624,6 +827,10 @@ impl HttpExchangeBuilder {
         }
     }
 
+    fn request_method(&self) -> Option<&str> {
+        self.request.headers.as_ref()?.method.as_deref()
+    }
+
     fn observe(&mut self, row: &TrafficRow, event: TrafficEventRef<'_>) {
         self.first_sequence = self.first_sequence.min(row.sequence);
         self.latest_sequence = self.latest_sequence.max(row.sequence);
@@ -633,18 +840,52 @@ impl HttpExchangeBuilder {
         } else if let Some(headers) = event.http_response_headers() {
             self.response.headers = Some(headers.clone());
         } else if let Some(chunk) = event.http_body_chunk() {
-            let body = BodyChunk {
-                sequence: row.sequence,
-                offset: chunk.offset,
-                data_len: chunk.data_len,
-                data: chunk.data.map(<[u8]>::to_vec),
-                end_stream: chunk.end_stream,
-            };
-            if body_direction_is_response(&self.request, &self.response, chunk.direction) {
-                self.response.body.push(body);
-            } else {
-                self.request.body.push(body);
-            }
+            let role = self.role_for_body_direction(chunk.direction);
+            self.observe_body_chunk(row, chunk, role);
+        } else if let Some(gap) = event.gap() {
+            let role = self.role_for_body_direction(gap.direction);
+            self.observe_gap(row, gap, role);
+        }
+    }
+
+    fn observe_body_chunk(
+        &mut self,
+        row: &TrafficRow,
+        chunk: TrafficHttpBodyChunk<'_>,
+        role: BodyRole,
+    ) {
+        self.first_sequence = self.first_sequence.min(row.sequence);
+        self.latest_sequence = self.latest_sequence.max(row.sequence);
+        self.raw_sequences.push(row.sequence);
+        let body = BodyChunk {
+            sequence: row.sequence,
+            offset: chunk.offset,
+            data_len: chunk.data_len,
+            data: chunk.data.map(<[u8]>::to_vec),
+            end_stream: chunk.end_stream,
+        };
+        match role {
+            BodyRole::Request => self.request.body.push(body),
+            BodyRole::Response => self.response.body.push(body),
+        }
+    }
+
+    fn observe_gap(&mut self, row: &TrafficRow, gap: &Gap, role: BodyRole) {
+        self.first_sequence = self.first_sequence.min(row.sequence);
+        self.latest_sequence = self.latest_sequence.max(row.sequence);
+        self.raw_sequences.push(row.sequence);
+        let body_gap = CaptureGapEvidence::from_gap(row.sequence, gap);
+        match role {
+            BodyRole::Request => self.request.gaps.push(body_gap),
+            BodyRole::Response => self.response.gaps.push(body_gap),
+        }
+    }
+
+    fn role_for_body_direction(&self, direction: Direction) -> BodyRole {
+        if body_direction_is_response(&self.request, &self.response, direction) {
+            BodyRole::Response
+        } else {
+            BodyRole::Request
         }
     }
 
@@ -686,12 +927,12 @@ impl HttpExchangeBuilder {
             })
             .unwrap_or_else(|| "-".to_string());
         let summary = format!(
-            "{} {} -> {} (req {} B, resp {} B)",
+            "{} {} -> {} (req {}, resp {})",
             method,
             target,
             status,
-            self.request.body_len(),
-            self.response.body_len()
+            self.request.body_summary_label(),
+            self.response.body_summary_label()
         );
         let request_body = self.request.body_table_label();
         let response_body = self.response.body_table_label();
@@ -719,19 +960,129 @@ impl HttpExchangeBuilder {
 
 pub(super) fn build_http_exchange_rows(rows: &[TrafficRow]) -> Vec<HttpExchangeRow> {
     let mut exchanges = BTreeMap::<HttpExchangeIdentity, HttpExchangeBuilder>::new();
+    let mut active_body_targets = HashMap::<FlowDirectionKey, ActiveBodyTarget>::new();
+    let mut pending_requests = HashMap::<String, VecDeque<HttpExchangeIdentity>>::new();
     let mut ordered_rows = rows.iter().collect::<Vec<_>>();
     ordered_rows.sort_by_key(|row| row.sequence);
     for row in ordered_rows {
         let Some(event) = row.event_ref() else {
             continue;
         };
-        let Some(key) = http_exchange_key(event) else {
+        if let Some(headers) = event.http_request_headers() {
+            let Some(key) = http_exchange_key(event) else {
+                continue;
+            };
+            let builder = exchanges
+                .entry(key.clone())
+                .or_insert_with(|| HttpExchangeBuilder::new(key.clone(), row));
+            builder.observe(row, event);
+            if let Some(flow) = event.flow() {
+                pending_requests
+                    .entry(flow.id.0.clone())
+                    .or_default()
+                    .push_back(key.clone());
+            }
+            update_active_header_body_target(
+                &mut active_body_targets,
+                event,
+                headers,
+                &key,
+                BodyRole::Request,
+                None,
+            );
+            continue;
+        }
+        if let Some(headers) = event.http_response_headers() {
+            let Some(key) = response_exchange_key(row, event, headers, &mut pending_requests)
+            else {
+                continue;
+            };
+            let builder = exchanges
+                .entry(key.clone())
+                .or_insert_with(|| HttpExchangeBuilder::new(key.clone(), row));
+            builder.observe(row, event);
+            let request_method = builder.request_method().map(str::to_string);
+            update_active_header_body_target(
+                &mut active_body_targets,
+                event,
+                headers,
+                &key,
+                BodyRole::Response,
+                request_method.as_deref(),
+            );
+            continue;
+        }
+        if let Some(chunk) = event.http_body_chunk() {
+            if let Some(flow_direction) = FlowDirectionKey::from_event(event, chunk.direction)
+                && let Some(target) = active_body_targets.get(&flow_direction).cloned()
+            {
+                if let Some(exchange) = exchanges.get_mut(&target.exchange) {
+                    exchange.observe_body_chunk(row, chunk, target.role);
+                }
+                if chunk.end_stream {
+                    active_body_targets.remove(&flow_direction);
+                } else if !target.accepts_gap {
+                    active_body_targets.insert(
+                        flow_direction,
+                        ActiveBodyTarget {
+                            accepts_gap: true,
+                            ..target
+                        },
+                    );
+                }
+                continue;
+            }
+            let Some(key) = http_exchange_key(event) else {
+                continue;
+            };
+            let builder = exchanges
+                .entry(key.clone())
+                .or_insert_with(|| HttpExchangeBuilder::new(key.clone(), row));
+            let role = builder.role_for_body_direction(chunk.direction);
+            builder.observe_body_chunk(row, chunk, role);
+            if let Some(flow_direction) = FlowDirectionKey::from_event(event, chunk.direction) {
+                if chunk.end_stream {
+                    active_body_targets.remove(&flow_direction);
+                } else {
+                    active_body_targets.insert(
+                        flow_direction,
+                        ActiveBodyTarget {
+                            exchange: key,
+                            role,
+                            accepts_gap: true,
+                        },
+                    );
+                }
+            }
+            continue;
+        }
+        let Some(gap) = event.gap() else {
+            clear_http_assembly_for_boundary(
+                &mut active_body_targets,
+                &mut pending_requests,
+                event,
+            );
             continue;
         };
-        exchanges
-            .entry(key.clone())
-            .or_insert_with(|| HttpExchangeBuilder::new(key, row))
-            .observe(row, event);
+        let Some(flow_direction) = FlowDirectionKey::from_event(event, gap.direction) else {
+            continue;
+        };
+        if gap.next_offset.is_none() {
+            clear_pending_requests_for_event(&mut pending_requests, event);
+        }
+        let Some(target) = active_body_targets.get(&flow_direction).cloned() else {
+            continue;
+        };
+        if !target.accepts_gap {
+            if gap.next_offset.is_none() {
+                active_body_targets.remove(&flow_direction);
+            }
+            continue;
+        }
+        if let Some(exchange) = exchanges.get_mut(&target.exchange) {
+            exchange.observe_gap(row, gap, target.role);
+            active_body_targets.remove(&flow_direction);
+        }
     }
     let mut rows = exchanges
         .into_values()
@@ -746,22 +1097,213 @@ fn http_exchange_key(event: TrafficEventRef<'_>) -> Option<HttpExchangeIdentity>
     let stream_sequence = event
         .http_request_headers()
         .map(|headers| headers.stream_sequence)
-        .or_else(|| {
-            event
-                .http_response_headers()
-                .map(|headers| headers.stream_sequence)
-        })
         .or_else(|| event.http_body_chunk().map(|chunk| chunk.stream_sequence))?;
-    Some(HttpExchangeIdentity {
+    Some(HttpExchangeIdentity::request_stream(
         flow_id,
         stream_sequence,
-    })
+    ))
+}
+
+fn response_exchange_key(
+    row: &TrafficRow,
+    event: TrafficEventRef<'_>,
+    headers: &HttpHeaders,
+    pending_requests: &mut HashMap<String, VecDeque<HttpExchangeIdentity>>,
+) -> Option<HttpExchangeIdentity> {
+    let flow_id = event.flow()?.id.0.clone();
+    let matched = pending_requests.get_mut(&flow_id).and_then(|queue| {
+        let key = queue.front().cloned()?;
+        if !response_status_is_interim(headers.status) {
+            queue.pop_front();
+        }
+        Some((key, queue.is_empty()))
+    });
+    if let Some((key, empty)) = matched {
+        if empty {
+            pending_requests.remove(&flow_id);
+        }
+        return Some(key);
+    }
+    Some(HttpExchangeIdentity::orphan_response(
+        flow_id,
+        headers.stream_sequence,
+        row.sequence,
+    ))
+}
+
+fn update_active_header_body_target(
+    active_body_targets: &mut HashMap<FlowDirectionKey, ActiveBodyTarget>,
+    event: TrafficEventRef<'_>,
+    headers: &HttpHeaders,
+    exchange: &HttpExchangeIdentity,
+    role: BodyRole,
+    request_method: Option<&str>,
+) {
+    let Some(flow_direction) = FlowDirectionKey::from_event(event, headers.direction) else {
+        return;
+    };
+    if let Some(accepts_gap) = active_body_target_gap_policy(headers, request_method) {
+        active_body_targets.insert(
+            flow_direction,
+            ActiveBodyTarget {
+                exchange: exchange.clone(),
+                role,
+                accepts_gap,
+            },
+        );
+    } else {
+        active_body_targets.remove(&flow_direction);
+    }
+}
+
+fn clear_http_assembly_for_boundary(
+    active_body_targets: &mut HashMap<FlowDirectionKey, ActiveBodyTarget>,
+    pending_requests: &mut HashMap<String, VecDeque<HttpExchangeIdentity>>,
+    event: TrafficEventRef<'_>,
+) {
+    match event.kind() {
+        TrafficEventKindRef::ConnectionClosed => {
+            let Some(flow) = event.flow() else {
+                return;
+            };
+            active_body_targets.retain(|flow_direction, _| flow_direction.flow_id != flow.id.0);
+            pending_requests.remove(&flow.id.0);
+        }
+        TrafficEventKindRef::WebSocketHandoff(handoff) => {
+            remove_active_body_target(active_body_targets, event, handoff.direction);
+            clear_pending_requests_for_event(pending_requests, event);
+        }
+        TrafficEventKindRef::WebSocketFrame(frame) => {
+            remove_active_body_target(active_body_targets, event, frame.direction);
+        }
+        TrafficEventKindRef::WebSocketMessage(message) => {
+            remove_active_body_target(active_body_targets, event, message.direction);
+        }
+        TrafficEventKindRef::OpaqueStream(stream) => {
+            remove_active_body_target(active_body_targets, event, stream.direction);
+        }
+        TrafficEventKindRef::ProtocolError(error) => {
+            remove_active_body_target(active_body_targets, event, error.direction);
+        }
+        TrafficEventKindRef::ConnectionOpened
+        | TrafficEventKindRef::SseEvent(_)
+        | TrafficEventKindRef::CaptureLoss(_)
+        | TrafficEventKindRef::PolicyAlert(_)
+        | TrafficEventKindRef::PolicyVerdict(_)
+        | TrafficEventKindRef::PolicyRuntimeError(_)
+        | TrafficEventKindRef::EnforcementDecision(_)
+        | TrafficEventKindRef::L7MitmAudit(_)
+        | TrafficEventKindRef::HttpRequestHeaders(_)
+        | TrafficEventKindRef::HttpResponseHeaders(_)
+        | TrafficEventKindRef::HttpBodyChunk(_)
+        | TrafficEventKindRef::Gap(_) => {}
+    }
+}
+
+fn clear_pending_requests_for_event(
+    pending_requests: &mut HashMap<String, VecDeque<HttpExchangeIdentity>>,
+    event: TrafficEventRef<'_>,
+) {
+    if let Some(flow) = event.flow() {
+        pending_requests.remove(&flow.id.0);
+    }
+}
+
+fn remove_active_body_target(
+    active_body_targets: &mut HashMap<FlowDirectionKey, ActiveBodyTarget>,
+    event: TrafficEventRef<'_>,
+    direction: Direction,
+) {
+    if let Some(flow_direction) = FlowDirectionKey::from_event(event, direction) {
+        active_body_targets.remove(&flow_direction);
+    }
+}
+
+fn response_status_is_interim(status: Option<u16>) -> bool {
+    status.is_some_and(|status| (100..200).contains(&status) && status != 101)
+}
+
+fn active_body_target_gap_policy(
+    headers: &HttpHeaders,
+    request_method: Option<&str>,
+) -> Option<bool> {
+    if http_message_may_have_body(headers, request_method) {
+        return Some(true);
+    }
+    if response_body_chunk_may_arrive_without_request_context(headers, request_method) {
+        return Some(false);
+    }
+    None
+}
+
+fn response_body_chunk_may_arrive_without_request_context(
+    headers: &HttpHeaders,
+    request_method: Option<&str>,
+) -> bool {
+    if headers.status.is_none() || request_method.is_some() {
+        return false;
+    }
+    if headers.status.is_some_and(response_status_has_no_body) {
+        return false;
+    }
+    !matches!(
+        header_value(headers, "content-length").and_then(|value| value.trim().parse::<u64>().ok()),
+        Some(0)
+    )
+}
+
+fn http_message_may_have_body(headers: &HttpHeaders, request_method: Option<&str>) -> bool {
+    if headers.status.is_some() && request_method.is_none() {
+        return false;
+    }
+    if headers.status.is_some()
+        && request_method.is_some_and(|method| method.eq_ignore_ascii_case("HEAD"))
+    {
+        return false;
+    }
+    if headers
+        .status
+        .is_some_and(|status| (200..300).contains(&status))
+        && request_method.is_some_and(|method| method.eq_ignore_ascii_case("CONNECT"))
+    {
+        return false;
+    }
+    if headers.status.is_some_and(response_status_has_no_body) {
+        return false;
+    }
+    if header_value(headers, "transfer-encoding").is_some() {
+        return true;
+    }
+    match header_value(headers, "content-length").and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        Some(0) => false,
+        Some(_) => true,
+        None => headers.status.is_some(),
+    }
+}
+
+fn response_status_has_no_body(status: u16) -> bool {
+    (100..200).contains(&status) || status == 204 || status == 304
+}
+
+fn header_value<'a>(headers: &'a HttpHeaders, name: &str) -> Option<&'a str> {
+    headers
+        .headers
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
 }
 
 fn sorted_body_chunks(chunks: &[BodyChunk]) -> Vec<&BodyChunk> {
     let mut chunks = chunks.iter().collect::<Vec<_>>();
     chunks.sort_by_key(|chunk| chunk.offset);
     chunks
+}
+
+fn sorted_body_gaps(gaps: &[CaptureGapEvidence]) -> Vec<&CaptureGapEvidence> {
+    let mut gaps = gaps.iter().collect::<Vec<_>>();
+    gaps.sort_by_key(|gap| (gap.expected_stream_offset, gap.sequence));
+    gaps
 }
 
 fn body_direction_is_response(
@@ -783,7 +1325,7 @@ mod tests {
     use probe_core::{
         AddressPort, BodyChunk, CaptureOrigin, CaptureSource, EventEnvelope, EventKind,
         FlowContext, FlowIdentity, HttpHeaders, LIBPCAP_FALLBACK_RUNTIME_HINT, ProcessContext,
-        ProcessIdentity, Timestamp, TransportProtocol, UNKNOWN_PROCESS_LABEL,
+        ProcessIdentity, Timestamp, TransportProtocol, UNKNOWN_PROCESS_LABEL, WebSocketHandoff,
     };
 
     use crate::admin::{EventTailEvent, EventTailRecord};
@@ -909,6 +1451,892 @@ mod tests {
             assert_eq!(exchange.request_body, expected_payload);
             assert_eq!(exchange.response_body, "0B none");
         }
+    }
+
+    #[test]
+    fn response_capture_gap_marks_exchange_body_incomplete() {
+        let rows = vec![
+            TrafficRow::from_event(
+                1,
+                event(EventKind::HttpRequestHeaders(HttpHeaders {
+                    direction: Direction::Inbound,
+                    stream_sequence: 1,
+                    method: Some("GET".to_string()),
+                    target: Some("/large".to_string()),
+                    status: None,
+                    reason: None,
+                    version: "HTTP/1.1".to_string(),
+                    headers: Vec::new(),
+                })),
+            ),
+            TrafficRow::from_event(
+                2,
+                event(EventKind::HttpResponseHeaders(HttpHeaders {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    method: None,
+                    target: None,
+                    status: Some(200),
+                    reason: Some("OK".to_string()),
+                    version: "HTTP/1.1".to_string(),
+                    headers: vec![("content-length".to_string(), "110048".to_string())],
+                })),
+            ),
+            TrafficRow::from_event(
+                3,
+                event(EventKind::Gap(Gap {
+                    direction: Direction::Outbound,
+                    expected_offset: 480,
+                    next_offset: Some(110_048),
+                    reason:
+                        "eBPF outbound syscall sample truncated payload after 480 of 110048 byte(s)"
+                            .to_string(),
+                })),
+            ),
+            TrafficRow::from_event(
+                4,
+                event(EventKind::Gap(Gap {
+                    direction: Direction::Outbound,
+                    expected_offset: 110_048,
+                    next_offset: Some(120_000),
+                    reason: "later unrelated gap".to_string(),
+                })),
+            ),
+        ];
+
+        let exchange = single_exchange(rows);
+
+        assert_eq!(exchange.response_body, "0B incomplete");
+        assert_eq!(
+            exchange.summary,
+            "GET /large -> 200 OK (req 0 B, resp 0 B incomplete)"
+        );
+        let details = exchange.detail_lines();
+        assert!(
+            details
+                .iter()
+                .any(|line| line == "  Body payload: incomplete")
+        );
+        assert!(
+            details
+                .iter()
+                .any(|line| line == "  Incomplete reason: capture gap interrupted body payload")
+        );
+        assert!(details.iter().any(|line| {
+            line == "  Capture gap sequence=3 stream_expected_offset=480 stream_next_offset=110048: eBPF outbound syscall sample truncated payload after 480 of 110048 byte(s)"
+        }));
+        assert!(details.iter().any(|line| line == "  Sequences: 1, 2, 3"));
+        assert!(
+            !details
+                .iter()
+                .any(|line| line.contains("later unrelated gap"))
+        );
+    }
+
+    #[test]
+    fn response_gap_without_request_context_does_not_infer_body() {
+        let rows = vec![
+            TrafficRow::from_event(
+                1,
+                event(EventKind::HttpResponseHeaders(HttpHeaders {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    method: None,
+                    target: None,
+                    status: Some(200),
+                    reason: Some("OK".to_string()),
+                    version: "HTTP/1.1".to_string(),
+                    headers: vec![("content-length".to_string(), "128".to_string())],
+                })),
+            ),
+            TrafficRow::from_event(
+                2,
+                event(EventKind::Gap(Gap {
+                    direction: Direction::Outbound,
+                    expected_offset: 128,
+                    next_offset: Some(256),
+                    reason: "ambiguous response gap".to_string(),
+                })),
+            ),
+        ];
+
+        let exchange = single_exchange(rows);
+
+        assert_eq!(exchange.response_body, "0B none");
+        assert_eq!(exchange.raw_sequences.to_vec(), vec![1]);
+        assert!(
+            !exchange
+                .detail_lines()
+                .iter()
+                .any(|line| line.contains("ambiguous response gap"))
+        );
+    }
+
+    #[test]
+    fn final_response_after_interim_response_uses_pending_request_context_for_gap() {
+        let rows = vec![
+            TrafficRow::from_event(
+                1,
+                event(EventKind::HttpRequestHeaders(HttpHeaders {
+                    direction: Direction::Inbound,
+                    stream_sequence: 1,
+                    method: Some("GET".to_string()),
+                    target: Some("/continue".to_string()),
+                    status: None,
+                    reason: None,
+                    version: "HTTP/1.1".to_string(),
+                    headers: Vec::new(),
+                })),
+            ),
+            TrafficRow::from_event(
+                2,
+                event(EventKind::HttpResponseHeaders(HttpHeaders {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    method: None,
+                    target: None,
+                    status: Some(100),
+                    reason: Some("Continue".to_string()),
+                    version: "HTTP/1.1".to_string(),
+                    headers: Vec::new(),
+                })),
+            ),
+            TrafficRow::from_event(
+                3,
+                event(EventKind::HttpResponseHeaders(HttpHeaders {
+                    direction: Direction::Outbound,
+                    stream_sequence: 2,
+                    method: None,
+                    target: None,
+                    status: Some(200),
+                    reason: Some("OK".to_string()),
+                    version: "HTTP/1.1".to_string(),
+                    headers: vec![("content-length".to_string(), "110048".to_string())],
+                })),
+            ),
+            TrafficRow::from_event(
+                4,
+                event(EventKind::Gap(Gap {
+                    direction: Direction::Outbound,
+                    expected_offset: 480,
+                    next_offset: Some(110_048),
+                    reason: "truncated final response".to_string(),
+                })),
+            ),
+        ];
+
+        let exchanges = build_http_exchange_rows(&rows);
+        let final_response = exchanges
+            .iter()
+            .find(|exchange| exchange.status == "200 OK")
+            .unwrap_or_else(|| panic!("expected final response exchange: {exchanges:?}"));
+
+        assert_eq!(final_response.method, "GET");
+        assert_eq!(final_response.target, "/continue");
+        assert_eq!(final_response.response_body, "0B incomplete");
+        assert_eq!(final_response.raw_sequences.to_vec(), vec![1, 2, 3, 4]);
+        assert!(
+            final_response
+                .detail_lines()
+                .iter()
+                .any(|line| line.contains("truncated final response"))
+        );
+    }
+
+    #[test]
+    fn final_response_after_interim_response_does_not_attach_to_next_request() {
+        let rows = vec![
+            TrafficRow::from_event(
+                1,
+                event(EventKind::HttpRequestHeaders(HttpHeaders {
+                    direction: Direction::Inbound,
+                    stream_sequence: 1,
+                    method: Some("GET".to_string()),
+                    target: Some("/first".to_string()),
+                    status: None,
+                    reason: None,
+                    version: "HTTP/1.1".to_string(),
+                    headers: Vec::new(),
+                })),
+            ),
+            TrafficRow::from_event(
+                2,
+                event(EventKind::HttpResponseHeaders(HttpHeaders {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    method: None,
+                    target: None,
+                    status: Some(100),
+                    reason: Some("Continue".to_string()),
+                    version: "HTTP/1.1".to_string(),
+                    headers: Vec::new(),
+                })),
+            ),
+            TrafficRow::from_event(
+                3,
+                event(EventKind::HttpRequestHeaders(HttpHeaders {
+                    direction: Direction::Inbound,
+                    stream_sequence: 2,
+                    method: Some("HEAD".to_string()),
+                    target: Some("/second".to_string()),
+                    status: None,
+                    reason: None,
+                    version: "HTTP/1.1".to_string(),
+                    headers: Vec::new(),
+                })),
+            ),
+            TrafficRow::from_event(
+                4,
+                event(EventKind::HttpResponseHeaders(HttpHeaders {
+                    direction: Direction::Outbound,
+                    stream_sequence: 2,
+                    method: None,
+                    target: None,
+                    status: Some(200),
+                    reason: Some("OK".to_string()),
+                    version: "HTTP/1.1".to_string(),
+                    headers: vec![("content-length".to_string(), "4096".to_string())],
+                })),
+            ),
+            TrafficRow::from_event(
+                5,
+                event(EventKind::Gap(Gap {
+                    direction: Direction::Outbound,
+                    expected_offset: 512,
+                    next_offset: Some(4096),
+                    reason: "first response truncated".to_string(),
+                })),
+            ),
+        ];
+
+        let exchanges = build_http_exchange_rows(&rows);
+        let first = exchanges
+            .iter()
+            .find(|exchange| exchange.target == "/first")
+            .unwrap_or_else(|| panic!("expected first exchange: {exchanges:?}"));
+        let second = exchanges
+            .iter()
+            .find(|exchange| exchange.target == "/second")
+            .unwrap_or_else(|| panic!("expected second exchange: {exchanges:?}"));
+
+        assert_eq!(first.status, "200 OK");
+        assert_eq!(first.response_body, "0B incomplete");
+        assert_eq!(first.raw_sequences.to_vec(), vec![1, 2, 4, 5]);
+        assert_eq!(second.status, "pending");
+        assert_eq!(second.response_body, "0B none");
+        assert_eq!(second.raw_sequences.to_vec(), vec![3]);
+    }
+
+    #[test]
+    fn final_response_after_interim_response_hydrates_tail_body_chunk() {
+        let loaded_body = event(EventKind::HttpBodyChunk(BodyChunk {
+            direction: Direction::Outbound,
+            stream_sequence: 2,
+            offset: 0,
+            data: b"payload".to_vec().into(),
+            end_stream: true,
+        }));
+        let rows = vec![
+            TrafficRow::from_event(
+                1,
+                event(EventKind::HttpRequestHeaders(HttpHeaders {
+                    direction: Direction::Inbound,
+                    stream_sequence: 1,
+                    method: Some("GET".to_string()),
+                    target: Some("/tail-hydrate".to_string()),
+                    status: None,
+                    reason: None,
+                    version: "HTTP/1.1".to_string(),
+                    headers: Vec::new(),
+                })),
+            ),
+            TrafficRow::from_event(
+                2,
+                event(EventKind::HttpResponseHeaders(HttpHeaders {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    method: None,
+                    target: None,
+                    status: Some(100),
+                    reason: Some("Continue".to_string()),
+                    version: "HTTP/1.1".to_string(),
+                    headers: Vec::new(),
+                })),
+            ),
+            TrafficRow::from_event(
+                3,
+                event(EventKind::HttpResponseHeaders(HttpHeaders {
+                    direction: Direction::Outbound,
+                    stream_sequence: 2,
+                    method: None,
+                    target: None,
+                    status: Some(200),
+                    reason: Some("OK".to_string()),
+                    version: "HTTP/1.1".to_string(),
+                    headers: vec![("content-length".to_string(), "7".to_string())],
+                })),
+            ),
+            TrafficRow::from_record(EventTailRecord {
+                sequence: 4,
+                stored_at_unix_ns: 4,
+                event: EventTailEvent::from_envelope(&loaded_body),
+            }),
+        ];
+        let loaded_rows = [TrafficRow::from_event(4, loaded_body)];
+
+        let exchange = single_exchange(rows);
+
+        assert_eq!(exchange.response_body, "7B not loaded");
+        let details = exchange.detail_lines_with_loaded_rows(loaded_rows.iter());
+        assert!(details.iter().any(|line| line == "  Body payload: payload"));
+        assert!(
+            details
+                .iter()
+                .any(|line| line == "  Body chunk offset=0 end_stream=true: payload")
+        );
+    }
+
+    #[test]
+    fn unknown_gap_breaks_pending_request_response_context() {
+        let rows = vec![
+            TrafficRow::from_event(
+                1,
+                event(EventKind::HttpRequestHeaders(HttpHeaders {
+                    direction: Direction::Inbound,
+                    stream_sequence: 1,
+                    method: Some("GET".to_string()),
+                    target: Some("/stale".to_string()),
+                    status: None,
+                    reason: None,
+                    version: "HTTP/1.1".to_string(),
+                    headers: Vec::new(),
+                })),
+            ),
+            TrafficRow::from_event(
+                2,
+                event(EventKind::Gap(Gap {
+                    direction: Direction::Outbound,
+                    expected_offset: 0,
+                    next_offset: None,
+                    reason: "lost stream context".to_string(),
+                })),
+            ),
+            TrafficRow::from_event(
+                3,
+                event(EventKind::HttpResponseHeaders(HttpHeaders {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    method: None,
+                    target: None,
+                    status: Some(200),
+                    reason: Some("OK".to_string()),
+                    version: "HTTP/1.1".to_string(),
+                    headers: vec![("content-length".to_string(), "128".to_string())],
+                })),
+            ),
+            TrafficRow::from_event(
+                4,
+                event(EventKind::Gap(Gap {
+                    direction: Direction::Outbound,
+                    expected_offset: 0,
+                    next_offset: Some(128),
+                    reason: "response gap must stay orphaned".to_string(),
+                })),
+            ),
+        ];
+
+        let exchanges = build_http_exchange_rows(&rows);
+        let stale = exchanges
+            .iter()
+            .find(|exchange| exchange.target == "/stale")
+            .unwrap_or_else(|| panic!("expected stale request exchange: {exchanges:?}"));
+        let orphan_response = exchanges
+            .iter()
+            .find(|exchange| exchange.status == "200 OK")
+            .unwrap_or_else(|| panic!("expected orphan response exchange: {exchanges:?}"));
+
+        assert_eq!(stale.status, "pending");
+        assert_eq!(stale.raw_sequences.to_vec(), vec![1]);
+        assert_eq!(orphan_response.target, "-");
+        assert_eq!(orphan_response.response_body, "0B none");
+        assert_eq!(orphan_response.raw_sequences.to_vec(), vec![3]);
+        assert!(
+            !orphan_response
+                .detail_lines()
+                .iter()
+                .any(|line| line.contains("response gap must stay orphaned"))
+        );
+    }
+
+    #[test]
+    fn active_unknown_gap_breaks_pending_request_response_context() {
+        let rows = vec![
+            TrafficRow::from_event(
+                1,
+                event(EventKind::HttpRequestHeaders(HttpHeaders {
+                    direction: Direction::Inbound,
+                    stream_sequence: 1,
+                    method: Some("POST".to_string()),
+                    target: Some("/upload".to_string()),
+                    status: None,
+                    reason: None,
+                    version: "HTTP/1.1".to_string(),
+                    headers: vec![("content-length".to_string(), "4096".to_string())],
+                })),
+            ),
+            TrafficRow::from_event(
+                2,
+                event(EventKind::Gap(Gap {
+                    direction: Direction::Inbound,
+                    expected_offset: 512,
+                    next_offset: None,
+                    reason: "request body stream context lost".to_string(),
+                })),
+            ),
+            TrafficRow::from_event(
+                3,
+                event(EventKind::HttpResponseHeaders(HttpHeaders {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    method: None,
+                    target: None,
+                    status: Some(200),
+                    reason: Some("OK".to_string()),
+                    version: "HTTP/1.1".to_string(),
+                    headers: vec![("content-length".to_string(), "128".to_string())],
+                })),
+            ),
+        ];
+
+        let exchanges = build_http_exchange_rows(&rows);
+        let request = exchanges
+            .iter()
+            .find(|exchange| exchange.target == "/upload")
+            .unwrap_or_else(|| panic!("expected request exchange: {exchanges:?}"));
+        let orphan_response = exchanges
+            .iter()
+            .find(|exchange| exchange.status == "200 OK")
+            .unwrap_or_else(|| panic!("expected orphan response exchange: {exchanges:?}"));
+
+        assert_eq!(request.status, "pending");
+        assert_eq!(request.request_body, "0B incomplete");
+        assert_eq!(request.raw_sequences.to_vec(), vec![1, 2]);
+        assert_eq!(orphan_response.target, "-");
+        assert_eq!(orphan_response.raw_sequences.to_vec(), vec![3]);
+    }
+
+    #[test]
+    fn switching_protocols_response_closes_pending_request_context() {
+        let rows = vec![
+            TrafficRow::from_event(
+                1,
+                event(EventKind::HttpRequestHeaders(HttpHeaders {
+                    direction: Direction::Inbound,
+                    stream_sequence: 1,
+                    method: Some("GET".to_string()),
+                    target: Some("/socket".to_string()),
+                    status: None,
+                    reason: None,
+                    version: "HTTP/1.1".to_string(),
+                    headers: Vec::new(),
+                })),
+            ),
+            TrafficRow::from_event(
+                2,
+                event(EventKind::HttpResponseHeaders(HttpHeaders {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    method: None,
+                    target: None,
+                    status: Some(101),
+                    reason: Some("Switching Protocols".to_string()),
+                    version: "HTTP/1.1".to_string(),
+                    headers: vec![("upgrade".to_string(), "websocket".to_string())],
+                })),
+            ),
+            TrafficRow::from_event(
+                3,
+                event(EventKind::HttpResponseHeaders(HttpHeaders {
+                    direction: Direction::Outbound,
+                    stream_sequence: 2,
+                    method: None,
+                    target: None,
+                    status: Some(200),
+                    reason: Some("OK".to_string()),
+                    version: "HTTP/1.1".to_string(),
+                    headers: vec![("content-length".to_string(), "32".to_string())],
+                })),
+            ),
+        ];
+
+        let exchanges = build_http_exchange_rows(&rows);
+        let upgrade = exchanges
+            .iter()
+            .find(|exchange| exchange.target == "/socket")
+            .unwrap_or_else(|| panic!("expected upgrade exchange: {exchanges:?}"));
+        let orphan_response = exchanges
+            .iter()
+            .find(|exchange| exchange.status == "200 OK")
+            .unwrap_or_else(|| panic!("expected orphan response exchange: {exchanges:?}"));
+
+        assert_eq!(upgrade.status, "101 Switching Protocols");
+        assert_eq!(upgrade.raw_sequences.to_vec(), vec![1, 2]);
+        assert_eq!(orphan_response.target, "-");
+        assert_eq!(orphan_response.raw_sequences.to_vec(), vec![3]);
+    }
+
+    #[test]
+    fn capture_gap_keeps_loaded_body_prefix_visible() {
+        let rows = vec![
+            TrafficRow::from_event(
+                1,
+                event(EventKind::HttpResponseHeaders(HttpHeaders {
+                    direction: Direction::Inbound,
+                    stream_sequence: 1,
+                    method: None,
+                    target: None,
+                    status: Some(200),
+                    reason: Some("OK".to_string()),
+                    version: "HTTP/1.1".to_string(),
+                    headers: Vec::new(),
+                })),
+            ),
+            TrafficRow::from_event(
+                2,
+                event(EventKind::HttpBodyChunk(BodyChunk {
+                    direction: Direction::Inbound,
+                    stream_sequence: 1,
+                    offset: 0,
+                    data: b"hello".to_vec().into(),
+                    end_stream: false,
+                })),
+            ),
+            TrafficRow::from_event(
+                3,
+                event(EventKind::Gap(Gap {
+                    direction: Direction::Inbound,
+                    expected_offset: 5,
+                    next_offset: Some(12),
+                    reason: "capture gap".to_string(),
+                })),
+            ),
+        ];
+
+        let exchange = single_exchange(rows);
+
+        assert_eq!(exchange.response_body, "5B incomplete");
+        let details = exchange.detail_lines();
+        assert!(
+            details
+                .iter()
+                .any(|line| line == "  Observed body bytes: hello")
+        );
+        assert!(
+            details
+                .iter()
+                .any(|line| line == "  Incomplete reason: capture gap interrupted body payload")
+        );
+        assert!(details.iter().any(|line| {
+            line == "  Capture gap sequence=3 stream_expected_offset=5 stream_next_offset=12: capture gap"
+        }));
+    }
+
+    #[test]
+    fn capture_gap_with_unloaded_body_chunk_marks_exchange_incomplete() {
+        let rows = vec![
+            TrafficRow::from_event(
+                1,
+                event(EventKind::HttpResponseHeaders(HttpHeaders {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    method: None,
+                    target: None,
+                    status: Some(200),
+                    reason: Some("OK".to_string()),
+                    version: "HTTP/1.1".to_string(),
+                    headers: Vec::new(),
+                })),
+            ),
+            tail_body_row(2, 0, b"hello", false),
+            TrafficRow::from_event(
+                3,
+                event(EventKind::Gap(Gap {
+                    direction: Direction::Outbound,
+                    expected_offset: 5,
+                    next_offset: Some(12),
+                    reason: "capture gap".to_string(),
+                })),
+            ),
+        ];
+
+        let exchange = single_exchange(rows);
+
+        assert_eq!(exchange.response_body, "5B incomplete");
+        assert!(
+            exchange
+                .detail_lines()
+                .iter()
+                .any(|line| line == "  Body payload: incomplete")
+        );
+    }
+
+    #[test]
+    fn capture_gap_preserves_loaded_prefix_when_tail_chunk_is_unloaded() {
+        let rows = vec![
+            TrafficRow::from_event(
+                1,
+                event(EventKind::HttpResponseHeaders(HttpHeaders {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    method: None,
+                    target: None,
+                    status: Some(200),
+                    reason: Some("OK".to_string()),
+                    version: "HTTP/1.1".to_string(),
+                    headers: Vec::new(),
+                })),
+            ),
+            TrafficRow::from_event(
+                2,
+                event(EventKind::HttpBodyChunk(BodyChunk {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    offset: 0,
+                    data: b"hello".to_vec().into(),
+                    end_stream: false,
+                })),
+            ),
+            tail_body_row(3, 5, b"world", false),
+            TrafficRow::from_event(
+                4,
+                event(EventKind::Gap(Gap {
+                    direction: Direction::Outbound,
+                    expected_offset: 10,
+                    next_offset: Some(64),
+                    reason: "capture gap".to_string(),
+                })),
+            ),
+        ];
+
+        let exchange = single_exchange(rows);
+
+        assert_eq!(exchange.response_body, "10B incomplete");
+        let details = exchange.detail_lines();
+        assert!(
+            details
+                .iter()
+                .any(|line| line == "  Observed body bytes: hello")
+        );
+        assert!(
+            details
+                .iter()
+                .any(|line| line == "  Body chunk offset=5 len=5 end_stream=false not_loaded=true")
+        );
+        assert!(details.iter().any(|line| {
+            line == "  Capture gap sequence=4 stream_expected_offset=10 stream_next_offset=64: capture gap"
+        }));
+    }
+
+    #[test]
+    fn capture_gap_after_complete_body_does_not_reopen_exchange() {
+        let rows = vec![
+            TrafficRow::from_event(
+                1,
+                event(EventKind::HttpResponseHeaders(HttpHeaders {
+                    direction: Direction::Inbound,
+                    stream_sequence: 1,
+                    method: None,
+                    target: None,
+                    status: Some(200),
+                    reason: Some("OK".to_string()),
+                    version: "HTTP/1.1".to_string(),
+                    headers: vec![("content-length".to_string(), "5".to_string())],
+                })),
+            ),
+            TrafficRow::from_event(
+                2,
+                event(EventKind::HttpBodyChunk(BodyChunk {
+                    direction: Direction::Inbound,
+                    stream_sequence: 1,
+                    offset: 0,
+                    data: b"hello".to_vec().into(),
+                    end_stream: true,
+                })),
+            ),
+            TrafficRow::from_event(
+                3,
+                event(EventKind::Gap(Gap {
+                    direction: Direction::Inbound,
+                    expected_offset: 5,
+                    next_offset: Some(12),
+                    reason: "post-body gap".to_string(),
+                })),
+            ),
+        ];
+
+        let exchange = single_exchange(rows);
+
+        assert_eq!(exchange.response_body, "5B loaded");
+        assert_eq!(exchange.raw_sequences.to_vec(), vec![1, 2]);
+        assert!(
+            !exchange
+                .detail_lines()
+                .iter()
+                .any(|line| line.contains("post-body gap"))
+        );
+    }
+
+    #[test]
+    fn websocket_gap_after_handoff_does_not_mark_http_upgrade_incomplete() {
+        let rows = vec![
+            TrafficRow::from_event(
+                1,
+                event(EventKind::HttpResponseHeaders(HttpHeaders {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    method: None,
+                    target: None,
+                    status: Some(101),
+                    reason: Some("Switching Protocols".to_string()),
+                    version: "HTTP/1.1".to_string(),
+                    headers: vec![("upgrade".to_string(), "websocket".to_string())],
+                })),
+            ),
+            TrafficRow::from_event(
+                2,
+                event(EventKind::WebSocketHandoff(WebSocketHandoff {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    target: Some("/socket".to_string()),
+                    subprotocol: None,
+                    extensions: Vec::new(),
+                })),
+            ),
+            TrafficRow::from_event(
+                3,
+                event(EventKind::Gap(Gap {
+                    direction: Direction::Outbound,
+                    expected_offset: 12,
+                    next_offset: Some(24),
+                    reason: "websocket gap".to_string(),
+                })),
+            ),
+        ];
+
+        let exchange = single_exchange(rows);
+
+        assert_eq!(exchange.response_body, "0B none");
+        assert_eq!(exchange.raw_sequences.to_vec(), vec![1]);
+        assert!(
+            !exchange
+                .detail_lines()
+                .iter()
+                .any(|line| line.contains("websocket gap"))
+        );
+    }
+
+    #[test]
+    fn head_response_gap_does_not_mark_body_incomplete() {
+        let rows = vec![
+            TrafficRow::from_event(
+                1,
+                event(EventKind::HttpRequestHeaders(HttpHeaders {
+                    direction: Direction::Inbound,
+                    stream_sequence: 1,
+                    method: Some("HEAD".to_string()),
+                    target: Some("/metadata".to_string()),
+                    status: None,
+                    reason: None,
+                    version: "HTTP/1.1".to_string(),
+                    headers: Vec::new(),
+                })),
+            ),
+            TrafficRow::from_event(
+                2,
+                event(EventKind::HttpResponseHeaders(HttpHeaders {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    method: None,
+                    target: None,
+                    status: Some(200),
+                    reason: Some("OK".to_string()),
+                    version: "HTTP/1.1".to_string(),
+                    headers: vec![("content-length".to_string(), "128".to_string())],
+                })),
+            ),
+            TrafficRow::from_event(
+                3,
+                event(EventKind::Gap(Gap {
+                    direction: Direction::Outbound,
+                    expected_offset: 128,
+                    next_offset: Some(256),
+                    reason: "later stream gap".to_string(),
+                })),
+            ),
+        ];
+
+        let exchange = single_exchange(rows);
+
+        assert_eq!(exchange.response_body, "0B none");
+        assert_eq!(exchange.raw_sequences.to_vec(), vec![1, 2]);
+        assert!(
+            !exchange
+                .detail_lines()
+                .iter()
+                .any(|line| line.contains("later stream gap"))
+        );
+    }
+
+    #[test]
+    fn connect_tunnel_gap_does_not_mark_response_body_incomplete() {
+        let rows = vec![
+            TrafficRow::from_event(
+                1,
+                event(EventKind::HttpRequestHeaders(HttpHeaders {
+                    direction: Direction::Outbound,
+                    stream_sequence: 1,
+                    method: Some("CONNECT".to_string()),
+                    target: Some("example.test:443".to_string()),
+                    status: None,
+                    reason: None,
+                    version: "HTTP/1.1".to_string(),
+                    headers: Vec::new(),
+                })),
+            ),
+            TrafficRow::from_event(
+                2,
+                event(EventKind::HttpResponseHeaders(HttpHeaders {
+                    direction: Direction::Inbound,
+                    stream_sequence: 1,
+                    method: None,
+                    target: None,
+                    status: Some(200),
+                    reason: Some("Connection Established".to_string()),
+                    version: "HTTP/1.1".to_string(),
+                    headers: Vec::new(),
+                })),
+            ),
+            TrafficRow::from_event(
+                3,
+                event(EventKind::Gap(Gap {
+                    direction: Direction::Inbound,
+                    expected_offset: 64,
+                    next_offset: Some(128),
+                    reason: "tunnel gap".to_string(),
+                })),
+            ),
+        ];
+
+        let exchange = single_exchange(rows);
+
+        assert_eq!(exchange.response_body, "0B none");
+        assert_eq!(exchange.raw_sequences.to_vec(), vec![1, 2]);
+        assert!(
+            !exchange
+                .detail_lines()
+                .iter()
+                .any(|line| line.contains("tunnel gap"))
+        );
     }
 
     #[test]

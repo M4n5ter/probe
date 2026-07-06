@@ -1142,6 +1142,11 @@ impl TrafficState {
             .iter()
             .position(|row| row.matches_identity(&selection.identity))
             .or_else(|| {
+                self.http_exchanges
+                    .iter()
+                    .position(|row| row.matches_selection_fallback(&selection.identity))
+            })
+            .or_else(|| {
                 nearest_sequence_index(
                     &self.http_exchanges,
                     selection.order_sequence,
@@ -2392,6 +2397,38 @@ mod tests {
     }
 
     #[test]
+    fn paused_http_selection_prefers_strict_orphan_response_over_stale_request_fallback() {
+        let mut traffic = TrafficState::default();
+        traffic.set_viewport_rows(10);
+        let records = vec![
+            (
+                1,
+                request_event_with_flow("flow-stale-orphan", 1, "GET", "/stale"),
+            ),
+            (2, unknown_gap_event_with_flow("flow-stale-orphan", 2)),
+            (
+                3,
+                response_event_with_flow("flow-stale-orphan", 3, 200, "OK"),
+            ),
+            (4, request_event_with_flow("flow-later", 4, "GET", "/later")),
+        ];
+        traffic.apply_snapshot(tail_snapshot_from_records(records.clone()));
+        let orphan_index = traffic
+            .http_exchanges()
+            .iter()
+            .position(|exchange| exchange.status == "200 OK")
+            .expect("orphan response exchange should exist");
+
+        traffic.select_row(orphan_index, 10);
+        assert!(!traffic.following_tail());
+        traffic.apply_snapshot(tail_snapshot_from_records(records));
+
+        let selected = traffic.selected_http_exchange_index();
+        assert_eq!(traffic.http_exchanges()[selected].status, "200 OK");
+        assert_eq!(traffic.http_exchanges()[selected].target, "-");
+    }
+
+    #[test]
     fn live_tail_applies_to_each_projection_when_switching_views() {
         let mut traffic = TrafficState::default();
         traffic.set_viewport_rows(3);
@@ -3254,6 +3291,26 @@ mod tests {
                 expected_offset: sequence,
                 next_offset: Some(sequence + 1),
                 reason: "test gap".to_string(),
+            }),
+        )
+    }
+
+    fn unknown_gap_event_with_flow(flow_id: &str, sequence: u64) -> EventEnvelope {
+        let mut flow = test_flow();
+        flow.id = FlowIdentity(flow_id.to_string());
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: sequence,
+                wall_time_unix_ns: sequence as i64,
+            },
+            flow,
+            CaptureOrigin::from_source(CaptureSource::Replay),
+            "test",
+            EventKind::Gap(Gap {
+                direction: probe_core::Direction::Inbound,
+                expected_offset: sequence,
+                next_offset: None,
+                reason: "unknown gap".to_string(),
             }),
         )
     }
