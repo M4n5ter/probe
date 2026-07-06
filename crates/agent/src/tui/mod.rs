@@ -13,6 +13,7 @@ mod hit;
 mod local_profile;
 mod observation_setup;
 mod process_catalog_task;
+mod process_traffic_scope;
 mod process_view;
 mod processes;
 mod render;

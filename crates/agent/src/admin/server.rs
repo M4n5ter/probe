@@ -365,6 +365,7 @@ async fn handle_admin_request(
             limit,
             scan_limit,
             selector,
+            unknown_process_candidate_selector,
             event_types,
         } => {
             let plan = plan_handle.snapshot();
@@ -377,6 +378,7 @@ async fn handle_admin_request(
                     limit,
                     scan_limit: scan_limit.unwrap_or_else(|| default_tail_scan_limit(latest)),
                     selector,
+                    unknown_process_candidate_selector,
                     attribution_mode,
                     event_types,
                 },
@@ -601,6 +603,7 @@ mod tests {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
+    use crate::admin::UnknownProcessCandidateSelector;
     use capture::ReplayProvider;
     use enforcement::{
         EnforcementBackend, EnforcementBackendDecision, EnforcementBackendRequest,
@@ -882,6 +885,7 @@ mod tests {
                 limit: 10,
                 scan_limit: Some(10),
                 selector: None,
+                unknown_process_candidate_selector: None,
                 event_types: Vec::new(),
             },
             "event_tail",
@@ -955,6 +959,7 @@ mod tests {
                         ..TrafficSelector::default()
                     },
                 )),
+                unknown_process_candidate_selector: None,
                 event_types: Vec::new(),
             },
         )
@@ -1037,6 +1042,8 @@ mod tests {
                         ..TrafficSelector::default()
                     },
                 )),
+                unknown_process_candidate_selector:
+                    UnknownProcessCandidateSelector::from_listener_ports([8080]),
                 event_types: Vec::new(),
             },
         )
@@ -1124,6 +1131,7 @@ mod tests {
                         ..TrafficSelector::default()
                     },
                 )),
+                unknown_process_candidate_selector: None,
                 event_types: Vec::new(),
             },
         )
@@ -1189,6 +1197,7 @@ mod tests {
                         ..TrafficSelector::default()
                     },
                 )),
+                unknown_process_candidate_selector: None,
                 event_types: Vec::new(),
             },
         )

@@ -1,18 +1,16 @@
 use std::collections::VecDeque;
 
-use probe_core::{
-    CompiledSelector, Direction, EventType, FlowContext, Selector,
-    is_libpcap_unknown_process_candidate,
-};
+use probe_core::{EventType, Selector};
 use storage::{FjallSpool, StoredEvent};
 
 use super::{
     decode::{decode_stored_event, decode_tail_record},
     error::EventTailError,
     model::{
-        EventDetailSnapshot, EventTailAttributionMode, EventTailBudgetSnapshot, EventTailEvent,
-        EventTailOmission, EventTailOmissionReason, EventTailRecord, EventTailSnapshot,
+        EventDetailSnapshot, EventTailAttributionMode, EventTailBudgetSnapshot, EventTailOmission,
+        EventTailOmissionReason, EventTailRecord, EventTailSnapshot,
     },
+    selector::{EventTypeFilter, TailEventSelectorFilter, UnknownProcessCandidateSelector},
 };
 
 const MAX_TAIL_LIMIT: usize = 1_024;
@@ -64,6 +62,8 @@ pub(in crate::admin) struct EventTailRequest {
     pub(in crate::admin) limit: usize,
     pub(in crate::admin) scan_limit: usize,
     pub(in crate::admin) selector: Option<Selector>,
+    pub(in crate::admin) unknown_process_candidate_selector:
+        Option<UnknownProcessCandidateSelector>,
     pub(in crate::admin) attribution_mode: EventTailAttributionMode,
     pub(in crate::admin) event_types: Vec<EventType>,
 }
@@ -73,14 +73,13 @@ pub(in crate::admin) fn read_event_tail(
     request: EventTailRequest,
 ) -> Result<EventTailSnapshot, EventTailError> {
     let limit = normalize_limit(request.limit);
-    let filtered = request.selector.is_some() || !request.event_types.is_empty();
+    let selector_filter = TailEventSelectorFilter::compile(
+        request.selector.as_ref(),
+        request.unknown_process_candidate_selector.clone(),
+    )
+    .map_err(EventTailError::Selector)?;
+    let filtered = selector_filter.is_filtered() || !request.event_types.is_empty();
     let scan_limit = normalize_scan_limit(request.scan_limit, limit, filtered, request.latest);
-    let selector = request
-        .selector
-        .as_ref()
-        .map(Selector::compile)
-        .transpose()
-        .map_err(EventTailError::Selector)?;
     let event_type_filter = EventTypeFilter::new(&request.event_types);
     let last_export_sequence = spool.snapshot()?.last_export_sequence;
     let after_sequence = effective_after_sequence(&request, scan_limit, last_export_sequence);
@@ -104,9 +103,7 @@ pub(in crate::admin) fn read_event_tail(
         let payload_schema = stored_event.payload.schema().to_string();
         let record = decode_tail_record(stored_event)?;
         if event_type_filter.matches(&record.event)
-            && selector.as_ref().is_none_or(|selector| {
-                selector_matches_event(selector, &record.event, request.attribution_mode)
-            })
+            && selector_filter.matches(&record.event, request.attribution_mode)
             && tail.push_record(record, payload_schema, payload_bytes)?
         {
             break;
@@ -237,39 +234,6 @@ struct TailRecordCandidate {
     payload_bytes: usize,
 }
 
-fn selector_matches_event(
-    selector: &CompiledSelector,
-    event: &EventTailEvent,
-    mode: EventTailAttributionMode,
-) -> bool {
-    let Some(flow) = event.flow.as_ref() else {
-        return false;
-    };
-    let direction = event.kind.direction();
-    selector_matches_tail_flow(selector, flow, direction)
-        || (mode == EventTailAttributionMode::IncludeUnknownProcess
-            && is_libpcap_unknown_process_event(event)
-            && selector.matches_flow_with_unknown_process(flow, direction))
-}
-
-fn selector_matches_tail_flow(
-    selector: &CompiledSelector,
-    flow: &FlowContext,
-    direction: Option<Direction>,
-) -> bool {
-    direction.map_or_else(
-        || selector.matches_flow_without_direction(flow),
-        |direction| selector.matches_flow(flow, direction),
-    )
-}
-
-fn is_libpcap_unknown_process_event(event: &EventTailEvent) -> bool {
-    event
-        .flow
-        .as_ref()
-        .is_some_and(|flow| is_libpcap_unknown_process_candidate(event.origin.source(), flow))
-}
-
 fn effective_after_sequence(
     request: &EventTailRequest,
     scan_limit: usize,
@@ -279,20 +243,6 @@ fn effective_after_sequence(
         last_export_sequence.saturating_sub(scan_limit as u64)
     } else {
         request.after_sequence
-    }
-}
-
-struct EventTypeFilter<'a> {
-    event_types: &'a [EventType],
-}
-
-impl<'a> EventTypeFilter<'a> {
-    fn new(event_types: &'a [EventType]) -> Self {
-        Self { event_types }
-    }
-
-    fn matches(&self, event: &EventTailEvent) -> bool {
-        self.event_types.is_empty() || self.event_types.contains(&event.kind.event_type())
     }
 }
 
@@ -349,15 +299,15 @@ fn omission_for(stored: &StoredEvent, reason: EventTailOmissionReason) -> EventT
 mod tests {
     use pipeline::ExportEventWriter;
     use probe_core::{
-        AddressPort, CaptureOrigin, CaptureSource, Direction, EventEnvelope, EventKind,
-        FlowContext, FlowIdentity, HttpHeaders, LIBPCAP_FALLBACK_RUNTIME_HINT, ProcessContext,
-        ProcessIdentity, ProcessSelector, SelectorTerm, SpoolPayloadSchema, Timestamp,
-        TrafficSelector, TransportProtocol, UNKNOWN_PROCESS_LABEL,
+        AddressPort, CaptureLoss, CaptureOrigin, CaptureSource, Direction, EventEnvelope,
+        EventKind, FlowContext, FlowIdentity, HttpHeaders, LIBPCAP_FALLBACK_RUNTIME_HINT,
+        ProcessContext, ProcessIdentity, ProcessSelector, SelectorTerm, SpoolPayloadSchema,
+        Timestamp, TrafficSelector, TransportProtocol, UNKNOWN_PROCESS_LABEL,
     };
     use storage::SpoolPayload;
     use tempfile::tempdir;
 
-    use super::super::model::EventTailKind;
+    use super::super::model::{EventTailEvent, EventTailKind};
     use super::*;
 
     fn tail_request() -> EventTailRequest {
@@ -367,6 +317,7 @@ mod tests {
             limit: 16,
             scan_limit: 16,
             selector: None,
+            unknown_process_candidate_selector: None,
             attribution_mode: EventTailAttributionMode::Strict,
             event_types: Vec::new(),
         }
@@ -407,12 +358,15 @@ mod tests {
     }
 
     #[test]
-    fn relaxed_tail_includes_libpcap_unknown_process_candidates()
+    fn relaxed_tail_includes_explicit_libpcap_unknown_process_candidates()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempdir()?;
         let spool = FjallSpool::open(temp.path())?;
         ExportEventWriter::new(&spool).append_occurrence(&libpcap_unknown_process_event())?;
         let selector = exe_selector("/app/backend");
+        let unknown_process_candidate_selector =
+            UnknownProcessCandidateSelector::from_listener_ports([80])
+                .expect("listener port should produce candidate selector");
 
         let strict = read_event_tail(
             &spool,
@@ -422,10 +376,20 @@ mod tests {
                 ..tail_request()
             },
         )?;
+        let relaxed_without_candidate = read_event_tail(
+            &spool,
+            EventTailRequest {
+                selector: Some(selector.clone()),
+                attribution_mode: EventTailAttributionMode::IncludeUnknownProcess,
+                event_types: vec![EventType::HttpRequestHeaders],
+                ..tail_request()
+            },
+        )?;
         let relaxed = read_event_tail(
             &spool,
             EventTailRequest {
                 selector: Some(selector),
+                unknown_process_candidate_selector: Some(unknown_process_candidate_selector),
                 attribution_mode: EventTailAttributionMode::IncludeUnknownProcess,
                 event_types: vec![EventType::HttpRequestHeaders],
                 ..tail_request()
@@ -433,8 +397,60 @@ mod tests {
         )?;
 
         assert!(strict.events.is_empty());
+        assert!(relaxed_without_candidate.events.is_empty());
         assert_eq!(relaxed.events.len(), 1);
         assert_eq!(relaxed.events[0].sequence, 1);
+        assert_eq!(spool.export_cursor("webhook")?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_process_candidate_selector_does_not_match_strongly_attributed_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        ExportEventWriter::new(&spool).append_occurrence(&event_for_exe("/usr/bin/curl"))?;
+        ExportEventWriter::new(&spool).append_occurrence(&libpcap_unknown_process_event())?;
+
+        let tail = read_event_tail(
+            &spool,
+            EventTailRequest {
+                unknown_process_candidate_selector:
+                    UnknownProcessCandidateSelector::from_listener_ports([80]),
+                attribution_mode: EventTailAttributionMode::IncludeUnknownProcess,
+                event_types: vec![EventType::HttpRequestHeaders],
+                ..tail_request()
+            },
+        )?;
+
+        assert_eq!(tail.events.len(), 1);
+        assert_eq!(tail.events[0].sequence, 2);
+        assert_eq!(spool.export_cursor("webhook")?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn event_type_only_tail_includes_provider_events_without_flow()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        ExportEventWriter::new(&spool).append_occurrence(&provider_capture_loss_event())?;
+
+        let tail = read_event_tail(
+            &spool,
+            EventTailRequest {
+                event_types: vec![EventType::CaptureLoss],
+                ..tail_request()
+            },
+        )?;
+
+        assert_eq!(tail.events.len(), 1);
+        assert_eq!(tail.events[0].sequence, 1);
+        assert!(tail.events[0].event.flow.is_none());
+        assert!(matches!(
+            tail.events[0].event.kind,
+            EventTailKind::CaptureLoss(_)
+        ));
         assert_eq!(spool.export_cursor("webhook")?, 0);
         Ok(())
     }
@@ -881,6 +897,21 @@ mod tests {
                 reason: None,
                 version: "HTTP/1.1".to_string(),
                 headers: Vec::new(),
+            }),
+        )
+    }
+
+    fn provider_capture_loss_event() -> EventEnvelope {
+        EventEnvelope::from_provider(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            CaptureOrigin::from_source(CaptureSource::Libpcap),
+            "test",
+            EventKind::CaptureLoss(CaptureLoss {
+                lost_events: 7,
+                reason: "provider ring overflow".to_string(),
             }),
         )
     }

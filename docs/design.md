@@ -310,6 +310,13 @@ Operator TUI 能力事实：
   进程选择只写入 executable path selector；无法读取 executable path 时 fail-closed，
   不退回 process name selector。TUI model 不保留 raw argv；进程表只展示 redacted argv entry 数量。
   procfs 全局扫描失败或单进程读取失败会进入 catalog diagnostics，不与“确实没有进程”混淆。
+  process catalog 同时从 procfs socket table 建立 listener port index；该 index 只用于 libpcap
+  无法归因到进程时的弱候选匹配，不把端口流量提升为强进程归因。docker-proxy listener 会同时索引宿主发布端口和容器
+  target port，使 DNAT 前后观察到的明文 HTTP 都能作为候选流量展示。
+  listener port index 有明确 admin request budget：弱候选端口集超过上限时禁用该进程的弱候选匹配并报告 catalog
+  diagnostic，强 executable-path selector 继续生效。TUI 发送 `tail_events` 前还会对完整 admin request
+  执行大小预检；若强 selector 与弱候选组合超过 admin request budget，则丢弃弱候选后重试，强 selector
+  本身超过预算时才报告 request-too-large 错误。
 - Processes tab 提供同级键盘/鼠标浏览和搜索。`/`、`Ctrl-F` 与 `[Search]` 进入同一 process
   search edit session，按 PID、进程名和 executable path 过滤；`[Clear]` 清除过滤。选择和滚动基于过滤后的
   viewport offset，移动选中项时保留上下文行，而不是把选中行固定到列表顶部。
@@ -320,6 +327,10 @@ Operator TUI 能力事实：
   Traffic 状态行与 Data Path 详情。
   当选中进程有 readable executable path 时，Traffic tab 使用同一 selector model 过滤事件；选中进程无法形成 executable-path
   selector 时 fail-closed，不退回全机流量。
+  当 libpcap fallback 只能提供 unknown-process 事件时，Traffic tab 会把选中进程的 listener ports
+  作为 `unknown_process_candidate_selector.listener_ports` 传给 `tail_events`。该 selector 只在 admin tail 以
+  IncludeUnknownProcess 模式读取 libpcap unknown-process event 时生效；强归因事件仍必须匹配 executable-path
+  selector。TUI 行会保留 weak/unknown candidate attribution，避免把候选流量伪装成确定的进程归因。
   Traffic tab 有三个观察层级：HTTP exchange、WebSocket session 和 raw event。HTTP exchange
   将 request/response headers 和 body chunks 合并成面向请求/响应的行；WebSocket session 将
   Upgrade handoff、frame metadata 和有界 message payload 合并成面向连接语义的行；raw event
@@ -341,6 +352,9 @@ Operator TUI 能力事实：
   当没有 active admin socket 时，Traffic tab fail-closed 并显示 agent runtime 不可用状态。
 - `tail_events` 是 non-mutating admin command。它读取 `after_sequence` 之后的 export records，按可选 selector
   过滤，并返回 `next_after_sequence`；该响应 cursor 不会 ack 任何 exporter sink cursor。
+  `unknown_process_candidate_selector` 是单独的弱匹配输入，wire contract 只表达 bounded `listener_ports`，
+  由 admin tail 在 IncludeUnknownProcess 模式下匹配 libpcap unknown-process 候选事件的 local/remote port。
+  普通 selector 为空且 candidate selector 也为空才表示全量读取；candidate-only 请求不会匹配强归因事件。
   响应同时受单事件 payload budget 和总响应 payload budget 约束；超限事件通过 omission metadata 表达，不在响应中展开。
   当请求带 selector 且某条超限事件无法解码验证 selector 时，该事件不返回 omission metadata，只推进扫描 cursor。
 - Traffic tab 的 live tail 采用最新优先排序；HTTP exchange、WebSocket session 和 raw event 三个视图共享该排序语义。

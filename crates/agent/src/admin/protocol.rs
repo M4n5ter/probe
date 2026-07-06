@@ -13,7 +13,7 @@ use crate::{
 
 use super::debug_dump::AdminDebugDump;
 
-const ADMIN_REQUEST_MAX_BYTES: usize = 4 * 1024;
+pub(super) const ADMIN_REQUEST_MAX_BYTES: usize = 4 * 1024;
 const ADMIN_RESPONSE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const ADMIN_EVENT_DETAIL_RESPONSE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
@@ -91,6 +91,7 @@ admin_requests! {
         limit: usize,
         scan_limit: Option<usize>,
         selector: Option<probe_core::Selector>,
+        unknown_process_candidate_selector: Option<super::event_tail::UnknownProcessCandidateSelector>,
         event_types: Vec<probe_core::EventType>,
     } => ("tail_events", false, AdminResponseBudget::Default),
     EventDetail {
@@ -357,6 +358,7 @@ mod tests {
                 limit: 1,
                 scan_limit: Some(1),
                 selector: None,
+                unknown_process_candidate_selector: None,
                 event_types: Vec::new(),
             },
             "tail_events",
@@ -434,6 +436,7 @@ mod tests {
                 limit: 16,
                 scan_limit: None,
                 selector: None,
+                unknown_process_candidate_selector: None,
                 event_types: Vec::new(),
             }
         );

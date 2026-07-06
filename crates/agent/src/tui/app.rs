@@ -15,8 +15,9 @@ use super::observation_setup::{
     ProcessObservationMode, process_observation_exe_paths, remove_process_observation,
     replace_process_observations_with, upsert_process_observation,
 };
+use super::process_traffic_scope::ProcessTrafficSelector;
 use super::process_view::ProcessViewState;
-use super::processes::{ProcessCatalog, ProcessEntry, selector_for_exe_path};
+use super::processes::{ProcessCatalog, ProcessEntry};
 use super::runtime_attachment::RuntimeAttachment;
 use super::runtime_status::{
     ActiveRuntimeGeneration, RuntimeGenerationReloadObservation, TrafficRuntimeDiagnostics,
@@ -27,7 +28,7 @@ use super::text::terminal_safe_inline_text;
 use super::traffic::{
     TrafficDetailLoadRequest, TrafficDetailLoadResult, TrafficEventFilter, TrafficRefreshRequest,
     TrafficRefreshResult, TrafficState, TrafficViewMode, load_traffic_refresh,
-    traffic_selector_key,
+    traffic_refresh_selector_key,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,7 +154,7 @@ struct TrafficRefreshIdentity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TrafficFilterSelector {
-    Ready(probe_core::Selector),
+    Ready(ProcessTrafficSelector),
     NoProcessCatalogEntries,
     NoSelectedProcess,
     UnavailableSelectedProcess,
@@ -863,8 +864,8 @@ impl TuiApp {
             }
             return None;
         };
-        let selector = match self.traffic_filter_selector() {
-            TrafficFilterSelector::Ready(selector) => selector,
+        let selector_set = match self.traffic_filter_selector() {
+            TrafficFilterSelector::Ready(selector_set) => selector_set,
             TrafficFilterSelector::NoProcessCatalogEntries => {
                 let message = "No readable process entries are available; keeping the current traffic view unchanged";
                 self.traffic.mark_refresh_paused(message);
@@ -884,7 +885,11 @@ impl TuiApp {
                 return None;
             }
         };
-        let traffic = self.traffic.begin_refresh(socket_path.clone(), selector);
+        let traffic = self.traffic.begin_refresh(
+            socket_path.clone(),
+            selector_set.selector,
+            selector_set.unknown_process_candidate_selector,
+        );
         Some(TrafficRefreshLoadRequest {
             identity: TrafficRefreshIdentity {
                 runtime_epoch: self.runtime_epoch,
@@ -970,8 +975,11 @@ impl TuiApp {
             && self.runtime_attachment.active_socket_path() == Some(identity.socket_path.as_path())
             && matches!(
                 self.traffic_filter_selector(),
-                TrafficFilterSelector::Ready(selector)
-                    if traffic_selector_key(&selector) == identity.selector_key
+                TrafficFilterSelector::Ready(selector_set)
+                    if traffic_refresh_selector_key(
+                        &selector_set.selector,
+                        selector_set.unknown_process_candidate_selector.as_ref(),
+                    ) == identity.selector_key
             )
     }
 
@@ -1465,25 +1473,11 @@ impl TuiApp {
     }
 
     fn traffic_filter_selector(&self) -> TrafficFilterSelector {
-        let mut selectors = self
-            .process_view
-            .monitored_exe_paths()
-            .iter()
-            .cloned()
-            .map(selector_for_exe_path)
-            .collect::<Vec<_>>();
-        match selectors.len() {
-            1 => {
-                return TrafficFilterSelector::Ready(
-                    selectors
-                        .pop()
-                        .expect("selector vector has one element after length check"),
-                );
-            }
-            count if count > 1 => {
-                return TrafficFilterSelector::Ready(probe_core::Selector::Any { selectors });
-            }
-            _ => {}
+        if let Some(selector) = self
+            .processes
+            .traffic_selector_for_exe_paths(self.process_view.monitored_exe_paths().iter().cloned())
+        {
+            return TrafficFilterSelector::Ready(selector);
         }
         if self.processes.entries().is_empty() {
             return TrafficFilterSelector::NoProcessCatalogEntries;
@@ -1491,8 +1485,8 @@ impl TuiApp {
         let Some(process) = self.selected_process() else {
             return TrafficFilterSelector::NoSelectedProcess;
         };
-        process
-            .selector()
+        self.processes
+            .traffic_selector_for_entry(process)
             .map(TrafficFilterSelector::Ready)
             .unwrap_or(TrafficFilterSelector::UnavailableSelectedProcess)
     }
@@ -1500,7 +1494,21 @@ impl TuiApp {
     #[cfg(test)]
     fn ready_traffic_filter_selector(&self) -> Option<probe_core::Selector> {
         match self.traffic_filter_selector() {
-            TrafficFilterSelector::Ready(selector) => Some(selector),
+            TrafficFilterSelector::Ready(selector_set) => Some(selector_set.selector),
+            TrafficFilterSelector::NoProcessCatalogEntries
+            | TrafficFilterSelector::NoSelectedProcess
+            | TrafficFilterSelector::UnavailableSelectedProcess => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn ready_unknown_process_candidate_selector(
+        &self,
+    ) -> Option<crate::admin::UnknownProcessCandidateSelector> {
+        match self.traffic_filter_selector() {
+            TrafficFilterSelector::Ready(selector_set) => {
+                selector_set.unknown_process_candidate_selector
+            }
             TrafficFilterSelector::NoProcessCatalogEntries
             | TrafficFilterSelector::NoSelectedProcess
             | TrafficFilterSelector::UnavailableSelectedProcess => None,
@@ -2337,6 +2345,22 @@ mod tests {
             panic!("multiple watched processes should use any selector");
         };
         assert_eq!(selectors.len(), 2);
+    }
+
+    #[test]
+    fn traffic_filter_builds_listener_port_unknown_process_candidate_selector() {
+        let app = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::from_entries([process(42, "backend", "/app/backend")])
+                .with_listener_ports("/app/backend", [8080, 8081]),
+        );
+
+        let candidate = app
+            .ready_unknown_process_candidate_selector()
+            .expect("listener ports should produce a weak candidate selector");
+
+        assert_eq!(candidate.listener_ports(), &[8080, 8081]);
     }
 
     #[test]

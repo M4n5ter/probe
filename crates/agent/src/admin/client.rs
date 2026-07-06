@@ -10,7 +10,7 @@ use tokio::{
     net::UnixStream,
 };
 
-use super::protocol::AdminRequest;
+use super::protocol::{ADMIN_REQUEST_MAX_BYTES, AdminRequest};
 
 const ADMIN_CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -38,6 +38,7 @@ async fn send_admin_json_request_with_response_limit(
     max_response_bytes: usize,
 ) -> Result<serde_json::Value, AdminClientError> {
     let command = request.command_name();
+    let request = encode_admin_request(request, command)?;
     let mut stream = connect_admin_socket(socket_path, timeout).await?;
     write_admin_request(&mut stream, request, timeout).await?;
     let response = read_bounded_response(&mut stream, timeout, command, max_response_bytes).await?;
@@ -57,13 +58,27 @@ async fn connect_admin_socket(
         })
 }
 
+fn encode_admin_request(
+    request: AdminRequest,
+    command: &'static str,
+) -> Result<Vec<u8>, AdminClientError> {
+    let mut request = serde_json::to_vec(&request)?;
+    if request.len() > ADMIN_REQUEST_MAX_BYTES {
+        return Err(AdminClientError::RequestTooLarge {
+            command,
+            encoded_bytes: request.len(),
+            limit: ADMIN_REQUEST_MAX_BYTES,
+        });
+    }
+    request.push(b'\n');
+    Ok(request)
+}
+
 async fn write_admin_request(
     stream: &mut UnixStream,
-    request: AdminRequest,
+    request: Vec<u8>,
     timeout: Duration,
 ) -> Result<(), AdminClientError> {
-    let mut request = serde_json::to_vec(&request)?;
-    request.push(b'\n');
     with_timeout(stream.write_all(&request), timeout).await?;
     with_timeout(stream.shutdown(), timeout).await
 }
@@ -111,6 +126,12 @@ pub(crate) enum AdminClientError {
     Io(#[from] std::io::Error),
     #[error("failed to encode admin request JSON: {0}")]
     RequestJson(#[from] serde_json::Error),
+    #[error("admin {command} request encodes to {encoded_bytes} bytes, limit is {limit}")]
+    RequestTooLarge {
+        command: &'static str,
+        encoded_bytes: usize,
+        limit: usize,
+    },
     #[error("admin response is empty")]
     EmptyResponse,
     #[error("admin {command} response exceeds {limit} bytes")]
@@ -125,6 +146,7 @@ pub(crate) enum AdminClientError {
 mod tests {
     use std::time::Duration;
 
+    use probe_core::{ProcessSelector, Selector, TrafficSelector};
     use serde_json::json;
     use tempfile::{TempDir, tempdir};
     use tokio::{
@@ -134,6 +156,36 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn client_rejects_oversized_request_before_io() {
+        let request = AdminRequest::TailEvents {
+            after_sequence: 0,
+            latest: false,
+            limit: 1,
+            scan_limit: None,
+            selector: Some(Selector::term(
+                ProcessSelector {
+                    exe_path_globs: vec!["/".repeat(ADMIN_REQUEST_MAX_BYTES)],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            )),
+            unknown_process_candidate_selector: None,
+            event_types: Vec::new(),
+        };
+
+        let error = encode_admin_request(request, "tail_events")
+            .expect_err("oversized request should be rejected before socket I/O");
+
+        assert!(matches!(
+            error,
+            AdminClientError::RequestTooLarge {
+                command: "tail_events",
+                ..
+            }
+        ));
+    }
 
     #[tokio::test]
     async fn client_reads_one_json_line_without_waiting_for_eof()

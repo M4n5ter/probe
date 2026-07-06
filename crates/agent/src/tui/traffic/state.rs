@@ -12,7 +12,7 @@ use super::{
 use crate::{
     admin::{
         AdminClientError, EventDetailSnapshot, EventTailAttributionMode, EventTailOmission,
-        EventTailSnapshot,
+        EventTailSnapshot, UnknownProcessCandidateSelector,
     },
     tui::{
         runtime_status::{
@@ -67,6 +67,7 @@ pub(crate) async fn load_traffic_detail(
 pub(crate) struct TrafficRefreshRequest {
     socket_path: PathBuf,
     selector: Selector,
+    unknown_process_candidate_selector: Option<UnknownProcessCandidateSelector>,
     selector_key: String,
     after_sequence: u64,
     latest_window: bool,
@@ -102,6 +103,7 @@ pub(crate) async fn load_traffic_refresh(request: TrafficRefreshRequest) -> Traf
         request.after_sequence,
         request.latest_window,
         request.selector.clone(),
+        request.unknown_process_candidate_selector.clone(),
         &event_types,
     )
     .await;
@@ -114,6 +116,7 @@ pub(crate) async fn load_traffic_refresh(request: TrafficRefreshRequest) -> Traf
                     request.after_sequence,
                     request.latest_window,
                     request.selector,
+                    request.unknown_process_candidate_selector,
                     &[],
                 )
                 .await
@@ -860,14 +863,17 @@ impl TrafficState {
         &mut self,
         socket_path: PathBuf,
         selector: Selector,
+        unknown_process_candidate_selector: Option<UnknownProcessCandidateSelector>,
     ) -> TrafficRefreshRequest {
-        let selector_key = traffic_selector_key(&selector);
+        let selector_key =
+            traffic_refresh_selector_key(&selector, unknown_process_candidate_selector.as_ref());
         if Some(selector_key.clone()) != self.selector_key {
             self.reset_for_selector(selector_key);
         }
         TrafficRefreshRequest {
             socket_path,
             selector,
+            unknown_process_candidate_selector,
             selector_key: self
                 .selector_key
                 .clone()
@@ -1874,6 +1880,17 @@ pub(crate) fn traffic_selector_key(selector: &Selector) -> String {
     serde_json::to_string(selector).unwrap_or_else(|_| format!("{selector:?}"))
 }
 
+pub(crate) fn traffic_refresh_selector_key(
+    selector: &Selector,
+    unknown_process_candidate_selector: Option<&UnknownProcessCandidateSelector>,
+) -> String {
+    let selector = traffic_selector_key(selector);
+    let candidate = unknown_process_candidate_selector
+        .and_then(|selector| serde_json::to_string(selector).ok())
+        .unwrap_or_else(|| "-".to_string());
+    format!("selector={selector};candidate={candidate}")
+}
+
 fn traffic_refresh_error_message(error: &TrafficClientError) -> String {
     match error {
         TrafficClientError::AdminClient(AdminClientError::Connect { path, source })
@@ -2112,7 +2129,8 @@ mod tests {
     #[test]
     fn stale_refresh_result_is_ignored_after_event_filter_changes() {
         let mut traffic = TrafficState::default();
-        let request = traffic.begin_refresh(PathBuf::from("/tmp/admin.sock"), Selector::default());
+        let request =
+            traffic.begin_refresh(PathBuf::from("/tmp/admin.sock"), Selector::default(), None);
 
         traffic.cycle_event_filter();
         let applied = traffic.apply_refresh_result(TrafficRefreshResult {

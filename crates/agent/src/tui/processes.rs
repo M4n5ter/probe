@@ -4,6 +4,8 @@ use attribution::{ProcessAttributor, ProcfsAttributor};
 use probe_core::ProcessContext;
 use probe_core::{ProcessSelector, Selector, TrafficSelector};
 
+use super::process_traffic_scope::{ProcessTrafficScope, ProcessTrafficSelector};
+
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ProcessEntry {
     pub(crate) pid: u32,
@@ -147,11 +149,14 @@ pub(crate) fn selector_for_exe_path(exe_path: String) -> Selector {
 pub(crate) struct ProcessCatalog {
     entries: Vec<ProcessEntry>,
     diagnostics: Vec<String>,
+    traffic_scope: ProcessTrafficScope,
 }
 
 impl ProcessCatalog {
     pub(crate) fn from_proc() -> Self {
-        Self::from_attributor(&ProcfsAttributor::new())
+        let mut catalog = Self::from_attributor(&ProcfsAttributor::new());
+        catalog.load_traffic_scope();
+        catalog
     }
 
     fn from_attributor(attributor: &ProcfsAttributor) -> Self {
@@ -161,6 +166,7 @@ impl ProcessCatalog {
                 return Self {
                     entries: Vec::new(),
                     diagnostics: vec![format!("procfs process scan failed: {error}")],
+                    traffic_scope: ProcessTrafficScope::default(),
                 };
             }
         };
@@ -193,6 +199,7 @@ impl ProcessCatalog {
         Self {
             entries,
             diagnostics,
+            traffic_scope: ProcessTrafficScope::default(),
         }
     }
 
@@ -200,12 +207,37 @@ impl ProcessCatalog {
         &self.entries
     }
 
+    pub(crate) fn traffic_selector_for_entry(
+        &self,
+        entry: &ProcessEntry,
+    ) -> Option<ProcessTrafficSelector> {
+        self.traffic_scope.selector_for_entry(entry)
+    }
+
+    pub(crate) fn traffic_selector_for_exe_paths(
+        &self,
+        exe_paths: impl IntoIterator<Item = String>,
+    ) -> Option<ProcessTrafficSelector> {
+        self.traffic_scope.selector_for_exe_paths(exe_paths)
+    }
+
     #[cfg(test)]
     pub(crate) fn from_entries(entries: impl IntoIterator<Item = ProcessEntry>) -> Self {
         Self {
             entries: entries.into_iter().collect(),
             diagnostics: Vec::new(),
+            traffic_scope: ProcessTrafficScope::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_listener_ports(
+        mut self,
+        exe_path: impl Into<String>,
+        ports: impl IntoIterator<Item = u16>,
+    ) -> Self {
+        self.traffic_scope = self.traffic_scope.with_listener_ports(exe_path, ports);
+        self
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -213,10 +245,26 @@ impl ProcessCatalog {
     }
 
     pub(crate) fn diagnostic_summary(&self) -> Option<String> {
-        if self.diagnostics.is_empty() {
+        let diagnostics = self
+            .diagnostics
+            .iter()
+            .chain(self.traffic_scope.diagnostics())
+            .cloned()
+            .collect::<Vec<_>>();
+        if diagnostics.is_empty() {
             None
         } else {
-            Some(self.diagnostics.join("; "))
+            Some(diagnostics.join("; "))
+        }
+    }
+
+    fn load_traffic_scope(&mut self) {
+        match ProcessTrafficScope::from_procfs() {
+            Ok(scope) => self.traffic_scope = scope,
+            Err(error) => {
+                self.diagnostics
+                    .push(format!("procfs listener scan failed: {error}"));
+            }
         }
     }
 }

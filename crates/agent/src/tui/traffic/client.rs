@@ -6,7 +6,8 @@ use thiserror::Error;
 
 use crate::admin::{
     AdminClientError, AdminRequest, EventDetailSnapshot, EventDetailTooLargeSnapshot,
-    EventTailSnapshot, default_tail_scan_limit, send_admin_json_request_with_timeout,
+    EventTailSnapshot, UnknownProcessCandidateSelector, default_tail_scan_limit,
+    send_admin_json_request_with_timeout,
 };
 
 const TAIL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -20,23 +21,29 @@ pub(super) async fn request_tail_events(
     after_sequence: u64,
     latest: bool,
     selector: Selector,
+    unknown_process_candidate_selector: Option<UnknownProcessCandidateSelector>,
     event_types: &[EventType],
 ) -> Result<EventTailSnapshot, TrafficClientError> {
     let mut limit = tail_limit(latest);
     let scan_limit = default_tail_scan_limit(latest);
+    let mut request = TailEventsWireRequest {
+        socket_path,
+        after_sequence,
+        latest,
+        selector,
+        unknown_process_candidate_selector,
+        event_types,
+        scan_limit,
+    };
     loop {
-        let result = request_tail_events_with_limit(
-            socket_path,
-            after_sequence,
-            latest,
-            selector.clone(),
-            event_types,
-            limit,
-            scan_limit,
-        )
-        .await;
+        let result = request_tail_events_with_limit(&request, limit).await;
         match result {
             Ok(snapshot) => return Ok(snapshot),
+            Err(TrafficClientError::AdminClient(AdminClientError::RequestTooLarge { .. }))
+                if request.unknown_process_candidate_selector.is_some() =>
+            {
+                request.unknown_process_candidate_selector = None;
+            }
             Err(TrafficClientError::AdminClient(AdminClientError::ResponseTooLarge {
                 command: _,
                 limit: response_limit_bytes,
@@ -55,6 +62,16 @@ pub(super) async fn request_tail_events(
     }
 }
 
+struct TailEventsWireRequest<'a> {
+    socket_path: &'a Path,
+    after_sequence: u64,
+    latest: bool,
+    selector: Selector,
+    unknown_process_candidate_selector: Option<UnknownProcessCandidateSelector>,
+    event_types: &'a [EventType],
+    scan_limit: usize,
+}
+
 fn tail_limit(latest: bool) -> usize {
     if latest {
         INITIAL_TAIL_LIMIT
@@ -64,23 +81,19 @@ fn tail_limit(latest: bool) -> usize {
 }
 
 async fn request_tail_events_with_limit(
-    socket_path: &Path,
-    after_sequence: u64,
-    latest: bool,
-    selector: Selector,
-    event_types: &[EventType],
+    request: &TailEventsWireRequest<'_>,
     limit: usize,
-    scan_limit: usize,
 ) -> Result<EventTailSnapshot, TrafficClientError> {
     let response = send_admin_json_request_with_timeout(
-        socket_path,
+        request.socket_path,
         AdminRequest::TailEvents {
-            after_sequence,
-            latest,
+            after_sequence: request.after_sequence,
+            latest: request.latest,
             limit,
-            scan_limit: Some(scan_limit),
-            selector: Some(selector),
-            event_types: event_types.to_vec(),
+            scan_limit: Some(request.scan_limit),
+            selector: Some(request.selector.clone()),
+            unknown_process_candidate_selector: request.unknown_process_candidate_selector.clone(),
+            event_types: request.event_types.to_vec(),
         },
         TAIL_TIMEOUT,
     )
@@ -218,6 +231,7 @@ mod tests {
     };
 
     use super::*;
+    use probe_core::{ProcessSelector, TrafficSelector};
 
     const TAIL_FIXTURE_MAX_EVENT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
     const TAIL_FIXTURE_MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
@@ -258,7 +272,8 @@ mod tests {
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
 
-        let tail = request_tail_events(&socket_path, 0, false, Selector::default(), &[]).await?;
+        let tail =
+            request_tail_events(&socket_path, 0, false, Selector::default(), None, &[]).await?;
 
         assert_eq!(tail.limit, LIVE_TAIL_LIMIT / TAIL_RETRY_DIVISOR);
         assert_eq!(tail.scan_limit, default_tail_scan_limit(false));
@@ -287,7 +302,8 @@ mod tests {
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
 
-        let tail = request_tail_events(&socket_path, 0, true, Selector::default(), &[]).await?;
+        let tail =
+            request_tail_events(&socket_path, 0, true, Selector::default(), None, &[]).await?;
 
         assert_eq!(tail.limit, INITIAL_TAIL_LIMIT);
         assert_eq!(tail.scan_limit, default_tail_scan_limit(true));
@@ -317,12 +333,48 @@ mod tests {
             0,
             true,
             Selector::default(),
+            None,
             &[EventType::HttpRequestHeaders],
         )
         .await?;
 
         assert_eq!(tail.limit, 1_024);
         assert_eq!(tail.scan_limit, default_tail_scan_limit(true));
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tail_events_retries_without_unknown_process_candidate_when_request_is_too_large()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let temp = tempdir()?;
+        let socket_path = temp.path().join("admin.sock");
+        let listener = UnixListener::bind(&socket_path)?;
+        let server = tokio::spawn(async move {
+            let mut stream = accept_request(&listener).await?;
+            let request = read_request(&mut stream).await?;
+            assert_eq!(request["limit"], json!(LIVE_TAIL_LIMIT));
+            assert!(request["unknown_process_candidate_selector"].is_null());
+            write_tail_response(&mut stream, LIVE_TAIL_LIMIT, default_tail_scan_limit(false))
+                .await?;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+
+        let selector = Selector::term(
+            ProcessSelector {
+                exe_path_globs: vec!["/".repeat(3 * 1024)],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector::default(),
+        );
+        let candidate =
+            UnknownProcessCandidateSelector::from_listener_ports(10_000_u16..10_000_u16 + 512)
+                .expect("bounded candidate ports should be valid");
+
+        let tail =
+            request_tail_events(&socket_path, 0, false, selector, Some(candidate), &[]).await?;
+
+        assert_eq!(tail.limit, LIVE_TAIL_LIMIT);
         server.await??;
         Ok(())
     }
@@ -345,7 +397,7 @@ mod tests {
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
 
-        let error = request_tail_events(&socket_path, 0, false, Selector::default(), &[])
+        let error = request_tail_events(&socket_path, 0, false, Selector::default(), None, &[])
             .await
             .expect_err("tail_events should report final response budget");
 

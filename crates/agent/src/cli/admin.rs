@@ -96,6 +96,7 @@ fn admin_request(command: AdminCliCommand) -> AdminRequest {
             limit,
             scan_limit,
             selector: process_exe_glob.map(process_exe_selector),
+            unknown_process_candidate_selector: None,
             event_types: tail_event_types(http, event_types),
         },
         AdminCliCommand::EventDetail { sequence } => AdminRequest::EventDetail { sequence },
@@ -203,6 +204,7 @@ mod tests {
                 limit: 10,
                 scan_limit: Some(100),
                 selector: Some(process_exe_selector("/usr/bin/curl".to_string())),
+                unknown_process_candidate_selector: None,
                 event_types: vec![
                     EventType::Gap,
                     EventType::HttpBodyChunk,
@@ -228,6 +230,7 @@ mod tests {
                 limit: 10,
                 scan_limit: None,
                 selector: None,
+                unknown_process_candidate_selector: None,
                 event_types: Vec::new(),
             }
         );
