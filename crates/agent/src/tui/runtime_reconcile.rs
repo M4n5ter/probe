@@ -25,6 +25,10 @@ impl PendingRuntimeReconcile {
     pub(super) fn must_finish_before_quit(&self) -> bool {
         matches!(self.origin, RuntimeReconcileOrigin::Saved(_))
     }
+
+    pub(super) fn blocks_initial_traffic_refresh(&self) -> bool {
+        matches!(self.origin, RuntimeReconcileOrigin::Startup)
+    }
 }
 
 enum RuntimeReconcileOrigin {

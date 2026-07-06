@@ -176,6 +176,7 @@ async fn stop_managed_agent(mut agent: ManagedAgent) {
             agent.runtime_config_path.display()
         );
     }
+    remove_runtime_file(&agent.socket_path, "TUI managed agent admin socket");
     remove_runtime_file(&agent.readiness_path, "TUI managed agent readiness socket");
     if let Err(error) = fs::remove_dir(&agent.runtime_dir)
         && error.kind() != std::io::ErrorKind::NotFound
@@ -272,6 +273,7 @@ impl ManagedRuntimeLayout {
 struct ManagedStartupGuard {
     runtime_dir: PathBuf,
     config_path: PathBuf,
+    socket_path: PathBuf,
     readiness_path: PathBuf,
     log_path: PathBuf,
     keep_log: bool,
@@ -283,6 +285,7 @@ impl ManagedStartupGuard {
         Self {
             runtime_dir: layout.runtime_dir.clone(),
             config_path: layout.config_path.clone(),
+            socket_path: layout.socket_path.clone(),
             readiness_path: layout.readiness_path.clone(),
             log_path: layout.log_path.clone(),
             keep_log: false,
@@ -304,11 +307,12 @@ impl Drop for ManagedStartupGuard {
         if !self.armed {
             return;
         }
-        remove_startup_file(&self.config_path, "TUI runtime config");
+        remove_runtime_file(&self.config_path, "TUI runtime config");
+        remove_runtime_file(&self.socket_path, "TUI managed agent admin socket");
         if !self.keep_log {
-            remove_startup_file(&self.log_path, "TUI managed agent log");
+            remove_runtime_file(&self.log_path, "TUI managed agent log");
         }
-        remove_startup_file(&self.readiness_path, "TUI managed agent readiness socket");
+        remove_runtime_file(&self.readiness_path, "TUI managed agent readiness socket");
         if let Err(error) = fs::remove_dir(&self.runtime_dir)
             && error.kind() != std::io::ErrorKind::NotFound
             && error.kind() != std::io::ErrorKind::DirectoryNotEmpty
@@ -322,14 +326,6 @@ impl Drop for ManagedStartupGuard {
 }
 
 fn remove_runtime_file(path: &Path, label: &str) {
-    if let Err(error) = fs::remove_file(path)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        eprintln!("failed to remove {label} {}: {error}", path.display());
-    }
-}
-
-fn remove_startup_file(path: &Path, label: &str) {
     if let Err(error) = fs::remove_file(path)
         && error.kind() != std::io::ErrorKind::NotFound
     {
@@ -789,11 +785,13 @@ mod tests {
         let layout = test_layout(temp.path().join("session"));
         fs::create_dir_all(&layout.runtime_dir)?;
         fs::write(&layout.config_path, "config")?;
+        fs::write(&layout.socket_path, "socket")?;
         fs::write(&layout.log_path, "log")?;
 
         drop(ManagedStartupGuard::new(&layout));
 
         assert!(!layout.config_path.exists());
+        assert!(!layout.socket_path.exists());
         assert!(!layout.log_path.exists());
         assert!(!layout.runtime_dir.exists());
         Ok(())
@@ -806,6 +804,7 @@ mod tests {
         let layout = test_layout(temp.path().join("session"));
         fs::create_dir_all(&layout.runtime_dir)?;
         fs::write(&layout.config_path, "config")?;
+        fs::write(&layout.socket_path, "socket")?;
         fs::write(&layout.log_path, "startup failed")?;
 
         let mut guard = ManagedStartupGuard::new(&layout);
@@ -813,6 +812,7 @@ mod tests {
         drop(guard);
 
         assert!(!layout.config_path.exists());
+        assert!(!layout.socket_path.exists());
         assert!(layout.log_path.exists());
         assert!(layout.runtime_dir.exists());
         Ok(())

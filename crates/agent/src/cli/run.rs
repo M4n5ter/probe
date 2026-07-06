@@ -80,6 +80,8 @@ enum Command {
         height: u16,
         #[arg(long, default_value = "traffic", requires = "snapshot")]
         tab: CliTuiTab,
+        #[arg(long, requires = "snapshot")]
+        open_detail: bool,
     },
     Admin {
         #[arg(
@@ -255,6 +257,7 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             width,
             height,
             tab,
+            open_detail,
         } => {
             if snapshot {
                 run_tui_snapshot(TuiSnapshotOptions {
@@ -262,6 +265,7 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
                     width,
                     height,
                     tab: tab.into(),
+                    open_detail,
                 })
                 .await?;
             } else {
@@ -633,6 +637,7 @@ mod tests {
             "157",
             "--height",
             "45",
+            "--open-detail",
         ])
         .expect("TUI snapshot options should parse");
 
@@ -641,6 +646,7 @@ mod tests {
             width,
             height,
             tab,
+            open_detail,
             ..
         } = cli.command
         else {
@@ -651,14 +657,16 @@ mod tests {
         assert_eq!(width, 157);
         assert_eq!(height, 45);
         assert_eq!(tab, CliTuiTab::Traffic);
+        assert!(open_detail);
     }
 
     #[test]
     fn tui_cli_rejects_snapshot_options_without_snapshot_mode() {
         for args in [
-            ["traffic-probe", "tui", "--tab", "traffic"],
-            ["traffic-probe", "tui", "--width", "157"],
-            ["traffic-probe", "tui", "--height", "45"],
+            &["traffic-probe", "tui", "--tab", "traffic"][..],
+            &["traffic-probe", "tui", "--width", "157"][..],
+            &["traffic-probe", "tui", "--height", "45"][..],
+            &["traffic-probe", "tui", "--open-detail"][..],
         ] {
             assert!(Cli::try_parse_from(args).is_err());
         }

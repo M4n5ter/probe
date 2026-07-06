@@ -57,8 +57,18 @@ impl HttpExchangeRow {
             format!("Remote: {}", self.endpoint),
             format!("Summary: {}", self.summary),
         ]);
-        lines.extend(self.request.detail_lines("Request"));
-        lines.extend(self.response.detail_lines("Response"));
+        lines.push(String::new());
+        lines.extend(self.request.start_lines(HttpMessageRole::Request));
+        lines.extend(self.response.start_lines(HttpMessageRole::Response));
+        lines.push(String::new());
+        lines.push("Payloads".to_string());
+        lines.extend(self.request.body_lines(HttpMessageRole::Request));
+        lines.extend(self.response.body_lines(HttpMessageRole::Response));
+        lines.push(String::new());
+        lines.push("Headers".to_string());
+        lines.extend(self.request.header_lines(HttpMessageRole::Request));
+        lines.extend(self.response.header_lines(HttpMessageRole::Response));
+        lines.push(String::new());
         lines.push(format!(
             "Raw event sequences: {}",
             self.raw_sequences
@@ -215,7 +225,18 @@ impl HttpMessage {
         }
     }
 
-    fn detail_lines(&self, label: &str) -> Vec<String> {
+    fn start_lines(&self, role: HttpMessageRole) -> Vec<String> {
+        let label = role.label();
+        let mut lines = vec![label.to_string()];
+        match &self.headers {
+            Some(headers) => lines.push(format!("  {}", role.start_line(headers))),
+            None => lines.push("  Start line: not observed in current window".to_string()),
+        }
+        lines
+    }
+
+    fn header_lines(&self, role: HttpMessageRole) -> Vec<String> {
+        let label = role.label();
         let mut lines = Vec::new();
         lines.push(format!("{label} headers"));
         match &self.headers {
@@ -246,8 +267,16 @@ impl HttpMessage {
                         .map(|(name, value)| format!("  {name}: {}", escape_text(value))),
                 );
             }
-            None => lines.push("  Headers: not observed in current window".to_string()),
+            None => {
+                lines.push("  Headers: not observed in current window".to_string());
+            }
         }
+        lines
+    }
+
+    fn body_lines(&self, role: HttpMessageRole) -> Vec<String> {
+        let label = role.label();
+        let mut lines = Vec::new();
         lines.push(format!("{label} body"));
         lines.push(format!("  Body bytes: {}", self.body_len()));
         let state = self.body_payload_state();
@@ -278,6 +307,43 @@ impl HttpMessage {
             .filter(|chunk| chunk.data.is_none())
             .map(|chunk| chunk.sequence)
             .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpMessageRole {
+    Request,
+    Response,
+}
+
+impl HttpMessageRole {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Request => "Request",
+            Self::Response => "Response",
+        }
+    }
+
+    fn start_line(self, headers: &HttpHeaders) -> String {
+        match self {
+            Self::Request => format!(
+                "{} {} {}",
+                headers.method.as_deref().unwrap_or("-"),
+                headers.target.as_deref().unwrap_or("-"),
+                headers.version
+            ),
+            Self::Response => format!(
+                "{} {} {}",
+                headers.version,
+                headers
+                    .status
+                    .map(|status| status.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                headers.reason.as_deref().unwrap_or("")
+            )
+            .trim_end()
+            .to_string(),
+        }
     }
 }
 
@@ -745,10 +811,16 @@ mod tests {
         assert_section_order(
             &details,
             &[
-                "Request headers",
+                "Request",
+                "  POST /api/tasks HTTP/1.1",
+                "Response",
+                "  HTTP/1.1 201 Created",
+                "Payloads",
                 "Request body",
-                "Response headers",
                 "Response body",
+                "Headers",
+                "Request headers",
+                "Response headers",
             ],
         );
         assert!(details.iter().any(|line| line == "  Body payload: hello"));

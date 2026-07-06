@@ -17,6 +17,7 @@ use super::{
     config_edit::{TuiError, load_or_create_config},
     processes::ProcessCatalog,
     render::draw,
+    traffic::load_traffic_detail,
 };
 
 const MIN_SNAPSHOT_WIDTH: u16 = 40;
@@ -30,6 +31,7 @@ pub(crate) struct TuiSnapshotOptions {
     pub(crate) width: u16,
     pub(crate) height: u16,
     pub(crate) tab: TuiTab,
+    pub(crate) open_detail: bool,
 }
 
 pub(crate) async fn run_tui_snapshot(options: TuiSnapshotOptions) -> Result<(), TuiError> {
@@ -57,6 +59,9 @@ pub(crate) async fn run_tui_snapshot(options: TuiSnapshotOptions) -> Result<(), 
         let result = load_traffic_refresh_with_diagnostics(request).await;
         app.apply_traffic_refresh_result(result);
     }
+    if options.open_detail {
+        open_selected_traffic_detail(&mut app).await;
+    }
 
     let output = render_snapshot_text(&mut app, width, height);
     if let Some(supervisor) = supervisor.take() {
@@ -78,6 +83,20 @@ impl TuiSnapshotOptions {
 
 fn resolve_config_path(config: Option<PathBuf>) -> PathBuf {
     config.unwrap_or_else(default_config_path)
+}
+
+async fn open_selected_traffic_detail(app: &mut TuiApp) {
+    if app.active_tab() != TuiTab::Traffic {
+        return;
+    }
+    if let Some(request) = app.begin_open_selected_traffic_detail_load() {
+        let result = load_traffic_detail(request).await;
+        app.apply_traffic_detail_result(result);
+    }
+    while let Some(request) = app.begin_next_open_traffic_detail_load() {
+        let result = load_traffic_detail(request).await;
+        app.apply_traffic_detail_result(result);
+    }
 }
 
 fn render_snapshot_text(app: &mut TuiApp, width: u16, height: u16) -> String {
@@ -147,6 +166,7 @@ mod tests {
             width: 1,
             height: 1,
             tab: TuiTab::Traffic,
+            open_detail: false,
         };
 
         assert_eq!(options.size(), (MIN_SNAPSHOT_WIDTH, MIN_SNAPSHOT_HEIGHT));
@@ -159,6 +179,7 @@ mod tests {
             width: u16::MAX,
             height: u16::MAX,
             tab: TuiTab::Traffic,
+            open_detail: false,
         };
 
         assert_eq!(options.size(), (MAX_SNAPSHOT_WIDTH, MAX_SNAPSHOT_HEIGHT));

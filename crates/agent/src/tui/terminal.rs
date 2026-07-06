@@ -133,7 +133,11 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
                 && last_traffic_refresh.elapsed() >= TRAFFIC_REFRESH_INTERVAL
                 && pending_traffic_refresh.is_none()
             {
-                if let Some(request) = app.begin_traffic_refresh() {
+                if let Some(message) =
+                    traffic_refresh_waiting_for_runtime(&supervisor, &pending_runtime_reconcile)
+                {
+                    app.mark_info(message);
+                } else if let Some(request) = app.begin_traffic_refresh() {
                     pending_traffic_refresh = Some(PendingTrafficRefresh {
                         task: tokio::spawn(load_traffic_refresh_with_diagnostics(request)),
                     });
@@ -227,6 +231,21 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
 
 struct PendingTrafficRefresh {
     task: tokio::task::JoinHandle<TrafficRefreshLoadResult>,
+}
+
+fn traffic_refresh_waiting_for_runtime(
+    supervisor: &Option<TuiAgentSupervisor>,
+    pending_runtime_reconcile: &Option<PendingRuntimeReconcile>,
+) -> Option<&'static str> {
+    if supervisor.is_none()
+        && pending_runtime_reconcile
+            .as_ref()
+            .is_some_and(PendingRuntimeReconcile::blocks_initial_traffic_refresh)
+    {
+        Some(STARTUP_BACKGROUND_STATUS)
+    } else {
+        None
+    }
 }
 
 fn apply_config_save_and_queue_runtime(
@@ -1049,6 +1068,30 @@ mod tests {
             &pending_runtime_reconcile,
             &queued_runtime_reconcile
         ));
+    }
+
+    #[tokio::test]
+    async fn traffic_refresh_waits_for_runtime_reconcile_before_reporting_admin_unavailable() {
+        let startup_runtime_reconcile = Some(completed_startup_runtime_reconcile_for_test(
+            "startup still running",
+        ));
+        let saved_runtime_reconcile = Some(completed_runtime_reconcile_for_test(
+            "saved runtime apply still running",
+        ));
+        let no_pending_runtime = None;
+
+        assert_eq!(
+            traffic_refresh_waiting_for_runtime(&None, &startup_runtime_reconcile),
+            Some(STARTUP_BACKGROUND_STATUS)
+        );
+        assert_eq!(
+            traffic_refresh_waiting_for_runtime(&None, &saved_runtime_reconcile),
+            None
+        );
+        assert_eq!(
+            traffic_refresh_waiting_for_runtime(&None, &no_pending_runtime),
+            None
+        );
     }
 
     fn first_hit_coordinate(

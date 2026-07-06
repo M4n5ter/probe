@@ -1067,6 +1067,15 @@ impl TuiApp {
         self.begin_traffic_detail_load(sequence)
     }
 
+    pub(crate) fn begin_open_selected_traffic_detail_load(
+        &mut self,
+    ) -> Option<TrafficDetailLoadRequest> {
+        match self.open_traffic_detail()? {
+            TuiEffect::LoadTrafficDetail { sequence } => self.begin_traffic_detail_load(sequence),
+            _ => None,
+        }
+    }
+
     pub(crate) fn is_current_traffic_detail_request(&self, sequence: u64, request_id: u64) -> bool {
         self.traffic.is_detail_loading_request(sequence, request_id)
     }
