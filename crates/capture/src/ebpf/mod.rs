@@ -9,7 +9,7 @@ pub use host::{EbpfHostProbe, EbpfHostProbeConfig, EbpfHostProbeReport, Unprivil
 pub use process_observation::{
     EbpfAcceptTracepointObservation, EbpfCloseRangeTracepointObservation,
     EbpfCloseTracepointObservation, EbpfConnectTracepointObservation, EbpfObservedProcess,
-    EbpfProcessObservation, EbpfProcessObservationActiveTracepointLiveness,
+    EbpfProcessHint, EbpfProcessObservation, EbpfProcessObservationActiveTracepointLiveness,
     EbpfProcessObservationActiveTracepointLivenessProgram,
     EbpfProcessObservationActiveTracepointLivenessState,
     EbpfProcessObservationLinkOwnershipSnapshot,
@@ -21,4 +21,5 @@ pub use process_observation::{
     EbpfProcessObservationTracepointDiagnostics, EbpfProcessObservationTracepointFiring,
     EbpfResolvedSocketFlow, EbpfSocketEndpoint, EbpfSocketFlowLookup, EbpfSocketFlowResolver,
     EbpfSocketReadObservation, EbpfSocketWriteObservation, ProcessPayloadSampleAuthorization,
+    process_payload_hint_command_key,
 };

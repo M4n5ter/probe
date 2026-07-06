@@ -499,8 +499,10 @@ impl BlockingCaptureRun {
                 log_startup_stage(startup_started, "signaled data-plane readiness");
             }
             let mut handoff_drain = RuntimeGenerationHandoffDrain::default();
+            let mut shutdown_drain_requested = false;
             loop {
                 if shutdown::requested(&shutdown_requested) {
+                    shutdown_drain_requested = true;
                     break;
                 }
                 if runtime_generation.has_pending_or_applying_reload() {
@@ -509,6 +511,7 @@ impl BlockingCaptureRun {
                         summary.capture_events_read,
                         &shutdown_requested,
                     ) else {
+                        shutdown_drain_requested = shutdown::requested(&shutdown_requested);
                         break;
                     };
                     let drain_summary =
@@ -516,7 +519,11 @@ impl BlockingCaptureRun {
                     let provider_finished = drain_summary.pipeline.capture_provider_finished;
                     let handoff_outcome = drain_summary.outcome;
                     summary.merge(drain_summary.pipeline);
-                    if provider_finished || shutdown::requested(&shutdown_requested) {
+                    if provider_finished {
+                        break;
+                    }
+                    if shutdown::requested(&shutdown_requested) {
+                        shutdown_drain_requested = true;
                         break;
                     }
                     let handoff = match handoff_drain.observe(handoff_outcome) {
@@ -546,6 +553,7 @@ impl BlockingCaptureRun {
                     summary.capture_events_read,
                     &shutdown_requested,
                 ) else {
+                    shutdown_drain_requested = shutdown::requested(&shutdown_requested);
                     break;
                 };
                 let capture_summary =
@@ -553,9 +561,21 @@ impl BlockingCaptureRun {
                 let provider_finished = capture_summary.capture_provider_finished;
                 summary.merge(capture_summary);
                 runtime_generation.record_capture_safe_point();
-                if provider_finished || shutdown::requested(&shutdown_requested) {
+                if provider_finished {
                     break;
                 }
+                if shutdown::requested(&shutdown_requested) {
+                    shutdown_drain_requested = true;
+                    break;
+                }
+            }
+            if shutdown_drain_requested
+                && let Some(drain_options) =
+                    live_capture_shutdown_drain_options(max_events, summary.capture_events_read)
+            {
+                let drain_summary =
+                    pipeline.drain_provider_before_handoff(provider.as_mut(), drain_options)?;
+                summary.merge(drain_summary.pipeline);
             }
             Ok::<_, AgentError>(summary)
         })();
@@ -598,6 +618,19 @@ fn live_capture_handoff_drain_options(
         shutdown_requested,
         RUNTIME_GENERATION_HANDOFF_DRAIN_POLLS,
     )
+}
+
+fn live_capture_shutdown_drain_options(
+    max_events: Option<u64>,
+    events_read: u64,
+) -> Option<PipelineRunOptions> {
+    let remaining_events = max_events.map(|max_events| max_events.saturating_sub(events_read));
+    if remaining_events == Some(0) {
+        return None;
+    }
+    let mut options = PipelineRunOptions::max_polls(RUNTIME_GENERATION_HANDOFF_DRAIN_POLLS);
+    options.max_events = remaining_events;
+    Some(options)
 }
 
 fn live_capture_run_options_with_max_polls(
@@ -853,6 +886,19 @@ mod tests {
             options.max_polls,
             Some(RUNTIME_GENERATION_HANDOFF_DRAIN_POLLS)
         );
+    }
+
+    #[test]
+    fn live_capture_shutdown_drain_options_ignore_shutdown_cancellation() {
+        let options = live_capture_shutdown_drain_options(Some(7), 5)
+            .expect("remaining events should produce a shutdown drain batch");
+
+        assert_eq!(options.max_events, Some(2));
+        assert_eq!(
+            options.max_polls,
+            Some(RUNTIME_GENERATION_HANDOFF_DRAIN_POLLS)
+        );
+        assert!(!options.cancellation.is_cancelled());
     }
 
     #[tokio::test]

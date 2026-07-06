@@ -11,8 +11,8 @@ use probe_core::{CapabilityKind, CapabilityState, ProcessContext, TcpConnection,
 use super::{
     AttributionError,
     inode_scan::{
-        SocketFdCandidate, SocketFdCandidateSource, hinted_socket_fd_candidates,
-        read_socket_cookie_for_pid_fd, socket_fd_candidates_for_lookup, socket_inode_owner_scan,
+        SocketFdCandidate, SocketFdCandidateSource, read_socket_cookie_for_pid_fd,
+        socket_fd_candidates_for_lookup, socket_inode_owner_scan,
     },
     io::read_tcp_table_to_string,
     listener::{
@@ -291,6 +291,13 @@ impl ProcfsSocketResolver {
         self.attributor.identify_process(pid)
     }
 
+    pub fn resolve_processes_by_hint(
+        &self,
+        hint: SocketProcessHint,
+    ) -> Result<Vec<ProcessContext>, AttributionError> {
+        self.attributor.identify_processes_by_hint(&hint)
+    }
+
     fn refresh_snapshot_if_needed(&mut self) -> Result<(), AttributionError> {
         if self.snapshot_needs_refresh() {
             self.snapshot = Some(CachedProcfsSocketSnapshot {
@@ -556,11 +563,33 @@ impl ProcfsSocketAttributor {
         if let Some(error) = optional_error_for_expected_remote(snapshot, &lookup) {
             return Err(error);
         }
-        self.identify_hinted_fd_in_snapshot(&lookup, snapshot)
+        Ok(None)
     }
 
     fn identify_process(&self, pid: u32) -> Result<Option<ProcessContext>, AttributionError> {
         self.process_attributor.identify_if_present(pid)
+    }
+
+    fn identify_processes_by_hint(
+        &self,
+        hint: &SocketProcessHint,
+    ) -> Result<Vec<ProcessContext>, AttributionError> {
+        let mut processes = Vec::new();
+        for pid in self.process_attributor.process_ids()? {
+            let Some(process) = self.process_attributor.identify_if_present(pid)? else {
+                continue;
+            };
+            if !process_matches_hint(&process, hint) {
+                continue;
+            }
+            if !processes
+                .iter()
+                .any(|existing: &ProcessContext| existing.identity == process.identity)
+            {
+                processes.push(process);
+            }
+        }
+        Ok(processes)
     }
 
     fn identify_fd_candidates_in_snapshot(
@@ -583,24 +612,11 @@ impl ProcfsSocketAttributor {
             ) else {
                 continue;
             };
-            let process = match self.process_attributor.identify(candidate.process_pid) {
-                Ok(process) => process,
-                Err(error)
-                    if is_disappearing_process_error(
-                        &error,
-                        &self.process_attributor.proc_root,
-                        candidate.process_pid,
-                    ) =>
-                {
-                    continue;
-                }
-                Err(error) => return Err(error),
+            let Some(process) = self.identify_fd_candidate_process(candidate, lookup)? else {
+                continue;
             };
-            if candidate.source == SocketFdCandidateSource::ProcessHint
-                && !lookup
-                    .process_hint
-                    .as_ref()
-                    .is_some_and(|hint| process_matches_hint(&process, hint))
+            if let Some(hint) = &lookup.process_hint
+                && !process_matches_hint(&process, hint)
             {
                 continue;
             }
@@ -633,37 +649,46 @@ impl ProcfsSocketAttributor {
         )
     }
 
-    fn identify_hinted_fd_in_snapshot(
+    fn identify_fd_candidate_process(
         &self,
+        candidate: &SocketFdCandidate,
         lookup: &SocketFdLookup,
-        snapshot: &ProcfsSocketSnapshot,
-    ) -> Result<Option<SocketFdConnectionContext>, AttributionError> {
-        if lookup.process_hint.is_none() || lookup.expected_remote_endpoint.is_none() {
+    ) -> Result<Option<ProcessContext>, AttributionError> {
+        let Some(process) = self.identify_candidate_pid(candidate.process_pid)? else {
+            return Ok(None);
+        };
+        if candidate.source != SocketFdCandidateSource::Direct
+            || candidate.process_pid == lookup.tgid
+        {
+            return Ok(Some(process));
+        }
+        if process.identity.tgid != lookup.tgid {
             return Ok(None);
         }
-        let candidate_scan =
-            hinted_socket_fd_candidates(&self.process_attributor.proc_root, lookup)?;
-        if !candidate_scan.complete {
-            return Ok(None);
+        self.identify_candidate_pid(lookup.tgid)
+    }
+
+    fn identify_candidate_pid(&self, pid: u32) -> Result<Option<ProcessContext>, AttributionError> {
+        match self.process_attributor.identify(pid) {
+            Ok(process) => Ok(Some(process)),
+            Err(error)
+                if is_disappearing_process_error(
+                    &error,
+                    &self.process_attributor.proc_root,
+                    pid,
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
         }
-        if let Some(resolved) =
-            self.identify_fd_candidates_in_snapshot(&candidate_scan.candidates, lookup, snapshot)?
-        {
-            return Ok(Some(resolved));
-        }
-        if !candidate_scan.candidates.is_empty()
-            && let Some(error) = optional_error_for_expected_remote(snapshot, lookup)
-        {
-            return Err(error);
-        }
-        Ok(None)
     }
 
     fn capabilities(&self) -> Vec<CapabilityState> {
         match self.probe() {
             Ok(()) => vec![CapabilityState::degraded(
                 CapabilityKind::ProcfsSocketAttribution,
-                "procfs socket attribution can read /proc/net/tcp and proc root, opportunistically reads /proc/net/tcp6, resolves fd lookups through procfs PID namespace aliases, maps docker-proxy published listeners to the target container listener when the command line exposes the container endpoint, captures SO_COOKIE for live socket fd lookups when pidfd_getfd is permitted and the duplicated fd inode still matches, and can use unique fd/process-hint candidates when kernel PIDs are hidden; fd races, hidepid, namespace boundaries, and PID reuse remain possible",
+                "procfs socket attribution can read /proc/net/tcp and proc root, opportunistically reads /proc/net/tcp6, resolves fd lookups through procfs PID namespace aliases, maps docker-proxy published listeners to the target container listener when the command line exposes the container endpoint, captures SO_COOKIE for live socket fd lookups when pidfd_getfd is permitted and the duplicated fd inode still matches, and can use unique fd/process-hint candidates when observed kernel PIDs are hidden or collide with unrelated host PIDs; fd races, hidepid, namespace boundaries, and PID reuse remain possible",
             )],
             Err(error) => vec![CapabilityState::unavailable(
                 CapabilityKind::ProcfsSocketAttribution,
@@ -1194,6 +1219,125 @@ mod tests {
     }
 
     #[test]
+    fn resolves_processes_by_hint_from_visible_procfs_processes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_process_with_socket(321, "python3", 424_242)?;
+        proc.write_process_with_socket(654, "other-worker", 535_353)?;
+        let resolver = ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path());
+
+        let processes = resolver.resolve_processes_by_hint(SocketProcessHint {
+            name: "python3".to_string(),
+            uid: 1000,
+            gid: 1000,
+        })?;
+
+        let [process] = processes.as_slice() else {
+            panic!("expected one process from hint: {processes:?}");
+        };
+        assert_eq!(process.identity.pid, 321);
+        assert_eq!(process.name, "python3");
+        Ok(())
+    }
+
+    #[test]
+    fn tcp_fd_lookup_uses_process_hint_when_observed_tgid_collides_with_visible_host_pid()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[
+            tcp_line(0, "0100007F:1F90", "0100007F:CAFE", "01", 111_111),
+            tcp_line(1, "0100007F:20FB", "0100007F:CAFE", "01", 424_242),
+        ])?;
+        proc.write_process_with_socket(832, "unrelated-host", 111_111)?;
+        proc.write_process_with_socket(321, "traffic-probe-e", 424_242)?;
+        let mut resolver = ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path());
+
+        let resolved = resolver
+            .resolve_tcp_fd(SocketFdLookup {
+                tgid: 832,
+                thread_pid: 832,
+                fd: 7,
+                expected_remote_endpoint: Some(TcpEndpoint::new("127.0.0.1".parse()?, 51966)),
+                process_hint: Some(SocketProcessHint {
+                    name: "traffic-probe-e".to_string(),
+                    uid: 1000,
+                    gid: 1000,
+                }),
+            })?
+            .expect("hinted host-visible process fd should resolve");
+
+        assert_eq!(resolved.process.identity.pid, 321);
+        assert_eq!(resolved.process.name, "traffic-probe-e");
+        assert_eq!(resolved.socket_inode, 424_242);
+        assert_eq!(resolved.connection.local.port, 8443);
+        assert_eq!(resolved.connection.remote.port, 51966);
+        Ok(())
+    }
+
+    #[test]
+    fn tcp_fd_lookup_does_not_splice_thread_fd_with_tgid_process_hint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[
+            tcp_line(0, "0100007F:1F90", "0100007F:CAFE", "01", 111_111),
+            tcp_line(1, "0100007F:20FB", "0100007F:BEEF", "01", 424_242),
+        ])?;
+        proc.write_process_with_socket(832, "traffic-probe-e", 424_242)?;
+        proc.write_process_with_socket(900, "unrelated-thread", 111_111)?;
+        let mut resolver = ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path());
+
+        let resolved = resolver.resolve_tcp_fd(SocketFdLookup {
+            tgid: 832,
+            thread_pid: 900,
+            fd: 7,
+            expected_remote_endpoint: Some(TcpEndpoint::new("127.0.0.1".parse()?, 51966)),
+            process_hint: Some(SocketProcessHint {
+                name: "traffic-probe-e".to_string(),
+                uid: 1000,
+                gid: 1000,
+            }),
+        })?;
+
+        assert!(resolved.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn tcp_fd_lookup_normalizes_verified_thread_fd_to_tgid_process()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[
+            tcp_line(0, "0100007F:1F90", "0100007F:CAFE", "01", 111_111),
+            tcp_line(1, "0100007F:20FB", "0100007F:BEEF", "01", 424_242),
+        ])?;
+        proc.write_process_with_socket(832, "traffic-probe-e", 424_242)?;
+        proc.write_process_thread_with_socket(900, 832, "worker-thread", 111_111)?;
+        let mut resolver = ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path());
+
+        let resolved = resolver
+            .resolve_tcp_fd(SocketFdLookup {
+                tgid: 832,
+                thread_pid: 900,
+                fd: 7,
+                expected_remote_endpoint: Some(TcpEndpoint::new("127.0.0.1".parse()?, 51966)),
+                process_hint: Some(SocketProcessHint {
+                    name: "traffic-probe-e".to_string(),
+                    uid: 1000,
+                    gid: 1000,
+                }),
+            })?
+            .expect("verified thread fd should resolve to the process identity");
+
+        assert_eq!(resolved.process.identity.pid, 832);
+        assert_eq!(resolved.process.identity.tgid, 832);
+        assert_eq!(resolved.process.name, "traffic-probe-e");
+        assert_eq!(resolved.socket_inode, 111_111);
+        assert_eq!(resolved.connection.local.port, 8080);
+        assert_eq!(resolved.connection.remote.port, 51966);
+        Ok(())
+    }
+
+    #[test]
     fn endpoint_listener_lookup_uses_process_namespace_addresses()
     -> Result<(), Box<dyn std::error::Error>> {
         let proc = FakeProc::new()?;
@@ -1492,7 +1636,7 @@ mod tests {
                 "-use-listen-fd",
             ],
         )?;
-        proc.write_process_with_socket(321, "sssa-backend", 424_242)?;
+        proc.write_process_with_socket(321, "demo-backend", 424_242)?;
         proc.write_process_tcp_table(
             321,
             "net:[4026532661]",
@@ -1516,7 +1660,7 @@ mod tests {
         assert_eq!(listener.observed.socket_inode, 909_090);
         assert_eq!(listener.observed.local.port, 8081);
         assert_eq!(listener.owner.process.identity.pid, 321);
-        assert_eq!(listener.owner.process.name, "sssa-backend");
+        assert_eq!(listener.owner.process.name, "demo-backend");
         assert_eq!(listener.owner.confidence, DOCKER_PROXY_TARGET_CONFIDENCE);
         assert_eq!(
             listener.owner.source,
@@ -1535,7 +1679,7 @@ mod tests {
         assert_eq!(listener.observed.socket_inode, 909_090);
         assert_eq!(listener.observed.local.port, 8081);
         assert_eq!(listener.owner.process.identity.pid, 321);
-        assert_eq!(listener.owner.process.name, "sssa-backend");
+        assert_eq!(listener.owner.process.name, "demo-backend");
         assert_eq!(listener.owner.confidence, DOCKER_PROXY_TARGET_CONFIDENCE);
         Ok(())
     }
@@ -1568,7 +1712,7 @@ mod tests {
         ];
         proc.write_process_with_socket_and_cmdline(123, "docker-proxy", 909_090, &proxy_cmdline)?;
         proc.write_process_with_socket_and_cmdline(124, "docker-proxy", 909_091, &proxy_cmdline)?;
-        proc.write_process_with_socket(321, "sssa-backend", 424_242)?;
+        proc.write_process_with_socket(321, "demo-backend", 424_242)?;
         proc.write_process_tcp_table(
             321,
             "net:[4026532661]",
@@ -1591,7 +1735,7 @@ mod tests {
         assert_eq!(listener.observed.process.name, "docker-proxy");
         assert_eq!(listener.observed.socket_inode, 909_090);
         assert_eq!(listener.owner.process.identity.pid, 321);
-        assert_eq!(listener.owner.process.name, "sssa-backend");
+        assert_eq!(listener.owner.process.name, "demo-backend");
         assert_eq!(listener.owner.confidence, DOCKER_PROXY_TARGET_CONFIDENCE);
         Ok(())
     }
@@ -1620,7 +1764,7 @@ mod tests {
                 "-use-listen-fd",
             ],
         )?;
-        proc.write_process_with_socket(321, "sssa-backend", 424_242)?;
+        proc.write_process_with_socket(321, "demo-backend", 424_242)?;
         proc.write_process_tcp_table(
             321,
             "net:[4026532661]",
@@ -1788,6 +1932,36 @@ mod tests {
                 ),
             )?;
             fs::write(process_root.join("cmdline"), nul_joined(cmdline))?;
+            fs::write(
+                process_root.join("cgroup"),
+                "0::/system.slice/demo.service\n",
+            )?;
+            symlink("/usr/bin/demo-listener", process_root.join("exe"))?;
+            symlink(format!("socket:[{inode}]"), process_root.join("fd/7"))?;
+            Ok(())
+        }
+
+        fn write_process_thread_with_socket(
+            &self,
+            pid: u32,
+            tgid: u32,
+            name: &str,
+            inode: u64,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let process_root = self.root.path().join(pid.to_string());
+            fs::create_dir(&process_root)?;
+            fs::create_dir(process_root.join("fd"))?;
+            fs::write(process_root.join("stat"), stat(pid, name, 99))?;
+            fs::write(
+                process_root.join("status"),
+                format!(
+                    "Name:\t{name}\nTgid:\t{tgid}\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n"
+                ),
+            )?;
+            fs::write(
+                process_root.join("cmdline"),
+                nul_joined(&[name, "--worker"]),
+            )?;
             fs::write(
                 process_root.join("cgroup"),
                 "0::/system.slice/demo.service\n",

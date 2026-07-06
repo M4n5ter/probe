@@ -1,9 +1,10 @@
 use std::time::Instant;
 
-use probe_core::Timestamp;
+use probe_core::{ProcessContext, Timestamp};
 
 use crate::{CaptureError, CaptureEvent};
 
+use super::bridge::process_hint_from_observed;
 use super::{
     EbpfAcceptTracepointObservation, EbpfConnectTracepointObservation, EbpfProcessLifecycleKind,
     EbpfSocketFlowResolver, accept_opened_event_from_observation,
@@ -56,7 +57,7 @@ impl PendingEbpfFlowStart {
         timestamp: Timestamp,
         resolver: &mut dyn EbpfSocketFlowResolver,
     ) -> Option<CaptureEvent> {
-        let resolved_process = resolver.resolve_process(self.tgid()).ok().flatten();
+        let resolved_process = self.resolved_process(resolver);
         match self {
             Self::Connect(connect) => {
                 observed_connect_opened_event_from_observation(connect, timestamp, resolved_process)
@@ -73,7 +74,7 @@ impl PendingEbpfFlowStart {
         reason: String,
         resolver: &mut dyn EbpfSocketFlowResolver,
     ) -> CaptureEvent {
-        let resolved_process = resolver.resolve_process(self.tgid()).ok().flatten();
+        let resolved_process = self.resolved_process(resolver);
         match self {
             Self::Connect(connect) => unresolved_connect_gap_from_observation(
                 connect,
@@ -136,6 +137,19 @@ impl PendingEbpfFlowStart {
         )
     }
 
+    fn resolved_process(
+        &self,
+        resolver: &mut dyn EbpfSocketFlowResolver,
+    ) -> Option<ProcessContext> {
+        if let Some(hint) = match self {
+            Self::Connect(connect) => process_hint_from_observed(&connect.process),
+            Self::Accept(accept) => process_hint_from_observed(&accept.process),
+        } {
+            return unique_process(resolver.resolve_processes_by_hint(hint).ok()?);
+        }
+        resolver.resolve_process(self.tgid()).ok().flatten()
+    }
+
     fn invalid_descriptor_lease_reason(&self) -> String {
         format!(
             "eBPF flow-start observation did not carry a valid descriptor lease; tgid={}, thread_pid={}, fd={}, fd_table_epoch={}, fd_generation={}",
@@ -181,4 +195,10 @@ impl PendingEbpfFlowStart {
             Self::Accept(accept) => accept.fd_generation,
         }
     }
+}
+
+fn unique_process(candidates: impl IntoIterator<Item = ProcessContext>) -> Option<ProcessContext> {
+    let mut candidates = candidates.into_iter();
+    let process = candidates.next()?;
+    candidates.next().is_none().then_some(process)
 }

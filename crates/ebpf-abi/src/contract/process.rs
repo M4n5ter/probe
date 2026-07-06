@@ -774,7 +774,7 @@ pub struct EbpfPendingSocketWriteSample {
     pub fd_generation: u64,
     pub captured_len: u16,
     pub flags: u16,
-    pub _reserved: u32,
+    pub _reserved: [u8; 4],
     pub buffer: [u8; EBPF_SOCKET_WRITE_SAMPLE_BYTES],
 }
 

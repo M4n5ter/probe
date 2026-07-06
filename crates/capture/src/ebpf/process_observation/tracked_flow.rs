@@ -55,7 +55,12 @@ impl TrackedEbpfFlows {
         &mut self,
         close: &EbpfCloseTracepointObservation,
     ) -> Option<TrackedEbpfFlow> {
-        self.remove(DescriptorLeaseKey::from_close(close)?)
+        if let Some(key) = DescriptorLeaseKey::from_close(close)
+            && let Some(tracked) = self.remove(key)
+        {
+            return Some(tracked);
+        }
+        None
     }
 
     pub(super) fn remove_close_range(
@@ -114,14 +119,24 @@ impl TrackedEbpfFlows {
         &mut self,
         write: &EbpfSocketWriteObservation,
     ) -> Option<&mut TrackedEbpfFlow> {
-        self.get_recent_mut(DescriptorLeaseKey::from_write(write)?, Direction::Outbound)
+        if let Some(key) = DescriptorLeaseKey::from_write(write)
+            && self.has_exact_payload_match(key, Direction::Outbound)
+        {
+            return self.refresh_and_get_mut(key);
+        }
+        None
     }
 
     pub(super) fn get_read_mut(
         &mut self,
         read: &EbpfSocketReadObservation,
     ) -> Option<&mut TrackedEbpfFlow> {
-        self.get_recent_mut(DescriptorLeaseKey::from_read(read)?, Direction::Inbound)
+        if let Some(key) = DescriptorLeaseKey::from_read(read)
+            && self.has_exact_payload_match(key, Direction::Inbound)
+        {
+            return self.refresh_and_get_mut(key);
+        }
+        None
     }
 
     fn insert(
@@ -145,18 +160,17 @@ impl TrackedEbpfFlows {
         self.by_lease.remove(&key)
     }
 
-    fn get_recent_mut(
-        &mut self,
+    fn has_exact_payload_match(
+        &self,
         key: DescriptorLeaseKey,
         required_direction: Direction,
-    ) -> Option<&mut TrackedEbpfFlow> {
-        if !self
-            .by_lease
+    ) -> bool {
+        self.by_lease
             .get(&key)
             .is_some_and(|tracked| tracked.allows_payload(required_direction))
-        {
-            return None;
-        }
+    }
+
+    fn refresh_and_get_mut(&mut self, key: DescriptorLeaseKey) -> Option<&mut TrackedEbpfFlow> {
         self.by_lease.refresh(&key);
         self.by_lease.get_mut(&key)
     }
@@ -502,6 +516,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tracked_flows_do_not_match_payload_without_exact_descriptor_generation() {
+        let mut tracked = TrackedEbpfFlows::bounded(4);
+        insert_flow_for_descriptor_generation(&mut tracked, 7, 10, flow("fd-7"));
+
+        let stale_other_tgid = read_observation_for_process_generation(
+            observed_process_for_tgid_named(200, "curl"),
+            7,
+            1,
+        );
+
+        assert!(tracked.get_read_mut(&stale_other_tgid).is_none());
+    }
+
+    #[test]
+    fn tracked_flows_do_not_use_process_hint_alias_for_same_tgid_generation_mismatch() {
+        let mut tracked = TrackedEbpfFlows::bounded(4);
+        insert_flow_for_descriptor_generation(&mut tracked, 7, 10, flow("fd-7-generation-10"));
+
+        let stale_same_tgid = read_observation_for_process_generation(
+            observed_process_for_tgid_named(100, "curl"),
+            7,
+            1,
+        );
+
+        assert!(tracked.get_read_mut(&stale_same_tgid).is_none());
+    }
+
+    #[test]
+    fn tracked_flows_do_not_close_without_exact_descriptor_generation() {
+        let mut tracked = TrackedEbpfFlows::bounded(4);
+        insert_flow_for_descriptor_generation(&mut tracked, 7, 10, flow("fd-7"));
+
+        let stale_other_tgid = close_observation_for_process_generation_named(200, 7, 1, "curl");
+
+        assert!(tracked.remove_close(&stale_other_tgid).is_none());
+        assert_eq!(
+            tracked
+                .remove_close(&close_observation_with_generation(7, 10))
+                .expect("exact generation should remain tracked")
+                .flow
+                .id,
+            FlowIdentity("fd-7".to_string())
+        );
+    }
+
+    #[test]
+    fn tracked_flows_do_not_close_with_process_hint_alias_for_same_tgid_generation_mismatch() {
+        let mut tracked = TrackedEbpfFlows::bounded(4);
+        insert_flow_for_descriptor_generation(&mut tracked, 7, 10, flow("fd-7-generation-10"));
+
+        let stale_same_tgid = close_observation_for_process_generation_named(100, 7, 1, "curl");
+
+        assert!(tracked.remove_close(&stale_same_tgid).is_none());
+        assert_eq!(
+            tracked
+                .remove_close(&close_observation_with_generation(7, 10))
+                .expect("exact generation should remain tracked")
+                .flow
+                .id,
+            FlowIdentity("fd-7-generation-10".to_string())
+        );
+    }
+
     fn insert_flow_for_descriptor(tracked: &mut TrackedEbpfFlows, fd: i32, flow: FlowContext) {
         insert_flow_for_descriptor_generation(tracked, fd, 1, flow);
     }
@@ -599,10 +677,18 @@ mod tests {
     }
 
     fn read_observation(fd: i32) -> EbpfSocketReadObservation {
+        read_observation_for_process_generation(observed_process(), fd, 1)
+    }
+
+    fn read_observation_for_process_generation(
+        process: EbpfObservedProcess,
+        fd: i32,
+        fd_generation: u64,
+    ) -> EbpfSocketReadObservation {
         EbpfSocketReadObservation {
-            process: observed_process(),
+            process,
             fd,
-            fd_generation: 1,
+            fd_generation,
             original_len: 5,
             buffer: b"hello".to_vec(),
             truncated: false,
@@ -615,13 +701,38 @@ mod tests {
     }
 
     fn observed_process_for_tgid(tgid: u32) -> EbpfObservedProcess {
+        observed_process_for_tgid_named(tgid, "")
+    }
+
+    fn observed_process_for_tgid_named(tgid: u32, name: &str) -> EbpfObservedProcess {
         EbpfObservedProcess {
             pid: tgid.saturating_add(1),
             tgid,
             uid: 1000,
             gid: 1000,
-            command: [0; 16],
+            command: nul_padded_command(name),
         }
+    }
+
+    fn close_observation_for_process_generation_named(
+        tgid: u32,
+        fd: i32,
+        fd_generation: u64,
+        name: &str,
+    ) -> EbpfCloseTracepointObservation {
+        EbpfCloseTracepointObservation {
+            process: observed_process_for_tgid_named(tgid, name),
+            fd,
+            fd_generation,
+        }
+    }
+
+    fn nul_padded_command(name: &str) -> [u8; 16] {
+        let mut command = [0; 16];
+        for (slot, byte) in command.iter_mut().zip(name.bytes()) {
+            *slot = byte;
+        }
+        command
     }
 
     fn flow(id: &str) -> FlowContext {

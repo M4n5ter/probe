@@ -6,21 +6,28 @@ use ebpf_abi::{
 };
 
 use super::payload::{
-    PayloadAttemptSource, PayloadBufferAttempt, PayloadIovecAttempt, PayloadLogicalLen,
-    PayloadSamplePlan, clamp_u64_to_u32, iovec_payload_source_from_tracepoint,
-    msghdr_payload_source_from_tracepoint, payload_read_flag_bits, payload_sample_plan_from_source,
-    read_payload_prefix_from_attempt, read_payload_prefix_from_iovec,
-    single_buffer_payload_source_from_tracepoint, syscall_result_from_tracepoint,
+    PayloadAttemptSource, PayloadBufferAttempt, PayloadFdKind, PayloadIovecAttempt,
+    PayloadLogicalLen, PayloadSamplePlan, clamp_u64_to_u32, iovec_payload_source_from_tracepoint,
+    msghdr_payload_source_from_tracepoint, payload_read_flag_bits,
+    payload_sample_plan_from_source, read_payload_prefix_from_attempt,
+    read_payload_prefix_from_iovec, single_buffer_payload_source_from_tracepoint,
+    syscall_result_from_tracepoint,
 };
 
 pub(crate) fn read_source_from_tracepoint(ctx: &TracePointContext) -> Option<PayloadAttemptSource> {
-    single_buffer_payload_source_from_tracepoint(ctx)
+    single_buffer_payload_source_from_tracepoint(ctx, PayloadFdKind::Generic)
+}
+
+pub(crate) fn recvfrom_source_from_tracepoint(
+    ctx: &TracePointContext,
+) -> Option<PayloadAttemptSource> {
+    single_buffer_payload_source_from_tracepoint(ctx, PayloadFdKind::Socket)
 }
 
 pub(crate) fn readv_source_from_tracepoint(
     ctx: &TracePointContext,
 ) -> Option<PayloadAttemptSource> {
-    iovec_payload_source_from_tracepoint(ctx)
+    iovec_payload_source_from_tracepoint(ctx, PayloadFdKind::Generic)
 }
 
 pub(crate) fn recvmsg_source_from_tracepoint(
@@ -59,13 +66,14 @@ fn pending_read_buffer_attempt(attempt: PayloadBufferAttempt) -> EbpfPendingSock
 }
 
 fn pending_read_iovec_attempt(attempt: PayloadIovecAttempt) -> EbpfPendingSocketReadAttempt {
+    let logical_len_flags =
+        EBPF_PENDING_SOCKET_READ_LOGICAL_LEN_UNKNOWN | EBPF_PENDING_SOCKET_READ_SOURCE_IOVEC;
     EbpfPendingSocketReadAttempt {
         fd: attempt.fd,
         requested_len: 0,
         fd_generation: 0,
         readable_len: clamp_u64_to_u32(attempt.iovlen),
-        logical_len_flags: EBPF_PENDING_SOCKET_READ_LOGICAL_LEN_UNKNOWN
-            | EBPF_PENDING_SOCKET_READ_SOURCE_IOVEC,
+        logical_len_flags,
         user_buffer: attempt.user_iovec,
     }
 }
@@ -165,11 +173,13 @@ mod tests {
 
     #[test]
     fn pending_iovec_attempt_keeps_iovec_source_for_exit_sampling() {
-        let attempt = pending_read_iovec_attempt(PayloadIovecAttempt {
-            fd: 7,
-            user_iovec: 0x1000,
-            iovlen: 9,
-        });
+        let attempt = pending_read_iovec_attempt(
+            PayloadIovecAttempt {
+                fd: 7,
+                user_iovec: 0x1000,
+                iovlen: 9,
+            },
+        );
 
         assert_eq!(attempt.fd, 7);
         assert_eq!(attempt.fd_generation, 0);

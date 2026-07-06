@@ -67,6 +67,19 @@ pub(crate) struct PayloadAttemptSource {
     user_pointer: u64,
     count: u64,
     kind: PayloadAttemptKind,
+    fd_kind: PayloadFdKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PayloadFdKind {
+    Generic,
+    Socket,
+}
+
+impl PayloadFdKind {
+    pub(crate) const fn is_socket(self) -> bool {
+        matches!(self, Self::Socket)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -82,6 +95,7 @@ pub(crate) const fn payload_read_flag_bits(truncated_flag: u16, read_failed_flag
 
 pub(crate) fn single_buffer_payload_source_from_tracepoint(
     ctx: &TracePointContext,
+    fd_kind: PayloadFdKind,
 ) -> Option<PayloadAttemptSource> {
     let fd = tracepoint_fd(ctx)?;
     let user_buffer = tracepoint_u64(ctx, SYSCALL_USER_BUFFER_OFFSET)?;
@@ -97,11 +111,13 @@ pub(crate) fn single_buffer_payload_source_from_tracepoint(
         user_pointer: user_buffer,
         count: requested_len,
         kind: PayloadAttemptKind::SingleBuffer,
+        fd_kind,
     })
 }
 
 pub(crate) fn iovec_payload_source_from_tracepoint(
     ctx: &TracePointContext,
+    fd_kind: PayloadFdKind,
 ) -> Option<PayloadAttemptSource> {
     let fd = tracepoint_fd(ctx)?;
     let user_iovec = tracepoint_u64(ctx, SYSCALL_USER_BUFFER_OFFSET)?;
@@ -114,6 +130,7 @@ pub(crate) fn iovec_payload_source_from_tracepoint(
         user_pointer: user_iovec,
         count: iovlen,
         kind: PayloadAttemptKind::Iovec,
+        fd_kind,
     })
 }
 
@@ -130,7 +147,14 @@ pub(crate) fn msghdr_payload_source_from_tracepoint(
         user_pointer: user_msghdr,
         count: 0,
         kind: PayloadAttemptKind::Msghdr,
+        fd_kind: PayloadFdKind::Socket,
     })
+}
+
+impl PayloadAttemptSource {
+    pub(crate) const fn fd_kind(self) -> PayloadFdKind {
+        self.fd_kind
+    }
 }
 
 #[inline(always)]

@@ -2510,24 +2510,24 @@ mod tests {
             PathBuf::from("/tmp/admin.sock"),
             None,
             None,
-            Some("sssa-backend".to_string()),
+            Some("demo-backend".to_string()),
         );
         traffic.apply_snapshot(tail_snapshot_from_records(vec![(
             1,
             libpcap_unknown_request_event("GET", "/candidate"),
         )]));
 
-        traffic.set_search_query("sssa".to_string());
+        traffic.set_search_query("demo".to_string());
 
         assert!(traffic.showing_http_exchanges());
         assert_eq!(traffic.visible_http_exchanges().len(), 1);
         let exchange = &traffic.visible_http_exchanges()[0];
-        assert_eq!(exchange.process, "sssa-backend candidate");
+        assert_eq!(exchange.process, "demo-backend candidate");
         assert!(
             exchange
                 .detail_lines()
                 .iter()
-                .any(|line| line == "  Process candidate scope: sssa-backend")
+                .any(|line| line == "  Process candidate scope: demo-backend")
         );
     }
 
@@ -2538,7 +2538,7 @@ mod tests {
             PathBuf::from("/tmp/admin.sock"),
             None,
             None,
-            Some("sssa-backend".to_string()),
+            Some("demo-backend".to_string()),
         );
         traffic.apply_snapshot(tail_snapshot_from_records(vec![(
             1,
@@ -2553,7 +2553,7 @@ mod tests {
         assert!(
             details
                 .iter()
-                .any(|line| line == "Process candidate scope: sssa-backend")
+                .any(|line| line == "Process candidate scope: demo-backend")
         );
     }
 

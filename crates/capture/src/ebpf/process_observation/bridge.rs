@@ -49,6 +49,13 @@ pub trait EbpfSocketFlowResolver {
         Ok(None)
     }
 
+    fn resolve_processes_by_hint(
+        &mut self,
+        _hint: EbpfProcessHint,
+    ) -> Result<Vec<ProcessContext>, CaptureError> {
+        Ok(Vec::new())
+    }
+
     fn invalidate_cached_resolution(&mut self) {}
 }
 
@@ -319,7 +326,7 @@ fn process_context_from_observed(process: &EbpfObservedProcess) -> ProcessContex
     }
 }
 
-fn process_hint_from_observed(process: &EbpfObservedProcess) -> Option<EbpfProcessHint> {
+pub(crate) fn process_hint_from_observed(process: &EbpfObservedProcess) -> Option<EbpfProcessHint> {
     let name = process.command_lossy();
     (!name.is_empty()).then_some(EbpfProcessHint {
         name,

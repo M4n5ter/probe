@@ -11,7 +11,7 @@ pub(super) fn apply_process_observation_projection(mut config: AgentConfig) -> A
 
     let raw_selection = config.capture.selection;
     let raw_may_use_libpcap = config.capture.may_use_backend(CaptureBackend::Libpcap);
-    config.capture.selection = capture_selection_for(&config.observations);
+    config.capture.selection = projected_capture_selection_for(&config.observations, raw_selection);
     normalize_projected_capture_defaults(&mut config.capture, raw_selection, raw_may_use_libpcap);
     config.capture.deep_observe_selector = Some(selector_for(&config.observations));
     config
@@ -46,7 +46,10 @@ fn normalize_projected_capture_defaults(
     capture.capture_event_feed = defaults.capture_event_feed;
 }
 
-fn capture_selection_for(observations: &[ProcessObservationConfig]) -> CaptureSelection {
+fn projected_capture_selection_for(
+    observations: &[ProcessObservationConfig],
+    raw_selection: CaptureSelection,
+) -> CaptureSelection {
     let mut explicit = observations
         .iter()
         .filter_map(|observation| match observation.data_path {
@@ -63,9 +66,18 @@ fn capture_selection_for(observations: &[ProcessObservationConfig]) -> CaptureSe
     explicit.dedup();
 
     match explicit.as_slice() {
-        [] => CaptureSelection::Auto,
+        [] => live_capture_selection_or_auto(raw_selection),
         [selection] => *selection,
         _ => CaptureSelection::Auto,
+    }
+}
+
+fn live_capture_selection_or_auto(selection: CaptureSelection) -> CaptureSelection {
+    match selection {
+        CaptureSelection::Auto | CaptureSelection::Ebpf | CaptureSelection::Libpcap => selection,
+        CaptureSelection::PlaintextFeed
+        | CaptureSelection::CaptureEventFeed
+        | CaptureSelection::Replay => CaptureSelection::Auto,
     }
 }
 
@@ -167,6 +179,63 @@ mod tests {
             panic!("multiple observations should project to any selector");
         };
         assert_eq!(selectors.len(), 2);
+    }
+
+    #[test]
+    fn auto_only_observations_preserve_explicit_capture_selection() {
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Libpcap;
+        config.observations.push(observation(
+            "frontend",
+            "/usr/bin/frontend",
+            ObservationDataPathMode::Auto,
+            vec![Direction::Inbound, Direction::Outbound],
+        ));
+
+        let projected = apply_process_observation_projection(config);
+
+        assert_eq!(projected.capture.selection, CaptureSelection::Libpcap);
+        assert!(
+            projected
+                .capture
+                .deep_observe_selector
+                .expect("selector should be projected")
+                .compile()
+                .expect("selector should compile")
+                .matches_unattributed_flow(&process("/usr/bin/frontend"), Direction::Inbound)
+        );
+    }
+
+    #[test]
+    fn auto_only_observations_project_non_live_capture_selection_to_live_auto() {
+        let mut config = AgentConfig::default();
+        config.capture.selection = CaptureSelection::Replay;
+        config.capture.fallback_backends.clear();
+        config.capture.plaintext_feed.path = Some("/tmp/plaintext.jsonl".into());
+        config.capture.capture_event_feed.path = Some("/tmp/capture-events.jsonl".into());
+        config.capture.capture_event_feed.follow = Some(true);
+        config.observations.push(observation(
+            "frontend",
+            "/usr/bin/frontend",
+            ObservationDataPathMode::Auto,
+            vec![Direction::Inbound, Direction::Outbound],
+        ));
+
+        let projected = apply_process_observation_projection(config);
+
+        assert_eq!(projected.capture.selection, CaptureSelection::Auto);
+        assert_eq!(
+            projected.capture.fallback_backends,
+            CaptureConfig::default().fallback_backends
+        );
+        assert_eq!(
+            projected.capture.plaintext_feed,
+            CaptureConfig::default().plaintext_feed
+        );
+        assert_eq!(
+            projected.capture.capture_event_feed,
+            CaptureConfig::default().capture_event_feed
+        );
     }
 
     #[test]

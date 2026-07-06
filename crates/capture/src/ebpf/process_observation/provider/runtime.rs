@@ -5,7 +5,7 @@ use std::{
 
 use probe_core::{
     CancellationToken, CapabilityKind, CapabilityState, CaptureSource, CompiledSelector,
-    FlowContext, Timestamp,
+    FlowContext, ProcessContext, Timestamp,
 };
 
 use crate::output_loss::OutputLossTracker;
@@ -16,13 +16,14 @@ use crate::{
 };
 
 use super::super::{
-    EbpfCloseRangeTracepointObservation, EbpfCloseTracepointObservation, EbpfProcessLifecycleKind,
-    EbpfProcessLifecycleObservation, EbpfProcessObservation, EbpfProcessObservationProbe,
-    EbpfProcessObservationProbeConfig, EbpfProcessObservationProbeSnapshot, EbpfSocketFlowResolver,
+    EbpfCloseRangeTracepointObservation, EbpfCloseTracepointObservation, EbpfObservedProcess,
+    EbpfProcessLifecycleKind, EbpfProcessLifecycleObservation, EbpfProcessObservation,
+    EbpfProcessObservationProbe, EbpfProcessObservationProbeConfig,
+    EbpfProcessObservationProbeSnapshot, EbpfSocketFlowResolver,
     active_liveness::{
         active_tracepoint_liveness_from_firings, trigger_safe_active_tracepoint_liveness_probe,
     },
-    bridge::output_loss_event,
+    bridge::{output_loss_event, process_hint_from_observed},
     clock::EbpfObservationClock,
     flow_start::{PendingEbpfFlowResolution, PendingEbpfFlowStart},
     observation_source::{EbpfObservationSource, ProbeObservationSource},
@@ -138,15 +139,15 @@ impl EbpfProcessObservationProvider {
         {
             return Ok(CapturePoll::event(event));
         }
+        if !self.pending_flows.is_empty() {
+            return self.poll_pending_flow_resolution();
+        }
         if let Some(observation) = self.observations.next_observation()? {
             self.output_loss.record_observation();
             return self.poll_observation(observation);
         }
         if let Some(event) = self.output_loss_events()? {
             return Ok(CapturePoll::event(event));
-        }
-        if !self.pending_flows.is_empty() {
-            return self.poll_pending_flow_resolution();
         }
         Ok(if self.stop_when_idle {
             CapturePoll::Finished
@@ -273,27 +274,28 @@ impl EbpfProcessObservationProvider {
             self.track_flow_start_event(&pending.flow_start, &event)?;
             return Ok(CapturePoll::event(event));
         }
+        if pending.attempts_completed < self.resolution_retries {
+            pending.attempts_completed = pending.attempts_completed.saturating_add(1);
+            pending.retry_at = Some(Instant::now() + self.resolution_retry_sleep);
+            self.resolver.invalidate_cached_resolution();
+            return Ok(self.queue_pending_flow_resolution(pending));
+        }
         if let Some(event) = pending
             .flow_start
             .observed_opened_event(pending.timestamp, self.resolver.as_mut())
         {
             self.track_flow_start_event(&pending.flow_start, &event)?;
-            return Ok(CapturePoll::event(event));
-        }
-        if pending.attempts_completed >= self.resolution_retries {
+            Ok(CapturePoll::event(event))
+        } else {
             let reason = pending
                 .flow_start
                 .unresolved_reason(self.resolution_retries.saturating_add(1));
-            return Ok(CapturePoll::event(pending.flow_start.unresolved_gap(
+            Ok(CapturePoll::event(pending.flow_start.unresolved_gap(
                 pending.timestamp,
                 reason,
                 self.resolver.as_mut(),
-            )));
+            )))
         }
-        pending.attempts_completed = pending.attempts_completed.saturating_add(1);
-        pending.retry_at = Some(Instant::now() + self.resolution_retry_sleep);
-        self.resolver.invalidate_cached_resolution();
-        Ok(self.queue_pending_flow_resolution(pending))
     }
 
     fn queue_pending_flow_resolution(&mut self, pending: PendingEbpfFlowResolution) -> CapturePoll {
@@ -442,16 +444,10 @@ impl EbpfProcessObservationProvider {
                 .observations
                 .revoke_process_payload_sample(lifecycle.process.tgid),
             EbpfProcessLifecycleKind::Exec => {
-                let authorization = match self.resolver.resolve_process(lifecycle.process.tgid) {
-                    Ok(Some(process)) => {
-                        ProcessPayloadSampleAuthorization::from_unattributed_selector(
-                            lifecycle.process.tgid,
-                            &process,
-                            &selector,
-                        )
-                    }
-                    Ok(None) | Err(_) => None,
-                };
+                let authorization = self.process_payload_authorization_for_observed_process(
+                    &lifecycle.process,
+                    &selector,
+                );
                 match authorization {
                     Some(authorization) => self
                         .observations
@@ -461,6 +457,28 @@ impl EbpfProcessObservationProvider {
                         .revoke_process_payload_sample(lifecycle.process.tgid),
                 }
             }
+        }
+    }
+
+    fn process_payload_authorization_for_observed_process(
+        &mut self,
+        process: &EbpfObservedProcess,
+        selector: &CompiledSelector,
+    ) -> Option<ProcessPayloadSampleAuthorization> {
+        if let Some(hint) = process_hint_from_observed(process) {
+            let candidates = self.resolver.resolve_processes_by_hint(hint).ok()?;
+            return unique_process_payload_authorization(process.tgid, candidates, selector);
+        }
+
+        match self.resolver.resolve_process(process.tgid) {
+            Ok(Some(resolved_process)) => {
+                ProcessPayloadSampleAuthorization::from_unattributed_selector(
+                    process.tgid,
+                    &resolved_process,
+                    selector,
+                )
+            }
+            Ok(None) | Err(_) => None,
         }
     }
 
@@ -623,6 +641,19 @@ fn run_active_liveness_probe(
     }
 }
 
+fn unique_process_payload_authorization(
+    observed_tgid: u32,
+    candidates: impl IntoIterator<Item = ProcessContext>,
+    selector: &CompiledSelector,
+) -> Option<ProcessPayloadSampleAuthorization> {
+    let mut candidates = candidates.into_iter();
+    let process = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    ProcessPayloadSampleAuthorization::from_unattributed_selector(observed_tgid, &process, selector)
+}
+
 fn connection_closed_event(timestamp: Timestamp, flow: FlowContext) -> CaptureEvent {
     CaptureEvent::ConnectionClosed {
         timestamp,
@@ -639,7 +670,23 @@ impl CaptureProvider for EbpfProcessObservationProvider {
     fn capabilities(&self) -> Vec<CapabilityState> {
         vec![CapabilityState::degraded(
             CapabilityKind::Ebpf,
-            "eBPF provider emits connect and accept/accept4 flow-start observations with descriptor leases, prefers procfs-resolved socket metadata when available, falls back to degraded observed flows when kernel tracepoints provide a remote endpoint before procfs resolution succeeds, selector-authorized always-degraded outbound single-buffer and bounded multi-iovec prefix syscall argument samples, outbound available sendfile family kernel-transfer byte-count gaps, inbound single-buffer and bounded multi-iovec prefix syscall result samples bound to descriptor generation, descriptor-generation close/plain close_range lifecycle events, TGID-level process exit/exec cancellation of pending flow resolution plus lifecycle boundary gaps for active payload-tracked flows, userspace tracked-flow displacement as event-local terminal provider-state boundary gaps, output ring-buffer failure conversion to degraded capture_loss events, conservative unknown-offset gap fan-out to active tracked payload flows, per-tracepoint kernel firing counters, and safe active pipe read/write tracepoint liveness diagnostics; payload beyond the bounded multi-iovec scan/sample or fixed verifier-friendly append slots, kernel-transfer payload bytes, partial-write retry semantics, precise flow-specific lost-event reconstruction, and kernel socket-object lifetime are not implemented",
+            "eBPF provider emits connect and accept/accept4 flow-start observations with descriptor leases, \
+             prefers procfs-resolved socket metadata when available, falls back to degraded observed flows when \
+             kernel tracepoints provide a remote endpoint before procfs resolution succeeds, uses direct TGID or \
+             unique process-hint procfs matches for process lifecycle payload allowance when observed kernel TGIDs \
+             are hidden from host procfs or collide with unrelated host PIDs, binds flow-start payload capture through \
+             descriptor/socket allow maps, emits selector-authorized always-degraded outbound single-buffer and \
+             bounded multi-iovec prefix syscall argument samples, outbound available sendfile family kernel-transfer \
+             byte-count gaps, inbound single-buffer and bounded multi-iovec prefix syscall result samples bound to \
+             descriptor generation, descriptor-generation close/plain \
+             close_range lifecycle events, TGID-level process exit/exec cancellation of pending flow resolution plus \
+             lifecycle boundary gaps for active payload-tracked flows, userspace tracked-flow displacement as \
+             event-local terminal provider-state boundary gaps, output ring-buffer failure conversion to degraded \
+             capture_loss events, conservative unknown-offset gap fan-out to active tracked payload flows, \
+             per-tracepoint kernel firing counters, and safe active pipe read/write tracepoint liveness diagnostics; \
+             payload beyond the bounded multi-iovec scan/sample or fixed verifier-friendly append slots, \
+             kernel-transfer payload bytes, partial-write retry semantics, precise flow-specific lost-event \
+             reconstruction, and kernel socket-object lifetime are not implemented",
         )]
     }
 
@@ -700,7 +747,7 @@ mod tests {
     use crate::ebpf::{
         EbpfAcceptTracepointObservation, EbpfCloseRangeTracepointObservation,
         EbpfCloseTracepointObservation, EbpfConnectTracepointObservation, EbpfObservedProcess,
-        EbpfResolvedSocketFlow, EbpfSocketEndpoint, EbpfSocketFlowLookup,
+        EbpfProcessHint, EbpfResolvedSocketFlow, EbpfSocketEndpoint, EbpfSocketFlowLookup,
         EbpfSocketReadObservation, EbpfSocketWriteObservation,
     };
 
@@ -1012,6 +1059,60 @@ mod tests {
     }
 
     #[test]
+    fn pending_flow_resolution_precedes_later_payload_observations() -> TestResult {
+        let (local, remote) = inbound_loopback();
+        let process = observed_process(101, 100);
+        let observations = [
+            missing_accept_observation(process.clone(), 9, 3),
+            EbpfProcessObservation::Read(EbpfSocketReadObservation {
+                process,
+                fd: 9,
+                fd_generation: 10,
+                original_len: 5,
+                buffer: b"GET /".to_vec(),
+                truncated: false,
+                read_failed: false,
+            }),
+        ];
+        let selector = Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                local_ports: vec![443],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        )
+        .compile()?;
+        let resolver = Box::new(RetryResolver {
+            calls: 0,
+            resolved: EbpfResolvedSocketFlow {
+                process: demo_process(),
+                confidence: 90,
+                connection: TcpConnection::new(local, remote),
+                socket_cookie: None,
+            },
+        });
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source_from_observations(observations),
+            resolver,
+            Some(selector),
+        );
+        provider.resolution_retries = 1;
+        provider.resolution_retry_sleep = Duration::ZERO;
+
+        let (_, opened) = expect_connection_opened(&mut provider)?;
+        let bytes = expect_bytes(&mut provider)?;
+
+        assert_eq!(opened.local.port, 443);
+        assert_eq!(opened.remote.port, 50_000);
+        assert_eq!(bytes.direction, Direction::Inbound);
+        assert_eq!(bytes.flow.local.port, 443);
+        assert_eq!(bytes.flow.remote.port, 50_000);
+        assert_eq!(bytes.bytes.as_ref(), b"GET /");
+        Ok(())
+    }
+
+    #[test]
     fn emits_connection_closed_events() -> TestResult {
         let (local, remote) = outbound_loopback();
         let process = observed_process(101, 100);
@@ -1187,6 +1288,191 @@ mod tests {
                 .lock()
                 .expect("revoked process lock poisoned")
                 .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flow_start_does_not_grant_process_payload_allowance_from_hint_candidate() -> TestResult {
+        let (_, remote) = inbound_loopback();
+        let process = observed_process_named(101, 4_271, "curl");
+        let allowed = Arc::new(Mutex::new(Vec::new()));
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let source = ProcessRecordingObservationSource {
+            observations: VecDeque::from([accept_observation(process, 9, 3, remote)]),
+            allowed: Arc::clone(&allowed),
+            revoked: Arc::clone(&revoked),
+        };
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source,
+            Box::new(HintProcessResolver {
+                direct_process: None,
+                hinted_processes: vec![demo_process()],
+            }),
+            Some(process_selector([100])?),
+        );
+
+        let _ = provider.poll_next()?;
+
+        assert!(
+            allowed
+                .lock()
+                .expect("allowed process lock poisoned")
+                .is_empty()
+        );
+        assert!(
+            revoked
+                .lock()
+                .expect("revoked process lock poisoned")
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn observed_flow_start_prefers_unique_hint_candidate_over_colliding_direct_tgid() -> TestResult
+    {
+        let (_, remote) = inbound_loopback();
+        let observed_tgid = 4_271;
+        let process = observed_process_named(101, observed_tgid, "curl");
+        let mut colliding = demo_process();
+        colliding.identity.pid = observed_tgid;
+        colliding.identity.tgid = observed_tgid;
+        colliding.name = "unrelated".to_string();
+        colliding.cmdline = vec!["unrelated".to_string()];
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source_from_observations([accept_observation(process, 9, 3, remote)]),
+            Box::new(HintProcessResolver {
+                direct_process: Some(colliding),
+                hinted_processes: vec![demo_process()],
+            }),
+            None,
+        );
+
+        let (_, flow) = expect_connection_opened(&mut provider)?;
+
+        assert_eq!(flow.process.identity.pid, 100);
+        assert_eq!(flow.process.identity.tgid, 100);
+        assert_eq!(flow.process.name, "curl");
+        assert_eq!(flow.attribution_confidence, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn process_exec_authorizes_observed_tgid_from_unique_hint_candidate() -> TestResult {
+        let observed_tgid = 4_271;
+        let process = observed_process_named(101, observed_tgid, "curl");
+        let allowed = Arc::new(Mutex::new(Vec::new()));
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let source = ProcessRecordingObservationSource {
+            observations: VecDeque::from([process_exec_observation(process)]),
+            allowed: Arc::clone(&allowed),
+            revoked: Arc::clone(&revoked),
+        };
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source,
+            Box::new(HintProcessResolver {
+                direct_process: None,
+                hinted_processes: vec![demo_process()],
+            }),
+            Some(process_selector([100])?),
+        );
+
+        assert!(matches!(provider.poll_next()?, CapturePoll::Progress));
+
+        assert_eq!(
+            allowed
+                .lock()
+                .expect("allowed process lock poisoned")
+                .as_slice(),
+            &[observed_tgid]
+        );
+        assert!(
+            revoked
+                .lock()
+                .expect("revoked process lock poisoned")
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn process_exec_skips_hint_authorization_when_candidates_are_ambiguous() -> TestResult {
+        let process = observed_process_named(101, 4_271, "curl");
+        let allowed = Arc::new(Mutex::new(Vec::new()));
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let source = ProcessRecordingObservationSource {
+            observations: VecDeque::from([process_exec_observation(process)]),
+            allowed: Arc::clone(&allowed),
+            revoked: Arc::clone(&revoked),
+        };
+        let mut other = demo_process();
+        other.identity.pid = 101;
+        other.identity.tgid = 101;
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source,
+            Box::new(HintProcessResolver {
+                direct_process: None,
+                hinted_processes: vec![demo_process(), other],
+            }),
+            Some(process_selector([100, 101])?),
+        );
+
+        assert!(matches!(provider.poll_next()?, CapturePoll::Progress));
+
+        assert!(
+            allowed
+                .lock()
+                .expect("allowed process lock poisoned")
+                .is_empty()
+        );
+        assert_eq!(
+            revoked
+                .lock()
+                .expect("revoked process lock poisoned")
+                .as_slice(),
+            &[4_271]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn process_exec_rejects_colliding_direct_tgid_without_unique_hint_candidate() -> TestResult {
+        let observed_tgid = 4_271;
+        let process = observed_process_named(101, observed_tgid, "curl");
+        let allowed = Arc::new(Mutex::new(Vec::new()));
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let source = ProcessRecordingObservationSource {
+            observations: VecDeque::from([process_exec_observation(process)]),
+            allowed: Arc::clone(&allowed),
+            revoked: Arc::clone(&revoked),
+        };
+        let mut colliding = demo_process();
+        colliding.identity.pid = observed_tgid;
+        colliding.identity.tgid = observed_tgid;
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source,
+            Box::new(HintProcessResolver {
+                direct_process: Some(colliding),
+                hinted_processes: Vec::new(),
+            }),
+            Some(process_selector([100])?),
+        );
+
+        assert!(matches!(provider.poll_next()?, CapturePoll::Progress));
+
+        assert!(
+            allowed
+                .lock()
+                .expect("allowed process lock poisoned")
+                .is_empty()
+        );
+        assert_eq!(
+            revoked
+                .lock()
+                .expect("revoked process lock poisoned")
+                .as_slice(),
+            &[observed_tgid]
         );
         Ok(())
     }
@@ -1689,6 +1975,33 @@ mod tests {
     }
 
     #[test]
+    fn flow_start_retries_procfs_before_observed_endpoint_fallback() -> TestResult {
+        let (local, remote) = inbound_loopback();
+        let observation = accept_observation(observed_process(101, 100), 9, 3, remote);
+        let resolver = Box::new(RetryResolver {
+            calls: 0,
+            resolved: EbpfResolvedSocketFlow {
+                process: demo_process(),
+                confidence: 90,
+                connection: TcpConnection::new(local, remote),
+                socket_cookie: None,
+            },
+        });
+        let mut provider =
+            EbpfProcessObservationProvider::from_observations_for_test([observation], resolver);
+        provider.resolution_retries = 1;
+        provider.resolution_retry_sleep = Duration::ZERO;
+
+        let (_, flow) = expect_connection_opened(&mut provider)?;
+
+        assert_eq!(flow.attribution_confidence, 90);
+        assert_eq!(flow.local.port, 443);
+        assert_eq!(flow.remote.port, 50_000);
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn degraded_observed_flow_tracks_authorized_payload() -> TestResult {
         let (_, remote) = inbound_loopback();
         let process = observed_process(101, 100);
@@ -1779,7 +2092,7 @@ mod tests {
     }
 
     #[test]
-    fn process_lifecycle_cancels_pending_flow_resolution_for_same_tgid() -> TestResult {
+    fn process_lifecycle_waits_for_pending_flow_resolution() -> TestResult {
         let (local, remote) = outbound_loopback();
         let process = observed_process(101, 100);
         let observations = [
@@ -1800,18 +2113,16 @@ mod tests {
         provider.resolution_retries = 1;
         provider.resolution_retry_sleep = Duration::ZERO;
 
-        let gap = expect_gap(&mut provider)?;
+        let (_, flow) = expect_connection_opened(&mut provider)?;
 
-        assert_eq!(gap.timestamp.monotonic_ns, 2);
-        assert!(gap.gap.reason.contains("abandoned"));
-        assert!(gap.gap.reason.contains("process exec"));
-        assert!(gap.gap.reason.contains("fd=7"));
+        assert_eq!(flow.local.port, 50_000);
+        assert_eq!(flow.remote.port, 443);
         assert!(provider.next()?.is_none());
         Ok(())
     }
 
     #[test]
-    fn unresolved_flow_resolution_does_not_block_later_flow_start() -> TestResult {
+    fn unresolved_flow_resolution_emits_gap_before_later_flow_start() -> TestResult {
         let (local, remote) = outbound_loopback();
         let process = observed_process(101, 100);
         let observations = [
@@ -1831,14 +2142,14 @@ mod tests {
             EbpfProcessObservationProvider::from_observations_for_test(observations, resolver);
         provider.resolution_retries = 1;
 
+        let Some(CaptureEvent::Gap(gap)) = provider.next()? else {
+            panic!("expected unresolved flow gap before later flow start");
+        };
+        assert!(gap.gap.reason.contains("fd=7"));
+
         let (_, flow) = expect_connection_opened(&mut provider)?;
         assert_eq!(flow.local.port, 50_000);
         assert_eq!(flow.remote.port, 443);
-
-        let Some(CaptureEvent::Gap(gap)) = provider.next()? else {
-            panic!("expected unresolved flow gap after later flow start");
-        };
-        assert!(gap.gap.reason.contains("fd=7"));
         assert!(provider.next()?.is_none());
         Ok(())
     }
@@ -1847,9 +2158,8 @@ mod tests {
     fn full_pending_flow_resolution_queue_emits_gap() -> TestResult {
         let (_, remote) = outbound_loopback();
         let process = observed_process(101, 100);
-        let observation = missing_connect_observation(process.clone(), 7);
         let mut provider = EbpfProcessObservationProvider::from_observations_for_test(
-            [observation],
+            [],
             Box::new(StaticResolver { resolved: None }),
         );
         provider.resolution_retries = 1;
@@ -1861,7 +2171,12 @@ mod tests {
             ));
         }
 
-        let Some(CaptureEvent::Gap(gap)) = provider.next()? else {
+        let CapturePoll::Event(event) = provider
+            .queue_pending_flow_resolution(pending_missing_connect_resolution(process.clone(), 7))
+        else {
+            panic!("expected degraded gap when pending flow queue is full");
+        };
+        let CaptureEvent::Gap(gap) = *event else {
             panic!("expected degraded gap when pending flow queue is full");
         };
         assert!(
@@ -2289,6 +2604,40 @@ mod tests {
 
         fn resolve_process(&mut self, _tgid: u32) -> Result<Option<ProcessContext>, CaptureError> {
             Ok(Some(self.process.clone()))
+        }
+    }
+
+    struct HintProcessResolver {
+        direct_process: Option<ProcessContext>,
+        hinted_processes: Vec<ProcessContext>,
+    }
+
+    impl EbpfSocketFlowResolver for HintProcessResolver {
+        fn resolve_socket_flow(
+            &mut self,
+            _lookup: EbpfSocketFlowLookup,
+        ) -> Result<Option<EbpfResolvedSocketFlow>, CaptureError> {
+            Ok(None)
+        }
+
+        fn resolve_process(&mut self, _tgid: u32) -> Result<Option<ProcessContext>, CaptureError> {
+            Ok(self.direct_process.clone())
+        }
+
+        fn resolve_processes_by_hint(
+            &mut self,
+            hint: EbpfProcessHint,
+        ) -> Result<Vec<ProcessContext>, CaptureError> {
+            Ok(self
+                .hinted_processes
+                .iter()
+                .filter(|process| {
+                    process.name == hint.name
+                        && process.identity.uid == hint.uid
+                        && process.identity.gid == hint.gid
+                })
+                .cloned()
+                .collect())
         }
     }
 
@@ -2793,6 +3142,22 @@ mod tests {
         })
     }
 
+    fn missing_accept_observation(
+        process: EbpfObservedProcess,
+        fd: i32,
+        listen_fd: i32,
+    ) -> EbpfProcessObservation {
+        EbpfProcessObservation::Accept(EbpfAcceptTracepointObservation {
+            process,
+            fd,
+            listen_fd,
+            addrlen: 0,
+            fd_table_epoch: 9,
+            fd_generation: 10,
+            endpoint: EbpfSocketEndpoint::Missing,
+        })
+    }
+
     fn close_observation(process: EbpfObservedProcess, fd: i32) -> EbpfProcessObservation {
         EbpfProcessObservation::Close(EbpfCloseTracepointObservation {
             process,
@@ -2835,6 +3200,14 @@ mod tests {
             gid: 1000,
             command: [0; 16],
         }
+    }
+
+    fn observed_process_named(pid: u32, tgid: u32, name: &str) -> EbpfObservedProcess {
+        let mut process = observed_process(pid, tgid);
+        for (slot, byte) in process.command.iter_mut().zip(name.bytes()) {
+            *slot = byte;
+        }
+        process
     }
 
     fn demo_process() -> ProcessContext {

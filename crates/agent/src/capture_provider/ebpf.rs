@@ -1,11 +1,5 @@
-use std::collections::BTreeSet;
-
-use attribution::{ProcessAttributor, ProcfsAttributor};
-use capture::{
-    CaptureProvider, EbpfProcessObservationProbeConfig, EbpfProcessObservationProvider,
-    ProcessPayloadSampleAuthorization,
-};
-use probe_core::{CancellationToken, CompiledSelector, ProcessContext, ProcessSelector, Selector};
+use capture::{CaptureProvider, EbpfProcessObservationProbeConfig, EbpfProcessObservationProvider};
+use probe_core::{CancellationToken, CompiledSelector, ProcessSelector, Selector};
 use runtime::RuntimePlan;
 
 use super::{
@@ -30,14 +24,13 @@ pub(super) fn build_ebpf_capture_provider(
             )
         })?;
     let (deep_observe_selector, process_payload_selector) = deep_observe_selector_plan(plan)?;
-    let mut provider = EbpfProcessObservationProvider::open_with_cancellation(
+    let provider = EbpfProcessObservationProvider::open_with_cancellation(
         EbpfProcessObservationProbeConfig::new(object_path),
         Box::<ProcfsTcpProcessResolver>::default(),
         deep_observe_selector.clone(),
         process_payload_selector.clone(),
         cancellation,
     )?;
-    seed_process_payload_authorizations(&mut provider, process_payload_selector.as_ref())?;
     let provider_details = Some(
         CaptureProviderRuntimeDetailsSnapshot::ebpf_process_observation(provider.probe_snapshot()),
     );
@@ -69,38 +62,6 @@ fn deep_observe_selector_plan(
     Ok((Some(compiled), process_payload_selector))
 }
 
-fn seed_process_payload_authorizations(
-    provider: &mut EbpfProcessObservationProvider,
-    selector: Option<&CompiledSelector>,
-) -> Result<(), AgentError> {
-    let Some(selector) = selector else {
-        return Ok(());
-    };
-    let attributor = ProcfsAttributor::new();
-    let Ok(process_ids) = attributor.process_ids() else {
-        return Ok(());
-    };
-    let mut tgids = BTreeSet::new();
-    for process in process_ids
-        .into_iter()
-        .filter_map(|pid| attributor.identify_if_present(pid).ok().flatten())
-        .filter_map(|process| tgids.insert(process.identity.tgid).then_some(process))
-    {
-        let Some(authorization) = ProcessPayloadSampleAuthorization::from_unattributed_selector(
-            process.identity.tgid,
-            &process,
-            selector,
-        ) else {
-            continue;
-        };
-        provider.allow_process_payload_sample(authorization)?;
-        if !process_identity_still_current(&attributor, &process) {
-            provider.revoke_process_payload_sample(process.identity.tgid)?;
-        }
-    }
-    Ok(())
-}
-
 fn selector_requires_process_constraint_on_all_paths(selector: &Selector) -> bool {
     match selector {
         Selector::Match { term } => term.process != ProcessSelector::default(),
@@ -112,14 +73,6 @@ fn selector_requires_process_constraint_on_all_paths(selector: &Selector) -> boo
             .all(selector_requires_process_constraint_on_all_paths),
         Selector::Not { .. } | Selector::Ref { .. } => false,
     }
-}
-
-fn process_identity_still_current(attributor: &ProcfsAttributor, process: &ProcessContext) -> bool {
-    attributor
-        .identify_if_present(process.identity.pid)
-        .ok()
-        .flatten()
-        .is_some_and(|current| current.identity == process.identity)
 }
 
 #[cfg(test)]

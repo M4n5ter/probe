@@ -48,6 +48,19 @@ impl EbpfSocketFlowResolver for ProcfsEbpfFlowResolver {
             .map_err(|error| CaptureError::provider("procfs_socket_attribution", error.to_string()))
     }
 
+    fn resolve_processes_by_hint(
+        &mut self,
+        hint: capture::EbpfProcessHint,
+    ) -> Result<Vec<ProcessContext>, CaptureError> {
+        self.resolver
+            .resolve_processes_by_hint(SocketProcessHint {
+                name: hint.name,
+                uid: hint.uid,
+                gid: hint.gid,
+            })
+            .map_err(|error| CaptureError::provider("procfs_socket_attribution", error.to_string()))
+    }
+
     fn invalidate_cached_resolution(&mut self) {
         self.resolver.invalidate_snapshot();
     }

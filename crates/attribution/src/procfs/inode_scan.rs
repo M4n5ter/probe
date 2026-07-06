@@ -147,21 +147,14 @@ pub(super) fn socket_fd_candidates_for_lookup(
     lookup: &SocketFdLookup,
 ) -> Result<SocketFdCandidateScan, AttributionError> {
     let mut candidates = Vec::new();
+    let mut complete = true;
     let thread_inode = read_socket_inode_for_pid_fd(proc_root, lookup.thread_pid, lookup.fd)?;
-    if let Some(inode) = thread_inode {
-        push_socket_fd_candidate(
-            &mut candidates,
-            SocketFdCandidate {
-                inode,
-                fd_pid: lookup.thread_pid,
-                process_pid: lookup.tgid,
-                source: SocketFdCandidateSource::Direct,
-            },
-        );
-    }
-    if lookup.thread_pid != lookup.tgid
-        && let Some(inode) = read_socket_inode_for_pid_fd(proc_root, lookup.tgid, lookup.fd)?
-    {
+    let tgid_inode = if lookup.thread_pid != lookup.tgid {
+        read_socket_inode_for_pid_fd(proc_root, lookup.tgid, lookup.fd)?
+    } else {
+        thread_inode
+    };
+    if let Some(inode) = tgid_inode {
         push_socket_fd_candidate(
             &mut candidates,
             SocketFdCandidate {
@@ -172,75 +165,76 @@ pub(super) fn socket_fd_candidates_for_lookup(
             },
         );
     }
-    if !candidates.is_empty() || pid_dir_is_visible(proc_root, lookup.tgid) {
+    if lookup.thread_pid != lookup.tgid
+        && let Some(inode) = thread_inode
+        && tgid_inode != Some(inode)
+    {
+        push_socket_fd_candidate(
+            &mut candidates,
+            SocketFdCandidate {
+                inode,
+                fd_pid: lookup.thread_pid,
+                process_pid: lookup.thread_pid,
+                source: SocketFdCandidateSource::Direct,
+            },
+        );
+    }
+    let observed_pid_visible = pid_dir_is_visible(proc_root, lookup.tgid);
+    if lookup.process_hint.is_none() && (!candidates.is_empty() || observed_pid_visible) {
         return Ok(SocketFdCandidateScan {
             candidates,
             complete: true,
         });
     }
 
-    let mut complete = true;
-    let namespace_scan = namespace_tgid_candidates(proc_root, lookup.tgid)?;
-    complete &= namespace_scan.complete;
-    for process_pid in namespace_scan.pids {
-        if process_pid == lookup.tgid {
-            continue;
-        }
-        match read_socket_inode_for_candidate_pid_fd(proc_root, process_pid, lookup.fd)? {
-            SocketFdRead::Present(inode) => {
-                push_socket_fd_candidate(
-                    &mut candidates,
-                    SocketFdCandidate {
-                        inode,
-                        fd_pid: process_pid,
-                        process_pid,
-                        source: SocketFdCandidateSource::NamespaceAlias,
-                    },
-                );
+    if !observed_pid_visible || lookup.process_hint.is_some() {
+        let namespace_scan = namespace_tgid_candidates(proc_root, lookup.tgid)?;
+        complete &= namespace_scan.complete;
+        for process_pid in namespace_scan.pids {
+            if process_pid == lookup.tgid {
+                continue;
             }
-            SocketFdRead::Absent => {}
-            SocketFdRead::Unknown => complete = false,
+            match read_socket_inode_for_candidate_pid_fd(proc_root, process_pid, lookup.fd)? {
+                SocketFdRead::Present(inode) => {
+                    push_socket_fd_candidate(
+                        &mut candidates,
+                        SocketFdCandidate {
+                            inode,
+                            fd_pid: process_pid,
+                            process_pid,
+                            source: SocketFdCandidateSource::NamespaceAlias,
+                        },
+                    );
+                }
+                SocketFdRead::Absent => {}
+                SocketFdRead::Unknown => complete = false,
+            }
         }
-    }
-    Ok(SocketFdCandidateScan {
-        candidates,
-        complete,
-    })
-}
-
-pub(super) fn hinted_socket_fd_candidates(
-    proc_root: &Path,
-    lookup: &SocketFdLookup,
-) -> Result<SocketFdCandidateScan, AttributionError> {
-    if pid_dir_is_visible(proc_root, lookup.tgid) {
-        return Ok(SocketFdCandidateScan {
-            candidates: Vec::new(),
-            complete: true,
-        });
     }
 
-    let mut candidates = Vec::new();
-    let mut complete = true;
-    for ProcfsPidEntry { pid, .. } in numeric_pid_dirs(proc_root)? {
-        if pid == lookup.tgid || pid == lookup.thread_pid {
-            continue;
-        }
-        match read_socket_inode_for_candidate_pid_fd(proc_root, pid, lookup.fd)? {
-            SocketFdRead::Present(inode) => {
-                push_socket_fd_candidate(
-                    &mut candidates,
-                    SocketFdCandidate {
-                        inode,
-                        fd_pid: pid,
-                        process_pid: pid,
-                        source: SocketFdCandidateSource::ProcessHint,
-                    },
-                );
+    if lookup.process_hint.is_some() && lookup.expected_remote_endpoint.is_some() {
+        for ProcfsPidEntry { pid, .. } in numeric_pid_dirs(proc_root)? {
+            if pid == lookup.tgid || pid == lookup.thread_pid {
+                continue;
             }
-            SocketFdRead::Absent => {}
-            SocketFdRead::Unknown => complete = false,
+            match read_socket_inode_for_candidate_pid_fd(proc_root, pid, lookup.fd)? {
+                SocketFdRead::Present(inode) => {
+                    push_socket_fd_candidate(
+                        &mut candidates,
+                        SocketFdCandidate {
+                            inode,
+                            fd_pid: pid,
+                            process_pid: pid,
+                            source: SocketFdCandidateSource::ProcessHint,
+                        },
+                    );
+                }
+                SocketFdRead::Absent => {}
+                SocketFdRead::Unknown => complete = false,
+            }
         }
     }
+
     Ok(SocketFdCandidateScan {
         candidates,
         complete,

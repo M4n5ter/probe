@@ -6,7 +6,7 @@ use ebpf_abi::{
 };
 
 use super::payload::{
-    PayloadAttemptSource, PayloadLogicalLen, PayloadSamplePlan, clamp_u64_to_u32,
+    PayloadAttemptSource, PayloadFdKind, PayloadLogicalLen, PayloadSamplePlan, clamp_u64_to_u32,
     iovec_payload_source_from_tracepoint, msghdr_payload_source_from_tracepoint,
     payload_read_flag_bits, payload_sample_plan_from_source, read_payload_prefix_from_plan,
     single_buffer_payload_source_from_tracepoint, syscall_result_from_tracepoint,
@@ -17,13 +17,19 @@ const SENDFILE_OUT_FD_OFFSET: usize = 16;
 pub(crate) fn write_source_from_tracepoint(
     ctx: &TracePointContext,
 ) -> Option<PayloadAttemptSource> {
-    single_buffer_payload_source_from_tracepoint(ctx)
+    single_buffer_payload_source_from_tracepoint(ctx, PayloadFdKind::Generic)
+}
+
+pub(crate) fn sendto_source_from_tracepoint(
+    ctx: &TracePointContext,
+) -> Option<PayloadAttemptSource> {
+    single_buffer_payload_source_from_tracepoint(ctx, PayloadFdKind::Socket)
 }
 
 pub(crate) fn writev_source_from_tracepoint(
     ctx: &TracePointContext,
 ) -> Option<PayloadAttemptSource> {
-    iovec_payload_source_from_tracepoint(ctx)
+    iovec_payload_source_from_tracepoint(ctx, PayloadFdKind::Generic)
 }
 
 pub(crate) fn sendmsg_source_from_tracepoint(
@@ -50,7 +56,13 @@ pub(crate) fn capture_kernel_transfer_write_gap(
     fd: i32,
     pending: &mut EbpfPendingSocketWriteSample,
 ) {
-    reset_pending_write_sample(pending, fd, 0, 0, EBPF_SOCKET_WRITE_KERNEL_TRANSFER);
+    reset_pending_write_sample(
+        pending,
+        fd,
+        0,
+        0,
+        EBPF_SOCKET_WRITE_KERNEL_TRANSFER,
+    );
 }
 
 fn capture_write_sample_from_plan(
@@ -163,7 +175,7 @@ fn reset_pending_write_sample(
     pending.fd_generation = 0;
     pending.captured_len = captured_len;
     pending.flags = flags;
-    pending._reserved = 0;
+    pending._reserved = [0; 4];
     pending.buffer = [0; EBPF_SOCKET_WRITE_SAMPLE_BYTES];
 }
 
@@ -262,10 +274,16 @@ mod tests {
             fd_generation: 0,
             captured_len: 0,
             flags: 0,
-            _reserved: 0,
+            _reserved: [0; 4],
             buffer: [0; EBPF_SOCKET_WRITE_SAMPLE_BYTES],
         };
-        reset_pending_write_sample(&mut pending, 7, original_len, captured.len() as u16, flags);
+        reset_pending_write_sample(
+            &mut pending,
+            7,
+            original_len,
+            captured.len() as u16,
+            flags,
+        );
         pending.buffer[..captured.len()].copy_from_slice(captured);
         pending
     }

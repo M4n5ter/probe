@@ -400,13 +400,13 @@ mod tests {
         let resolver =
             FakeFlowOwnerResolver::with_listener_results([Ok(listener_lookup([listener_alias(
                 process_context(7, "docker-proxy"),
-                process_context(42, "sssa-backend"),
+                process_context(42, "demo-backend"),
                 Ipv4Addr::UNSPECIFIED,
                 8081,
             )]))]);
         let classifier = classifier(
             ProcessSelector {
-                names: vec!["sssa-backend".to_string()],
+                names: vec!["demo-backend".to_string()],
                 ..ProcessSelector::default()
             },
             TrafficSelector {

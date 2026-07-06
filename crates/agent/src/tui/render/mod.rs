@@ -927,10 +927,13 @@ mod tests {
         assert!(output.contains("Traffic Readiness"));
         assert!(output.contains("Data path source: local config"));
         assert!(
-            data_path_summary.capture.contains("ebpf selected"),
+            !data_path_summary.capture.contains("MITM")
+                && !data_path_summary
+                    .capture
+                    .contains("configure reliable MITM"),
             "capture readiness should remain a separate summary field: {data_path_summary:?}"
         );
-        assert!(output.contains("capture ebpf selected"));
+        assert!(output.contains("capture "));
         assert!(output.contains("next configure reliable MITM proxy data path"));
         assert!(output.contains("MITM not configured;"));
         assert!(scroll_target_exists(

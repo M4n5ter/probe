@@ -13,8 +13,8 @@ pub use ebpf::{
     EBPF_ABI_REVISION, EBPF_PAYLOAD_SAMPLE_BYTES, EBPF_PROCESS_OPTIONAL_TRACEPOINT_PAIR_SPECS,
     EbpfAcceptTracepointObservation, EbpfCloseRangeTracepointObservation,
     EbpfCloseTracepointObservation, EbpfConnectTracepointObservation, EbpfHostProbe,
-    EbpfHostProbeConfig, EbpfHostProbeReport, EbpfObservedProcess, EbpfProcessObservation,
-    EbpfProcessObservationActiveTracepointLiveness,
+    EbpfHostProbeConfig, EbpfHostProbeReport, EbpfObservedProcess, EbpfProcessHint,
+    EbpfProcessObservation, EbpfProcessObservationActiveTracepointLiveness,
     EbpfProcessObservationActiveTracepointLivenessProgram,
     EbpfProcessObservationActiveTracepointLivenessState,
     EbpfProcessObservationLinkOwnershipSnapshot,
@@ -27,6 +27,7 @@ pub use ebpf::{
     EbpfProcessOptionalTracepointPairSpec, EbpfResolvedSocketFlow, EbpfSocketEndpoint,
     EbpfSocketFlowLookup, EbpfSocketFlowResolver, EbpfSocketReadObservation,
     EbpfSocketWriteObservation, ProcessPayloadSampleAuthorization, UnprivilegedBpfStatus,
+    process_payload_hint_command_key,
 };
 pub use event::{
     CaptureEvent, CapturedBytes, CapturedGap, CapturedLoss, EnforcementEvidencePropagation,

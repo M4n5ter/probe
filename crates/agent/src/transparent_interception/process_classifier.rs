@@ -651,7 +651,7 @@ mod tests {
                 "8080",
             ],
         )?;
-        proc.write_process_with_socket(321, "sssa-backend", 424_242)?;
+        proc.write_process_with_socket(321, "demo-backend", 424_242)?;
         proc.write_process_tcp_table(
             321,
             "net:[4026532661]",
@@ -670,7 +670,7 @@ mod tests {
                 TransparentInterceptionHostRuleBoundary::HostRules(host_scope(8081)),
                 process_scope_from_selector(Selector::term(
                     ProcessSelector {
-                        names: vec!["sssa-backend".to_string()],
+                        names: vec!["demo-backend".to_string()],
                         ..ProcessSelector::default()
                     },
                     inbound_local_port(8081),

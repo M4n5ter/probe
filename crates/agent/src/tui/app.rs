@@ -888,7 +888,13 @@ impl TuiApp {
                     "No active agent admin socket is attached; {}",
                     self.runtime_agent_status()
                 );
-                self.traffic.mark_admin_unavailable(message);
+                self.traffic.mark_admin_unavailable(message.clone());
+                if matches!(
+                    self.data_path_diagnostics,
+                    DataPathDiagnosticsView::LocalConfig { .. }
+                ) {
+                    self.data_path_diagnostics = DataPathDiagnosticsView::unavailable(message);
+                }
                 self.status = StatusMessage::warning(self.traffic.status().text.clone());
             }
             return None;
@@ -3384,6 +3390,27 @@ mod tests {
                 .any(|line| line == "failure: kernel capture privileges are missing")
         );
         assert!(popup.lines.iter().any(|line| line.contains("CAP_NET_RAW")));
+    }
+
+    #[test]
+    fn traffic_refresh_without_runtime_marks_data_path_unavailable() {
+        let mut app = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::default(),
+        );
+
+        let request = app.begin_traffic_refresh();
+
+        assert!(request.is_none());
+        assert_eq!(app.status().kind, StatusKind::Warning);
+        assert_eq!(overview_value(&app, "Data path source"), "unavailable");
+        assert!(app.overview_data_path_lines().iter().any(|line| {
+            line.label == "Reason"
+                && line
+                    .value
+                    .contains("No active agent admin socket is attached")
+        }));
     }
 
     #[test]

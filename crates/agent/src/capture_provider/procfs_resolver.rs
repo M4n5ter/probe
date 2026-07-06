@@ -1,7 +1,7 @@
 use attribution::{ProcfsSocketResolver, TcpListenerProcessLookup};
 use capture::{
-    CaptureError, EbpfResolvedSocketFlow, EbpfSocketFlowLookup, EbpfSocketFlowResolver,
-    ProcessResolver, ResolvedProcess,
+    CaptureError, EbpfProcessHint, EbpfResolvedSocketFlow, EbpfSocketFlowLookup,
+    EbpfSocketFlowResolver, ProcessResolver, ResolvedProcess,
 };
 use probe_core::{CapabilityKind, ProcessContext, RuntimeMode, TcpConnection, TcpEndpoint};
 use runtime::RuntimePlan;
@@ -120,6 +120,19 @@ impl EbpfSocketFlowResolver for ProcfsTcpProcessResolver {
     fn resolve_process(&mut self, tgid: u32) -> Result<Option<ProcessContext>, CaptureError> {
         self.resolver
             .resolve_process(tgid)
+            .map_err(|error| CaptureError::provider("procfs_socket_attribution", error.to_string()))
+    }
+
+    fn resolve_processes_by_hint(
+        &mut self,
+        hint: EbpfProcessHint,
+    ) -> Result<Vec<ProcessContext>, CaptureError> {
+        self.resolver
+            .resolve_processes_by_hint(attribution::SocketProcessHint {
+                name: hint.name,
+                uid: hint.uid,
+                gid: hint.gid,
+            })
             .map_err(|error| CaptureError::provider("procfs_socket_attribution", error.to_string()))
     }
 

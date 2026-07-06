@@ -98,6 +98,14 @@ fn payload_directions_for_flow(
     payload_directions
 }
 
+pub fn process_payload_hint_command_key(name: &str) -> [u8; 16] {
+    let mut command = [0; 16];
+    for (slot, byte) in command.iter_mut().zip(name.bytes()) {
+        *slot = byte;
+    }
+    command
+}
+
 #[cfg(test)]
 mod tests {
     use probe_core::{
@@ -317,9 +325,16 @@ mod tests {
     fn process_direction_selector(
         directions: impl IntoIterator<Item = Direction>,
     ) -> Result<CompiledSelector, Box<dyn std::error::Error>> {
+        named_process_direction_selector("curl", directions)
+    }
+
+    fn named_process_direction_selector(
+        name: &str,
+        directions: impl IntoIterator<Item = Direction>,
+    ) -> Result<CompiledSelector, Box<dyn std::error::Error>> {
         Ok(Selector::term(
             ProcessSelector {
-                names: vec!["curl".to_string()],
+                names: vec![name.to_string()],
                 ..ProcessSelector::default()
             },
             TrafficSelector {
