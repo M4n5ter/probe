@@ -449,6 +449,14 @@ impl TrafficState {
         self.active_view().active == TrafficViewMode::WebSocket
     }
 
+    pub(crate) fn selected_detail_title(&self) -> &'static str {
+        match self.active_view().active {
+            TrafficViewMode::Http => "HTTP Exchange Detail",
+            TrafficViewMode::WebSocket => "WebSocket Session Detail",
+            TrafficViewMode::Events => "Traffic Event Detail",
+        }
+    }
+
     pub(crate) fn selected_detail_lines(&self) -> Option<Vec<String>> {
         match self.active_view().active {
             TrafficViewMode::Http => {

@@ -45,32 +45,36 @@ impl HttpExchangeRow {
 
     pub(crate) fn detail_lines(&self) -> Vec<String> {
         let mut lines = vec![
-            format!("Sequence: {}", self.sequence),
-            format!("Latest event sequence: {}", self.latest_sequence),
-            "View: HTTP exchange".to_string(),
-            format!("Process: {}", self.process),
+            "Overview".to_string(),
+            format!("  Sequence: {}", self.sequence),
+            format!("  Latest event sequence: {}", self.latest_sequence),
+            "  View: HTTP exchange".to_string(),
+            format!("  Process: {}", self.process),
         ];
-        lines.extend(self.attribution.detail_lines());
+        lines.extend(
+            self.attribution
+                .detail_lines()
+                .into_iter()
+                .map(|line| format!("  {line}")),
+        );
         lines.extend([
-            format!("Capture path: {}", self.capture_path),
-            format!("Direction: {}", self.direction),
-            format!("Remote: {}", self.endpoint),
-            format!("Summary: {}", self.summary),
+            format!("  Capture path: {}", self.capture_path),
+            format!("  Direction: {}", self.direction),
+            format!("  Remote: {}", self.endpoint),
+            format!("  Summary: {}", self.summary),
         ]);
         lines.push(String::new());
         lines.extend(self.request.start_lines(HttpMessageRole::Request));
-        lines.extend(self.response.start_lines(HttpMessageRole::Response));
-        lines.push(String::new());
-        lines.push("Payloads".to_string());
         lines.extend(self.request.body_lines(HttpMessageRole::Request));
-        lines.extend(self.response.body_lines(HttpMessageRole::Response));
-        lines.push(String::new());
-        lines.push("Headers".to_string());
         lines.extend(self.request.header_lines(HttpMessageRole::Request));
+        lines.push(String::new());
+        lines.extend(self.response.start_lines(HttpMessageRole::Response));
+        lines.extend(self.response.body_lines(HttpMessageRole::Response));
         lines.extend(self.response.header_lines(HttpMessageRole::Response));
         lines.push(String::new());
+        lines.push("Raw events".to_string());
         lines.push(format!(
-            "Raw event sequences: {}",
+            "  Sequences: {}",
             self.raw_sequences
                 .iter()
                 .map(u64::to_string)
@@ -90,7 +94,7 @@ impl HttpExchangeRow {
             format!("Response: {}", self.status),
             format!("Request body: {}", self.request.body_preview()),
             format!("Response body: {}", self.response.body_preview()),
-            "Detail: headers and payloads".to_string(),
+            "Full detail: request, response, headers, payloads".to_string(),
         ];
         fit_preview_lines(lines, max_lines)
     }
@@ -811,16 +815,16 @@ mod tests {
         assert_section_order(
             &details,
             &[
+                "Overview",
                 "Request",
                 "  POST /api/tasks HTTP/1.1",
+                "Request body",
+                "Request headers",
                 "Response",
                 "  HTTP/1.1 201 Created",
-                "Payloads",
-                "Request body",
                 "Response body",
-                "Headers",
-                "Request headers",
                 "Response headers",
+                "Raw events",
             ],
         );
         assert!(details.iter().any(|line| line == "  Body payload: hello"));
@@ -888,7 +892,7 @@ mod tests {
             exchange
                 .detail_lines()
                 .iter()
-                .any(|line| line == "Process match: libpcap unknown-process candidate")
+                .any(|line| line == "  Process match: libpcap unknown-process candidate")
         );
     }
 

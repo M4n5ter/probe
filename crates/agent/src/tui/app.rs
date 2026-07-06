@@ -437,7 +437,7 @@ impl TuiApp {
     pub(crate) fn traffic_popup_view(&self) -> Option<TrafficPopupView> {
         let state = self.traffic_popup?;
         Some(TrafficPopupView {
-            title: traffic_popup_title_for(state.kind),
+            title: self.traffic_popup_title_for(state.kind),
             lines: self.traffic_popup_lines(state.kind),
             scroll: state.scroll,
         })
@@ -504,7 +504,7 @@ impl TuiApp {
         if self.traffic.rows().is_empty() {
             "Traffic Readiness"
         } else {
-            "Selected Traffic"
+            self.traffic.selected_detail_title()
         }
     }
 
@@ -1556,6 +1556,13 @@ impl TuiApp {
         }
     }
 
+    fn traffic_popup_title_for(&self, kind: TrafficPopup) -> &'static str {
+        match kind {
+            TrafficPopup::RowDetail => self.traffic.selected_detail_title(),
+            TrafficPopup::Diagnostics => "Data Path Diagnostics",
+        }
+    }
+
     fn traffic_popup_max_scroll(&self) -> usize {
         self.traffic_popup_content_rows
             .saturating_sub(self.traffic_popup_viewport_rows.max(1))
@@ -1649,13 +1656,6 @@ fn process_observation_removed_status(process_name: &str) -> StatusMessage {
     StatusMessage::saved(format!("Stopped observing {process_name}"))
 }
 
-fn traffic_popup_title_for(kind: TrafficPopup) -> &'static str {
-    match kind {
-        TrafficPopup::RowDetail => "Traffic Detail",
-        TrafficPopup::Diagnostics => "Data Path Diagnostics",
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MonitorMode {
     Keep,
@@ -1710,6 +1710,11 @@ mod tests {
     use crate::admin::{
         EventTailAttributionMode, EventTailBudgetSnapshot, EventTailEvent, EventTailRecord,
         EventTailSnapshot,
+    };
+    use probe_core::{
+        AddressPort, CaptureOrigin, CaptureSource, Direction, EventEnvelope, EventKind,
+        FlowContext, FlowIdentity, HttpHeaders, ProcessContext, ProcessIdentity, Timestamp,
+        TransportProtocol, WebSocketHandoff,
     };
 
     use probe_config::{
@@ -2093,6 +2098,57 @@ mod tests {
                 .lines
                 .iter()
                 .any(|line| line.contains("Select a traffic row"))
+        );
+    }
+
+    #[test]
+    fn traffic_detail_titles_follow_active_protocol_view() {
+        let mut http_app = test_app();
+        apply_traffic_snapshot(
+            &mut http_app,
+            tail_snapshot_with_event(21, http_request_event(21)),
+        );
+        http_app.set_traffic_view_mode(TrafficViewMode::Http);
+        assert_eq!(http_app.traffic_preview_title(), "HTTP Exchange Detail");
+        http_app.open_traffic_detail();
+        assert_eq!(
+            http_app
+                .traffic_popup_view()
+                .expect("http detail popup should be open")
+                .title,
+            "HTTP Exchange Detail"
+        );
+
+        let mut websocket_app = test_app();
+        apply_traffic_snapshot(
+            &mut websocket_app,
+            tail_snapshot_with_event(22, websocket_handoff_event(22)),
+        );
+        websocket_app.set_traffic_view_mode(TrafficViewMode::WebSocket);
+        assert_eq!(
+            websocket_app.traffic_preview_title(),
+            "WebSocket Session Detail"
+        );
+        websocket_app.open_traffic_detail();
+        assert_eq!(
+            websocket_app
+                .traffic_popup_view()
+                .expect("websocket detail popup should be open")
+                .title,
+            "WebSocket Session Detail"
+        );
+
+        let mut event_app = test_app();
+        apply_traffic_snapshot(&mut event_app, tail_snapshot_with_capture_loss(23));
+        event_app.set_traffic_view_mode(TrafficViewMode::Events);
+        assert_eq!(event_app.traffic_preview_title(), "Traffic Event Detail");
+        event_app.open_traffic_detail();
+        assert_eq!(
+            event_app
+                .traffic_popup_view()
+                .expect("event detail popup should be open")
+                .title,
+            "Traffic Event Detail"
         );
     }
 
@@ -3064,6 +3120,33 @@ mod tests {
         });
     }
 
+    fn apply_traffic_snapshot(app: &mut TuiApp, snapshot: EventTailSnapshot) {
+        app.attach_agent(RuntimeAttachment::existing(PathBuf::from(
+            "/tmp/admin.sock",
+        )));
+        let request = app
+            .begin_traffic_refresh()
+            .expect("attached test app should produce a traffic selector");
+        app.apply_traffic_refresh_result(TrafficRefreshLoadResult {
+            identity: request.identity.clone(),
+            diagnostics: Ok(runtime_generation_diagnostics(1, "local", None)),
+            traffic: TrafficRefreshResult::from_request_for_test(&request.traffic, snapshot),
+        });
+    }
+
+    fn tail_snapshot_with_event(sequence: u64, event: EventEnvelope) -> EventTailSnapshot {
+        tail_snapshot(
+            sequence.saturating_sub(1),
+            sequence,
+            1,
+            vec![EventTailRecord {
+                sequence,
+                stored_at_unix_ns: sequence,
+                event: EventTailEvent::from_envelope(&event),
+            }],
+        )
+    }
+
     fn tail_snapshot_with_capture_loss(sequence: u64) -> EventTailSnapshot {
         let event = probe_core::EventEnvelope::from_provider(
             probe_core::Timestamp {
@@ -3087,6 +3170,93 @@ mod tests {
                 event: EventTailEvent::from_envelope(&event),
             }],
         )
+    }
+
+    fn http_request_event(sequence: u64) -> EventEnvelope {
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: sequence,
+                wall_time_unix_ns: i64::try_from(sequence).expect("test sequence fits i64"),
+            },
+            test_flow(sequence),
+            CaptureOrigin::from_source(CaptureSource::Replay),
+            "test",
+            EventKind::HttpRequestHeaders(HttpHeaders {
+                direction: Direction::Outbound,
+                stream_sequence: 1,
+                method: Some("GET".to_string()),
+                target: Some("/api/tasks".to_string()),
+                status: None,
+                reason: None,
+                version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+            }),
+        )
+    }
+
+    fn websocket_handoff_event(sequence: u64) -> EventEnvelope {
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: sequence,
+                wall_time_unix_ns: i64::try_from(sequence).expect("test sequence fits i64"),
+            },
+            test_flow(sequence),
+            CaptureOrigin::from_source(CaptureSource::Replay),
+            "test",
+            EventKind::WebSocketHandoff(WebSocketHandoff {
+                direction: Direction::Outbound,
+                stream_sequence: 1,
+                target: Some("/ws".to_string()),
+                subprotocol: Some("chat".to_string()),
+                extensions: Vec::new(),
+            }),
+        )
+    }
+
+    fn test_flow(sequence: u64) -> FlowContext {
+        let process = ProcessContext {
+            identity: ProcessIdentity {
+                pid: 42,
+                tgid: 42,
+                start_time_ticks: 7,
+                boot_id: "boot".to_string(),
+                exe_path: "/usr/bin/curl".to_string(),
+                cmdline_hash: "hash".to_string(),
+                uid: 1000,
+                gid: 1000,
+                cgroup: None,
+                systemd_service: None,
+                container_id: None,
+                runtime_hint: None,
+            },
+            name: "curl".to_string(),
+            cmdline: vec!["curl".to_string()],
+        };
+        let local = AddressPort {
+            address: "127.0.0.1".to_string(),
+            port: 50_000,
+        };
+        let remote = AddressPort {
+            address: "127.0.0.1".to_string(),
+            port: 80,
+        };
+        FlowContext {
+            id: FlowIdentity::stable(
+                &process.identity,
+                &local,
+                &remote,
+                TransportProtocol::Tcp,
+                sequence,
+                None,
+            ),
+            process,
+            local,
+            remote,
+            protocol: TransportProtocol::Tcp,
+            start_monotonic_ns: sequence,
+            socket_cookie: None,
+            attribution_confidence: 100,
+        }
     }
 
     fn empty_tail_snapshot(after_sequence: u64) -> EventTailSnapshot {
