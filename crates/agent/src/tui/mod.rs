@@ -23,6 +23,7 @@ mod runtime_status;
 mod terminal;
 mod text;
 mod traffic;
+mod traffic_detail_task;
 mod wire;
 
 pub(crate) use config_edit::TuiError;

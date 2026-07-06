@@ -38,7 +38,7 @@ use super::{
         spawn_saved_runtime_reconcile, spawn_startup_runtime_reconcile,
         take_finished_runtime_reconcile, wait_for_runtime_reconcile,
     },
-    traffic::{TrafficDetailLoadResult, load_traffic_detail},
+    traffic_detail_task::TrafficDetailTaskPool,
 };
 
 const TRAFFIC_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -67,7 +67,7 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
             .unwrap_or_else(Instant::now);
         let mut last_agent_poll = Instant::now();
         let mut config_saves = ConfigSaveState::default();
-        let mut pending_traffic_detail: Option<PendingTrafficDetail> = None;
+        let mut traffic_detail_tasks = TrafficDetailTaskPool::default();
         let mut pending_traffic_refresh: Option<PendingTrafficRefresh> = None;
 
         loop {
@@ -98,12 +98,10 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
                     ));
                 }
             }
-            if let Some(result) = take_finished_traffic_detail(&mut pending_traffic_detail).await
-                && let Some(TuiEffect::LoadTrafficDetail { sequence }) =
-                    app.apply_traffic_detail_result(result)
-            {
-                start_traffic_detail_load(&mut app, &mut pending_traffic_detail, sequence);
+            for result in traffic_detail_tasks.drain_finished().await {
+                app.apply_traffic_detail_result(result);
             }
+            traffic_detail_tasks.fill(&mut app, None);
             if let Some(result) = take_finished_traffic_refresh(&mut pending_traffic_refresh).await
             {
                 match result {
@@ -206,14 +204,12 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
                     }
                     TuiEffect::ReloadRuntimeActions => reload_runtime_actions(&mut app).await,
                     TuiEffect::LoadTrafficDetail { sequence } => {
-                        start_traffic_detail_load(&mut app, &mut pending_traffic_detail, sequence)
+                        traffic_detail_tasks.fill(&mut app, Some(sequence));
                     }
                 }
             }
         }
-        if let Some(pending) = pending_traffic_detail {
-            pending.task.abort();
-        }
+        traffic_detail_tasks.abort_all();
         if let Some(pending) = pending_traffic_refresh {
             pending.task.abort();
         }
@@ -227,30 +223,6 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
         supervisor.stop().await;
     }
     result
-}
-
-fn start_traffic_detail_load(
-    app: &mut TuiApp,
-    pending_traffic_detail: &mut Option<PendingTrafficDetail>,
-    sequence: u64,
-) {
-    let Some(request) = app.begin_traffic_detail_load(sequence) else {
-        return;
-    };
-    if let Some(pending) = pending_traffic_detail.take() {
-        pending.task.abort();
-    }
-    *pending_traffic_detail = Some(PendingTrafficDetail {
-        sequence: request.sequence,
-        request_id: request.request_id,
-        task: tokio::spawn(load_traffic_detail(request)),
-    });
-}
-
-struct PendingTrafficDetail {
-    sequence: u64,
-    request_id: u64,
-    task: tokio::task::JoinHandle<TrafficDetailLoadResult>,
 }
 
 struct PendingTrafficRefresh {
@@ -431,26 +403,6 @@ fn spawn_queued_runtime_reconcile(
 ) -> PendingRuntimeReconcile {
     let active_socket_path = app.active_admin_socket_path().map(PathBuf::from);
     spawn_saved_runtime_reconcile(supervisor, queued, active_socket_path)
-}
-
-async fn take_finished_traffic_detail(
-    pending: &mut Option<PendingTrafficDetail>,
-) -> Option<TrafficDetailLoadResult> {
-    if !pending
-        .as_ref()
-        .is_some_and(|pending| pending.task.is_finished())
-    {
-        return None;
-    }
-    let pending = pending.take().expect("pending detail task was checked");
-    match pending.task.await {
-        Ok(result) => Some(result),
-        Err(error) => Some(TrafficDetailLoadResult::failed(
-            pending.sequence,
-            pending.request_id,
-            format!("traffic detail task failed: {error}"),
-        )),
-    }
 }
 
 async fn take_finished_traffic_refresh(
@@ -1058,31 +1010,6 @@ mod tests {
 
         assert_eq!(resolve_config_path(Some(explicit.clone())), explicit);
         assert_eq!(resolve_config_path(None), default_config_path());
-    }
-
-    #[tokio::test]
-    async fn finished_traffic_detail_task_is_reaped_without_blocking() {
-        let mut pending = Some(PendingTrafficDetail {
-            sequence: 7,
-            request_id: 11,
-            task: tokio::spawn(async { TrafficDetailLoadResult::failed(7, 11, "detail failed") }),
-        });
-        for _ in 0..10 {
-            if pending
-                .as_ref()
-                .is_some_and(|pending| pending.task.is_finished())
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-
-        let result = take_finished_traffic_detail(&mut pending)
-            .await
-            .expect("finished task should be reaped");
-
-        assert_eq!(result.sequence, 7);
-        assert!(pending.is_none());
     }
 
     #[tokio::test]

@@ -722,6 +722,10 @@ impl TrafficState {
         self.mark_detail_error(sequence, message.into());
     }
 
+    pub(crate) fn is_detail_loading_request(&self, sequence: u64, request_id: u64) -> bool {
+        self.detail_state.is_loading_request(sequence, request_id)
+    }
+
     pub(crate) fn apply_detail_load_result(&mut self, result: TrafficDetailLoadResult) -> bool {
         if !self
             .detail_state
@@ -729,7 +733,7 @@ impl TrafficState {
         {
             return false;
         }
-        self.detail_state.clear_loading();
+        self.detail_state.complete_loading(result.sequence);
         match result.result {
             Ok(detail) => self.apply_detail(detail),
             Err(message) => self.mark_detail_error(result.sequence, message),
@@ -1384,7 +1388,7 @@ impl DetailLoadLabels {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct TrafficDetailState {
-    loading: Option<TrafficDetailLoading>,
+    loading: BTreeMap<u64, u64>,
     loaded: BTreeMap<u64, TrafficRow>,
     failures: BTreeMap<u64, String>,
 }
@@ -1392,30 +1396,21 @@ struct TrafficDetailState {
 impl TrafficDetailState {
     fn mark_loading(&mut self, sequence: u64, request_id: u64) {
         self.failures.remove(&sequence);
-        self.loading = Some(TrafficDetailLoading {
-            sequence,
-            request_id,
-        });
+        self.loading.insert(sequence, request_id);
     }
 
     fn is_loading_request(&self, sequence: u64, request_id: u64) -> bool {
-        matches!(
-            self.loading,
-            Some(TrafficDetailLoading {
-                sequence: loading_sequence,
-                request_id: loading_request_id,
-            }) if loading_sequence == sequence && loading_request_id == request_id
-        )
+        self.loading
+            .get(&sequence)
+            .is_some_and(|loading_request_id| *loading_request_id == request_id)
     }
 
     fn is_loading(&self, sequence: u64) -> bool {
-        self.loading
-            .as_ref()
-            .is_some_and(|loading| loading.sequence == sequence)
+        self.loading.contains_key(&sequence)
     }
 
-    fn clear_loading(&mut self) {
-        self.loading = None;
+    fn complete_loading(&mut self, sequence: u64) {
+        self.loading.remove(&sequence);
     }
 
     fn insert_loaded(&mut self, row: TrafficRow) {
@@ -1446,16 +1441,10 @@ impl TrafficDetailState {
     }
 
     fn clear(&mut self) {
-        self.loading = None;
+        self.loading.clear();
         self.loaded.clear();
         self.failures.clear();
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TrafficDetailLoading {
-    sequence: u64,
-    request_id: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1692,6 +1681,51 @@ mod tests {
 
         assert!(!detail_error.chars().any(char::is_control));
         assert!(detail_error.chars().count() <= INLINE_TEXT_MAX_CHARS + "Reason: ".len());
+    }
+
+    #[test]
+    fn traffic_detail_state_tracks_multiple_loading_requests_independently() {
+        let mut traffic = TrafficState::default();
+        traffic.mark_detail_loading(2, 11);
+        traffic.mark_detail_loading(3, 12);
+
+        assert!(
+            !traffic.apply_detail_load_result(TrafficDetailLoadResult::failed(
+                2,
+                99,
+                "stale request",
+            ))
+        );
+        assert!(traffic.detail_state.is_loading(2));
+        assert!(traffic.detail_state.is_loading(3));
+
+        assert!(
+            traffic.apply_detail_load_result(TrafficDetailLoadResult::failed(
+                2,
+                11,
+                "detail failed",
+            ))
+        );
+        assert!(!traffic.detail_state.is_loading(2));
+        assert!(traffic.detail_state.is_loading(3));
+
+        assert!(
+            traffic.apply_detail_load_result(TrafficDetailLoadResult {
+                sequence: 3,
+                request_id: 12,
+                result: Ok(EventDetailSnapshot {
+                    sequence: 3,
+                    stored_at_unix_ns: 3,
+                    payload_schema: SpoolPayloadSchema::EventEnvelopeSubjectOriginJson
+                        .as_str()
+                        .to_string(),
+                    payload_bytes: 128,
+                    event: body_event(b"ok"),
+                }),
+            })
+        );
+        assert!(!traffic.detail_state.is_loading(3));
+        assert!(traffic.detail_state.loaded(3).is_some());
     }
 
     #[test]

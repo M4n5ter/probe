@@ -1044,12 +1044,9 @@ impl TuiApp {
         })
     }
 
-    pub(crate) fn apply_traffic_detail_result(
-        &mut self,
-        result: TrafficDetailLoadResult,
-    ) -> Option<TuiEffect> {
+    pub(crate) fn apply_traffic_detail_result(&mut self, result: TrafficDetailLoadResult) -> bool {
         if !self.traffic.apply_detail_load_result(result) {
-            return None;
+            return false;
         }
         match self.traffic.status().kind {
             super::traffic::TrafficStatusKind::Error
@@ -1060,19 +1057,28 @@ impl TuiApp {
                 self.status = StatusMessage::info(self.traffic.status().text.clone());
             }
         }
-        self.next_open_traffic_detail_load()
+        true
     }
 
-    fn next_open_traffic_detail_load(&self) -> Option<TuiEffect> {
+    pub(crate) fn begin_next_open_traffic_detail_load(
+        &mut self,
+    ) -> Option<TrafficDetailLoadRequest> {
+        let sequence = self.next_open_traffic_detail_sequence()?;
+        self.begin_traffic_detail_load(sequence)
+    }
+
+    pub(crate) fn is_current_traffic_detail_request(&self, sequence: u64, request_id: u64) -> bool {
+        self.traffic.is_detail_loading_request(sequence, request_id)
+    }
+
+    fn next_open_traffic_detail_sequence(&self) -> Option<u64> {
         if !matches!(
             self.traffic_popup.map(|popup| popup.kind),
             Some(TrafficPopup::RowDetail)
         ) {
             return None;
         }
-        self.traffic
-            .selected_detail_auto_fetch_sequence()
-            .map(|sequence| TuiEffect::LoadTrafficDetail { sequence })
+        self.traffic.selected_detail_auto_fetch_sequence()
     }
 
     fn next_traffic_detail_request_id(&mut self) -> u64 {
