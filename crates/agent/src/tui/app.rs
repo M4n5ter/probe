@@ -560,13 +560,13 @@ impl TuiApp {
         self.status = StatusMessage::info(status);
     }
 
-    pub(crate) fn mark_runtime_starting(&mut self, status: impl Into<String>) {
+    pub(crate) fn mark_runtime_starting_with_status(&mut self, status: StatusMessage) {
         self.runtime_attachment = RuntimeAttachment::starting();
         self.runtime_generation_identity = None;
         self.runtime_generation_reload_pending = None;
         self.invalidate_runtime_reads();
         self.refresh_local_runtime_diagnostics();
-        self.status = StatusMessage::info(status);
+        self.status = status;
     }
 
     pub(crate) fn detach_agent(&mut self, message: impl Into<String>) {
@@ -600,9 +600,9 @@ impl TuiApp {
         self.status = status;
     }
 
-    pub(crate) fn mark_traffic_refresh_waiting_for_runtime(&mut self, message: impl Into<String>) {
-        self.traffic.mark_refresh_waiting(message);
-        self.status = StatusMessage::info(self.traffic.status().text.clone());
+    pub(crate) fn mark_traffic_refresh_waiting_for_runtime(&mut self, status: StatusMessage) {
+        self.traffic.mark_refresh_waiting(status.text.clone());
+        self.status = status;
     }
 
     pub(crate) fn note_runtime_config_reloaded(&mut self) {
@@ -882,7 +882,7 @@ impl TuiApp {
                     "Waiting for TUI agent admin socket; {}",
                     self.runtime_agent_status()
                 );
-                self.mark_traffic_refresh_waiting_for_runtime(message);
+                self.mark_traffic_refresh_waiting_for_runtime(StatusMessage::info(message));
             } else {
                 let message = format!(
                     "No active agent admin socket is attached; {}",
@@ -3286,7 +3286,7 @@ mod tests {
             config,
             ProcessCatalog::default(),
         );
-        app.mark_runtime_starting("Starting TUI agent");
+        app.mark_runtime_starting_with_status(StatusMessage::info("Starting TUI agent"));
 
         let request = app.begin_traffic_refresh();
 

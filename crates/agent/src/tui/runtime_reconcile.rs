@@ -26,6 +26,7 @@ pub(super) struct PendingRuntimeReconcile {
     task: tokio::task::JoinHandle<RuntimeReconcileResult>,
     origin: RuntimeReconcileOrigin,
     cancellation: CancellationToken,
+    traffic_wait_status: Option<StatusMessage>,
 }
 
 impl PendingRuntimeReconcile {
@@ -36,8 +37,8 @@ impl PendingRuntimeReconcile {
         )
     }
 
-    pub(super) fn blocks_initial_traffic_refresh(&self) -> bool {
-        matches!(self.origin, RuntimeReconcileOrigin::Startup)
+    pub(super) fn traffic_wait_status(&self) -> Option<&StatusMessage> {
+        self.traffic_wait_status.as_ref()
     }
 }
 
@@ -82,6 +83,7 @@ enum RuntimeReconcileCompletion {
     SavedUnavailable {
         saved_status: StatusMessage,
         message: String,
+        log_path: Option<PathBuf>,
     },
     SavedManagedRestartFailed {
         saved_status: StatusMessage,
@@ -132,7 +134,10 @@ impl RuntimeApplyEffect {
     }
 }
 
-pub(super) fn spawn_startup_runtime_reconcile(config: AgentConfig) -> PendingRuntimeReconcile {
+pub(super) fn spawn_startup_runtime_reconcile(
+    config: AgentConfig,
+    traffic_wait_status: StatusMessage,
+) -> PendingRuntimeReconcile {
     let cancellation = CancellationToken::new();
     let task_cancellation = cancellation.clone();
     PendingRuntimeReconcile {
@@ -141,6 +146,7 @@ pub(super) fn spawn_startup_runtime_reconcile(config: AgentConfig) -> PendingRun
         ),
         origin: RuntimeReconcileOrigin::Startup,
         cancellation,
+        traffic_wait_status: Some(traffic_wait_status),
     }
 }
 
@@ -148,6 +154,7 @@ pub(super) fn spawn_agent_management_runtime_reconcile(
     supervisor: &mut Option<TuiAgentSupervisor>,
     config: AgentConfig,
     status: StatusMessage,
+    traffic_wait_status: StatusMessage,
 ) -> PendingRuntimeReconcile {
     let running = supervisor.take();
     let cancellation = CancellationToken::new();
@@ -159,6 +166,7 @@ pub(super) fn spawn_agent_management_runtime_reconcile(
         }),
         origin: RuntimeReconcileOrigin::AgentManagement(origin_status),
         cancellation,
+        traffic_wait_status: Some(traffic_wait_status),
     }
 }
 
@@ -261,6 +269,9 @@ pub(super) fn spawn_saved_runtime_reconcile(
     active_socket_path: Option<PathBuf>,
 ) -> PendingRuntimeReconcile {
     let origin = RuntimeReconcileOrigin::Saved(queued.saved_status.clone());
+    let traffic_wait_status = active_socket_path
+        .is_none()
+        .then(|| saved_runtime_starting_status(&queued.saved_status));
     let running = supervisor.take();
     let cancellation = CancellationToken::new();
     let task_cancellation = cancellation.clone();
@@ -270,6 +281,7 @@ pub(super) fn spawn_saved_runtime_reconcile(
         }),
         origin,
         cancellation,
+        traffic_wait_status,
     }
 }
 
@@ -368,6 +380,7 @@ async fn saved_runtime_reconcile(
                 completion: RuntimeReconcileCompletion::SavedUnavailable {
                     saved_status,
                     message: error.to_string(),
+                    log_path: error.managed_agent_log_path().map(Path::to_path_buf),
                 },
             },
         },
@@ -512,6 +525,7 @@ pub(super) fn completed_runtime_reconcile_for_test(
     completed_runtime_reconcile_for_test_with_context(
         message,
         RuntimeReconcileOrigin::Saved(StatusMessage::saved("Saved config")),
+        None,
     )
 }
 
@@ -519,13 +533,29 @@ pub(super) fn completed_runtime_reconcile_for_test(
 pub(super) fn completed_startup_runtime_reconcile_for_test(
     message: &'static str,
 ) -> PendingRuntimeReconcile {
-    completed_runtime_reconcile_for_test_with_context(message, RuntimeReconcileOrigin::Startup)
+    completed_runtime_reconcile_for_test_with_context(
+        message,
+        RuntimeReconcileOrigin::Startup,
+        Some(StatusMessage::info(message)),
+    )
+}
+
+#[cfg(test)]
+pub(super) fn completed_blocking_saved_runtime_reconcile_for_test(
+    message: &'static str,
+) -> PendingRuntimeReconcile {
+    completed_runtime_reconcile_for_test_with_context(
+        message,
+        RuntimeReconcileOrigin::Saved(StatusMessage::saved("Saved config")),
+        Some(StatusMessage::saved("Saved config")),
+    )
 }
 
 #[cfg(test)]
 fn completed_runtime_reconcile_for_test_with_context(
     message: &'static str,
     origin: RuntimeReconcileOrigin,
+    traffic_wait_status: Option<StatusMessage>,
 ) -> PendingRuntimeReconcile {
     PendingRuntimeReconcile {
         task: tokio::spawn(async move {
@@ -539,6 +569,7 @@ fn completed_runtime_reconcile_for_test_with_context(
         }),
         origin,
         cancellation: CancellationToken::default(),
+        traffic_wait_status,
     }
 }
 
@@ -553,6 +584,7 @@ impl RuntimeReconcileOrigin {
             Self::Saved(saved_status) => RuntimeReconcileCompletion::SavedUnavailable {
                 saved_status,
                 message,
+                log_path: None,
             },
             Self::AgentManagement(status) => {
                 RuntimeReconcileCompletion::AgentUnavailable { status, message }
@@ -636,11 +668,13 @@ pub(super) fn apply_runtime_reconcile_result(
         RuntimeReconcileCompletion::SavedUnavailable {
             saved_status,
             message,
+            log_path,
         } => {
-            mark_saved_runtime_error(
+            detach_saved_runtime_error_with_log(
                 app,
                 &saved_status,
                 format!("TUI agent is still unavailable: {message}"),
+                log_path,
             );
         }
         RuntimeReconcileCompletion::SavedManagedRestartFailed {
@@ -762,20 +796,30 @@ fn mark_saved_runtime_warning(
     app.mark_warning(saved_runtime_status_text(saved_status, suffix));
 }
 
-fn mark_saved_runtime_error(
-    app: &mut TuiApp,
-    saved_status: &StatusMessage,
-    suffix: impl AsRef<str>,
-) {
-    app.mark_error(saved_runtime_status_text(saved_status, suffix));
-}
-
 fn detach_saved_runtime_error(
     app: &mut TuiApp,
     saved_status: &StatusMessage,
     suffix: impl AsRef<str>,
 ) {
-    app.detach_agent(saved_runtime_status_text(saved_status, suffix));
+    detach_saved_runtime_error_with_log(app, saved_status, suffix, None);
+}
+
+fn detach_saved_runtime_error_with_log(
+    app: &mut TuiApp,
+    saved_status: &StatusMessage,
+    suffix: impl AsRef<str>,
+    log_path: Option<PathBuf>,
+) {
+    app.detach_agent_with_log(saved_runtime_status_text(saved_status, suffix), log_path);
+}
+
+fn saved_runtime_starting_status(saved_status: &StatusMessage) -> StatusMessage {
+    let text = saved_runtime_status_text(saved_status, "starting or attaching TUI agent");
+    match saved_status.kind {
+        StatusKind::Error => StatusMessage::error(text),
+        StatusKind::Warning => StatusMessage::warning(text),
+        StatusKind::Info | StatusKind::Saved => StatusMessage::info(text),
+    }
 }
 
 fn saved_runtime_status_text(saved_status: &StatusMessage, suffix: impl AsRef<str>) -> String {
@@ -810,7 +854,7 @@ mod tests {
 
     use super::{
         super::{
-            app::{StatusKind, StatusMessage, TuiApp},
+            app::{StatusKind, StatusMessage, TuiAction, TuiApp},
             processes::ProcessCatalog,
             runtime_attachment::RuntimeAttachment,
         },
@@ -837,29 +881,6 @@ mod tests {
                 .contains("MITM proxy executable is missing")
         );
         assert!(app.status().text.contains("restarted TUI managed agent"));
-    }
-
-    #[test]
-    fn saved_runtime_error_preserves_operation_context() {
-        let mut app = TuiApp::new(
-            PathBuf::from("/tmp/agent.toml"),
-            AgentConfig::default(),
-            ProcessCatalog::default(),
-        );
-        let status = StatusMessage::saved(
-            "Saved bidirectional MITM observation for curl; runtime bidirectional MITM expansion is pending",
-        );
-
-        mark_saved_runtime_error(
-            &mut app,
-            &status,
-            "TUI agent is still unavailable: startup failed",
-        );
-
-        assert_eq!(app.status().kind, StatusKind::Error);
-        assert!(app.status().text.contains("bidirectional MITM observation"));
-        assert!(app.status().text.contains("MITM expansion is pending"));
-        assert!(app.status().text.contains("startup failed"));
     }
 
     #[test]
@@ -927,6 +948,65 @@ mod tests {
                 .contains("MITM expansion is pending")
         );
         assert!(app.status().text.contains("restart failed"));
+    }
+
+    #[test]
+    fn saved_runtime_unavailable_detaches_starting_runtime() {
+        let mut app = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::default(),
+        );
+        let mut supervisor = None;
+        let status = StatusMessage::saved("Saved observation for backend");
+        app.mark_runtime_starting_with_status(StatusMessage::info(
+            "Saved observation for backend; starting or attaching TUI agent",
+        ));
+
+        apply_runtime_reconcile_result(
+            &mut supervisor,
+            &mut app,
+            RuntimeReconcileResult {
+                supervisor: None,
+                completion: RuntimeReconcileCompletion::SavedUnavailable {
+                    saved_status: status,
+                    message: "startup failed".to_string(),
+                    log_path: Some(PathBuf::from("/tmp/tui-agent.log")),
+                },
+            },
+        );
+
+        assert_eq!(app.status().kind, StatusKind::Error);
+        assert!(app.runtime_agent_status().contains("startup failed"));
+        assert!(!app.runtime_agent_status().contains("Starting or attaching"));
+        assert!(app.begin_traffic_refresh().is_none());
+        assert!(app.status().text.contains("TUI agent is still unavailable"));
+        assert!(
+            !app.status()
+                .text
+                .contains("Waiting for TUI agent admin socket")
+        );
+        app.handle_action(TuiAction::OpenTrafficDiagnostics);
+        let popup = app
+            .traffic_popup_view()
+            .expect("data path popup should be open");
+        assert!(
+            popup
+                .lines
+                .iter()
+                .any(|line| line == "Path: /tmp/tui-agent.log")
+        );
+    }
+
+    #[test]
+    fn saved_runtime_starting_status_preserves_failure_severity() {
+        let status = StatusMessage::error("Config save failed; applying last saved snapshot");
+
+        let wait = saved_runtime_starting_status(&status);
+
+        assert_eq!(wait.kind, StatusKind::Error);
+        assert!(wait.text.contains("Config save failed"));
+        assert!(wait.text.contains("starting or attaching TUI agent"));
     }
 
     #[test]
@@ -1141,6 +1221,7 @@ mod tests {
             task,
             origin: RuntimeReconcileOrigin::Saved(saved_status),
             cancellation: CancellationToken::default(),
+            traffic_wait_status: None,
         });
         for _ in 0..10 {
             if pending
@@ -1160,9 +1241,11 @@ mod tests {
             RuntimeReconcileCompletion::SavedUnavailable {
                 saved_status,
                 message,
+                log_path,
             } => {
                 assert_eq!(saved_status.text, "Saved selected process observation");
                 assert!(message.contains("TUI runtime task failed"));
+                assert!(log_path.is_none());
             }
             other => panic!("unexpected runtime reconcile completion: {other:?}"),
         }

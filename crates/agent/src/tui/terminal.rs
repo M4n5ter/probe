@@ -60,9 +60,13 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
     app.select_tab(options.tab);
     let mut supervisor = None;
     let mut pending_process_catalog = Some(spawn_process_catalog_load());
-    let mut pending_runtime_reconcile = Some(spawn_startup_runtime_reconcile(app.config().clone()));
+    let startup_runtime_reconcile = spawn_startup_runtime_reconcile(
+        app.config().clone(),
+        StatusMessage::info(STARTUP_BACKGROUND_STATUS),
+    );
+    apply_pending_runtime_wait_status(&mut app, &startup_runtime_reconcile);
+    let mut pending_runtime_reconcile = Some(startup_runtime_reconcile);
     let mut queued_runtime_reconcile: Option<QueuedRuntimeReconcile> = None;
-    app.mark_runtime_starting(STARTUP_BACKGROUND_STATUS);
     let result = async {
         let mut terminal = TerminalSession::enter()?;
         let mut last_traffic_refresh = Instant::now()
@@ -96,7 +100,7 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
                 if let Some(queued) = queued_runtime_reconcile.take() {
                     pending_runtime_reconcile = Some(spawn_queued_runtime_reconcile(
                         &mut supervisor,
-                        &app,
+                        &mut app,
                         queued,
                     ));
                 }
@@ -244,13 +248,12 @@ struct PendingTrafficRefresh {
 fn traffic_refresh_waiting_for_runtime(
     supervisor: &Option<TuiAgentSupervisor>,
     pending_runtime_reconcile: &Option<PendingRuntimeReconcile>,
-) -> Option<&'static str> {
-    if supervisor.is_none()
-        && pending_runtime_reconcile
+) -> Option<StatusMessage> {
+    if supervisor.is_none() {
+        pending_runtime_reconcile
             .as_ref()
-            .is_some_and(PendingRuntimeReconcile::blocks_initial_traffic_refresh)
-    {
-        Some(STARTUP_BACKGROUND_STATUS)
+            .and_then(PendingRuntimeReconcile::traffic_wait_status)
+            .cloned()
     } else {
         None
     }
@@ -383,12 +386,14 @@ fn queue_agent_management(
         app.mark_info("Agent startup or runtime apply is already in progress");
         return;
     }
-    *pending_runtime_reconcile = Some(spawn_agent_management_runtime_reconcile(
+    let pending = spawn_agent_management_runtime_reconcile(
         supervisor,
         app.config().clone(),
         StatusMessage::info("Manage agent"),
-    ));
-    app.mark_runtime_starting(STARTUP_BACKGROUND_STATUS);
+        StatusMessage::info(STARTUP_BACKGROUND_STATUS),
+    );
+    apply_pending_runtime_wait_status(app, &pending);
+    *pending_runtime_reconcile = Some(pending);
 }
 
 fn queue_saved_runtime_reconcile(
@@ -428,8 +433,12 @@ fn queue_runtime_reconcile_for_config(
         );
         return;
     }
-    *pending_runtime_reconcile = Some(spawn_queued_runtime_reconcile(supervisor, app, queued));
-    mark_saved_runtime_success(app, &status, "applying runtime changes in background");
+    let pending = spawn_queued_runtime_reconcile(supervisor, app, queued);
+    let waits_for_runtime = pending.traffic_wait_status().is_some();
+    *pending_runtime_reconcile = Some(pending);
+    if !waits_for_runtime {
+        mark_saved_runtime_success(app, &status, "applying runtime changes in background");
+    }
 }
 
 fn runtime_reconcile_request(
@@ -446,11 +455,20 @@ fn runtime_reconcile_request(
 
 fn spawn_queued_runtime_reconcile(
     supervisor: &mut Option<TuiAgentSupervisor>,
-    app: &TuiApp,
+    app: &mut TuiApp,
     queued: QueuedRuntimeReconcile,
 ) -> PendingRuntimeReconcile {
     let active_socket_path = app.active_admin_socket_path().map(PathBuf::from);
-    spawn_saved_runtime_reconcile(supervisor, queued, active_socket_path)
+    let pending = spawn_saved_runtime_reconcile(supervisor, queued, active_socket_path);
+    apply_pending_runtime_wait_status(app, &pending);
+    pending
+}
+
+fn apply_pending_runtime_wait_status(app: &mut TuiApp, pending: &PendingRuntimeReconcile) {
+    let Some(status) = pending.traffic_wait_status().cloned() else {
+        return;
+    };
+    app.mark_runtime_starting_with_status(status);
 }
 
 async fn take_finished_traffic_refresh(
@@ -688,11 +706,12 @@ mod tests {
 
     use super::{
         super::{
-            app::{TuiAction, TuiApp, TuiTab},
+            app::{StatusKind, StatusMessage, TuiAction, TuiApp, TuiTab},
             hit::{HitArea, HitMap, HitTarget, ScrollTarget},
             processes::{ProcessCatalog, ProcessEntry},
             render::draw,
             runtime_reconcile::{
+                completed_blocking_saved_runtime_reconcile_for_test,
                 completed_runtime_reconcile_for_test, completed_startup_runtime_reconcile_for_test,
             },
             traffic::{TrafficEventFilter, TrafficStatusKind, TrafficViewMode},
@@ -1133,25 +1152,99 @@ mod tests {
     #[tokio::test]
     async fn traffic_refresh_waits_for_runtime_reconcile_before_reporting_admin_unavailable() {
         let startup_runtime_reconcile = Some(completed_startup_runtime_reconcile_for_test(
-            "startup still running",
+            STARTUP_BACKGROUND_STATUS,
         ));
-        let saved_runtime_reconcile = Some(completed_runtime_reconcile_for_test(
-            "saved runtime apply still running",
-        ));
+        let saved_runtime_reconcile_with_active_socket =
+            Some(completed_runtime_reconcile_for_test(
+                "saved runtime apply still running with active socket",
+            ));
+        let saved_runtime_reconcile_without_active_socket =
+            Some(completed_blocking_saved_runtime_reconcile_for_test(
+                "saved runtime apply still attaching",
+            ));
         let no_pending_runtime = None;
 
         assert_eq!(
             traffic_refresh_waiting_for_runtime(&None, &startup_runtime_reconcile),
-            Some(STARTUP_BACKGROUND_STATUS)
+            Some(StatusMessage::info(STARTUP_BACKGROUND_STATUS))
         );
         assert_eq!(
-            traffic_refresh_waiting_for_runtime(&None, &saved_runtime_reconcile),
+            traffic_refresh_waiting_for_runtime(&None, &saved_runtime_reconcile_with_active_socket),
             None
+        );
+        assert_eq!(
+            traffic_refresh_waiting_for_runtime(
+                &None,
+                &saved_runtime_reconcile_without_active_socket
+            ),
+            Some(StatusMessage::saved("Saved config"))
         );
         assert_eq!(
             traffic_refresh_waiting_for_runtime(&None, &no_pending_runtime),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn saved_runtime_apply_without_active_socket_marks_runtime_starting() {
+        let mut app = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::default(),
+        );
+        let mut supervisor = None;
+        let mut pending_runtime_reconcile = None;
+        let mut queued_runtime_reconcile = None;
+
+        queue_runtime_reconcile_for_config(
+            &mut supervisor,
+            &mut pending_runtime_reconcile,
+            &mut queued_runtime_reconcile,
+            &mut app,
+            AgentConfig::default(),
+            PathBuf::from("/tmp/agent.toml"),
+            StatusMessage::warning("Saved observation for backend"),
+        );
+
+        assert!(pending_runtime_reconcile.is_some());
+        assert!(queued_runtime_reconcile.is_none());
+        assert_eq!(app.status().kind, StatusKind::Warning);
+        assert!(app.status().text.contains("Saved observation for backend"));
+        assert!(
+            app.status()
+                .text
+                .contains("starting or attaching TUI agent")
+        );
+        assert!(app.runtime_agent_status().contains("Starting or attaching"));
+        cancel_pending_runtime_reconcile(pending_runtime_reconcile.take()).await;
+    }
+
+    #[tokio::test]
+    async fn queued_saved_runtime_spawn_applies_wait_state_without_active_socket() {
+        let mut app = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::default(),
+        );
+        let mut supervisor = None;
+        let queued = runtime_reconcile_request(
+            AgentConfig::default(),
+            PathBuf::from("/tmp/agent.toml"),
+            StatusMessage::error("Config save failed; applying last saved config snapshot"),
+        );
+
+        let pending = spawn_queued_runtime_reconcile(&mut supervisor, &mut app, queued);
+
+        assert!(pending.traffic_wait_status().is_some());
+        assert_eq!(app.status().kind, StatusKind::Error);
+        assert!(app.status().text.contains("Config save failed"));
+        assert!(
+            app.status()
+                .text
+                .contains("starting or attaching TUI agent")
+        );
+        assert!(app.runtime_agent_status().contains("Starting or attaching"));
+        cancel_pending_runtime_reconcile(Some(pending)).await;
     }
 
     #[tokio::test]
@@ -1162,9 +1255,9 @@ mod tests {
             ProcessCatalog::default(),
         );
         let pending_runtime_reconcile = Some(completed_startup_runtime_reconcile_for_test(
-            "startup still running",
+            STARTUP_BACKGROUND_STATUS,
         ));
-        app.mark_runtime_starting(STARTUP_BACKGROUND_STATUS);
+        app.mark_runtime_starting_with_status(StatusMessage::info(STARTUP_BACKGROUND_STATUS));
 
         let message = traffic_refresh_waiting_for_runtime(&None, &pending_runtime_reconcile)
             .expect("startup reconcile should pause traffic refresh");
