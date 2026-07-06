@@ -621,7 +621,7 @@ fn key_to_action(key: KeyEvent, editing_text: bool, active_tab: TuiTab) -> Optio
             traffic_digit_action(digit)
         }
         (KeyCode::Char('t'), _) if active_tab == TuiTab::Traffic => {
-            Some(TuiAction::FollowTrafficTail)
+            Some(TuiAction::FollowTrafficLive)
         }
         (KeyCode::Char('a'), _) if active_tab == TuiTab::Traffic => Some(TuiAction::ObserveAuto),
         (KeyCode::Char('e'), _) if active_tab == TuiTab::Traffic => Some(TuiAction::ObserveEbpf),
@@ -807,7 +807,7 @@ mod tests {
                 false,
                 TuiTab::Traffic
             ),
-            Some(TuiAction::FollowTrafficTail)
+            Some(TuiAction::FollowTrafficLive)
         );
         for (digit, action) in [
             ('1', TuiAction::SetTrafficViewMode(TrafficViewMode::Http)),

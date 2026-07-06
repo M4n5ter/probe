@@ -182,7 +182,7 @@ pub(crate) struct TrafficState {
     http_view: TrafficViewport,
     websocket_view: TrafficViewport,
     viewport_rows: usize,
-    follow_tail: bool,
+    follow_live_edge: bool,
     status: TrafficStatus,
     last_export_sequence: u64,
     detail_state: TrafficDetailState,
@@ -298,6 +298,12 @@ struct TrafficViewport {
     scroll: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrafficLiveEdge {
+    Head,
+    Tail,
+}
+
 impl TrafficViewport {
     fn selected_index(self) -> usize {
         self.selected_index
@@ -325,43 +331,69 @@ impl TrafficViewport {
         self.scroll = self.scroll.min(len.saturating_sub(1));
     }
 
-    fn select_tail(&mut self, len: usize, visible_rows: usize) {
+    fn select_live_edge(&mut self, len: usize, visible_rows: usize, edge: TrafficLiveEdge) {
         if len == 0 {
             self.reset();
             return;
         }
-        self.selected_index = len.saturating_sub(1);
-        self.scroll = Self::max_scroll(len, visible_rows);
+        match edge {
+            TrafficLiveEdge::Head => {
+                self.selected_index = 0;
+                self.scroll = 0;
+            }
+            TrafficLiveEdge::Tail => {
+                self.selected_index = len.saturating_sub(1);
+                self.scroll = Self::max_scroll(len, visible_rows);
+            }
+        }
     }
 
-    fn move_selection(&mut self, len: usize, delta: isize, visible_rows: usize) -> Option<bool> {
+    fn move_selection(
+        &mut self,
+        len: usize,
+        delta: isize,
+        visible_rows: usize,
+        edge: TrafficLiveEdge,
+    ) -> Option<bool> {
         if len == 0 {
             return None;
         }
         let raw = self.selected_index as isize + delta;
         self.selected_index = raw.clamp(0, len.saturating_sub(1) as isize) as usize;
         self.keep_selected_visible(visible_rows);
-        Some(self.selection_is_at_tail(len))
+        Some(self.selection_is_at_live_edge(len, edge))
     }
 
-    fn select_row(&mut self, len: usize, index: usize, visible_rows: usize) -> Option<bool> {
+    fn select_row(
+        &mut self,
+        len: usize,
+        index: usize,
+        visible_rows: usize,
+        edge: TrafficLiveEdge,
+    ) -> Option<bool> {
         if index >= len {
             return None;
         }
         self.selected_index = index;
         self.keep_selected_visible(visible_rows);
-        Some(self.selection_is_at_tail(len))
+        Some(self.selection_is_at_live_edge(len, edge))
     }
 
-    fn scroll_viewport(&mut self, len: usize, delta: isize, visible_rows: usize) -> Option<bool> {
+    fn scroll_viewport(
+        &mut self,
+        len: usize,
+        delta: isize,
+        visible_rows: usize,
+        edge: TrafficLiveEdge,
+    ) -> Option<bool> {
         if len == 0 {
             return None;
         }
         let max_scroll = Self::max_scroll(len, visible_rows);
         self.scroll = scroll_position(self.scroll, delta, max_scroll);
         self.clamp_selection_to_viewport(len, visible_rows);
-        if self.viewport_is_at_tail(len, visible_rows) {
-            self.selected_index = len.saturating_sub(1);
+        if self.viewport_is_at_live_edge(len, visible_rows, edge) {
+            self.select_live_edge(len, visible_rows, edge);
             Some(true)
         } else {
             Some(false)
@@ -374,20 +406,20 @@ impl TrafficViewport {
         offset: usize,
         height: usize,
         visible_rows: usize,
+        edge: TrafficLiveEdge,
     ) -> Option<bool> {
         if len == 0 {
             return None;
         }
         let max_scroll = Self::max_scroll(len, visible_rows);
         if max_scroll == 0 {
-            self.scroll = 0;
-            self.selected_index = len.saturating_sub(1);
+            self.select_live_edge(len, visible_rows, edge);
             return Some(true);
         }
         self.scroll = drag_position_to_scroll(offset, height, max_scroll);
         self.clamp_selection_to_viewport(len, visible_rows);
-        if self.viewport_is_at_tail(len, visible_rows) {
-            self.selected_index = len.saturating_sub(1);
+        if self.viewport_is_at_live_edge(len, visible_rows, edge) {
+            self.select_live_edge(len, visible_rows, edge);
             Some(true)
         } else {
             Some(false)
@@ -422,12 +454,23 @@ impl TrafficViewport {
         self.selected_index = self.selected_index.min(max_index);
     }
 
-    fn selection_is_at_tail(self, len: usize) -> bool {
-        len > 0 && self.selected_index == len.saturating_sub(1)
+    fn selection_is_at_live_edge(self, len: usize, edge: TrafficLiveEdge) -> bool {
+        match edge {
+            TrafficLiveEdge::Head => len > 0 && self.selected_index == 0,
+            TrafficLiveEdge::Tail => len > 0 && self.selected_index == len.saturating_sub(1),
+        }
     }
 
-    fn viewport_is_at_tail(self, len: usize, visible_rows: usize) -> bool {
-        self.scroll == Self::max_scroll(len, visible_rows)
+    fn viewport_is_at_live_edge(
+        self,
+        len: usize,
+        visible_rows: usize,
+        edge: TrafficLiveEdge,
+    ) -> bool {
+        match edge {
+            TrafficLiveEdge::Head => self.scroll == 0,
+            TrafficLiveEdge::Tail => self.scroll == Self::max_scroll(len, visible_rows),
+        }
     }
 
     fn max_scroll(len: usize, visible_rows: usize) -> usize {
@@ -467,7 +510,7 @@ impl Default for TrafficState {
             http_view: TrafficViewport::default(),
             websocket_view: TrafficViewport::default(),
             viewport_rows: 12,
-            follow_tail: true,
+            follow_live_edge: true,
             status: TrafficStatus::idle("Traffic view uses the running admin socket"),
             last_export_sequence: 0,
             detail_state: TrafficDetailState::default(),
@@ -738,12 +781,16 @@ impl TrafficState {
     }
 
     #[cfg(test)]
-    fn following_tail(&self) -> bool {
-        self.follow_tail
+    fn following_live_edge(&self) -> bool {
+        self.follow_live_edge
     }
 
-    pub(crate) fn tail_mode_label(&self) -> &'static str {
-        if self.follow_tail { "Live" } else { "Paused" }
+    pub(crate) fn live_mode_label(&self) -> &'static str {
+        if self.follow_live_edge {
+            "Live"
+        } else {
+            "Paused"
+        }
     }
 
     pub(crate) fn view_mode_label(&self) -> String {
@@ -752,8 +799,8 @@ impl TrafficState {
 
     pub(crate) fn set_viewport_rows(&mut self, rows: usize) {
         self.viewport_rows = rows.max(1);
-        if self.follow_tail {
-            self.sync_tail_viewports(self.viewport_rows);
+        if self.follow_live_edge {
+            self.sync_live_edge_viewports(self.viewport_rows);
         } else {
             self.clamp_viewports_to_visible_rows();
         }
@@ -976,8 +1023,8 @@ impl TrafficState {
         self.search_query = terminal_safe_inline_text(query.trim());
         self.rebuild_visible_projection();
         self.reset_viewports();
-        if self.follow_tail {
-            self.sync_tail_viewports(self.viewport_rows);
+        if self.follow_live_edge {
+            self.sync_live_edge_viewports(self.viewport_rows);
         } else {
             self.clamp_selection();
         }
@@ -1000,8 +1047,8 @@ impl TrafficState {
         self.search_query.clear();
         self.rebuild_visible_projection();
         self.reset_viewports();
-        if self.follow_tail {
-            self.sync_tail_viewports(self.viewport_rows);
+        if self.follow_live_edge {
+            self.sync_live_edge_viewports(self.viewport_rows);
         } else {
             self.clamp_selection();
         }
@@ -1022,8 +1069,8 @@ impl TrafficState {
             return;
         }
         self.view_mode = view_mode;
-        if self.follow_tail {
-            self.sync_tail_viewports(self.viewport_rows);
+        if self.follow_live_edge {
+            self.sync_live_edge_viewports(self.viewport_rows);
         } else {
             self.clamp_selection();
         }
@@ -1050,55 +1097,65 @@ impl TrafficState {
 
     pub(crate) fn move_selection(&mut self, delta: isize, visible_rows: usize) {
         let projection = self.active_projection();
-        let follow_tail =
-            self.viewport_mut(projection.mode)
-                .move_selection(projection.len, delta, visible_rows);
-        if let Some(follow_tail) = follow_tail {
-            self.set_follow_tail(follow_tail, visible_rows);
+        let follow_live_edge = self.viewport_mut(projection.mode).move_selection(
+            projection.len,
+            delta,
+            visible_rows,
+            projection.mode.live_edge(),
+        );
+        if let Some(follow_live_edge) = follow_live_edge {
+            self.set_follow_live_edge(follow_live_edge, visible_rows);
         }
     }
 
     pub(crate) fn select_row(&mut self, index: usize, visible_rows: usize) {
         let projection = self.active_projection();
-        let follow_tail =
-            self.viewport_mut(projection.mode)
-                .select_row(projection.len, index, visible_rows);
-        if let Some(follow_tail) = follow_tail {
-            self.set_follow_tail(follow_tail, visible_rows);
+        let follow_live_edge = self.viewport_mut(projection.mode).select_row(
+            projection.len,
+            index,
+            visible_rows,
+            projection.mode.live_edge(),
+        );
+        if let Some(follow_live_edge) = follow_live_edge {
+            self.set_follow_live_edge(follow_live_edge, visible_rows);
         }
     }
 
     pub(crate) fn scroll_viewport(&mut self, delta: isize, visible_rows: usize) {
         let projection = self.active_projection();
-        let follow_tail =
-            self.viewport_mut(projection.mode)
-                .scroll_viewport(projection.len, delta, visible_rows);
-        if let Some(follow_tail) = follow_tail {
-            self.set_follow_tail(follow_tail, visible_rows);
+        let follow_live_edge = self.viewport_mut(projection.mode).scroll_viewport(
+            projection.len,
+            delta,
+            visible_rows,
+            projection.mode.live_edge(),
+        );
+        if let Some(follow_live_edge) = follow_live_edge {
+            self.set_follow_live_edge(follow_live_edge, visible_rows);
         }
     }
 
     pub(crate) fn drag_scrollbar(&mut self, offset: usize, height: usize, visible_rows: usize) {
         let projection = self.active_projection();
-        let follow_tail = self.viewport_mut(projection.mode).drag_scrollbar(
+        let follow_live_edge = self.viewport_mut(projection.mode).drag_scrollbar(
             projection.len,
             offset,
             height,
             visible_rows,
+            projection.mode.live_edge(),
         );
-        if let Some(follow_tail) = follow_tail {
-            self.set_follow_tail(follow_tail, visible_rows);
+        if let Some(follow_live_edge) = follow_live_edge {
+            self.set_follow_live_edge(follow_live_edge, visible_rows);
         }
     }
 
-    pub(crate) fn jump_to_tail(&mut self, visible_rows: usize) {
+    pub(crate) fn jump_to_latest(&mut self, visible_rows: usize) {
         if self.active_row_count() == 0 {
             self.reset_viewports();
-            self.follow_tail = true;
+            self.follow_live_edge = true;
             self.status = TrafficStatus::idle("Following latest matching traffic events");
             return;
         }
-        self.sync_tail_viewports(visible_rows);
+        self.sync_live_edge_viewports(visible_rows);
         self.status = TrafficStatus::active("Following latest matching traffic events");
     }
 
@@ -1118,7 +1175,7 @@ impl TrafficState {
         self.event_view.reset();
         self.http_view.reset();
         self.websocket_view.reset();
-        self.follow_tail = true;
+        self.follow_live_edge = true;
         self.detail_state.clear();
         self.attribution_mode = EventTailAttributionMode::Strict;
         self.empty_filter_diagnostics = None;
@@ -1132,30 +1189,30 @@ impl TrafficState {
         self.attribution_mode = snapshot.attribution_mode;
         let received = snapshot.events.len();
         let has_new_rows = !snapshot.events.is_empty() || !snapshot.omissions.is_empty();
-        let selected_event_sequence = (!self.follow_tail)
+        let selected_event_sequence = (!self.follow_live_edge)
             .then(|| {
                 self.visible_rows()
                     .get(self.event_view.selected_index())
                     .map(|row| row.sequence)
             })
             .flatten();
-        let event_anchor_sequence = (!self.follow_tail)
+        let event_anchor_sequence = (!self.follow_live_edge)
             .then(|| {
                 self.visible_rows()
                     .get(self.event_view.scroll())
                     .map(|row| row.sequence)
             })
             .flatten();
-        let selected_http = (!self.follow_tail)
+        let selected_http = (!self.follow_live_edge)
             .then(|| self.http_selection_at(self.http_view.selected_index()))
             .flatten();
-        let http_anchor = (!self.follow_tail)
+        let http_anchor = (!self.follow_live_edge)
             .then(|| self.http_selection_at(self.http_view.scroll()))
             .flatten();
-        let selected_websocket = (!self.follow_tail)
+        let selected_websocket = (!self.follow_live_edge)
             .then(|| self.websocket_selection_at(self.websocket_view.selected_index()))
             .flatten();
-        let websocket_anchor = (!self.follow_tail)
+        let websocket_anchor = (!self.follow_live_edge)
             .then(|| self.websocket_selection_at(self.websocket_view.scroll()))
             .flatten();
         let status = traffic_status_for_snapshot(
@@ -1173,9 +1230,9 @@ impl TrafficState {
             self.rows.drain(0..overflow);
             self.rebuild_protocol_views();
         }
-        if self.follow_tail && has_new_rows {
-            self.sync_tail_viewports(self.viewport_rows);
-        } else if !self.follow_tail {
+        if self.follow_live_edge && has_new_rows {
+            self.sync_live_edge_viewports(self.viewport_rows);
+        } else if !self.follow_live_edge {
             self.restore_viewport_anchors(event_anchor_sequence, http_anchor, websocket_anchor);
             self.restore_event_selection(selected_event_sequence);
             self.restore_protocol_selections(selected_http, selected_websocket);
@@ -1213,19 +1270,20 @@ impl TrafficState {
         }
     }
 
-    fn set_follow_tail(&mut self, follow_tail: bool, visible_rows: usize) {
-        self.follow_tail = follow_tail;
-        if follow_tail {
-            self.sync_tail_viewports(visible_rows);
+    fn set_follow_live_edge(&mut self, follow_live_edge: bool, visible_rows: usize) {
+        self.follow_live_edge = follow_live_edge;
+        if follow_live_edge {
+            self.sync_live_edge_viewports(visible_rows);
         }
     }
 
-    fn sync_tail_viewports(&mut self, visible_rows: usize) {
+    fn sync_live_edge_viewports(&mut self, visible_rows: usize) {
         for mode in TrafficViewMode::all() {
             let len = self.projection_len(mode);
-            self.viewport_mut(mode).select_tail(len, visible_rows);
+            self.viewport_mut(mode)
+                .select_live_edge(len, visible_rows, mode.live_edge());
         }
-        self.follow_tail = true;
+        self.follow_live_edge = true;
     }
 
     fn clamp_viewports_to_visible_rows(&mut self) {
@@ -1317,15 +1375,24 @@ impl TrafficState {
             http_selection.and_then(|selection| self.http_index_for_selection(&selection));
         if let Some(index) = http_index {
             let len = self.projection_len(TrafficViewMode::Http);
-            self.http_view.select_row(len, index, self.viewport_rows);
+            self.http_view.select_row(
+                len,
+                index,
+                self.viewport_rows,
+                TrafficViewMode::Http.live_edge(),
+            );
         }
 
         let websocket_index = websocket_selection
             .and_then(|selection| self.websocket_index_for_selection(&selection));
         if let Some(index) = websocket_index {
             let len = self.projection_len(TrafficViewMode::WebSocket);
-            self.websocket_view
-                .select_row(len, index, self.viewport_rows);
+            self.websocket_view.select_row(
+                len,
+                index,
+                self.viewport_rows,
+                TrafficViewMode::WebSocket.live_edge(),
+            );
         }
     }
 
@@ -1356,7 +1423,12 @@ impl TrafficState {
             return;
         };
         let len = self.projection_len(TrafficViewMode::Events);
-        self.event_view.select_row(len, index, self.viewport_rows);
+        self.event_view.select_row(
+            len,
+            index,
+            self.viewport_rows,
+            TrafficViewMode::Events.live_edge(),
+        );
     }
 
     fn active_view(&self) -> TrafficActiveView {
@@ -1506,6 +1578,13 @@ impl TrafficViewMode {
             Self::Http => "HTTP exchanges",
             Self::WebSocket => "WebSocket sessions",
             Self::Events => "raw traffic events",
+        }
+    }
+
+    fn live_edge(self) -> TrafficLiveEdge {
+        match self {
+            Self::Http | Self::WebSocket => TrafficLiveEdge::Head,
+            Self::Events => TrafficLiveEdge::Tail,
         }
     }
 
@@ -2402,7 +2481,7 @@ mod tests {
         traffic.set_search_query("/keep".to_string());
         traffic.select_row(1, 2);
 
-        assert!(!traffic.following_tail());
+        assert!(!traffic.following_live_edge());
         assert_eq!(traffic.visible_http_exchanges()[1].target, "/keep/2");
 
         traffic.apply_snapshot(tail_snapshot_from_records(vec![(
@@ -2410,10 +2489,12 @@ mod tests {
             request_event_with_flow("keep-flow-4", 5, "GET", "/keep/4"),
         )]));
 
-        assert!(!traffic.following_tail());
+        assert!(!traffic.following_live_edge());
         assert_eq!(traffic.active_row_count(), 4);
-        assert_eq!(traffic.selected_http_exchange_index(), 1);
-        assert_eq!(traffic.visible_http_exchanges()[1].target, "/keep/2");
+        assert_eq!(
+            traffic.visible_http_exchanges()[traffic.selected_http_exchange_index()].target,
+            "/keep/2"
+        );
     }
 
     #[test]
@@ -2598,7 +2679,7 @@ mod tests {
             ..Default::default()
         };
 
-        traffic.jump_to_tail(10);
+        traffic.jump_to_latest(10);
 
         assert_eq!(traffic.scroll(), 0);
         assert_eq!(traffic.selected_index(), 0);
@@ -2616,9 +2697,9 @@ mod tests {
             1..=MAX_TRAFFIC_EVENT_ROWS as u64,
         ));
 
-        let old_session_index = 5;
+        let old_session_index = traffic.websocket_sessions().len().saturating_sub(6);
         traffic.select_row(old_session_index, 10);
-        assert!(!traffic.following_tail());
+        assert!(!traffic.following_live_edge());
         assert_eq!(traffic.websocket_sessions()[old_session_index].sequence, 6);
 
         traffic.apply_snapshot(tail_snapshot_with_websocket_handoffs(
@@ -2640,9 +2721,13 @@ mod tests {
             (25, websocket_handoff_event_with_flow("flow-d", 25, "/d")),
         ]));
 
-        assert_eq!(traffic.websocket_sessions()[0].target, "/b");
-        traffic.select_row(0, 10);
-        assert!(!traffic.following_tail());
+        let b_index = traffic
+            .websocket_sessions()
+            .iter()
+            .position(|session| session.target == "/b")
+            .expect("session /b should exist");
+        traffic.select_row(b_index, 10);
+        assert!(!traffic.following_live_edge());
 
         traffic.apply_snapshot(tail_snapshot_from_records(vec![
             (30, websocket_handoff_event_with_flow("flow-c", 30, "/c")),
@@ -2676,9 +2761,9 @@ mod tests {
         traffic.select_row(3, 3);
         assert_eq!(
             traffic.http_exchanges()[traffic.http_scroll()].target,
-            "/http/4"
+            "/http/5"
         );
-        assert!(!traffic.following_tail());
+        assert!(!traffic.following_live_edge());
 
         traffic.apply_snapshot(tail_snapshot_from_records(
             (7..=8)
@@ -2698,10 +2783,10 @@ mod tests {
 
         assert_eq!(
             traffic.http_exchanges()[traffic.http_scroll()].target,
-            "/http/4"
+            "/http/5"
         );
         assert_eq!(traffic.http_scroll(), 3);
-        assert!(!traffic.following_tail());
+        assert!(!traffic.following_live_edge());
     }
 
     #[test]
@@ -2727,9 +2812,9 @@ mod tests {
         traffic.select_row(3, 3);
         assert_eq!(
             traffic.websocket_sessions()[traffic.websocket_scroll()].target,
-            "/ws/4"
+            "/ws/5"
         );
-        assert!(!traffic.following_tail());
+        assert!(!traffic.following_live_edge());
 
         traffic.apply_snapshot(tail_snapshot_from_records(
             (7..=8)
@@ -2748,10 +2833,10 @@ mod tests {
 
         assert_eq!(
             traffic.websocket_sessions()[traffic.websocket_scroll()].target,
-            "/ws/4"
+            "/ws/5"
         );
         assert_eq!(traffic.websocket_scroll(), 3);
-        assert!(!traffic.following_tail());
+        assert!(!traffic.following_live_edge());
     }
 
     #[test]
@@ -2767,9 +2852,13 @@ mod tests {
             ),
         ]));
 
-        assert_eq!(traffic.http_exchanges()[0].target, "/long");
-        traffic.select_row(0, 10);
-        assert!(!traffic.following_tail());
+        let long_index = traffic
+            .http_exchanges()
+            .iter()
+            .position(|exchange| exchange.target == "/long")
+            .expect("long exchange should exist");
+        traffic.select_row(long_index, 10);
+        assert!(!traffic.following_live_edge());
 
         let long_late_sequence = MAX_TRAFFIC_EVENT_ROWS as u64 + 40;
         let other_late_sequence = MAX_TRAFFIC_EVENT_ROWS as u64 + 10;
@@ -2818,7 +2907,7 @@ mod tests {
             .expect("orphan response exchange should exist");
 
         traffic.select_row(orphan_index, 10);
-        assert!(!traffic.following_tail());
+        assert!(!traffic.following_live_edge());
         traffic.apply_snapshot(tail_snapshot_from_records(records));
 
         let selected = traffic.selected_http_exchange_index();
@@ -2827,13 +2916,15 @@ mod tests {
     }
 
     #[test]
-    fn live_tail_applies_to_each_projection_when_switching_views() {
+    fn live_edge_applies_to_each_projection_when_switching_views() {
         let mut traffic = TrafficState::default();
         traffic.set_viewport_rows(3);
 
         traffic.apply_snapshot(tail_snapshot_with_mixed_projection_events());
 
-        assert!(traffic.following_tail());
+        assert!(traffic.following_live_edge());
+        assert_eq!(traffic.http_scroll(), 0);
+        assert_eq!(traffic.selected_http_exchange_index(), 0);
         assert_eq!(
             traffic.http_exchanges()[traffic.selected_http_exchange_index()].target,
             "/http/2"
@@ -2841,6 +2932,8 @@ mod tests {
 
         traffic.cycle_view_mode();
         assert_eq!(traffic.view_mode_label(), "WebSocket");
+        assert_eq!(traffic.websocket_scroll(), 0);
+        assert_eq!(traffic.selected_websocket_session_index(), 0);
         assert_eq!(
             traffic.websocket_sessions()[traffic.selected_websocket_session_index()].target,
             "/ws/2"
@@ -2852,7 +2945,8 @@ mod tests {
             .selected_row()
             .expect("latest event row is selected");
         assert_eq!(row.sequence, 5);
-        assert!(traffic.following_tail());
+        assert_eq!(traffic.scroll(), 2);
+        assert!(traffic.following_live_edge());
     }
 
     #[test]
@@ -2863,8 +2957,8 @@ mod tests {
         traffic.cycle_view_mode();
         assert_eq!(traffic.view_mode_label(), "WebSocket");
 
-        traffic.select_row(0, 3);
-        assert!(!traffic.following_tail());
+        traffic.select_row(1, 3);
+        assert!(!traffic.following_live_edge());
         assert_eq!(
             traffic.websocket_sessions()[traffic.selected_websocket_session_index()].target,
             "/ws/1"
@@ -2877,7 +2971,7 @@ mod tests {
         traffic.cycle_view_mode();
         assert_eq!(traffic.view_mode_label(), "WebSocket");
 
-        assert_eq!(traffic.tail_mode_label(), "Paused");
+        assert_eq!(traffic.live_mode_label(), "Paused");
         assert_eq!(
             traffic.websocket_sessions()[traffic.selected_websocket_session_index()].target,
             "/ws/1"
@@ -2885,7 +2979,7 @@ mod tests {
     }
 
     #[test]
-    fn traffic_tail_follows_new_events_by_default() {
+    fn live_edge_follows_new_events_by_default() {
         let mut traffic = traffic_in_events_view();
         traffic.set_viewport_rows(5);
 
@@ -2895,7 +2989,7 @@ mod tests {
         assert_eq!(traffic.rows()[9].sequence, 10);
         assert_eq!(traffic.selected_index(), 9);
         assert_eq!(traffic.scroll(), 5);
-        assert!(traffic.following_tail());
+        assert!(traffic.following_live_edge());
 
         traffic.apply_snapshot(tail_snapshot_with_body_events(11..=12));
 
@@ -2903,11 +2997,62 @@ mod tests {
         assert_eq!(traffic.rows()[11].sequence, 12);
         assert_eq!(traffic.selected_index(), 11);
         assert_eq!(traffic.scroll(), 7);
-        assert!(traffic.following_tail());
+        assert!(traffic.following_live_edge());
     }
 
     #[test]
-    fn traffic_scroll_pauses_tail_follow_until_user_returns_to_latest_viewport() {
+    fn protocol_scroll_to_head_resumes_live_follow_for_newest_first_rows() {
+        let mut traffic = TrafficState::default();
+        traffic.set_viewport_rows(3);
+        traffic.apply_snapshot(tail_snapshot_from_records(
+            (1..=6)
+                .map(|sequence| {
+                    (
+                        sequence,
+                        request_event_with_flow(
+                            &format!("http-live-flow-{sequence}"),
+                            sequence,
+                            "GET",
+                            &format!("/http/{sequence}"),
+                        ),
+                    )
+                })
+                .collect(),
+        ));
+
+        assert_eq!(traffic.http_scroll(), 0);
+        assert_eq!(traffic.selected_http_exchange_index(), 0);
+        assert_eq!(traffic.http_exchanges()[0].target, "/http/6");
+        assert!(traffic.following_live_edge());
+
+        traffic.scroll_viewport(2, 3);
+
+        assert_eq!(traffic.http_scroll(), 2);
+        assert_eq!(
+            traffic.http_exchanges()[traffic.selected_http_exchange_index()].target,
+            "/http/4"
+        );
+        assert!(!traffic.following_live_edge());
+
+        traffic.scroll_viewport(-10, 3);
+
+        assert_eq!(traffic.http_scroll(), 0);
+        assert_eq!(traffic.selected_http_exchange_index(), 0);
+        assert!(traffic.following_live_edge());
+
+        traffic.apply_snapshot(tail_snapshot_from_records(vec![(
+            7,
+            request_event_with_flow("http-live-flow-7", 7, "GET", "/http/7"),
+        )]));
+
+        assert_eq!(traffic.http_scroll(), 0);
+        assert_eq!(traffic.selected_http_exchange_index(), 0);
+        assert_eq!(traffic.http_exchanges()[0].target, "/http/7");
+        assert!(traffic.following_live_edge());
+    }
+
+    #[test]
+    fn traffic_scroll_pauses_live_follow_until_user_returns_to_latest_viewport() {
         let mut traffic = traffic_in_events_view();
         traffic.set_viewport_rows(5);
         traffic.apply_snapshot(tail_snapshot_with_body_events(1..=10));
@@ -2918,37 +3063,37 @@ mod tests {
         assert_eq!(traffic.selected_index(), 6);
         assert_eq!(traffic.rows()[traffic.selected_index()].sequence, 7);
         assert_eq!(traffic.rows()[traffic.scroll()].sequence, 3);
-        assert!(!traffic.following_tail());
+        assert!(!traffic.following_live_edge());
 
         traffic.apply_snapshot(tail_snapshot_with_body_events(11..=12));
 
         assert_eq!(traffic.rows()[traffic.selected_index()].sequence, 7);
         assert_eq!(traffic.rows()[traffic.scroll()].sequence, 3);
         assert_eq!(traffic.scroll(), 2);
-        assert!(!traffic.following_tail());
+        assert!(!traffic.following_live_edge());
 
         traffic.scroll_viewport(5, 5);
 
         assert_eq!(traffic.selected_index(), 11);
         assert_eq!(traffic.scroll(), 7);
-        assert!(traffic.following_tail());
+        assert!(traffic.following_live_edge());
 
         traffic.set_viewport_rows(5);
 
         assert_eq!(traffic.selected_index(), 11);
         assert_eq!(traffic.scroll(), 7);
-        assert!(traffic.following_tail());
+        assert!(traffic.following_live_edge());
 
         traffic.apply_snapshot(tail_snapshot_with_body_events(13..=14));
 
         assert_eq!(traffic.rows()[13].sequence, 14);
         assert_eq!(traffic.selected_index(), 13);
         assert_eq!(traffic.scroll(), 9);
-        assert!(traffic.following_tail());
+        assert!(traffic.following_live_edge());
     }
 
     #[test]
-    fn traffic_scrollbar_drag_to_latest_viewport_resumes_tail_follow() {
+    fn traffic_scrollbar_drag_to_latest_viewport_resumes_live_follow() {
         let mut traffic = traffic_in_events_view();
         traffic.set_viewport_rows(5);
         traffic.apply_snapshot(tail_snapshot_with_body_events(1..=10));
@@ -2958,17 +3103,17 @@ mod tests {
         assert_eq!(traffic.rows()[traffic.selected_index()].sequence, 7);
         assert_eq!(traffic.rows()[traffic.scroll()].sequence, 3);
         assert_eq!(traffic.scroll(), 2);
-        assert!(!traffic.following_tail());
+        assert!(!traffic.following_live_edge());
 
         traffic.drag_scrollbar(9, 10, 5);
 
         assert_eq!(traffic.selected_index(), 11);
         assert_eq!(traffic.scroll(), 7);
-        assert!(traffic.following_tail());
+        assert!(traffic.following_live_edge());
     }
 
     #[test]
-    fn live_tail_selects_new_omission_rows_after_viewport_returns_to_latest() {
+    fn live_follow_selects_new_omission_rows_after_viewport_returns_to_latest() {
         let mut traffic = traffic_in_events_view();
         traffic.set_viewport_rows(5);
         traffic.apply_snapshot(tail_snapshot_with_body_events(1..=10));
@@ -2976,7 +3121,7 @@ mod tests {
         traffic.scroll_viewport(-3, 5);
         traffic.apply_snapshot(tail_snapshot_with_body_events(11..=12));
         traffic.scroll_viewport(5, 5);
-        assert!(traffic.following_tail());
+        assert!(traffic.following_live_edge());
         assert_eq!(traffic.selected_index(), 11);
 
         traffic.apply_snapshot(tail_snapshot_with_response_budget_omission_at(13));
@@ -2988,22 +3133,22 @@ mod tests {
     }
 
     #[test]
-    fn traffic_jump_to_tail_resumes_live_follow_after_scroll_pause() {
+    fn traffic_jump_to_latest_resumes_live_follow_after_scroll_pause() {
         let mut traffic = traffic_in_events_view();
         traffic.set_viewport_rows(5);
         traffic.apply_snapshot(tail_snapshot_with_body_events(1..=10));
 
         traffic.scroll_viewport(-3, 5);
         traffic.apply_snapshot(tail_snapshot_with_body_events(11..=12));
-        assert_eq!(traffic.tail_mode_label(), "Paused");
-        assert!(!traffic.following_tail());
+        assert_eq!(traffic.live_mode_label(), "Paused");
+        assert!(!traffic.following_live_edge());
 
-        traffic.jump_to_tail(5);
+        traffic.jump_to_latest(5);
 
-        assert_eq!(traffic.tail_mode_label(), "Live");
+        assert_eq!(traffic.live_mode_label(), "Live");
         assert_eq!(traffic.selected_index(), 11);
         assert_eq!(traffic.scroll(), 7);
-        assert!(traffic.following_tail());
+        assert!(traffic.following_live_edge());
     }
 
     #[test]

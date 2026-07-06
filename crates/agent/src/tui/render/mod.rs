@@ -843,7 +843,7 @@ mod tests {
         assert!(output.contains("[All]"));
         assert!(output.contains("[Sec]"));
         assert!(output.contains("[Diag]"));
-        assert!(output.contains("[Tail Live]"));
+        assert!(output.contains("[Live]"));
         assert!(output.contains("[Search]"));
         assert!(output.contains("[Watch]"));
         assert!(output.contains("[Auto]"));
@@ -904,7 +904,7 @@ mod tests {
         }
         assert!(hit_exists(
             &hit_map,
-            Some(HitTarget::Control(ControlId::TrafficTailFollow)),
+            Some(HitTarget::Control(ControlId::TrafficLiveFollow)),
             100,
             24
         ));

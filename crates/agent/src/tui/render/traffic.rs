@@ -211,10 +211,10 @@ fn render_traffic_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, hits: 
             traffic.active_unfiltered_count()
         )),
         Span::raw("   "),
-        Span::styled("tail ", Style::default().fg(Color::Gray)),
+        Span::styled("live ", Style::default().fg(Color::Gray)),
         Span::raw(format!(
             "{} {}",
-            traffic.tail_mode_label(),
+            traffic.live_mode_label(),
             traffic.rows().len()
         )),
         Span::raw("   "),
@@ -290,13 +290,12 @@ fn render_traffic_action_bar(
             false,
         );
     }
-    let tail_label = format!("Tail {}", app.traffic().tail_mode_label());
     cursor.render_button(
         frame,
         hits,
-        &tail_label,
-        HitTarget::Control(ControlId::TrafficTailFollow),
-        app.is_hovered(HitTarget::Control(ControlId::TrafficTailFollow)),
+        ControlId::TrafficLiveFollow.traffic_action_label(),
+        HitTarget::Control(ControlId::TrafficLiveFollow),
+        app.is_hovered(HitTarget::Control(ControlId::TrafficLiveFollow)),
         false,
     );
     if let Some(index) = app

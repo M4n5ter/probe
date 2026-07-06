@@ -12,7 +12,7 @@ pub(crate) enum ControlId {
     OpenTrafficDiagnostics,
     TrafficView(TrafficViewMode),
     TrafficFilter(TrafficEventFilter),
-    TrafficTailFollow,
+    TrafficLiveFollow,
     ObserveAuto,
     ObserveEbpf,
     ObserveLibpcap,
@@ -50,7 +50,7 @@ impl ControlId {
             Self::OpenTrafficDiagnostics => "Show data path",
             Self::TrafficView(mode) => mode.control_label(),
             Self::TrafficFilter(filter) => filter.control_label(),
-            Self::TrafficTailFollow => "Follow latest traffic events",
+            Self::TrafficLiveFollow => "Follow latest traffic rows",
             Self::ObserveAuto => "Observe selected process with auto data path",
             Self::ObserveEbpf => "Observe selected process with eBPF",
             Self::ObserveLibpcap => "Observe selected process with libpcap",
@@ -67,7 +67,7 @@ impl ControlId {
             Self::OpenTrafficDiagnostics => "open diagnostics",
             Self::TrafficView(_) => "select view",
             Self::TrafficFilter(_) => "select filter",
-            Self::TrafficTailFollow => "jump to live",
+            Self::TrafficLiveFollow => "jump to live",
             Self::ObserveAuto | Self::ObserveEbpf | Self::ObserveLibpcap => "observe process",
             Self::SearchProcesses => "search",
             Self::ClearProcessSearch => "clear",
@@ -81,7 +81,7 @@ impl ControlId {
             Self::OpenTrafficDiagnostics => "Data Path",
             Self::TrafficView(mode) => mode.short_label(),
             Self::TrafficFilter(filter) => filter.short_label(),
-            Self::TrafficTailFollow => "Live",
+            Self::TrafficLiveFollow => "Live",
             Self::ObserveAuto => "Auto",
             Self::ObserveEbpf => "eBPF",
             Self::ObserveLibpcap => "libpcap",
@@ -97,8 +97,8 @@ impl ControlId {
             Self::OpenTrafficDiagnostics => "capture and MITM runtime diagnostics".to_string(),
             Self::TrafficView(mode) => mode.description().to_string(),
             Self::TrafficFilter(filter) => filter.description().to_string(),
-            Self::TrafficTailFollow => {
-                "jump to the newest traffic event and resume live follow".to_string()
+            Self::TrafficLiveFollow => {
+                "jump to the newest visible traffic row and resume live follow".to_string()
             }
             Self::ObserveAuto => {
                 "selected process, inbound and outbound, auto data path".to_string()

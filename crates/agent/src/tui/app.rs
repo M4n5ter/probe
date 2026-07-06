@@ -112,7 +112,7 @@ pub(crate) enum TuiAction {
     CycleTrafficEventFilter,
     SetTrafficViewMode(TrafficViewMode),
     SetTrafficEventFilter(TrafficEventFilter),
-    FollowTrafficTail,
+    FollowTrafficLive,
     ObserveAuto,
     ObserveEbpf,
     ObserveLibpcap,
@@ -650,7 +650,7 @@ impl TuiApp {
             TuiAction::SetTrafficEventFilter(event_filter) => {
                 self.set_traffic_event_filter(event_filter);
             }
-            TuiAction::FollowTrafficTail => self.follow_traffic_tail(),
+            TuiAction::FollowTrafficLive => self.follow_traffic_live(),
             TuiAction::ObserveAuto => {
                 return self.apply_process_observation(ProcessObservationMode::Auto);
             }
@@ -1229,8 +1229,8 @@ impl TuiApp {
                 self.set_traffic_event_filter(event_filter);
                 None
             }
-            ControlId::TrafficTailFollow => {
-                self.follow_traffic_tail();
+            ControlId::TrafficLiveFollow => {
+                self.follow_traffic_live();
                 None
             }
             ControlId::ObserveAuto => self.apply_process_observation(ProcessObservationMode::Auto),
@@ -1537,8 +1537,8 @@ impl TuiApp {
         self.status = StatusMessage::info(self.traffic.status().text.clone());
     }
 
-    fn follow_traffic_tail(&mut self) {
-        self.traffic.jump_to_tail(self.traffic_visible_rows);
+    fn follow_traffic_live(&mut self) {
+        self.traffic.jump_to_latest(self.traffic_visible_rows);
         self.status = StatusMessage::info(self.traffic.status().text.clone());
     }
 

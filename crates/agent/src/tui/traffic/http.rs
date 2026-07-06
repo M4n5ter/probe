@@ -1088,7 +1088,12 @@ pub(super) fn build_http_exchange_rows(rows: &[TrafficRow]) -> Vec<HttpExchangeR
         .into_values()
         .map(HttpExchangeBuilder::into_row)
         .collect::<Vec<_>>();
-    rows.sort_by_key(HttpExchangeRow::order_sequence);
+    rows.sort_by(|left, right| {
+        right
+            .order_sequence()
+            .cmp(&left.order_sequence())
+            .then_with(|| right.sequence.cmp(&left.sequence))
+    });
     rows
 }
 
@@ -2814,7 +2819,7 @@ mod tests {
     }
 
     #[test]
-    fn orders_http_exchanges_chronologically() {
+    fn orders_http_exchanges_newest_first() {
         let rows = vec![
             TrafficRow::from_event(
                 10,
@@ -2857,12 +2862,12 @@ mod tests {
                 .iter()
                 .map(|exchange| exchange.target.as_str())
                 .collect::<Vec<_>>(),
-            vec!["/early", "/late"]
+            vec!["/late", "/early"]
         );
     }
 
     #[test]
-    fn orders_http_exchanges_by_latest_activity_without_changing_identity_sequence() {
+    fn orders_http_exchanges_by_latest_activity_descending_without_changing_identity_sequence() {
         let rows = vec![
             TrafficRow::from_event(
                 10,
@@ -2921,10 +2926,10 @@ mod tests {
                 .iter()
                 .map(|exchange| exchange.target.as_str())
                 .collect::<Vec<_>>(),
-            vec!["/new", "/long"]
+            vec!["/long", "/new"]
         );
-        assert_eq!(exchanges[1].sequence, 10);
-        assert_eq!(exchanges[1].order_sequence(), 40);
+        assert_eq!(exchanges[0].sequence, 10);
+        assert_eq!(exchanges[0].order_sequence(), 40);
     }
 
     fn assert_section_order(details: &[String], sections: &[&str]) {

@@ -410,7 +410,12 @@ pub(super) fn build_websocket_session_rows(rows: &[TrafficRow]) -> Vec<WebSocket
         .into_values()
         .map(WebSocketSessionBuilder::into_row)
         .collect::<Vec<_>>();
-    rows.sort_by_key(WebSocketSessionRow::order_sequence);
+    rows.sort_by(|left, right| {
+        right
+            .order_sequence()
+            .cmp(&left.order_sequence())
+            .then_with(|| right.sequence.cmp(&left.sequence))
+    });
     rows
 }
 
@@ -556,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn orders_sessions_chronologically_by_latest_observed_sequence() {
+    fn orders_sessions_newest_first_by_latest_observed_sequence() {
         let rows = vec![
             TrafficRow::from_event(
                 1,
@@ -610,7 +615,7 @@ mod tests {
                 .iter()
                 .map(|session| session.target.as_str())
                 .collect::<Vec<_>>(),
-            vec!["/early", "/late"]
+            vec!["/late", "/early"]
         );
     }
 
