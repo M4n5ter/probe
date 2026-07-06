@@ -22,6 +22,7 @@ use super::runtime_status::{
     ActiveRuntimeGeneration, RuntimeGenerationReloadObservation, TrafficRuntimeDiagnostics,
     local_traffic_runtime_diagnostics, request_traffic_runtime_diagnostics,
 };
+use super::scrollbar::drag_position_to_scroll;
 use super::text::terminal_safe_inline_text;
 use super::traffic::{
     TrafficDetailLoadRequest, TrafficDetailLoadResult, TrafficEventFilter, TrafficRefreshRequest,
@@ -520,6 +521,8 @@ impl TuiApp {
             return self.traffic.detail_preview_lines(max_lines);
         }
         let mut lines = self.data_path_diagnostics.detail_lines();
+        lines.insert(0, format!("Traffic: {}", self.traffic.status().text));
+        lines.insert(0, format!("Agent: {}", self.runtime_agent_status()));
         lines.push("Actions: select a process, then choose Auto, eBPF, or libpcap to observe inbound and outbound traffic".to_string());
         fit_lines(lines, max_lines.max(1))
     }
@@ -825,7 +828,10 @@ impl TuiApp {
     }
 
     fn drag_scrollbar(&mut self, target: ScrollTarget, offset: usize, height: usize) {
-        if target_scrolls_traffic_events(self.active_tab, Some(target)) {
+        if target_scrolls_processes(self.active_tab, Some(target)) {
+            self.process_view
+                .drag_scrollbar(offset, height, &self.processes);
+        } else if target_scrolls_traffic_events(self.active_tab, Some(target)) {
             self.traffic
                 .drag_scrollbar(offset, height, self.traffic_visible_rows);
         }
@@ -1610,8 +1616,7 @@ impl TuiApp {
         }
         self.traffic_popup_viewport_rows = height.max(1);
         let max_scroll = self.traffic_popup_max_scroll();
-        let track = height.saturating_sub(1).max(1);
-        let scroll = offset.min(track).saturating_mul(max_scroll) / track;
+        let scroll = drag_position_to_scroll(offset, height, max_scroll);
         if let Some(popup) = &mut self.traffic_popup {
             popup.scroll = scroll;
         }

@@ -81,13 +81,18 @@ fn render_process_picker(
         table_area,
         &mut state,
     );
+    let scroll_track = super::table_scroll_track(table_area);
     super::render_vertical_scrollbar(
         frame,
-        super::table_scroll_track(table_area),
+        scroll_track,
         filtered_indices.len(),
         app.process_scroll(),
         visible_rows,
     );
+    let scroll_hit = super::table_scrollbar_hit_rect(table_area);
+    if filtered_indices.len() > visible_rows && scroll_hit.width > 0 && scroll_hit.height > 0 {
+        hits.push(HitArea::scrollbar(scroll_hit, mode.scroll_target()));
+    }
 }
 
 fn register_process_row_hits(

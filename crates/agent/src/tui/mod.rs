@@ -20,6 +20,7 @@ mod runtime_actions;
 mod runtime_attachment;
 mod runtime_reconcile;
 mod runtime_status;
+mod scrollbar;
 mod snapshot;
 mod terminal;
 mod text;

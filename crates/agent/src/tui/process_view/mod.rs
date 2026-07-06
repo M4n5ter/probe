@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use super::processes::ProcessCatalog;
+use super::{processes::ProcessCatalog, scrollbar::drag_position_to_scroll};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProcessViewState {
@@ -153,6 +153,31 @@ impl ProcessViewState {
         self.keep_selected_visible(catalog);
     }
 
+    pub(crate) fn drag_scrollbar(
+        &mut self,
+        offset: usize,
+        height: usize,
+        catalog: &ProcessCatalog,
+    ) {
+        let indices = self.filtered_indices(catalog);
+        if indices.is_empty() {
+            self.selected_index = None;
+            self.scroll = 0;
+            return;
+        }
+        let max_scroll = indices.len().saturating_sub(self.visible_rows.max(1));
+        self.scroll = drag_position_to_scroll(offset, height, max_scroll);
+        let selected_is_visible =
+            self.selected_filtered_position(catalog)
+                .is_some_and(|position| {
+                    position >= self.scroll
+                        && position < self.scroll.saturating_add(self.visible_rows.max(1))
+                });
+        if !selected_is_visible {
+            self.selected_index = indices.get(self.scroll).copied();
+        }
+    }
+
     pub(crate) fn filtered_indices(&self, catalog: &ProcessCatalog) -> Vec<usize> {
         catalog
             .entries()
@@ -228,6 +253,23 @@ mod tests {
         assert_eq!(view.selected_index(), Some(3));
         assert_eq!(view.scroll(), 2);
         assert!(view.monitors_process(Some("/app/backend")));
+    }
+
+    #[test]
+    fn dragging_scrollbar_moves_process_viewport_and_selection() {
+        let catalog = ProcessCatalog::from_entries([
+            process(1, "alpha", "/usr/bin/alpha"),
+            process(2, "beta", "/usr/bin/beta"),
+            process(3, "gamma", "/usr/bin/gamma"),
+            process(4, "backend", "/app/backend"),
+        ]);
+        let mut view = ProcessViewState::default();
+        view.set_viewport_rows(2, &catalog);
+
+        view.drag_scrollbar(3, 4, &catalog);
+
+        assert_eq!(view.scroll(), 2);
+        assert_eq!(view.selected_index(), Some(2));
     }
 
     fn process(pid: u32, name: &str, exe_path: &str) -> ProcessEntry {

@@ -56,6 +56,10 @@ pub(super) fn render_traffic(
 
     render_traffic_status(frame, status_area, app, hits);
     super::process_picker::render_traffic_process_picker(frame, process_area, app, hits);
+    if app.traffic().rows().is_empty() {
+        render_traffic_readiness(frame, right_area, app, hits);
+        return;
+    }
     render_traffic_events(frame, table_area, app, hits);
     render_traffic_detail_preview(frame, detail_area, app);
 }
@@ -455,6 +459,24 @@ fn render_traffic_events(
     render_traffic_event_rows(frame, area, app, hits);
 }
 
+fn render_traffic_readiness(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &TuiApp,
+    hits: &mut Vec<HitArea>,
+) {
+    hits.push(HitArea::scroll(area, ScrollTarget::TrafficEvents));
+    let lines = preview_lines_for_render(
+        app.traffic_preview_lines(area.height.saturating_sub(2).max(1) as usize),
+    );
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title("Traffic Readiness"))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 fn render_http_exchanges(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -714,17 +736,9 @@ fn render_traffic_table<'a>(
         spec.scroll,
         spec.visible_rows,
     );
-    if spec.total_len > spec.visible_rows && scroll_track.width > 0 && scroll_track.height > 0 {
-        let hit_width = area.width.min(3);
-        hits.push(HitArea::scrollbar(
-            Rect::new(
-                area.x.saturating_add(area.width.saturating_sub(hit_width)),
-                scroll_track.y,
-                hit_width,
-                scroll_track.height,
-            ),
-            ScrollTarget::TrafficEvents,
-        ));
+    let scroll_hit = super::table_scrollbar_hit_rect(area);
+    if spec.total_len > spec.visible_rows && scroll_hit.width > 0 && scroll_hit.height > 0 {
+        hits.push(HitArea::scrollbar(scroll_hit, ScrollTarget::TrafficEvents));
     }
 }
 

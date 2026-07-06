@@ -394,10 +394,21 @@ fn table_data_row_start(area: Rect) -> u16 {
 }
 
 fn table_scroll_track(area: Rect) -> Rect {
+    let x = area.x.saturating_add(area.width.saturating_sub(1));
     Rect::new(
-        area.x,
+        x,
         table_data_row_start(area),
-        area.width,
+        area.width.min(1),
+        area.height.saturating_sub(3),
+    )
+}
+
+fn table_scrollbar_hit_rect(area: Rect) -> Rect {
+    let width = area.width.min(3);
+    Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width)),
+        table_data_row_start(area),
+        width,
         area.height.saturating_sub(3),
     )
 }
@@ -418,6 +429,8 @@ fn render_vertical_scrollbar(
         .viewport_content_length(viewport_len);
     frame.render_stateful_widget(
         Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
             .thumb_style(Style::default().fg(Color::Cyan))
             .track_style(Style::default().fg(Color::DarkGray)),
         area,
@@ -532,6 +545,55 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn render_registers_process_scrollbar_drag_targets() -> Result<(), Box<dyn std::error::Error>> {
+        let mut app = test_app_with_process_count(30);
+        let mut terminal = Terminal::new(TestBackend::new(100, 24))?;
+        let mut hit_map = HitMap::default();
+
+        app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Processes)));
+        terminal.draw(|frame| {
+            hit_map = draw(frame, &mut app);
+        })?;
+
+        assert!(scrollbar_target_exists(
+            &hit_map,
+            ScrollTarget::ProcessList,
+            100,
+            24
+        ));
+        assert_eq!(app.process_scroll(), 0);
+        app.handle_action(scrollbar_drag_to_bottom(
+            &hit_map,
+            ScrollTarget::ProcessList,
+            100,
+            24,
+        ));
+        assert!(app.process_scroll() > 0);
+
+        let mut app = test_app_with_process_count(30);
+        app.handle_action(TuiAction::Click(HitTarget::Tab(TuiTab::Traffic)));
+        terminal.draw(|frame| {
+            hit_map = draw(frame, &mut app);
+        })?;
+
+        assert!(scrollbar_target_exists(
+            &hit_map,
+            ScrollTarget::TrafficProcessList,
+            100,
+            24
+        ));
+        assert_eq!(app.process_scroll(), 0);
+        app.handle_action(scrollbar_drag_to_bottom(
+            &hit_map,
+            ScrollTarget::TrafficProcessList,
+            100,
+            24,
+        ));
+        assert!(app.process_scroll() > 0);
+        Ok(())
+    }
+
     fn hit_exists(hit_map: &HitMap, target: Option<HitTarget>, width: u16, height: u16) -> bool {
         (0..height).any(|row| (0..width).any(|column| hit_map.hit(column, row) == target))
     }
@@ -558,6 +620,28 @@ mod tests {
                     .is_some_and(|hit| hit.target == target)
             })
         })
+    }
+
+    fn scrollbar_drag_to_bottom(
+        hit_map: &HitMap,
+        target: ScrollTarget,
+        width: u16,
+        height: u16,
+    ) -> TuiAction {
+        (0..height)
+            .flat_map(|row| (0..width).map(move |column| (column, row)))
+            .filter_map(|(column, row)| {
+                hit_map
+                    .scrollbar_hit(column, row)
+                    .filter(|hit| hit.target == target)
+            })
+            .max_by_key(|hit| hit.offset)
+            .map(|hit| TuiAction::DragScrollbar {
+                target: hit.target,
+                offset: hit.offset,
+                height: hit.height,
+            })
+            .expect("scrollbar hit target should exist")
     }
 
     fn first_hit_coordinate(
@@ -850,7 +934,14 @@ mod tests {
         let table = Rect::new(10, 20, 80, 15);
 
         assert_eq!(table_data_row_start(table), 22);
-        assert_eq!(table_scroll_track(table), Rect::new(10, 22, 80, 12));
+        assert_eq!(table_scroll_track(table), Rect::new(89, 22, 1, 12));
+    }
+
+    #[test]
+    fn table_scrollbar_hit_rect_keeps_drag_tolerance() {
+        let table = Rect::new(10, 20, 80, 15);
+
+        assert_eq!(table_scrollbar_hit_rect(table), Rect::new(87, 22, 3, 12));
     }
 
     #[test]
@@ -879,7 +970,7 @@ mod tests {
             terminal
                 .backend()
                 .buffer()
-                .cell((3, 6))
+                .cell((3, 7))
                 .map(|cell| cell.style().fg),
             Some(Some(Color::Cyan))
         );
@@ -1053,6 +1144,22 @@ mod tests {
                 gid: 1000,
                 cgroup_path: Some("user.slice/user-1000.slice/app.slice/curl.scope".to_string()),
             }]),
+        )
+    }
+
+    fn test_app_with_process_count(count: u32) -> TuiApp {
+        TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::from_entries((0..count).map(|index| ProcessEntry {
+                pid: 1_000 + index,
+                name: format!("process-{index}"),
+                exe_path: Some(PathBuf::from(format!("/usr/bin/process-{index}"))),
+                argv: vec![format!("process-{index}")],
+                uid: 1000,
+                gid: 1000,
+                cgroup_path: None,
+            })),
         )
     }
 }

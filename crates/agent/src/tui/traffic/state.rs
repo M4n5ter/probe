@@ -19,6 +19,7 @@ use crate::{
             CaptureDiagnosticMessage, missing_mitm_configuration_action,
             mitm_data_path_coverage_line, mitm_visibility_lines,
         },
+        scrollbar::drag_position_to_scroll,
         text::terminal_safe_inline_text,
     },
 };
@@ -380,8 +381,7 @@ impl TrafficViewport {
             self.selected_index = len.saturating_sub(1);
             return Some(true);
         }
-        let track = height.saturating_sub(1).max(1);
-        self.scroll = offset.min(track).saturating_mul(max_scroll) / track;
+        self.scroll = drag_position_to_scroll(offset, height, max_scroll);
         self.clamp_selection_to_viewport(len, visible_rows);
         if self.viewport_is_at_tail(len, visible_rows) {
             self.selected_index = len.saturating_sub(1);
