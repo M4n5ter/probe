@@ -3,7 +3,7 @@ use capture::{
     LibsslUprobeAttachPlan, LibsslUprobeAttachPlanningReport, LibsslUprobeTargetDiscovery,
     plan_libssl_uprobes_for_processes,
 };
-use probe_core::CompiledSelector;
+use probe_core::{CancellationToken, CompiledSelector};
 
 use crate::error::AgentError;
 
@@ -37,9 +37,18 @@ impl LibsslUprobeAttachPlanner {
     }
 
     pub(super) fn plan(&self) -> Result<LibsslUprobeAttachPlanResult, AgentError> {
+        self.plan_with_cancellation(&CancellationToken::default())
+    }
+
+    pub(super) fn plan_with_cancellation(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<LibsslUprobeAttachPlanResult, AgentError> {
+        libssl_uprobe_planning_checkpoint(cancellation)?;
         match &self.source {
             LibsslUprobeAttachPlannerSource::Procfs { selector } => {
-                let report = build_libssl_uprobe_attach_planning_report(selector.as_ref())?;
+                let report =
+                    build_libssl_uprobe_attach_planning_report(selector.as_ref(), cancellation)?;
                 Ok(attach_plan_result_from_report(report))
             }
             #[cfg(test)]
@@ -86,19 +95,34 @@ impl LibsslUprobeAttachPlanBlocked {
 
 fn build_libssl_uprobe_attach_planning_report(
     selector: Option<&CompiledSelector>,
+    cancellation: &CancellationToken,
 ) -> Result<LibsslUprobeAttachPlanningReport, AgentError> {
     let attributor = ProcfsAttributor::new();
+    libssl_uprobe_planning_checkpoint(cancellation)?;
     attributor.probe()?;
-    let processes = attributor
-        .process_ids()?
-        .into_iter()
-        .filter_map(|pid| identify_attach_candidate_process(&attributor, pid).transpose())
-        .collect::<Result<Vec<_>, _>>()?;
+    libssl_uprobe_planning_checkpoint(cancellation)?;
+    let mut processes = Vec::new();
+    for pid in attributor.process_ids()? {
+        libssl_uprobe_planning_checkpoint(cancellation)?;
+        if let Some(process) = identify_attach_candidate_process(&attributor, pid)? {
+            processes.push(process);
+        }
+    }
+    libssl_uprobe_planning_checkpoint(cancellation)?;
     Ok(plan_libssl_uprobes_for_processes(
         processes,
         selector,
         &LibsslUprobeTargetDiscovery::default(),
     ))
+}
+
+fn libssl_uprobe_planning_checkpoint(cancellation: &CancellationToken) -> Result<(), AgentError> {
+    if cancellation.is_cancelled() {
+        return Err(AgentError::StartupCancelled(
+            "libssl uprobe attach planning cancelled",
+        ));
+    }
+    Ok(())
 }
 
 fn identify_attach_candidate_process(

@@ -1,15 +1,9 @@
-use std::{
-    collections::VecDeque,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-};
+use std::collections::VecDeque;
 
 use capture::{CaptureError, CapturePoll, CaptureProvider};
 use parsers::Http1ParserFactory;
 use pipeline::{CapturePipeline, PipelineHandoffDrainOutcome, PipelineRunOptions};
-use probe_core::CapabilityState;
+use probe_core::{CancellationToken, CapabilityState};
 use tempfile::tempdir;
 
 use super::fixture::{SequenceProvider, captured_bytes, demo_flow_with_ports};
@@ -71,14 +65,14 @@ fn run_provider_stops_when_shutdown_is_requested_before_poll()
     let mut parser_factory = Http1ParserFactory::default();
     let mut provider = UnreadableProvider;
     let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
-    let shutdown = Arc::new(AtomicBool::new(true));
+    let cancellation = CancellationToken::cancelled();
 
     let summary = pipeline.run_provider_with_options(
         &mut provider,
-        PipelineRunOptions::default().with_shutdown_signal(Arc::clone(&shutdown)),
+        PipelineRunOptions::default().with_cancellation_token(cancellation.clone()),
     )?;
 
-    assert!(shutdown.load(Ordering::SeqCst));
+    assert!(cancellation.is_cancelled());
     assert_eq!(summary.capture_events_read, 0);
     assert_eq!(summary.ingress_records_journaled, 0);
     assert_eq!(summary.ingress_records_processed, 0);

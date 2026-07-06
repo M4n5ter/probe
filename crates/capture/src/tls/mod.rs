@@ -32,9 +32,9 @@ pub use keylog::{
 };
 pub use plaintext::{
     LibsslResolvedFlow, LibsslUprobeFlowLookup, LibsslUprobeFlowResolver,
-    LibsslUprobePlaintextOpen, LibsslUprobePlaintextProbeConfig, LibsslUprobePlaintextProvider,
-    LibsslUprobePlaintextReconcile, LibsslUprobeReconcileTargetBucket,
-    MAX_LIBSSL_RECONCILE_TARGET_SNAPSHOTS_PER_BUCKET,
+    LibsslUprobePlaintextOpen, LibsslUprobePlaintextOpenError, LibsslUprobePlaintextProbeConfig,
+    LibsslUprobePlaintextProvider, LibsslUprobePlaintextReconcile,
+    LibsslUprobeReconcileTargetBucket, MAX_LIBSSL_RECONCILE_TARGET_SNAPSHOTS_PER_BUCKET,
 };
 pub(in crate::tls) use secret::{TLS_RANDOM_BYTES, decode_hex, hex_len, resolve_lookup};
 pub use secret::{TlsMaterialLookup, TlsRandom, TlsSecret};

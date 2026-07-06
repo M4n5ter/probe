@@ -75,6 +75,8 @@ pub(crate) enum TuiError {
         log_path: PathBuf,
         log_tail: String,
     },
+    #[error("TUI managed agent startup cancelled")]
+    ManagedAgentStartupCancelled,
 }
 
 #[derive(Debug, Clone)]

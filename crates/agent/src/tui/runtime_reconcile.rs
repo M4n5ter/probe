@@ -1,6 +1,10 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use probe_config::AgentConfig;
+use probe_core::CancellationToken;
 
 use super::{
     agent::TuiAgentSupervisor,
@@ -9,6 +13,8 @@ use super::{
     runtime_actions::request_runtime_actions_reload,
     runtime_attachment::RuntimeAttachment,
 };
+
+const QUIT_RECONCILE_DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
 
 pub(super) struct QueuedRuntimeReconcile {
     pub(super) config: AgentConfig,
@@ -19,6 +25,7 @@ pub(super) struct QueuedRuntimeReconcile {
 pub(super) struct PendingRuntimeReconcile {
     task: tokio::task::JoinHandle<RuntimeReconcileResult>,
     origin: RuntimeReconcileOrigin,
+    cancellation: CancellationToken,
 }
 
 impl PendingRuntimeReconcile {
@@ -75,6 +82,7 @@ enum RuntimeReconcileCompletion {
         saved_status: StatusMessage,
         message: String,
     },
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,14 +112,22 @@ impl RuntimeApplyEffect {
 }
 
 pub(super) fn spawn_startup_runtime_reconcile(config: AgentConfig) -> PendingRuntimeReconcile {
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
     PendingRuntimeReconcile {
-        task: tokio::spawn(async move { startup_runtime_reconcile(config).await }),
+        task: tokio::spawn(
+            async move { startup_runtime_reconcile(config, task_cancellation).await },
+        ),
         origin: RuntimeReconcileOrigin::Startup,
+        cancellation,
     }
 }
 
-async fn startup_runtime_reconcile(config: AgentConfig) -> RuntimeReconcileResult {
-    match TuiAgentSupervisor::attach_or_spawn(&config).await {
+async fn startup_runtime_reconcile(
+    config: AgentConfig,
+    cancellation: CancellationToken,
+) -> RuntimeReconcileResult {
+    match TuiAgentSupervisor::attach_or_spawn_with_cancellation(&config, cancellation).await {
         Ok(supervisor) => {
             let attachment = supervisor.attachment(&config);
             RuntimeReconcileResult {
@@ -135,11 +151,14 @@ pub(super) fn spawn_saved_runtime_reconcile(
 ) -> PendingRuntimeReconcile {
     let origin = RuntimeReconcileOrigin::Saved(queued.saved_status.clone());
     let running = supervisor.take();
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
     PendingRuntimeReconcile {
         task: tokio::spawn(async move {
-            saved_runtime_reconcile(running, queued, active_socket_path).await
+            saved_runtime_reconcile(running, queued, active_socket_path, task_cancellation).await
         }),
         origin,
+        cancellation,
     }
 }
 
@@ -147,12 +166,19 @@ async fn saved_runtime_reconcile(
     supervisor: Option<TuiAgentSupervisor>,
     queued: QueuedRuntimeReconcile,
     active_socket_path: Option<PathBuf>,
+    cancellation: CancellationToken,
 ) -> RuntimeReconcileResult {
     let QueuedRuntimeReconcile {
         config,
         config_path,
         saved_status,
     } = queued;
+    if cancellation.is_cancelled() {
+        return RuntimeReconcileResult {
+            supervisor,
+            completion: RuntimeReconcileCompletion::Cancelled,
+        };
+    }
     let plan_note = runtime_apply_plan_note(
         supervisor.as_ref(),
         active_socket_path.as_deref(),
@@ -173,26 +199,37 @@ async fn saved_runtime_reconcile(
         };
     }
     match supervisor {
-        Some(running) if running.is_managed() => match running.restart(&config).await {
-            Ok(next) => {
-                let attachment = next.attachment(&config);
-                RuntimeReconcileResult {
-                    supervisor: Some(next),
-                    completion: RuntimeReconcileCompletion::SavedRestarted {
-                        attachment,
-                        saved_status,
-                        plan_note,
-                    },
-                }
+        Some(running) if running.is_managed() => {
+            if cancellation.is_cancelled() {
+                return RuntimeReconcileResult {
+                    supervisor: Some(running),
+                    completion: RuntimeReconcileCompletion::Cancelled,
+                };
             }
-            Err(error) => RuntimeReconcileResult {
-                supervisor: None,
-                completion: RuntimeReconcileCompletion::SavedManagedRestartFailed {
-                    saved_status,
-                    message: error.to_string(),
+            match running
+                .restart_with_cancellation(&config, cancellation.clone())
+                .await
+            {
+                Ok(next) => {
+                    let attachment = next.attachment(&config);
+                    RuntimeReconcileResult {
+                        supervisor: Some(next),
+                        completion: RuntimeReconcileCompletion::SavedRestarted {
+                            attachment,
+                            saved_status,
+                            plan_note,
+                        },
+                    }
+                }
+                Err(error) => RuntimeReconcileResult {
+                    supervisor: None,
+                    completion: RuntimeReconcileCompletion::SavedManagedRestartFailed {
+                        saved_status,
+                        message: error.to_string(),
+                    },
                 },
-            },
-        },
+            }
+        }
         Some(running) => RuntimeReconcileResult {
             supervisor: Some(running),
             completion: RuntimeReconcileCompletion::SavedExternalNeedsRestart {
@@ -200,7 +237,9 @@ async fn saved_runtime_reconcile(
                 plan_note,
             },
         },
-        None => match TuiAgentSupervisor::attach_or_spawn(&config).await {
+        None => match TuiAgentSupervisor::attach_or_spawn_with_cancellation(&config, cancellation)
+            .await
+        {
             Ok(next) => {
                 let attachment = next.attachment(&config);
                 RuntimeReconcileResult {
@@ -298,8 +337,27 @@ pub(super) async fn cancel_pending_runtime_reconcile(pending: Option<PendingRunt
     let Some(pending) = pending else {
         return;
     };
-    pending.task.abort();
-    let _ = pending.task.await;
+    pending.cancellation.cancel();
+    let mut task = pending.task;
+    tokio::select! {
+        result = &mut task => {
+            stop_reconcile_supervisor(result).await;
+        }
+        _ = tokio::time::sleep(QUIT_RECONCILE_DRAIN_TIMEOUT) => {
+            task.abort();
+            if let Ok(result) = task.await {
+                stop_reconcile_supervisor(Ok(result)).await;
+            }
+        }
+    }
+}
+
+async fn stop_reconcile_supervisor(result: Result<RuntimeReconcileResult, tokio::task::JoinError>) {
+    if let Ok(result) = result
+        && let Some(supervisor) = result.supervisor
+    {
+        supervisor.stop().await;
+    }
 }
 
 #[cfg(test)]
@@ -334,6 +392,7 @@ fn completed_runtime_reconcile_for_test_with_context(
             }
         }),
         origin,
+        cancellation: CancellationToken::default(),
     }
 }
 
@@ -442,6 +501,7 @@ pub(super) fn apply_runtime_reconcile_result(
                 format!("failed to restart TUI managed agent: {message}"),
             );
         }
+        RuntimeReconcileCompletion::Cancelled => {}
     }
 }
 
@@ -776,6 +836,7 @@ mod tests {
         let mut pending = Some(PendingRuntimeReconcile {
             task,
             origin: RuntimeReconcileOrigin::Saved(saved_status),
+            cancellation: CancellationToken::default(),
         });
         for _ in 0..10 {
             if pending

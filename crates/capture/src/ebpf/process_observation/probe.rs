@@ -26,7 +26,7 @@ use ebpf_abi::{
 use ebpf_object::{
     EbpfObjectProbe, EbpfObjectProbeConfig, EbpfObjectProbeReport, EbpfPreflightedObject,
 };
-use probe_core::TcpEndpoint;
+use probe_core::{CancellationToken, TcpEndpoint};
 use thiserror::Error;
 
 use super::{
@@ -59,6 +59,8 @@ pub enum EbpfProcessObservationProbeError {
         summary: String,
         report: Box<EbpfObjectProbeReport>,
     },
+    #[error("eBPF process observation startup was cancelled")]
+    StartupCancelled,
     #[error("failed to load eBPF object with aya: {source}")]
     Load { source: EbpfError },
     #[error("eBPF object is missing program {name}")]
@@ -322,6 +324,14 @@ impl EbpfProcessObservationProbe {
     pub fn load(
         config: EbpfProcessObservationProbeConfig,
     ) -> Result<Self, EbpfProcessObservationProbeError> {
+        Self::load_with_cancellation(config, CancellationToken::default())
+    }
+
+    pub fn load_with_cancellation(
+        config: EbpfProcessObservationProbeConfig,
+        cancellation: CancellationToken,
+    ) -> Result<Self, EbpfProcessObservationProbeError> {
+        cancellation_checkpoint(&cancellation)?;
         let object = EbpfObjectProbe::preflight(&EbpfObjectProbeConfig::process_observation(
             config.object_path,
         ))
@@ -329,16 +339,19 @@ impl EbpfProcessObservationProbe {
             summary: report.summary(),
             report,
         })?;
-        Self::load_preflighted(object)
+        Self::load_preflighted(object, &cancellation)
     }
 
     fn load_preflighted(
         object: EbpfPreflightedObject,
+        cancellation: &CancellationToken,
     ) -> Result<Self, EbpfProcessObservationProbeError> {
+        cancellation_checkpoint(cancellation)?;
         let mut ebpf = Ebpf::load(object.bytes())
             .map_err(|source| EbpfProcessObservationProbeError::Load { source })?;
         let mut attached_tracepoints = Vec::new();
         for spec in EBPF_PROCESS_TRACEPOINT_SPECS {
+            cancellation_checkpoint(cancellation)?;
             if spec.role.has_optional_attach() {
                 continue;
             }
@@ -347,14 +360,20 @@ impl EbpfProcessObservationProbe {
         }
         let mut optional_tracepoint_pairs = Vec::new();
         for pair in EBPF_PROCESS_OPTIONAL_TRACEPOINT_PAIR_SPECS {
-            let report = load_and_attach_optional_tracepoint_pair(&mut ebpf, pair)?;
+            cancellation_checkpoint(cancellation)?;
+            let report = load_and_attach_optional_tracepoint_pair(&mut ebpf, pair, cancellation)?;
             attached_tracepoints.extend(report.attached_tracepoints);
             optional_tracepoint_pairs.push(report.snapshot);
         }
+        cancellation_checkpoint(cancellation)?;
         let events = open_events_ringbuf(&mut ebpf)?;
+        cancellation_checkpoint(cancellation)?;
         let allowed_socket_fds = open_socket_allow_map(&mut ebpf)?;
+        cancellation_checkpoint(cancellation)?;
         let allowed_process_tgids = open_process_allow_map(&mut ebpf)?;
+        cancellation_checkpoint(cancellation)?;
         let output_losses = open_output_loss_map(&mut ebpf)?;
+        cancellation_checkpoint(cancellation)?;
         let tracepoint_firings = open_tracepoint_firing_map(&mut ebpf)?;
         Ok(Self {
             _ebpf: ebpf,
@@ -515,12 +534,15 @@ struct OptionalTracepointPairAttachReport {
 fn load_and_attach_optional_tracepoint_pair(
     ebpf: &mut Ebpf,
     pair: EbpfProcessOptionalTracepointPairSpec,
+    cancellation: &CancellationToken,
 ) -> Result<OptionalTracepointPairAttachReport, EbpfProcessObservationProbeError> {
     let enter = pair.enter_spec();
     let exit = pair.exit_spec();
     match (tracepoint_exists(enter)?, tracepoint_exists(exit)?) {
         (true, true) => {
+            cancellation_checkpoint(cancellation)?;
             load_and_attach_tracepoint(ebpf, *enter)?;
+            cancellation_checkpoint(cancellation)?;
             load_and_attach_tracepoint(ebpf, *exit)?;
             Ok(OptionalTracepointPairAttachReport {
                 attached_tracepoints: vec![*enter, *exit],
@@ -534,6 +556,15 @@ fn load_and_attach_optional_tracepoint_pair(
         (true, false) => Err(incomplete_optional_tracepoint_pair(*enter, *exit)),
         (false, true) => Err(incomplete_optional_tracepoint_pair(*exit, *enter)),
     }
+}
+
+fn cancellation_checkpoint(
+    cancellation: &CancellationToken,
+) -> Result<(), EbpfProcessObservationProbeError> {
+    if cancellation.is_cancelled() {
+        return Err(EbpfProcessObservationProbeError::StartupCancelled);
+    }
+    Ok(())
 }
 
 fn load_and_attach_tracepoint(
@@ -907,6 +938,24 @@ mod tests {
     use probe_core::TcpEndpoint;
 
     use super::*;
+
+    #[test]
+    fn load_with_cancellation_stops_before_object_preflight_when_cancelled() {
+        let cancellation = CancellationToken::cancelled();
+
+        let error = match EbpfProcessObservationProbe::load_with_cancellation(
+            EbpfProcessObservationProbeConfig::new("/does/not/exist"),
+            cancellation,
+        ) {
+            Ok(_) => panic!("cancelled token should stop startup before object preflight"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            EbpfProcessObservationProbeError::StartupCancelled
+        ));
+    }
 
     #[test]
     fn process_observation_decodes_valid_wire_event() -> Result<(), Box<dyn std::error::Error>> {

@@ -5,7 +5,7 @@ use capture::{
     CaptureProvider, EbpfProcessObservationProbeConfig, EbpfProcessObservationProvider,
     ProcessPayloadSampleAuthorization,
 };
-use probe_core::{CompiledSelector, ProcessContext, ProcessSelector, Selector};
+use probe_core::{CancellationToken, CompiledSelector, ProcessContext, ProcessSelector, Selector};
 use runtime::RuntimePlan;
 
 use super::{
@@ -16,6 +16,7 @@ use crate::error::AgentError;
 
 pub(super) fn build_ebpf_capture_provider(
     plan: &RuntimePlan,
+    cancellation: CancellationToken,
 ) -> Result<OpenedLiveCaptureBackend, AgentError> {
     let object_path = plan
         .effective_config
@@ -29,11 +30,12 @@ pub(super) fn build_ebpf_capture_provider(
             )
         })?;
     let (deep_observe_selector, process_payload_selector) = deep_observe_selector_plan(plan)?;
-    let mut provider = EbpfProcessObservationProvider::open(
+    let mut provider = EbpfProcessObservationProvider::open_with_cancellation(
         EbpfProcessObservationProbeConfig::new(object_path),
         Box::<ProcfsTcpProcessResolver>::default(),
         deep_observe_selector.clone(),
         process_payload_selector.clone(),
+        cancellation,
     )?;
     seed_process_payload_authorizations(&mut provider, process_payload_selector.as_ref())?;
     let provider_details = Some(

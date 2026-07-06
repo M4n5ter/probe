@@ -1,22 +1,19 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use probe_core::CancellationToken;
 
-pub(crate) type ShutdownFlag = Arc<AtomicBool>;
+pub(crate) type ShutdownFlag = CancellationToken;
 
 pub(crate) fn new_flag() -> ShutdownFlag {
-    Arc::new(AtomicBool::new(false))
+    CancellationToken::new()
 }
 
 pub(crate) fn requested(flag: &ShutdownFlag) -> bool {
-    flag.load(Ordering::SeqCst)
+    flag.is_cancelled()
 }
 
 pub(crate) fn spawn_signal_task(flag: ShutdownFlag) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;
-        flag.store(true, Ordering::SeqCst);
+        flag.cancel();
     })
 }
 

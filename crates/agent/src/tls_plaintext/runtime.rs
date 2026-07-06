@@ -9,7 +9,7 @@ use capture::{
     LibsslUprobePlaintextOpen, LibsslUprobePlaintextProbeConfig, LibsslUprobePlaintextProvider,
     LibsslUprobePlaintextReconcile, LibsslUprobeReconcileTargetBucket,
 };
-use probe_core::RuntimeMode;
+use probe_core::{CancellationToken, RuntimeMode};
 use runtime::RuntimePlan;
 use serde::Serialize;
 
@@ -589,19 +589,22 @@ fn reconcile_attempt_sequence(attempt: &TlsPlaintextReconcileAttemptRuntimeSnaps
 pub(crate) fn build_tls_plaintext_instrumentation(
     plan: &RuntimePlan,
     runtime_state: Option<&TlsPlaintextRuntimeState>,
+    cancellation: CancellationToken,
 ) -> Result<TlsPlaintextInstrumentationBuild, AgentError> {
     if !plan.tls.plaintext.instrumentation.enabled {
         return Ok(TlsPlaintextInstrumentationBuild::NotConfigured);
     }
 
-    build_libssl_uprobe_plaintext_provider(plan, runtime_state)
+    build_libssl_uprobe_plaintext_provider(plan, runtime_state, cancellation)
 }
 
 fn build_libssl_uprobe_plaintext_provider(
     plan: &RuntimePlan,
     runtime_state: Option<&TlsPlaintextRuntimeState>,
+    cancellation: CancellationToken,
 ) -> Result<TlsPlaintextInstrumentationBuild, AgentError> {
     plan.require_live_capture()?;
+    tls_plaintext_startup_checkpoint(&cancellation)?;
     let object_path = plan
         .tls
         .plaintext
@@ -616,8 +619,9 @@ fn build_libssl_uprobe_plaintext_provider(
         })?;
     let attach_selector = compile_libssl_uprobe_selector(plan)?;
     let output_selector = compile_libssl_uprobe_selector(plan)?;
+    tls_plaintext_startup_checkpoint(&cancellation)?;
     let attach_planner = LibsslUprobeAttachPlanner::new(attach_selector);
-    let attach_plan = match attach_planner.plan()? {
+    let attach_plan = match attach_planner.plan_with_cancellation(&cancellation)? {
         Ok(plan) => plan,
         Err(blocked) => {
             return Ok(TlsPlaintextInstrumentationBuild::disabled(
@@ -628,10 +632,17 @@ fn build_libssl_uprobe_plaintext_provider(
 
     let attached_processes = AttachedLibsslProcessRegistry::default();
 
-    match LibsslUprobePlaintextProvider::open_best_effort(
+    tls_plaintext_startup_checkpoint(&cancellation)?;
+    match LibsslUprobePlaintextProvider::open_best_effort_with_cancellation(
         LibsslUprobePlaintextProbeConfig::new(object_path, attach_plan),
         Box::new(ProcfsLibsslFlowResolver::new(attached_processes.clone())),
-    ) {
+        cancellation,
+    )
+    .map_err(|error| match error {
+        capture::LibsslUprobePlaintextOpenError::StartupCancelled => {
+            tls_plaintext_startup_cancelled_error()
+        }
+    })? {
         LibsslUprobePlaintextOpen::Enabled(provider) => {
             let provider = *provider;
             Ok(TlsPlaintextInstrumentationBuild::enabled(
@@ -648,6 +659,17 @@ fn build_libssl_uprobe_plaintext_provider(
             Ok(TlsPlaintextInstrumentationBuild::disabled(reason))
         }
     }
+}
+
+fn tls_plaintext_startup_checkpoint(cancellation: &CancellationToken) -> Result<(), AgentError> {
+    if cancellation.is_cancelled() {
+        return Err(tls_plaintext_startup_cancelled_error());
+    }
+    Ok(())
+}
+
+fn tls_plaintext_startup_cancelled_error() -> AgentError {
+    AgentError::StartupCancelled("TLS plaintext startup cancelled")
 }
 
 fn compile_libssl_uprobe_selector(

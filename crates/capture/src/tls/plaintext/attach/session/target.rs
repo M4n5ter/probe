@@ -284,6 +284,7 @@ impl BestEffortAttachFailureKind {
             | LibsslUprobeAttachError::AttachProcess { .. } => Self::TargetStale,
             LibsslUprobeAttachError::Attach { .. } => Self::AttachFailed,
             LibsslUprobeAttachError::EmptyAttachPlan
+            | LibsslUprobeAttachError::StartupCancelled
             | LibsslUprobeAttachError::InvalidTargetPid { .. }
             | LibsslUprobeAttachError::MissingProgram { .. }
             | LibsslUprobeAttachError::Program { .. }

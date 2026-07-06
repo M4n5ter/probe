@@ -6,8 +6,8 @@ use pipeline::{
 };
 use policy::{PolicyHook, PolicyManifest, PolicyRuntime};
 use probe_core::{
-    CaptureOrigin, CaptureProviderKind, CaptureSource, Direction, EnforcementEvidence, EventKind,
-    Gap, SpoolPayloadSchema, Timestamp,
+    CancellationToken, CaptureOrigin, CaptureProviderKind, CaptureSource, Direction,
+    EnforcementEvidence, EventKind, Gap, SpoolPayloadSchema, Timestamp,
 };
 use storage::SpoolPayload;
 use tempfile::tempdir;
@@ -60,6 +60,30 @@ fn recover_ingress_journal_replays_capture_bytes() -> Result<(), Box<dyn std::er
         request_ids_for_target(&spool, "/recovered")?,
         vec![first_id]
     );
+    Ok(())
+}
+
+#[test]
+fn recover_ingress_journal_stops_when_shutdown_is_already_requested()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let spool = storage::FjallSpool::open(temp.path())?;
+    let event = captured_bytes_with_direction(
+        demo_flow_with_ports(50_000, 80, 32),
+        Direction::Outbound,
+        b"GET /shutdown-recovered HTTP/1.1\r\nHost: recovery.test\r\n\r\n",
+    );
+    spool.append_ingress(capture_event_payload(&event)?)?;
+    let cancellation = CancellationToken::cancelled();
+    let mut parser_factory = Http1ParserFactory::default();
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
+
+    let summary =
+        pipeline.recover_ingress_journal_until_idle_with_cancellation(16, &cancellation)?;
+
+    assert_eq!(summary, PipelineSummary::default());
+    assert_eq!(spool.ingress_cursor(PARSER_INGRESS_CURSOR_OWNER)?, 0);
+    assert_eq!(count_request_targets(&spool, "/shutdown-recovered")?, 0);
     Ok(())
 }
 

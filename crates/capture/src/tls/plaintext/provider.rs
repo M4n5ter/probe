@@ -4,8 +4,10 @@ use std::{
 };
 
 use probe_core::{
-    CapabilityKind, CapabilityState, CaptureSource, CompiledSelector, FlowContext, Timestamp,
+    CancellationToken, CapabilityKind, CapabilityState, CaptureSource, CompiledSelector,
+    FlowContext, Timestamp,
 };
+use thiserror::Error;
 
 use crate::output_loss::{OutputLossTracker, provider_output_loss_event};
 use crate::{
@@ -20,7 +22,8 @@ use super::{
     loss::TlsPlaintextLossTracker,
     probe::{
         LibsslUprobePlaintextProbe, LibsslUprobePlaintextProbeConfig,
-        LibsslUprobePlaintextProbeLoad, LibsslUprobePlaintextReconcile,
+        LibsslUprobePlaintextProbeError, LibsslUprobePlaintextProbeLoad,
+        LibsslUprobePlaintextReconcile,
     },
     record::LibsslUprobePlaintextSample,
 };
@@ -63,14 +66,29 @@ pub enum LibsslUprobePlaintextOpen {
     Disabled { reason: String },
 }
 
+#[derive(Debug, Error)]
+pub enum LibsslUprobePlaintextOpenError {
+    #[error("libssl uprobe plaintext startup was cancelled")]
+    StartupCancelled,
+}
+
 impl LibsslUprobePlaintextProvider {
     pub fn open(
         config: LibsslUprobePlaintextProbeConfig,
         resolver: Box<dyn LibsslUprobeFlowResolver>,
     ) -> Result<Self, CaptureError> {
-        let probe = LibsslUprobePlaintextProbe::load(config).map_err(|error| {
-            CaptureError::provider("libssl_uprobe_plaintext", error.to_string())
-        })?;
+        Self::open_with_cancellation(config, resolver, CancellationToken::default())
+    }
+
+    pub fn open_with_cancellation(
+        config: LibsslUprobePlaintextProbeConfig,
+        resolver: Box<dyn LibsslUprobeFlowResolver>,
+        cancellation: CancellationToken,
+    ) -> Result<Self, CaptureError> {
+        let probe = LibsslUprobePlaintextProbe::load_with_cancellation(config, cancellation)
+            .map_err(|error| {
+                CaptureError::provider("libssl_uprobe_plaintext", error.to_string())
+            })?;
         Ok(Self::from_live_source(Box::new(probe), resolver))
     }
 
@@ -78,18 +96,38 @@ impl LibsslUprobePlaintextProvider {
         config: LibsslUprobePlaintextProbeConfig,
         resolver: Box<dyn LibsslUprobeFlowResolver>,
     ) -> LibsslUprobePlaintextOpen {
-        match LibsslUprobePlaintextProbe::load_best_effort(config) {
-            Ok(LibsslUprobePlaintextProbeLoad::Enabled(probe)) => {
-                LibsslUprobePlaintextOpen::Enabled(Box::new(Self::from_live_source(
-                    probe, resolver,
-                )))
-            }
-            Ok(LibsslUprobePlaintextProbeLoad::Disabled { reason }) => {
-                LibsslUprobePlaintextOpen::Disabled { reason }
-            }
+        match Self::open_best_effort_with_cancellation(
+            config,
+            resolver,
+            CancellationToken::default(),
+        ) {
+            Ok(open) => open,
             Err(error) => LibsslUprobePlaintextOpen::Disabled {
                 reason: error.to_string(),
             },
+        }
+    }
+
+    pub fn open_best_effort_with_cancellation(
+        config: LibsslUprobePlaintextProbeConfig,
+        resolver: Box<dyn LibsslUprobeFlowResolver>,
+        cancellation: CancellationToken,
+    ) -> Result<LibsslUprobePlaintextOpen, LibsslUprobePlaintextOpenError> {
+        match LibsslUprobePlaintextProbe::load_best_effort_with_cancellation(config, cancellation) {
+            Ok(LibsslUprobePlaintextProbeLoad::Enabled(probe)) => {
+                Ok(LibsslUprobePlaintextOpen::Enabled(Box::new(
+                    Self::from_live_source(probe, resolver),
+                )))
+            }
+            Ok(LibsslUprobePlaintextProbeLoad::Disabled { reason }) => {
+                Ok(LibsslUprobePlaintextOpen::Disabled { reason })
+            }
+            Err(LibsslUprobePlaintextProbeError::StartupCancelled) => {
+                Err(LibsslUprobePlaintextOpenError::StartupCancelled)
+            }
+            Err(error) => Ok(LibsslUprobePlaintextOpen::Disabled {
+                reason: error.to_string(),
+            }),
         }
     }
 

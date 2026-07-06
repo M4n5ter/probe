@@ -4,7 +4,8 @@ use std::{
 };
 
 use probe_core::{
-    CapabilityKind, CapabilityState, CaptureSource, CompiledSelector, FlowContext, Timestamp,
+    CancellationToken, CapabilityKind, CapabilityState, CaptureSource, CompiledSelector,
+    FlowContext, Timestamp,
 };
 
 use crate::output_loss::OutputLossTracker;
@@ -72,7 +73,23 @@ impl EbpfProcessObservationProvider {
         deep_observe_selector: Option<CompiledSelector>,
         process_payload_selector: Option<CompiledSelector>,
     ) -> Result<Self, CaptureError> {
-        let probe = EbpfProcessObservationProbe::load(config)
+        Self::open_with_cancellation(
+            config,
+            resolver,
+            deep_observe_selector,
+            process_payload_selector,
+            CancellationToken::default(),
+        )
+    }
+
+    pub fn open_with_cancellation(
+        config: EbpfProcessObservationProbeConfig,
+        resolver: Box<dyn EbpfSocketFlowResolver>,
+        deep_observe_selector: Option<CompiledSelector>,
+        process_payload_selector: Option<CompiledSelector>,
+        cancellation: CancellationToken,
+    ) -> Result<Self, CaptureError> {
+        let probe = EbpfProcessObservationProbe::load_with_cancellation(config, cancellation)
             .map_err(|error| CaptureError::provider("ebpf", error.to_string()))?;
         let probe_snapshot = probe.probe_snapshot();
         let observations: Box<dyn EbpfObservationSource> =

@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use aya::Ebpf;
+use probe_core::CancellationToken;
 
 use super::{
     links::LibsslUprobeAttachedLinks,
@@ -46,9 +47,42 @@ impl LibsslUprobeAttachSession {
         recipes: &[LibsslUprobeAttachRecipeRequest],
         policy: AttachFailurePolicy,
     ) -> Result<LibsslUprobeAttachSummary, LibsslUprobeAttachError> {
+        self.attach_uprobes_with_startup_control(
+            ebpf,
+            recipes,
+            policy,
+            AttachStartupControl::Uncancellable,
+        )
+    }
+
+    pub(in crate::tls::plaintext) fn attach_uprobes_during_startup(
+        &mut self,
+        ebpf: &mut Ebpf,
+        recipes: &[LibsslUprobeAttachRecipeRequest],
+        policy: AttachFailurePolicy,
+        cancellation: &CancellationToken,
+    ) -> Result<LibsslUprobeAttachSummary, LibsslUprobeAttachError> {
+        self.attach_uprobes_with_startup_control(
+            ebpf,
+            recipes,
+            policy,
+            AttachStartupControl::Cancellable(cancellation),
+        )
+    }
+
+    fn attach_uprobes_with_startup_control(
+        &mut self,
+        ebpf: &mut Ebpf,
+        recipes: &[LibsslUprobeAttachRecipeRequest],
+        policy: AttachFailurePolicy,
+        startup: AttachStartupControl<'_>,
+    ) -> Result<LibsslUprobeAttachSummary, LibsslUprobeAttachError> {
+        startup.checkpoint()?;
         match policy {
-            AttachFailurePolicy::Strict => self.attach_uprobes_strict(ebpf, recipes),
-            AttachFailurePolicy::BestEffort => self.attach_uprobes_best_effort(ebpf, recipes),
+            AttachFailurePolicy::Strict => self.attach_uprobes_strict(ebpf, recipes, startup),
+            AttachFailurePolicy::BestEffort => {
+                self.attach_uprobes_best_effort(ebpf, recipes, startup)
+            }
         }
     }
 
@@ -56,9 +90,14 @@ impl LibsslUprobeAttachSession {
         &mut self,
         ebpf: &mut Ebpf,
         recipes: &[LibsslUprobeAttachRecipeRequest],
+        startup: AttachStartupControl<'_>,
     ) -> Result<LibsslUprobeAttachSummary, LibsslUprobeAttachError> {
         let mut summary = LibsslUprobeAttachSummary::from_recipes(recipes);
         for recipe in recipes {
+            if let Err(error) = startup.checkpoint() {
+                self.detach_all_best_effort(ebpf)?;
+                return Err(error);
+            }
             match attach_recipe_uprobes(ebpf, &mut self.loaded_programs, recipe) {
                 Ok(links) => {
                     let target = recipe.target_id();
@@ -78,9 +117,14 @@ impl LibsslUprobeAttachSession {
         &mut self,
         ebpf: &mut Ebpf,
         recipes: &[LibsslUprobeAttachRecipeRequest],
+        startup: AttachStartupControl<'_>,
     ) -> Result<LibsslUprobeAttachSummary, LibsslUprobeAttachError> {
         let mut summary = LibsslUprobeAttachSummary::from_recipes(recipes);
         for target_plan in BestEffortTargetPlan::from_recipes(recipes) {
+            if let Err(error) = startup.checkpoint() {
+                self.detach_all_best_effort(ebpf)?;
+                return Err(error);
+            }
             let outcome = match attach_best_effort_target_uprobes(
                 ebpf,
                 &mut self.loaded_programs,
@@ -128,6 +172,23 @@ impl LibsslUprobeAttachSession {
     ) -> Result<(), LibsslUprobeAttachError> {
         self.attached_links
             .detach_targets_best_effort(ebpf, targets)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AttachStartupControl<'a> {
+    Uncancellable,
+    Cancellable(&'a CancellationToken),
+}
+
+impl AttachStartupControl<'_> {
+    fn checkpoint(self) -> Result<(), LibsslUprobeAttachError> {
+        if let Self::Cancellable(cancellation) = self
+            && cancellation.is_cancelled()
+        {
+            return Err(LibsslUprobeAttachError::StartupCancelled);
+        }
+        Ok(())
     }
 }
 

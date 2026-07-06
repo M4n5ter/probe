@@ -1,6 +1,6 @@
 use capture::{CaptureMultiplexer, CaptureProvider, LibpcapProvider, MultiplexedProvider};
 use probe_config::{CaptureBackend, CaptureSelection};
-use probe_core::RuntimeMode;
+use probe_core::{CancellationToken, RuntimeMode};
 use runtime::{CaptureInputSource, CaptureProviderDescriptor, RuntimeError, RuntimePlan};
 
 use super::{
@@ -60,6 +60,22 @@ pub(crate) fn build_capture_provider(
     l7_mitm_runtime: &L7MitmRuntimeHandle,
     preflight: CaptureProviderPreflight,
 ) -> Result<BuiltCaptureProvider, AgentError> {
+    build_capture_provider_with_cancellation(
+        plan,
+        tls_plaintext_runtime,
+        l7_mitm_runtime,
+        preflight,
+        CancellationToken::default(),
+    )
+}
+
+pub(crate) fn build_capture_provider_with_cancellation(
+    plan: &RuntimePlan,
+    tls_plaintext_runtime: Option<&TlsPlaintextRuntimeState>,
+    l7_mitm_runtime: &L7MitmRuntimeHandle,
+    preflight: CaptureProviderPreflight,
+    cancellation: CancellationToken,
+) -> Result<BuiltCaptureProvider, AgentError> {
     match plan.capture.selected_backend {
         Some(CaptureBackend::PlaintextFeed) => Ok(BuiltCaptureProvider {
             provider: build_plaintext_feed_provider(plan)?,
@@ -117,6 +133,7 @@ pub(crate) fn build_capture_provider(
             l7_mitm_runtime,
             preflight.session_secret_auto_binding,
             preflight.mitm_plaintext_bridge,
+            cancellation,
         ),
     }
 }
@@ -127,11 +144,15 @@ fn build_live_capture_provider(
     l7_mitm_runtime: &L7MitmRuntimeHandle,
     session_secret_auto_binding: TlsSessionSecretAutoBindingBuild,
     mitm_plaintext_bridge: MitmPlaintextBridgePreflight,
+    cancellation: CancellationToken,
 ) -> Result<BuiltCaptureProvider, AgentError> {
     plan.require_live_capture()?;
-    let outcome = match try_build_live_primary_with_fallback(plan)? {
+    let outcome = match try_build_live_primary_with_fallback(plan, cancellation.clone())? {
         LiveCaptureOpenAttempt::Open(outcome) => outcome,
         LiveCaptureOpenAttempt::Failed(open_failures) => {
+            if cancellation.is_cancelled() {
+                return Err(capture_startup_cancelled_error());
+            }
             return build_mitm_capture_event_feed_provider_after_live_failures(
                 plan,
                 l7_mitm_runtime,
@@ -146,7 +167,8 @@ fn build_live_capture_provider(
         provider_details,
     } = outcome.provider;
     let primary = session_secret_auto_binding.wrap(primary);
-    let provider = with_tls_plaintext_provider(plan, primary, tls_plaintext_runtime)?;
+    let provider =
+        with_tls_plaintext_provider(plan, primary, tls_plaintext_runtime, cancellation.clone())?;
     let provider = with_mitm_plaintext_bridge_provider(
         plan,
         provider,
@@ -171,8 +193,11 @@ fn build_live_capture_provider(
 
 fn try_build_live_primary_with_fallback(
     plan: &RuntimePlan,
+    cancellation: CancellationToken,
 ) -> Result<LiveCaptureOpenAttempt<OpenedLiveCaptureBackend>, AgentError> {
-    try_open_live_backend_with_fallback(plan, |backend| build_live_capture_backend(plan, backend))
+    try_open_live_backend_with_fallback(plan, cancellation.clone(), |backend| {
+        build_live_capture_backend(plan, backend, cancellation.clone())
+    })
 }
 
 #[derive(Debug)]
@@ -193,7 +218,7 @@ fn open_live_backend_with_fallback<T>(
     plan: &RuntimePlan,
     open_backend: impl FnMut(CaptureBackend) -> Result<T, AgentError>,
 ) -> Result<LiveCaptureOpenOutcome<T>, AgentError> {
-    match try_open_live_backend_with_fallback(plan, open_backend)? {
+    match try_open_live_backend_with_fallback(plan, CancellationToken::default(), open_backend)? {
         LiveCaptureOpenAttempt::Open(outcome) => Ok(outcome),
         LiveCaptureOpenAttempt::Failed(failures) => Err(no_live_capture_error(plan, failures)),
     }
@@ -201,10 +226,14 @@ fn open_live_backend_with_fallback<T>(
 
 fn try_open_live_backend_with_fallback<T>(
     plan: &RuntimePlan,
+    cancellation: CancellationToken,
     mut open_backend: impl FnMut(CaptureBackend) -> Result<T, AgentError>,
 ) -> Result<LiveCaptureOpenAttempt<T>, AgentError> {
     let mut failures = Vec::new();
     for descriptor in plan.capture.live_provider_open_candidates() {
+        if cancellation.is_cancelled() {
+            return Err(capture_startup_cancelled_error());
+        }
         let backend = descriptor.backend;
         match open_backend(backend) {
             Ok(provider) => {
@@ -219,6 +248,9 @@ fn try_open_live_backend_with_fallback<T>(
                     backend,
                     reason: error.to_string(),
                 });
+                if cancellation.is_cancelled() {
+                    return Err(capture_startup_cancelled_error());
+                }
             }
             Err(error) => return Err(error),
         }
@@ -238,9 +270,14 @@ fn no_live_capture_error(
 fn build_live_capture_backend(
     plan: &RuntimePlan,
     backend: CaptureBackend,
+    cancellation: CancellationToken,
 ) -> Result<OpenedLiveCaptureBackend, AgentError> {
     match backend {
-        CaptureBackend::Ebpf => build_ebpf_capture_provider(plan),
+        CaptureBackend::Ebpf => match build_ebpf_capture_provider(plan, cancellation.clone()) {
+            Ok(provider) => Ok(provider),
+            Err(_) if cancellation.is_cancelled() => Err(capture_startup_cancelled_error()),
+            Err(error) => Err(error),
+        },
         CaptureBackend::Libpcap => Ok(OpenedLiveCaptureBackend {
             provider: Box::new(LibpcapProvider::open_with_process_resolver(
                 libpcap_config_from_agent(&plan.effective_config),
@@ -252,6 +289,10 @@ fn build_live_capture_backend(
             reason: format!("{backend:?} capture provider is selected but has no agent builder"),
         })),
     }
+}
+
+fn capture_startup_cancelled_error() -> AgentError {
+    AgentError::StartupCancelled("capture provider startup cancelled")
 }
 
 fn live_capture_failure_reason(
@@ -279,8 +320,10 @@ fn with_tls_plaintext_provider(
     plan: &RuntimePlan,
     primary: Box<dyn CaptureProvider>,
     tls_plaintext_runtime: Option<&TlsPlaintextRuntimeState>,
+    cancellation: CancellationToken,
 ) -> Result<Box<dyn CaptureProvider>, AgentError> {
-    let instrumentation_build = build_tls_plaintext_instrumentation(plan, tls_plaintext_runtime)?;
+    let instrumentation_build =
+        build_tls_plaintext_instrumentation(plan, tls_plaintext_runtime, cancellation)?;
     if let Some(runtime) = tls_plaintext_runtime {
         runtime.record_instrumentation_build(&instrumentation_build);
     }
@@ -458,11 +501,14 @@ mod tests {
         )?;
         let mut plan = auto_plan_with_live_and_mitm_plaintext_bridge(bridge_path)?;
         set_mitm_plaintext_bridge_follow(&mut plan, false);
-        let attempt = try_open_live_backend_with_fallback(&plan, |backend| {
-            Err::<OpenedLiveCaptureBackend, _>(AgentError::Runtime(RuntimeError::NoLiveCapture {
-                reason: format!("{backend:?} open failed"),
-            }))
-        })?;
+        let attempt =
+            try_open_live_backend_with_fallback(&plan, CancellationToken::default(), |backend| {
+                Err::<OpenedLiveCaptureBackend, _>(AgentError::Runtime(
+                    RuntimeError::NoLiveCapture {
+                        reason: format!("{backend:?} open failed"),
+                    },
+                ))
+            })?;
         let LiveCaptureOpenAttempt::Failed(open_failures) = attempt else {
             panic!("live providers should fail during the test");
         };

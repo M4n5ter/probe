@@ -11,6 +11,7 @@ use ebpf_abi::{
 use ebpf_object::{
     EbpfObjectArtifact, EbpfObjectProbe, EbpfObjectProbeReport, EbpfPreflightedObject,
 };
+use probe_core::CancellationToken;
 use thiserror::Error;
 
 use crate::{
@@ -58,10 +59,7 @@ pub(in crate::tls::plaintext) enum LibsslUprobePlaintextProbeError {
     #[error("failed to load eBPF TLS plaintext object with aya: {source}")]
     Load { source: Box<EbpfError> },
     #[error("{source}")]
-    Attach {
-        #[from]
-        source: LibsslUprobeAttachError,
-    },
+    Attach { source: LibsslUprobeAttachError },
     #[error("eBPF TLS plaintext object is missing map {name}")]
     MissingMap { name: &'static str },
     #[error("failed to access eBPF TLS plaintext map {name}: {source}")]
@@ -79,6 +77,8 @@ pub(in crate::tls::plaintext) enum LibsslUprobePlaintextProbeError {
     StateEpochExhausted,
     #[error("eBPF TLS plaintext provider is disabled after reconcile failure: {reason}")]
     Poisoned { reason: String },
+    #[error("eBPF TLS plaintext startup was cancelled")]
+    StartupCancelled,
 }
 
 pub(in crate::tls::plaintext) struct LibsslUprobePlaintextProbe {
@@ -96,11 +96,14 @@ pub(in crate::tls::plaintext) enum LibsslUprobePlaintextProbeLoad {
 }
 
 impl LibsslUprobePlaintextProbe {
-    pub(in crate::tls::plaintext) fn load(
+    pub(in crate::tls::plaintext) fn load_with_cancellation(
         config: LibsslUprobePlaintextProbeConfig,
+        cancellation: CancellationToken,
     ) -> Result<Self, LibsslUprobePlaintextProbeError> {
+        tls_plaintext_startup_checkpoint(&cancellation)?;
         let attach_plan = config.attach_plan;
-        let attach_work = strict_attach_work_from_plan(&attach_plan)?;
+        let attach_work = strict_attach_work_from_plan(&attach_plan).map_err(Self::attach_error)?;
+        tls_plaintext_startup_checkpoint(&cancellation)?;
         let object = EbpfObjectProbe::preflight(
             &EbpfObjectArtifact::TlsPlaintext.probe_config(config.object_path),
         )
@@ -108,14 +111,19 @@ impl LibsslUprobePlaintextProbe {
             summary: report.summary(),
             report,
         })?;
-        Self::load_preflighted(object, attach_work.as_recipes())
+        tls_plaintext_startup_checkpoint(&cancellation)?;
+        Self::load_preflighted(object, attach_work.as_recipes(), &cancellation)
     }
 
-    pub(in crate::tls::plaintext) fn load_best_effort(
+    pub(in crate::tls::plaintext) fn load_best_effort_with_cancellation(
         config: LibsslUprobePlaintextProbeConfig,
+        cancellation: CancellationToken,
     ) -> Result<LibsslUprobePlaintextProbeLoad, LibsslUprobePlaintextProbeError> {
+        tls_plaintext_startup_checkpoint(&cancellation)?;
         let attach_plan = config.attach_plan;
-        let attach_work = best_effort_attach_work_from_plan(&attach_plan)?;
+        let attach_work =
+            best_effort_attach_work_from_plan(&attach_plan).map_err(Self::attach_error)?;
+        tls_plaintext_startup_checkpoint(&cancellation)?;
         let object = EbpfObjectProbe::preflight(
             &EbpfObjectArtifact::TlsPlaintext.probe_config(config.object_path),
         )
@@ -123,23 +131,40 @@ impl LibsslUprobePlaintextProbe {
             summary: report.summary(),
             report,
         })?;
-        Self::load_preflighted_best_effort(object, &attach_work)
+        tls_plaintext_startup_checkpoint(&cancellation)?;
+        Self::load_preflighted_best_effort(object, &attach_work, &cancellation)
     }
 
     fn load_preflighted(
         object: EbpfPreflightedObject,
         attach_recipes: &[LibsslUprobeAttachRecipeRequest],
+        cancellation: &CancellationToken,
     ) -> Result<Self, LibsslUprobePlaintextProbeError> {
+        tls_plaintext_startup_checkpoint(cancellation)?;
         let mut ebpf =
             Ebpf::load(object.bytes()).map_err(|source| LibsslUprobePlaintextProbeError::Load {
                 source: Box::new(source),
             })?;
+        tls_plaintext_startup_checkpoint(cancellation)?;
         let mut state_epoch_fence = TlsStateEpochFence::default();
         enable_tls_state_epoch(&mut ebpf, &mut state_epoch_fence)?;
+        tls_plaintext_startup_checkpoint(cancellation)?;
         let mut attach_session = LibsslUprobeAttachSession::default();
-        attach_session.attach_uprobes(&mut ebpf, attach_recipes, AttachFailurePolicy::Strict)?;
-        let (events, output_losses) =
-            open_output_maps_or_detach(&mut ebpf, &mut attach_session, &mut state_epoch_fence)?;
+        attach_session
+            .attach_uprobes_during_startup(
+                &mut ebpf,
+                attach_recipes,
+                AttachFailurePolicy::Strict,
+                cancellation,
+            )
+            .map_err(Self::attach_error)?;
+        tls_plaintext_startup_checkpoint(cancellation)?;
+        let (events, output_losses) = open_output_maps_or_detach(
+            &mut ebpf,
+            &mut attach_session,
+            &mut state_epoch_fence,
+            cancellation,
+        )?;
         Ok(Self {
             ebpf,
             attach_session,
@@ -153,16 +178,23 @@ impl LibsslUprobePlaintextProbe {
     fn load_preflighted_best_effort(
         object: EbpfPreflightedObject,
         attach_work: &LibsslUprobeAttachWork,
+        cancellation: &CancellationToken,
     ) -> Result<LibsslUprobePlaintextProbeLoad, LibsslUprobePlaintextProbeError> {
+        tls_plaintext_startup_checkpoint(cancellation)?;
         let mut ebpf =
             Ebpf::load(object.bytes()).map_err(|source| LibsslUprobePlaintextProbeError::Load {
                 source: Box::new(source),
             })?;
+        tls_plaintext_startup_checkpoint(cancellation)?;
         let mut state_epoch_fence = TlsStateEpochFence::default();
         let mut attach_session = LibsslUprobeAttachSession::default();
         if attach_work.is_empty() {
-            let (events, output_losses) =
-                open_output_maps_or_detach(&mut ebpf, &mut attach_session, &mut state_epoch_fence)?;
+            let (events, output_losses) = open_output_maps_or_detach(
+                &mut ebpf,
+                &mut attach_session,
+                &mut state_epoch_fence,
+                cancellation,
+            )?;
             return Ok(LibsslUprobePlaintextProbeLoad::Enabled(Box::new(Self {
                 ebpf,
                 attach_session,
@@ -173,19 +205,30 @@ impl LibsslUprobePlaintextProbe {
             })));
         }
         enable_tls_state_epoch(&mut ebpf, &mut state_epoch_fence)?;
-        let attach_summary = attach_session.attach_uprobes(
-            &mut ebpf,
-            attach_work.as_recipes(),
-            AttachFailurePolicy::BestEffort,
-        )?;
+        tls_plaintext_startup_checkpoint(cancellation)?;
+        let attach_summary = attach_session
+            .attach_uprobes_during_startup(
+                &mut ebpf,
+                attach_work.as_recipes(),
+                AttachFailurePolicy::BestEffort,
+                cancellation,
+            )
+            .map_err(Self::attach_error)?;
+        tls_plaintext_startup_checkpoint(cancellation)?;
         if !attach_summary.has_committed_targets() {
-            attach_session.detach_all_best_effort(&mut ebpf)?;
+            attach_session
+                .detach_all_best_effort(&mut ebpf)
+                .map_err(Self::attach_error)?;
             return Ok(LibsslUprobePlaintextProbeLoad::Disabled {
                 reason: attach_summary.unresolvable_plaintext_reason(),
             });
         }
-        let (events, output_losses) =
-            open_output_maps_or_detach(&mut ebpf, &mut attach_session, &mut state_epoch_fence)?;
+        let (events, output_losses) = open_output_maps_or_detach(
+            &mut ebpf,
+            &mut attach_session,
+            &mut state_epoch_fence,
+            cancellation,
+        )?;
         Ok(LibsslUprobePlaintextProbeLoad::Enabled(Box::new(Self {
             ebpf,
             attach_session,
@@ -202,7 +245,8 @@ impl LibsslUprobePlaintextProbe {
     ) -> Result<LibsslUprobePlaintextReconcile, LibsslUprobePlaintextProbeError> {
         self.ensure_not_poisoned()?;
         let report = self.current_attach_state().reconcile(&next_plan);
-        let attach_work = best_effort_attach_work_from_plan(&report.attach_plan)?;
+        let attach_work =
+            best_effort_attach_work_from_plan(&report.attach_plan).map_err(Self::attach_error)?;
         match self.execute_reconcile_report(report, &attach_work) {
             Ok(result) => Ok(result),
             Err(error) => Err(self.poison_after_reconcile_error(error)),
@@ -226,7 +270,8 @@ impl LibsslUprobePlaintextProbe {
             self.disable_tls_state_epoch()?;
         }
         self.attach_session
-            .detach_targets_best_effort(&mut self.ebpf, detached_target_ids.iter().cloned())?;
+            .detach_targets_best_effort(&mut self.ebpf, detached_target_ids.iter().cloned())
+            .map_err(Self::attach_error)?;
         if epoch_plan.enable_before_attach {
             self.enable_tls_state_epoch()?;
         }
@@ -235,11 +280,14 @@ impl LibsslUprobePlaintextProbe {
         let mut attached_targets = LibsslUprobeReconcileTargetBucket::default();
         let mut attach_summary = None;
         if !attach_recipes.is_empty() {
-            let summary = self.attach_session.attach_uprobes(
-                &mut self.ebpf,
-                attach_recipes,
-                AttachFailurePolicy::BestEffort,
-            )?;
+            let summary = self
+                .attach_session
+                .attach_uprobes(
+                    &mut self.ebpf,
+                    attach_recipes,
+                    AttachFailurePolicy::BestEffort,
+                )
+                .map_err(Self::attach_error)?;
             let committed_targets = summary.committed_targets().collect::<Vec<_>>();
             attached_count = committed_targets.len();
             attached_targets = self.reconcile_owned_target_bucket(committed_targets);
@@ -312,6 +360,15 @@ impl LibsslUprobePlaintextProbe {
                 reason: reason.clone(),
             }),
             None => Ok(()),
+        }
+    }
+
+    fn attach_error(source: LibsslUprobeAttachError) -> LibsslUprobePlaintextProbeError {
+        match source {
+            LibsslUprobeAttachError::StartupCancelled => {
+                LibsslUprobePlaintextProbeError::StartupCancelled
+            }
+            source => LibsslUprobePlaintextProbeError::Attach { source },
         }
     }
 
@@ -581,23 +638,48 @@ fn open_output_maps_or_detach(
     ebpf: &mut Ebpf,
     attach_session: &mut LibsslUprobeAttachSession,
     state_epoch_fence: &mut TlsStateEpochFence,
+    cancellation: &CancellationToken,
 ) -> Result<(RingBuf<MapData>, OutputLossMap), LibsslUprobePlaintextProbeError> {
+    if let Err(error) = tls_plaintext_startup_checkpoint(cancellation) {
+        cleanup_after_startup_failure(ebpf, attach_session, state_epoch_fence);
+        return Err(error);
+    }
     let events = match open_events_ringbuf(ebpf) {
         Ok(events) => events,
         Err(error) => {
-            let _ = disable_tls_state_epoch(ebpf, state_epoch_fence);
-            let _ = attach_session.detach_all_best_effort(ebpf);
+            cleanup_after_startup_failure(ebpf, attach_session, state_epoch_fence);
             return Err(error);
         }
     };
+    if let Err(error) = tls_plaintext_startup_checkpoint(cancellation) {
+        cleanup_after_startup_failure(ebpf, attach_session, state_epoch_fence);
+        return Err(error);
+    }
     match open_output_loss_map(ebpf) {
         Ok(output_losses) => Ok((events, output_losses)),
         Err(error) => {
-            let _ = disable_tls_state_epoch(ebpf, state_epoch_fence);
-            let _ = attach_session.detach_all_best_effort(ebpf);
+            cleanup_after_startup_failure(ebpf, attach_session, state_epoch_fence);
             Err(error)
         }
     }
+}
+
+fn cleanup_after_startup_failure(
+    ebpf: &mut Ebpf,
+    attach_session: &mut LibsslUprobeAttachSession,
+    state_epoch_fence: &mut TlsStateEpochFence,
+) {
+    let _ = disable_tls_state_epoch(ebpf, state_epoch_fence);
+    let _ = attach_session.detach_all_best_effort(ebpf);
+}
+
+fn tls_plaintext_startup_checkpoint(
+    cancellation: &CancellationToken,
+) -> Result<(), LibsslUprobePlaintextProbeError> {
+    if cancellation.is_cancelled() {
+        return Err(LibsslUprobePlaintextProbeError::StartupCancelled);
+    }
+    Ok(())
 }
 
 fn plaintext_sample_from_ringbuf_record(
@@ -661,7 +743,10 @@ mod tests {
             )),
         );
 
-        let error = match LibsslUprobePlaintextProbe::load(config) {
+        let error = match LibsslUprobePlaintextProbe::load_with_cancellation(
+            config,
+            CancellationToken::default(),
+        ) {
             Ok(_) => panic!("missing object must fail in object preflight"),
             Err(error) => error,
         };

@@ -12,7 +12,9 @@ pub(crate) use activity::{CaptureInputActivityRuntimeSnapshot, CaptureInputSigna
 pub(crate) use activity::{
     CaptureInputPollActivityRuntimeSnapshot, CaptureInputProviderActivityRuntimeSnapshot,
 };
-pub(super) use factory::{CaptureProviderPreflight, build_capture_provider};
+pub(super) use factory::{
+    CaptureProviderPreflight, build_capture_provider, build_capture_provider_with_cancellation,
+};
 pub(crate) use runtime::{
     CaptureProviderOpenFailureSnapshot, CaptureProviderRuntimeDetailsSnapshot,
     CaptureProviderRuntimeSnapshot, CaptureProviderRuntimeState,

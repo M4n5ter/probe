@@ -38,19 +38,34 @@ async fn send_admin_json_request_with_response_limit(
     max_response_bytes: usize,
 ) -> Result<serde_json::Value, AdminClientError> {
     let command = request.command_name();
-    let mut stream = tokio::time::timeout(timeout, UnixStream::connect(socket_path))
+    let mut stream = connect_admin_socket(socket_path, timeout).await?;
+    write_admin_request(&mut stream, request, timeout).await?;
+    let response = read_bounded_response(&mut stream, timeout, command, max_response_bytes).await?;
+    serde_json::from_slice(&response).map_err(AdminClientError::Json)
+}
+
+async fn connect_admin_socket(
+    socket_path: &Path,
+    timeout: Duration,
+) -> Result<UnixStream, AdminClientError> {
+    tokio::time::timeout(timeout, UnixStream::connect(socket_path))
         .await
         .map_err(|_| AdminClientError::Timeout)?
         .map_err(|source| AdminClientError::Connect {
             path: socket_path.to_path_buf(),
             source,
-        })?;
+        })
+}
+
+async fn write_admin_request(
+    stream: &mut UnixStream,
+    request: AdminRequest,
+    timeout: Duration,
+) -> Result<(), AdminClientError> {
     let mut request = serde_json::to_vec(&request)?;
     request.push(b'\n');
     with_timeout(stream.write_all(&request), timeout).await?;
-    with_timeout(stream.shutdown(), timeout).await?;
-    let response = read_bounded_response(&mut stream, timeout, command, max_response_bytes).await?;
-    serde_json::from_slice(&response).map_err(AdminClientError::Json)
+    with_timeout(stream.shutdown(), timeout).await
 }
 
 async fn read_bounded_response(

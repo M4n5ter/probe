@@ -11,6 +11,8 @@ use crate::tls::{
 pub(in crate::tls::plaintext) enum LibsslUprobeAttachError {
     #[error("libssl uprobe attach plan has no attachable probes")]
     EmptyAttachPlan,
+    #[error("libssl uprobe attach startup was cancelled")]
+    StartupCancelled,
     #[error("libssl uprobe target pid {pid} cannot be represented as a Linux pid_t")]
     InvalidTargetPid { pid: u32 },
     #[error("eBPF TLS plaintext object is missing program {name}")]

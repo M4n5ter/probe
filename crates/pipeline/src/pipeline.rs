@@ -1,9 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -16,10 +13,10 @@ use enforcement::{EnforcementPlanRequest, EnforcementPlanner};
 use parsers::{ParserInput, ProtocolParserFactory};
 use policy::{PolicyHook, PolicyOutcome, PolicyRuntime, hook_for_event};
 use probe_core::{
-    CompiledSelector, DEFAULT_POLICY_RUNTIME_ERROR_DISABLE_THRESHOLD, EnforcementDecision,
-    EnforcementEvidence, EventEnvelope, EventKind, EventProvenance, FlowIdentity,
-    ObservationOnlyReason, PolicyEmissionStage, PolicyRuntimeError, SpoolPayloadSchema, Timestamp,
-    Verdict,
+    CancellationToken, CompiledSelector, DEFAULT_POLICY_RUNTIME_ERROR_DISABLE_THRESHOLD,
+    EnforcementDecision, EnforcementEvidence, EventEnvelope, EventKind, EventProvenance,
+    FlowIdentity, ObservationOnlyReason, PolicyEmissionStage, PolicyRuntimeError,
+    SpoolPayloadSchema, Timestamp, Verdict,
 };
 use storage::{DurableSpool, IngressCursorOwner, SpoolPayload};
 use thiserror::Error;
@@ -111,7 +108,7 @@ const PROVIDER_IDLE_SLEEP: Duration = Duration::from_millis(10);
 pub struct PipelineRunOptions {
     pub max_events: Option<u64>,
     pub max_polls: Option<u64>,
-    pub shutdown_requested: Option<Arc<AtomicBool>>,
+    pub cancellation: CancellationToken,
 }
 
 impl PipelineRunOptions {
@@ -119,7 +116,7 @@ impl PipelineRunOptions {
         Self {
             max_events: Some(max_events),
             max_polls: None,
-            shutdown_requested: None,
+            cancellation: CancellationToken::default(),
         }
     }
 
@@ -127,12 +124,12 @@ impl PipelineRunOptions {
         Self {
             max_events: None,
             max_polls: Some(max_polls),
-            shutdown_requested: None,
+            cancellation: CancellationToken::default(),
         }
     }
 
-    pub fn with_shutdown_signal(mut self, shutdown_requested: Arc<AtomicBool>) -> Self {
-        self.shutdown_requested = Some(shutdown_requested);
+    pub fn with_cancellation_token(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
         self
     }
 
@@ -142,10 +139,7 @@ impl PipelineRunOptions {
             && self
                 .max_polls
                 .is_none_or(|max_polls| polls_read < max_polls)
-            && !self
-                .shutdown_requested
-                .as_ref()
-                .is_some_and(|shutdown| shutdown.load(Ordering::SeqCst))
+            && !self.cancellation.is_cancelled()
     }
 }
 
@@ -492,14 +486,28 @@ where
         &mut self,
         batch_size: usize,
     ) -> Result<PipelineSummary, PipelineError> {
+        self.recover_ingress_journal_until_idle_with_cancellation(
+            batch_size,
+            &CancellationToken::default(),
+        )
+    }
+
+    pub fn recover_ingress_journal_until_idle_with_cancellation(
+        &mut self,
+        batch_size: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<PipelineSummary, PipelineError> {
         let mut total = PipelineSummary::default();
         let mut after_sequence = self.spool.ingress_cursor(PARSER_INGRESS_CURSOR_OWNER)?;
         if batch_size == 0 {
             return Ok(total);
         }
         loop {
+            if cancellation.is_cancelled() {
+                return Ok(total);
+            }
             let (batch, last_sequence) =
-                self.recover_ingress_journal_after(after_sequence, batch_size)?;
+                self.recover_ingress_journal_after(after_sequence, batch_size, cancellation)?;
             let recovered = batch.ingress_records_recovered;
             if let Some(sequence) = last_sequence {
                 after_sequence = sequence;
@@ -515,11 +523,15 @@ where
         &mut self,
         after_sequence: u64,
         limit: usize,
+        cancellation: &CancellationToken,
     ) -> Result<(PipelineSummary, Option<u64>), PipelineError> {
         let mut summary = PipelineSummary::default();
         let mut last_sequence = None;
         let stored_events = self.spool.read_ingress_batch_after(after_sequence, limit)?;
         for stored_event in stored_events {
+            if cancellation.is_cancelled() {
+                break;
+            }
             let capture_event = decode_ingress_capture_event(&stored_event)?;
             summary.ingress_records_recovered = summary.ingress_records_recovered.saturating_add(1);
             if let Some(metrics) = &self.runtime_metrics {

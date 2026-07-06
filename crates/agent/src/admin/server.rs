@@ -9,6 +9,7 @@ use std::{
 };
 
 use probe_config::CaptureBackend;
+use probe_core::CancellationToken;
 use runtime::{CaptureInputSource, CapturePlanMode, RuntimePlan};
 use storage::FjallSpool;
 use tokio::{
@@ -72,6 +73,7 @@ pub struct AdminRuntimeState {
     pub l7_mitm: Option<L7MitmRuntimeHandle>,
     pub runtime_generation: Option<RuntimeGenerationState>,
     pub runtime_config_reload_owner: RuntimeConfigReloadOwner,
+    pub shutdown_requested: CancellationToken,
     pub transparent_proxy: Option<TransparentProxyRuntimeHandle>,
 }
 
@@ -287,6 +289,10 @@ async fn handle_admin_request(
 ) -> AdminResponse {
     match request {
         AdminRequest::Ping => AdminResponse::Pong,
+        AdminRequest::Shutdown => {
+            runtime_state.shutdown_requested.cancel();
+            AdminResponse::Shutdown { requested: true }
+        }
         AdminRequest::ReloadPolicies => {
             let _config_apply_guard = runtime_state.config_apply_gate.lock().await;
             let plan = plan_handle.snapshot();
@@ -704,6 +710,37 @@ mod tests {
 
         assert_eq!(response["kind"], json!("pong"));
         assert_eq!(client_response["kind"], json!("pong"));
+        server.stop().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_shutdown_sets_runtime_shutdown_flag() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-shutdown")?;
+        let socket_path = temp.join("admin.sock");
+        let spool_path = temp.join("spool");
+        let spool = Arc::new(FjallSpool::open(&spool_path)?);
+        let plan = Arc::new(runtime_plan(spool_path)?);
+        let shutdown_requested = CancellationToken::new();
+        let server = spawn_admin_server(
+            RuntimePlanHandle::new(Arc::clone(&plan)),
+            Arc::clone(&spool),
+            AdminServerConfig::unix_socket(socket_path.clone()),
+            AdminRuntimeState {
+                shutdown_requested: shutdown_requested.clone(),
+                ..AdminRuntimeState::default()
+            },
+        )?;
+
+        let response = crate::admin::send_admin_json_request(
+            &socket_path,
+            crate::admin::AdminRequest::Shutdown,
+        )
+        .await?;
+
+        assert_eq!(response["kind"], json!("shutdown"));
+        assert_eq!(response["requested"], json!(true));
+        assert!(shutdown_requested.is_cancelled());
         server.stop().await;
         Ok(())
     }
@@ -1233,6 +1270,7 @@ mod tests {
                 { "name": "reload_runtime_actions", "mutating": true, "response_max_bytes": 16777216 },
                 { "name": "reload_policies", "mutating": true, "response_max_bytes": 16777216 },
                 { "name": "reload_enforcement_policy", "mutating": true, "response_max_bytes": 16777216 },
+                { "name": "shutdown", "mutating": true, "response_max_bytes": 16777216 },
             ])
         );
         assert_eq!(

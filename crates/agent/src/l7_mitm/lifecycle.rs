@@ -715,7 +715,7 @@ mod tests {
             panic!("managed backend readiness must run after the process is spawned")
         });
         let shutdown = crate::shutdown::new_flag();
-        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        shutdown.cancel();
 
         let error = match start_configured_backend_lifecycle(&runtime, &config, &shutdown) {
             Ok(_) => panic!("shutdown should cancel managed backend readiness"),

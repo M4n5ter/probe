@@ -58,6 +58,8 @@ pub(crate) enum AgentError {
     Capture(#[from] capture::CaptureError),
     #[error("capture task failed to join: {0}")]
     CaptureTaskJoin(String),
+    #[error("startup cancelled: {0}")]
+    StartupCancelled(&'static str),
     #[error("attribution error: {0}")]
     Attribution(#[from] attribution::AttributionError),
     #[error("plaintext feed error: {0}")]

@@ -8,9 +8,10 @@ use std::{
 };
 
 use probe_config::{AgentConfig, probe_home_path};
+use probe_core::CancellationToken;
 use rustix::{
     fs::OFlags,
-    process::{Pid, Signal, kill_process},
+    process::{Pid, Signal, kill_process, kill_process_group},
 };
 use tokio::{process::Command, time::Instant};
 
@@ -21,6 +22,8 @@ use super::{
 use crate::admin::{AdminRequest, send_admin_json_request_with_timeout};
 
 const ADMIN_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
+const ADMIN_SHUTDOWN_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+const ADMIN_SHUTDOWN_GRACE_TIMEOUT: Duration = Duration::from_secs(5);
 const MANAGED_AGENT_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const MANAGED_AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const LOG_TAIL_BYTES: u64 = 8 * 1024;
@@ -43,9 +46,15 @@ struct ExistingAgent {
     runtime_config_path: PathBuf,
 }
 
+impl Drop for ExistingAgent {
+    fn drop(&mut self) {
+        cleanup_existing_agent_files(self);
+    }
+}
+
 #[derive(Debug)]
 struct ManagedAgent {
-    child: tokio::process::Child,
+    child: ManagedChild,
     runtime_dir: PathBuf,
     runtime_config_path: PathBuf,
     socket_path: PathBuf,
@@ -53,15 +62,101 @@ struct ManagedAgent {
     log_path: PathBuf,
 }
 
+impl Drop for ManagedAgent {
+    fn drop(&mut self) {
+        cleanup_managed_runtime_files(self);
+    }
+}
+
+#[derive(Debug)]
+struct ManagedChild {
+    child: tokio::process::Child,
+}
+
+impl ManagedChild {
+    fn new(child: tokio::process::Child) -> Self {
+        Self { child }
+    }
+
+    fn id(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, std::io::Error> {
+        self.child.try_wait()
+    }
+
+    async fn wait_for_exit(&mut self, timeout: Duration) -> bool {
+        matches!(
+            tokio::time::timeout(timeout, self.child.wait()).await,
+            Ok(Ok(_))
+        )
+    }
+
+    async fn terminate(&mut self) {
+        if matches!(self.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        if !self.signal(Signal::TERM) {
+            let _ = self.child.start_kill();
+        }
+        if !self.wait_for_exit(MANAGED_AGENT_STOP_TIMEOUT).await {
+            let _ = self.signal(Signal::KILL);
+            let _ = self.child.start_kill();
+            let _ = self.child.wait().await;
+        }
+    }
+
+    fn signal(&mut self, signal: Signal) -> bool {
+        if matches!(self.try_wait(), Ok(Some(_))) {
+            return false;
+        }
+        let Some(pid) = self.id().and_then(|pid| Pid::from_raw(pid as i32)) else {
+            return false;
+        };
+        if let Err(error) = kill_process(pid, signal) {
+            eprintln!("failed to signal TUI managed agent process {pid}: {error}");
+        }
+        if signal == Signal::KILL
+            && let Err(error) = kill_process_group(pid, signal)
+        {
+            eprintln!("failed to signal TUI managed agent process group {pid}: {error}");
+        }
+        true
+    }
+
+    fn kill_on_drop(&mut self) {
+        if matches!(self.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        let _ = self.signal(Signal::TERM);
+        let _ = self.signal(Signal::KILL);
+        let _ = self.child.start_kill();
+    }
+}
+
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        self.kill_on_drop();
+    }
+}
+
 impl TuiAgentSupervisor {
     pub(crate) async fn attach_or_spawn(config: &AgentConfig) -> Result<Self, TuiError> {
+        Self::attach_or_spawn_with_cancellation(config, CancellationToken::default()).await
+    }
+
+    pub(crate) async fn attach_or_spawn_with_cancellation(
+        config: &AgentConfig,
+        cancellation: CancellationToken,
+    ) -> Result<Self, TuiError> {
         let configured_socket_path = config.admin.socket_path.clone();
         if admin_socket_responds(&configured_socket_path).await {
             return Ok(Self {
                 mode: TuiAgentMode::Existing(ExistingAgent::create()?),
             });
         }
-        spawn_managed_agent(config).await
+        spawn_managed_agent_with_cancellation(config, cancellation).await
     }
 
     pub(crate) fn attachment(&self, config: &AgentConfig) -> RuntimeAttachment {
@@ -98,14 +193,18 @@ impl TuiAgentSupervisor {
         }
     }
 
-    pub(crate) async fn restart(self, config: &AgentConfig) -> Result<Self, TuiError> {
+    pub(crate) async fn restart_with_cancellation(
+        self,
+        config: &AgentConfig,
+        cancellation: CancellationToken,
+    ) -> Result<Self, TuiError> {
         match self.mode {
             TuiAgentMode::Existing(agent) => Ok(Self {
                 mode: TuiAgentMode::Existing(agent),
             }),
             TuiAgentMode::Managed(agent) => {
                 stop_managed_agent(*agent).await;
-                spawn_managed_agent(config).await
+                spawn_managed_agent_with_cancellation(config, cancellation).await
             }
         }
     }
@@ -151,6 +250,10 @@ impl ExistingAgent {
 }
 
 fn cleanup_existing_agent(agent: ExistingAgent) {
+    cleanup_existing_agent_files(&agent);
+}
+
+fn cleanup_existing_agent_files(agent: &ExistingAgent) {
     remove_runtime_file(
         &agent.runtime_config_path,
         "TUI existing agent reload candidate",
@@ -167,17 +270,17 @@ fn cleanup_existing_agent(agent: ExistingAgent) {
 }
 
 async fn stop_managed_agent(mut agent: ManagedAgent) {
-    terminate_child(&mut agent.child).await;
-    if let Err(error) = fs::remove_file(&agent.runtime_config_path)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        eprintln!(
-            "failed to remove TUI runtime config {}: {error}",
-            agent.runtime_config_path.display()
-        );
+    if !request_admin_shutdown_and_wait(&mut agent).await {
+        agent.child.terminate().await;
     }
+    cleanup_managed_runtime_files(&agent);
+}
+
+fn cleanup_managed_runtime_files(agent: &ManagedAgent) {
+    remove_runtime_file(&agent.runtime_config_path, "TUI runtime config");
     remove_runtime_file(&agent.socket_path, "TUI managed agent admin socket");
     remove_runtime_file(&agent.readiness_path, "TUI managed agent readiness socket");
+    remove_runtime_file(&agent.log_path, "TUI managed agent log");
     if let Err(error) = fs::remove_dir(&agent.runtime_dir)
         && error.kind() != std::io::ErrorKind::NotFound
         && error.kind() != std::io::ErrorKind::DirectoryNotEmpty
@@ -189,7 +292,27 @@ async fn stop_managed_agent(mut agent: ManagedAgent) {
     }
 }
 
-async fn spawn_managed_agent(config: &AgentConfig) -> Result<TuiAgentSupervisor, TuiError> {
+async fn request_admin_shutdown_and_wait(agent: &mut ManagedAgent) -> bool {
+    if send_admin_json_request_with_timeout(
+        &agent.socket_path,
+        AdminRequest::Shutdown,
+        ADMIN_SHUTDOWN_REQUEST_TIMEOUT,
+    )
+    .await
+    .is_err()
+    {
+        return false;
+    }
+    agent
+        .child
+        .wait_for_exit(ADMIN_SHUTDOWN_GRACE_TIMEOUT)
+        .await
+}
+
+async fn spawn_managed_agent_with_cancellation(
+    config: &AgentConfig,
+    cancellation: CancellationToken,
+) -> Result<TuiAgentSupervisor, TuiError> {
     let layout = ManagedRuntimeLayout::create()?;
     let mut startup_guard = ManagedStartupGuard::new(&layout);
     let runtime_config = managed_runtime_config(config, &layout.socket_path);
@@ -210,23 +333,27 @@ async fn spawn_managed_agent(config: &AgentConfig) -> Result<TuiAgentSupervisor,
             }
         })?))
         .stderr(Stdio::from(log))
-        .kill_on_drop(true);
-    let mut child = command
+        .process_group(0);
+    let child = command
         .spawn()
         .map_err(|source| TuiError::AgentSupervisor {
             action: "spawn TUI managed agent",
             source,
         })?;
+    let mut child = ManagedChild::new(child);
     if let Err(error) = wait_for_managed_agent(
         &mut child,
         &readiness_listener,
         &layout.socket_path,
         &layout.log_path,
+        &cancellation,
     )
     .await
     {
-        terminate_child(&mut child).await;
-        startup_guard.keep_log();
+        child.terminate().await;
+        if !matches!(error, TuiError::ManagedAgentStartupCancelled) {
+            startup_guard.keep_log();
+        }
         return Err(error);
     }
     startup_guard.disarm();
@@ -309,10 +436,10 @@ impl Drop for ManagedStartupGuard {
         }
         remove_runtime_file(&self.config_path, "TUI runtime config");
         remove_runtime_file(&self.socket_path, "TUI managed agent admin socket");
+        remove_runtime_file(&self.readiness_path, "TUI managed agent readiness socket");
         if !self.keep_log {
             remove_runtime_file(&self.log_path, "TUI managed agent log");
         }
-        remove_runtime_file(&self.readiness_path, "TUI managed agent readiness socket");
         if let Err(error) = fs::remove_dir(&self.runtime_dir)
             && error.kind() != std::io::ErrorKind::NotFound
             && error.kind() != std::io::ErrorKind::DirectoryNotEmpty
@@ -443,17 +570,27 @@ fn runtime_config_suffix() -> String {
 }
 
 async fn wait_for_managed_agent(
-    child: &mut tokio::process::Child,
+    child: &mut ManagedChild,
     readiness_listener: &StdUnixListener,
     admin_socket_path: &Path,
     log_path: &Path,
+    cancellation: &CancellationToken,
 ) -> Result<(), TuiError> {
     let deadline = Instant::now() + MANAGED_AGENT_STARTUP_TIMEOUT;
     loop {
+        if cancellation.is_cancelled() {
+            return Err(TuiError::ManagedAgentStartupCancelled);
+        }
         match readiness_listener.accept() {
             Ok((_stream, _address)) => {
-                wait_for_admin_socket_after_readiness(child, admin_socket_path, log_path, deadline)
-                    .await?;
+                wait_for_admin_socket_after_readiness(
+                    child,
+                    admin_socket_path,
+                    log_path,
+                    deadline,
+                    cancellation,
+                )
+                .await?;
                 return Ok(());
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -489,12 +626,16 @@ async fn wait_for_managed_agent(
 }
 
 async fn wait_for_admin_socket_after_readiness(
-    child: &mut tokio::process::Child,
+    child: &mut ManagedChild,
     admin_socket_path: &Path,
     log_path: &Path,
     deadline: Instant,
+    cancellation: &CancellationToken,
 ) -> Result<(), TuiError> {
     loop {
+        if cancellation.is_cancelled() {
+            return Err(TuiError::ManagedAgentStartupCancelled);
+        }
         if admin_socket_responds(admin_socket_path).await {
             return Ok(());
         }
@@ -528,24 +669,6 @@ async fn admin_socket_responds(socket_path: &Path) -> bool {
         .is_ok_and(|response| {
             response.get("kind").and_then(serde_json::Value::as_str) == Some("pong")
         })
-}
-
-async fn terminate_child(child: &mut tokio::process::Child) {
-    if matches!(child.try_wait(), Ok(Some(_))) {
-        return;
-    }
-    if let Some(pid) = child.id().and_then(|pid| Pid::from_raw(pid as i32)) {
-        let _ = kill_process(pid, Signal::TERM);
-    } else {
-        let _ = child.start_kill();
-    }
-    match tokio::time::timeout(MANAGED_AGENT_STOP_TIMEOUT, child.wait()).await {
-        Ok(_) => {}
-        Err(_) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
-    }
 }
 
 fn managed_agent_exit_message(status: std::process::ExitStatus, log_path: &Path) -> String {
@@ -664,12 +787,10 @@ mod tests {
         let runtime_config_path = temp.path().join("agent.toml");
         let socket_path = temp.path().join("admin.sock");
         fs::write(&runtime_config_path, "stale")?;
-        let child = tokio::process::Command::new("/bin/true")
-            .kill_on_drop(true)
-            .spawn()?;
+        let child = tokio::process::Command::new("/bin/true").spawn()?;
         let mut supervisor = TuiAgentSupervisor {
             mode: TuiAgentMode::Managed(Box::new(ManagedAgent {
-                child,
+                child: ManagedChild::new(child),
                 runtime_dir: temp.path().to_path_buf(),
                 runtime_config_path: runtime_config_path.clone(),
                 socket_path: socket_path.clone(),
@@ -695,7 +816,7 @@ mod tests {
         assert_eq!(written.admin.socket_path, socket_path);
         assert!(!written.runtime_reload.watch_config);
         if let TuiAgentMode::Managed(agent) = &mut supervisor.mode {
-            let _ = agent.child.wait().await;
+            let _ = agent.child.wait_for_exit(Duration::from_secs(1)).await;
         }
         Ok(())
     }

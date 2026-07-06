@@ -101,6 +101,7 @@ admin_requests! {
     ReloadRuntimeActions => ("reload_runtime_actions", true, AdminResponseBudget::Default),
     ReloadPolicies => ("reload_policies", true, AdminResponseBudget::Default),
     ReloadEnforcementPolicy => ("reload_enforcement_policy", true, AdminResponseBudget::Default),
+    Shutdown => ("shutdown", true, AdminResponseBudget::Default),
 }
 
 #[derive(Debug, Serialize)]
@@ -143,6 +144,9 @@ pub(super) enum AdminResponse {
         actions: Vec<RuntimeReloadActionResult>,
     },
     EnforcementPolicyReload(EnforcementPolicyReloadSuccess),
+    Shutdown {
+        requested: bool,
+    },
     Error {
         message: String,
     },
@@ -390,6 +394,11 @@ mod tests {
         assert_command(
             AdminRequest::ReloadEnforcementPolicy,
             "reload_enforcement_policy",
+            AdminResponseBudget::Default,
+        );
+        assert_command(
+            AdminRequest::Shutdown,
+            "shutdown",
             AdminResponseBudget::Default,
         );
     }

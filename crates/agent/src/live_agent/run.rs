@@ -15,7 +15,8 @@ use crate::{
     },
     artifacts::hydrate_runtime_artifact_paths,
     capture_provider::{
-        CaptureProviderPreflight, CaptureProviderRuntimeState, build_capture_provider,
+        CaptureProviderPreflight, CaptureProviderRuntimeState,
+        build_capture_provider_with_cancellation,
     },
     configured_enforcement::{
         EnforcementRuntimeState, RuntimeEnforcementPlanner,
@@ -114,6 +115,7 @@ pub(crate) async fn run_live_agent(
     let runtime_generation =
         RuntimeGenerationState::for_config_version(plan.config.config_version.clone());
     let config_apply_gate = RuntimeReloadGate::default();
+    let shutdown_requested = shutdown::new_flag();
     let runtime_config_reload_owner =
         RuntimeConfigReloadOwner::for_config_path(config_path.as_deref());
     let transparent_proxy_runtime = transparent_interception.proxy_runtime_handle();
@@ -132,6 +134,7 @@ pub(crate) async fn run_live_agent(
         l7_mitm: Some(l7_mitm_runtime.clone()),
         runtime_generation: Some(runtime_generation.clone()),
         runtime_config_reload_owner,
+        shutdown_requested: shutdown_requested.clone(),
         transparent_proxy: Some(transparent_proxy_runtime.clone()),
         ..AdminRuntimeState::default()
     };
@@ -223,8 +226,7 @@ pub(crate) async fn run_live_agent(
         plan.capture.mode,
         plan.capture.selected_backend
     );
-    let shutdown_requested = shutdown::new_flag();
-    let shutdown_signal_task = shutdown::spawn_signal_task(Arc::clone(&shutdown_requested));
+    let shutdown_signal_task = shutdown::spawn_signal_task(shutdown_requested.clone());
     let blocking_run = BlockingCaptureRun {
         plan: plan.clone(),
         plan_handle: plan_handle.clone(),
@@ -241,7 +243,7 @@ pub(crate) async fn run_live_agent(
         tls_plaintext_runtime,
         l7_mitm,
         runtime_generation,
-        shutdown_requested: Arc::clone(&shutdown_requested),
+        shutdown_requested: shutdown_requested.clone(),
         max_events,
         readiness,
     };
@@ -422,8 +424,10 @@ impl BlockingCaptureRun {
                 plan.config.config_version.clone(),
             )
             .with_runtime_metrics(pipeline_metrics);
-            let mut summary =
-                pipeline.recover_ingress_journal_until_idle(INGRESS_RECOVERY_BATCH_SIZE)?;
+            let mut summary = pipeline.recover_ingress_journal_until_idle_with_cancellation(
+                INGRESS_RECOVERY_BATCH_SIZE,
+                &shutdown_requested,
+            )?;
             if shutdown::requested(&shutdown_requested) {
                 return Ok(summary);
             }
@@ -439,12 +443,17 @@ impl BlockingCaptureRun {
                 &shutdown_requested,
             )
             .map_err(AgentError::L7MitmRuntime)?;
-            let built_provider = build_capture_provider(
+            let built_provider = match build_capture_provider_with_cancellation(
                 &plan,
                 Some(&tls_plaintext_runtime),
                 &l7_mitm_runtime,
                 capture_provider_preflight,
-            )?;
+                shutdown_requested.clone(),
+            ) {
+                Ok(provider) => provider,
+                Err(AgentError::StartupCancelled(_)) => return Ok(summary),
+                Err(error) => return Err(error),
+            };
             capture_runtime.record(built_provider.runtime);
             let mut provider = capture_runtime.observe_capture_input(built_provider.provider);
             let runtime_generation_executor = RuntimeGenerationExecutor::new(
@@ -575,7 +584,7 @@ fn live_capture_run_options_with_max_polls(
         return None;
     }
     let mut options = PipelineRunOptions::max_polls(max_polls)
-        .with_shutdown_signal(Arc::clone(shutdown_requested));
+        .with_cancellation_token(shutdown_requested.clone());
     options.max_events = remaining_events;
     Some(options)
 }
