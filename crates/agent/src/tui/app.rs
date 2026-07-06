@@ -99,6 +99,7 @@ pub(crate) enum TuiAction {
     TextSubmit,
     TextCancel,
     StartProcessSearch,
+    StartTrafficSearch,
     ToggleProcessMonitor,
     OpenTrafficDiagnostics,
     CycleTrafficViewMode,
@@ -264,6 +265,7 @@ impl TextEditSession {
 enum TextEditTarget {
     Field(FieldId),
     ProcessSearch,
+    TrafficSearch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -580,6 +582,7 @@ impl TuiApp {
             | TuiAction::TextSubmit
             | TuiAction::TextCancel => {}
             TuiAction::StartProcessSearch => self.begin_process_search(),
+            TuiAction::StartTrafficSearch => self.begin_traffic_search(),
             TuiAction::ToggleProcessMonitor => return self.toggle_selected_process_monitor(),
             TuiAction::OpenTrafficDiagnostics => self.open_traffic_diagnostics(),
             TuiAction::CycleTrafficViewMode => self.cycle_traffic_view_mode(),
@@ -1185,6 +1188,14 @@ impl TuiApp {
                 self.clear_process_search();
                 None
             }
+            ControlId::SearchTraffic => {
+                self.begin_traffic_search();
+                None
+            }
+            ControlId::ClearTrafficSearch => {
+                self.clear_traffic_search();
+                None
+            }
         }
     }
 
@@ -1306,6 +1317,24 @@ impl TuiApp {
         }
     }
 
+    fn begin_traffic_search(&mut self) {
+        self.select_tab(TuiTab::Traffic);
+        self.clear_hover();
+        self.text_edit = Some(TextEditSession {
+            target: TextEditTarget::TrafficSearch,
+            label: "Traffic search".to_string(),
+            buffer: self.traffic.search_query().to_string(),
+            replace_on_input: self.traffic.search_query().is_empty(),
+        });
+        self.status = StatusMessage::info("Editing traffic search");
+    }
+
+    fn clear_traffic_search(&mut self) {
+        if self.traffic.clear_search_query() {
+            self.status = StatusMessage::info("Traffic search cleared");
+        }
+    }
+
     fn handle_text_edit_action(&mut self, action: TuiAction) -> Option<TuiEffect> {
         match action {
             TuiAction::TextInput(character) => {
@@ -1364,6 +1393,7 @@ impl TuiApp {
                 }
             }
             TextEditTarget::ProcessSearch => self.apply_process_search(edit.buffer),
+            TextEditTarget::TrafficSearch => self.apply_traffic_search(edit.buffer),
         }
     }
 
@@ -1375,6 +1405,11 @@ impl TuiApp {
             let count = self.filtered_process_indices().len();
             self.status = StatusMessage::info(format!("Process search matched {count} entries"));
         }
+    }
+
+    fn apply_traffic_search(&mut self, query: String) {
+        self.traffic.set_search_query(query);
+        self.status = StatusMessage::info(self.traffic.status().text.clone());
     }
 
     fn selected_process_selector(&self) -> Option<probe_core::Selector> {
@@ -1862,6 +1897,34 @@ mod tests {
         assert_eq!(app.process_filter(), "nginx");
         assert_eq!(app.filtered_process_indices(), vec![1]);
         assert_eq!(app.selected_process_index(), Some(1));
+    }
+
+    #[test]
+    fn traffic_table_search_keeps_process_filter_unchanged() {
+        let mut app = multi_process_app();
+        app.select_tab(TuiTab::Traffic);
+
+        app.handle_action(TuiAction::StartTrafficSearch);
+
+        assert_eq!(app.active_tab(), TuiTab::Traffic);
+        assert_eq!(
+            app.text_edit().map(|edit| edit.target),
+            Some(TextEditTarget::TrafficSearch)
+        );
+
+        input_text(&mut app, "POST /api/tasks");
+        app.handle_action(TuiAction::TextSubmit);
+
+        assert_eq!(app.active_tab(), TuiTab::Traffic);
+        assert_eq!(app.traffic().search_query(), "POST /api/tasks");
+        assert!(app.process_filter().is_empty());
+
+        app.handle_action(TuiAction::Click(HitTarget::Control(
+            ControlId::ClearTrafficSearch,
+        )));
+
+        assert!(app.traffic().search_query().is_empty());
+        assert!(app.process_filter().is_empty());
     }
 
     #[test]

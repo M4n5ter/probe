@@ -454,7 +454,7 @@ pub(super) fn apply_runtime_reconcile_result(
             app.attach_agent(attachment);
         }
         RuntimeReconcileCompletion::StartupUnavailable { message } => {
-            app.mark_error(format!("TUI agent unavailable: {message}"));
+            app.detach_agent(format!("TUI agent unavailable: {message}"));
         }
         RuntimeReconcileCompletion::SavedAttached {
             attachment,
@@ -712,6 +712,41 @@ mod tests {
         assert!(app.status().text.contains("bidirectional MITM observation"));
         assert!(app.status().text.contains("MITM expansion is pending"));
         assert!(app.status().text.contains("startup failed"));
+    }
+
+    #[test]
+    fn startup_unavailable_updates_runtime_attachment_for_traffic_diagnostics() {
+        let mut app = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::default(),
+        );
+        let mut supervisor = None;
+
+        apply_runtime_reconcile_result(
+            &mut supervisor,
+            &mut app,
+            RuntimeReconcileResult {
+                supervisor: None,
+                completion: RuntimeReconcileCompletion::StartupUnavailable {
+                    message: "libpcap is unavailable".to_string(),
+                },
+            },
+        );
+
+        assert_eq!(app.status().kind, StatusKind::Error);
+        assert!(
+            app.runtime_agent_status()
+                .contains("TUI agent unavailable: libpcap is unavailable")
+        );
+
+        assert!(app.begin_traffic_refresh().is_none());
+        assert!(
+            app.status()
+                .text
+                .contains("TUI agent unavailable: libpcap is unavailable")
+        );
+        assert!(!app.status().text.contains("No agent runtime attached"));
     }
 
     #[test]

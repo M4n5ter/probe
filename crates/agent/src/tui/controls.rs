@@ -18,6 +18,8 @@ pub(crate) enum ControlId {
     ObserveLibpcap,
     SearchProcesses,
     ClearProcessSearch,
+    SearchTraffic,
+    ClearTrafficSearch,
 }
 
 pub(crate) const TRAFFIC_VIEW_CONTROLS: [ControlId; 3] = [
@@ -54,6 +56,8 @@ impl ControlId {
             Self::ObserveLibpcap => "Observe selected process with libpcap",
             Self::SearchProcesses => "Search",
             Self::ClearProcessSearch => "Clear",
+            Self::SearchTraffic => "Search traffic",
+            Self::ClearTrafficSearch => "Clear traffic search",
         }
     }
 
@@ -67,6 +71,8 @@ impl ControlId {
             Self::ObserveAuto | Self::ObserveEbpf | Self::ObserveLibpcap => "observe process",
             Self::SearchProcesses => "search",
             Self::ClearProcessSearch => "clear",
+            Self::SearchTraffic => "search traffic",
+            Self::ClearTrafficSearch => "clear traffic search",
         }
     }
 
@@ -79,6 +85,8 @@ impl ControlId {
             Self::ObserveAuto => "Auto",
             Self::ObserveEbpf => "eBPF",
             Self::ObserveLibpcap => "libpcap",
+            Self::SearchTraffic => "Search",
+            Self::ClearTrafficSearch => "Clear",
             _ => self.label(),
         }
     }
@@ -97,6 +105,8 @@ impl ControlId {
             }
             Self::ObserveEbpf => "selected process, inbound and outbound, eBPF".to_string(),
             Self::ObserveLibpcap => "selected process, inbound and outbound, libpcap".to_string(),
+            Self::SearchTraffic => "filter the current traffic table by visible text".to_string(),
+            Self::ClearTrafficSearch => "clear the current traffic table search".to_string(),
             Self::SearchProcesses | Self::ClearProcessSearch => String::new(),
         }
     }

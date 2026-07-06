@@ -553,6 +553,12 @@ fn key_to_action(key: KeyEvent, editing_text: bool, active_tab: TuiTab) -> Optio
         (KeyCode::Char('s'), KeyModifiers::CONTROL) => Some(TuiAction::Save),
         (KeyCode::Char('r'), KeyModifiers::CONTROL) => Some(TuiAction::Reload),
         (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => Some(TuiAction::Quit),
+        (KeyCode::Char('/'), _) if active_tab == TuiTab::Traffic => {
+            Some(TuiAction::StartTrafficSearch)
+        }
+        (KeyCode::Char('f'), KeyModifiers::CONTROL) if active_tab == TuiTab::Traffic => {
+            Some(TuiAction::StartTrafficSearch)
+        }
         (KeyCode::Char('/'), _) => Some(TuiAction::StartProcessSearch),
         (KeyCode::Char('f'), KeyModifiers::CONTROL) => Some(TuiAction::StartProcessSearch),
         (KeyCode::Char('w'), _) => Some(TuiAction::ToggleProcessMonitor),
@@ -702,6 +708,14 @@ mod tests {
         );
         assert_eq!(
             key_to_action(
+                KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+                false,
+                TuiTab::Traffic
+            ),
+            Some(TuiAction::StartTrafficSearch)
+        );
+        assert_eq!(
+            key_to_action(
                 KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
                 false,
                 TuiTab::Traffic
@@ -820,6 +834,14 @@ mod tests {
                 TuiTab::Overview
             ),
             Some(TuiAction::StartProcessSearch)
+        );
+        assert_eq!(
+            key_to_action(
+                KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+                false,
+                TuiTab::Traffic
+            ),
+            Some(TuiAction::StartTrafficSearch)
         );
     }
 

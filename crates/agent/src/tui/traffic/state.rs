@@ -162,6 +162,7 @@ pub(crate) struct TrafficState {
     rows: Vec<TrafficRow>,
     http_exchanges: Vec<HttpExchangeRow>,
     websocket_sessions: Vec<WebSocketSessionRow>,
+    visible_projection: TrafficVisibleProjection,
     event_view: TrafficViewport,
     http_view: TrafficViewport,
     websocket_view: TrafficViewport,
@@ -172,8 +173,108 @@ pub(crate) struct TrafficState {
     detail_state: TrafficDetailState,
     event_filter: TrafficEventFilter,
     view_mode: TrafficViewMode,
+    search_query: String,
     attribution_mode: EventTailAttributionMode,
     empty_filter_diagnostics: Option<EmptyFilterDiagnostics>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TrafficVisibleProjection {
+    rows: Vec<usize>,
+    http_exchanges: Vec<usize>,
+    websocket_sessions: Vec<usize>,
+}
+
+impl TrafficVisibleProjection {
+    fn from_parts(
+        rows: &[TrafficRow],
+        http_exchanges: &[HttpExchangeRow],
+        websocket_sessions: &[WebSocketSessionRow],
+        search_query: &str,
+    ) -> Self {
+        if search_query.is_empty() {
+            return Self {
+                rows: all_indexes(rows.len()),
+                http_exchanges: all_indexes(http_exchanges.len()),
+                websocket_sessions: all_indexes(websocket_sessions.len()),
+            };
+        }
+        let normalized_query = search_query.to_lowercase();
+        Self {
+            rows: matching_indexes(rows, |row| row_matches_search(&normalized_query, row)),
+            http_exchanges: matching_indexes(http_exchanges, |exchange| {
+                http_exchange_matches_search(&normalized_query, exchange)
+            }),
+            websocket_sessions: matching_indexes(websocket_sessions, |session| {
+                websocket_session_matches_search(&normalized_query, session)
+            }),
+        }
+    }
+
+    fn len(&self, mode: TrafficViewMode) -> usize {
+        self.indexes(mode).len()
+    }
+
+    fn indexes(&self, mode: TrafficViewMode) -> &[usize] {
+        match mode {
+            TrafficViewMode::Http => &self.http_exchanges,
+            TrafficViewMode::WebSocket => &self.websocket_sessions,
+            TrafficViewMode::Events => &self.rows,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.rows.clear();
+        self.http_exchanges.clear();
+        self.websocket_sessions.clear();
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProjectedItems<'a, T> {
+    items: &'a [T],
+    indexes: &'a [usize],
+}
+
+impl<'a, T> ProjectedItems<'a, T> {
+    fn new(items: &'a [T], indexes: &'a [usize]) -> Self {
+        Self { items, indexes }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.indexes.len()
+    }
+
+    pub(crate) fn get(&self, index: usize) -> Option<&'a T> {
+        self.indexes
+            .get(index)
+            .and_then(|backing_index| self.items.get(*backing_index))
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &'a T> + '_ {
+        self.indexes
+            .iter()
+            .filter_map(|backing_index| self.items.get(*backing_index))
+    }
+
+    fn position(&self, mut matches: impl FnMut(&T) -> bool) -> Option<usize> {
+        self.iter().position(&mut matches)
+    }
+
+    fn nearest_index_by_key(&self, key: u64, item_key: impl Fn(&T) -> u64) -> Option<usize> {
+        self.iter()
+            .enumerate()
+            .min_by_key(|(_, item)| item_key(item).abs_diff(key))
+            .map(|(index, _)| index)
+    }
+}
+
+impl<T> std::ops::Index<usize> for ProjectedItems<'_, T> {
+    type Output = T;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.items[self.indexes[index]]
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -347,6 +448,7 @@ impl Default for TrafficState {
             rows: Vec::new(),
             http_exchanges: Vec::new(),
             websocket_sessions: Vec::new(),
+            visible_projection: TrafficVisibleProjection::default(),
             event_view: TrafficViewport::default(),
             http_view: TrafficViewport::default(),
             websocket_view: TrafficViewport::default(),
@@ -357,6 +459,7 @@ impl Default for TrafficState {
             detail_state: TrafficDetailState::default(),
             event_filter: TrafficEventFilter::Application,
             view_mode: TrafficViewMode::Http,
+            search_query: String::new(),
             attribution_mode: EventTailAttributionMode::Strict,
             empty_filter_diagnostics: None,
         }
@@ -366,6 +469,10 @@ impl Default for TrafficState {
 impl TrafficState {
     pub(crate) fn rows(&self) -> &[TrafficRow] {
         &self.rows
+    }
+
+    pub(crate) fn visible_rows(&self) -> ProjectedItems<'_, TrafficRow> {
+        ProjectedItems::new(&self.rows, &self.visible_projection.rows)
     }
 
     #[cfg(test)]
@@ -410,15 +517,31 @@ impl TrafficState {
     }
 
     pub(crate) fn selected_row(&self) -> Option<&TrafficRow> {
-        self.rows.get(self.event_view.selected_index())
+        self.visible_rows().get(self.event_view.selected_index())
     }
 
+    #[cfg(test)]
     pub(crate) fn http_exchanges(&self) -> &[HttpExchangeRow] {
         &self.http_exchanges
     }
 
+    pub(crate) fn visible_http_exchanges(&self) -> ProjectedItems<'_, HttpExchangeRow> {
+        ProjectedItems::new(
+            &self.http_exchanges,
+            &self.visible_projection.http_exchanges,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn websocket_sessions(&self) -> &[WebSocketSessionRow] {
         &self.websocket_sessions
+    }
+
+    pub(crate) fn visible_websocket_sessions(&self) -> ProjectedItems<'_, WebSocketSessionRow> {
+        ProjectedItems::new(
+            &self.websocket_sessions,
+            &self.visible_projection.websocket_sessions,
+        )
     }
 
     pub(crate) fn selected_http_exchange_index(&self) -> usize {
@@ -460,7 +583,8 @@ impl TrafficState {
     pub(crate) fn selected_detail_lines(&self) -> Option<Vec<String>> {
         match self.active_view().active {
             TrafficViewMode::Http => {
-                let exchange = self.http_exchanges.get(self.http_view.selected_index())?;
+                let visible = self.visible_http_exchanges();
+                let exchange = visible.get(self.http_view.selected_index())?;
                 let fetch_sequences = exchange.detail_fetch_sequences();
                 let loaded_rows = self.loaded_detail_rows(&fetch_sequences);
                 let mut lines = exchange.detail_lines_with_loaded_rows(loaded_rows);
@@ -472,9 +596,8 @@ impl TrafficState {
                 return Some(lines);
             }
             TrafficViewMode::WebSocket => {
-                let session = self
-                    .websocket_sessions
-                    .get(self.websocket_view.selected_index())?;
+                let visible = self.visible_websocket_sessions();
+                let session = visible.get(self.websocket_view.selected_index())?;
                 let fetch_sequences = session.detail_fetch_sequences();
                 let loaded_rows = self.loaded_detail_rows(&fetch_sequences);
                 let mut lines = session.detail_lines_with_loaded_rows(loaded_rows);
@@ -547,11 +670,11 @@ impl TrafficState {
     fn selected_detail_fetch_sequences(&self) -> Option<Vec<u64>> {
         let sequences = match self.active_view().active {
             TrafficViewMode::Http => self
-                .http_exchanges
+                .visible_http_exchanges()
                 .get(self.http_view.selected_index())?
                 .detail_fetch_sequences(),
             TrafficViewMode::WebSocket => self
-                .websocket_sessions
+                .visible_websocket_sessions()
                 .get(self.websocket_view.selected_index())?
                 .detail_fetch_sequences(),
             TrafficViewMode::Events => self
@@ -634,6 +757,25 @@ impl TrafficState {
         self.event_filter.label()
     }
 
+    pub(crate) fn search_query(&self) -> &str {
+        &self.search_query
+    }
+
+    pub(crate) fn search_label(&self) -> String {
+        if self.search_query.is_empty() {
+            return "<none>".to_string();
+        }
+        self.search_query.clone()
+    }
+
+    pub(crate) fn visible_match_count(&self) -> usize {
+        self.projection_len(self.active_view().active)
+    }
+
+    pub(crate) fn active_unfiltered_count(&self) -> usize {
+        self.unfiltered_projection_len(self.active_view().active)
+    }
+
     #[cfg(test)]
     pub(crate) fn requested_view_mode_is(&self, mode: TrafficViewMode) -> bool {
         self.view_mode == mode
@@ -670,7 +812,7 @@ impl TrafficState {
         match self.active_view().active {
             TrafficViewMode::Http => {
                 return self
-                    .http_exchanges
+                    .visible_http_exchanges()
                     .get(self.http_view.selected_index)
                     .map(|exchange| {
                         let fetch_sequences = exchange.detail_fetch_sequences();
@@ -684,7 +826,7 @@ impl TrafficState {
             }
             TrafficViewMode::WebSocket => {
                 return self
-                    .websocket_sessions
+                    .visible_websocket_sessions()
                     .get(self.websocket_view.selected_index)
                     .map(|session| {
                         let fetch_sequences = session.detail_fetch_sequences();
@@ -811,6 +953,43 @@ impl TrafficState {
         ));
     }
 
+    pub(crate) fn set_search_query(&mut self, query: String) {
+        self.search_query = terminal_safe_inline_text(query.trim());
+        self.rebuild_visible_projection();
+        self.reset_viewports();
+        if self.follow_tail {
+            self.sync_tail_viewports(self.viewport_rows);
+        } else {
+            self.clamp_selection();
+        }
+        if self.search_query.is_empty() {
+            self.status = TrafficStatus::idle("Traffic search cleared");
+        } else {
+            self.status = TrafficStatus::idle(format!(
+                "Traffic search matched {}/{} {} row(s)",
+                self.visible_match_count(),
+                self.active_unfiltered_count(),
+                self.active_view().label()
+            ));
+        }
+    }
+
+    pub(crate) fn clear_search_query(&mut self) -> bool {
+        if self.search_query.is_empty() {
+            return false;
+        }
+        self.search_query.clear();
+        self.rebuild_visible_projection();
+        self.reset_viewports();
+        if self.follow_tail {
+            self.sync_tail_viewports(self.viewport_rows);
+        } else {
+            self.clamp_selection();
+        }
+        self.status = TrafficStatus::idle("Traffic search cleared");
+        true
+    }
+
     pub(crate) fn cycle_view_mode(&mut self) {
         self.set_view_mode(self.view_mode.next());
     }
@@ -857,6 +1036,7 @@ impl TrafficState {
         self.rows.clear();
         self.http_exchanges.clear();
         self.websocket_sessions.clear();
+        self.visible_projection.clear();
         self.event_view.reset();
         self.http_view.reset();
         self.websocket_view.reset();
@@ -933,6 +1113,7 @@ impl TrafficState {
         self.rows.clear();
         self.http_exchanges.clear();
         self.websocket_sessions.clear();
+        self.visible_projection.clear();
         self.event_view.reset();
         self.http_view.reset();
         self.websocket_view.reset();
@@ -952,14 +1133,14 @@ impl TrafficState {
         let has_new_rows = !snapshot.events.is_empty() || !snapshot.omissions.is_empty();
         let selected_event_sequence = (!self.follow_tail)
             .then(|| {
-                self.rows
+                self.visible_rows()
                     .get(self.event_view.selected_index())
                     .map(|row| row.sequence)
             })
             .flatten();
         let event_anchor_sequence = (!self.follow_tail)
             .then(|| {
-                self.rows
+                self.visible_rows()
                     .get(self.event_view.scroll())
                     .map(|row| row.sequence)
             })
@@ -1064,20 +1245,30 @@ impl TrafficState {
     fn rebuild_protocol_views(&mut self) {
         self.http_exchanges = build_http_exchange_rows(&self.rows);
         self.websocket_sessions = build_websocket_session_rows(&self.rows);
-        self.http_view.clamp_to_len(self.http_exchanges.len());
-        self.websocket_view
-            .clamp_to_len(self.websocket_sessions.len());
+        self.rebuild_visible_projection();
+        self.clamp_selection();
+    }
+
+    fn rebuild_visible_projection(&mut self) {
+        self.visible_projection = TrafficVisibleProjection::from_parts(
+            &self.rows,
+            &self.http_exchanges,
+            &self.websocket_sessions,
+            &self.search_query,
+        );
     }
 
     fn http_selection_at(&self, index: usize) -> Option<HttpSelection> {
-        self.http_exchanges.get(index).map(|row| HttpSelection {
-            identity: row.identity(),
-            order_sequence: row.order_sequence(),
-        })
+        self.visible_http_exchanges()
+            .get(index)
+            .map(|row| HttpSelection {
+                identity: row.identity(),
+                order_sequence: row.order_sequence(),
+            })
     }
 
     fn websocket_selection_at(&self, index: usize) -> Option<WebSocketSelection> {
-        self.websocket_sessions
+        self.visible_websocket_sessions()
             .get(index)
             .map(|row| WebSocketSelection {
                 identity: row.identity(),
@@ -1091,28 +1282,28 @@ impl TrafficState {
         http_selection: Option<HttpSelection>,
         websocket_selection: Option<WebSocketSelection>,
     ) {
-        if let Some(index) = event_sequence
-            .and_then(|sequence| nearest_sequence_index(&self.rows, sequence, |row| row.sequence))
-        {
+        if let Some(index) = event_sequence.and_then(|sequence| {
+            let visible = self.visible_rows();
+            visible.nearest_index_by_key(sequence, |row| row.sequence)
+        }) {
+            let len = self.projection_len(TrafficViewMode::Events);
             self.event_view
-                .anchor_scroll(self.rows.len(), index, self.viewport_rows);
+                .anchor_scroll(len, index, self.viewport_rows);
         }
 
         if let Some(index) =
             http_selection.and_then(|selection| self.http_index_for_selection(&selection))
         {
-            self.http_view
-                .anchor_scroll(self.http_exchanges.len(), index, self.viewport_rows);
+            let len = self.projection_len(TrafficViewMode::Http);
+            self.http_view.anchor_scroll(len, index, self.viewport_rows);
         }
 
         if let Some(index) =
             websocket_selection.and_then(|selection| self.websocket_index_for_selection(&selection))
         {
-            self.websocket_view.anchor_scroll(
-                self.websocket_sessions.len(),
-                index,
-                self.viewport_rows,
-            );
+            let len = self.projection_len(TrafficViewMode::WebSocket);
+            self.websocket_view
+                .anchor_scroll(len, index, self.viewport_rows);
         }
     }
 
@@ -1124,66 +1315,55 @@ impl TrafficState {
         let http_index =
             http_selection.and_then(|selection| self.http_index_for_selection(&selection));
         if let Some(index) = http_index {
-            let len = self.http_exchanges.len();
+            let len = self.projection_len(TrafficViewMode::Http);
             self.http_view.select_row(len, index, self.viewport_rows);
         }
 
         let websocket_index = websocket_selection
             .and_then(|selection| self.websocket_index_for_selection(&selection));
         if let Some(index) = websocket_index {
-            let len = self.websocket_sessions.len();
+            let len = self.projection_len(TrafficViewMode::WebSocket);
             self.websocket_view
                 .select_row(len, index, self.viewport_rows);
         }
     }
 
     fn http_index_for_selection(&self, selection: &HttpSelection) -> Option<usize> {
-        self.http_exchanges
-            .iter()
+        let visible = self.visible_http_exchanges();
+        visible
             .position(|row| row.matches_identity(&selection.identity))
+            .or_else(|| visible.position(|row| row.matches_selection_fallback(&selection.identity)))
             .or_else(|| {
-                self.http_exchanges
-                    .iter()
-                    .position(|row| row.matches_selection_fallback(&selection.identity))
-            })
-            .or_else(|| {
-                nearest_sequence_index(
-                    &self.http_exchanges,
-                    selection.order_sequence,
-                    HttpExchangeRow::order_sequence,
-                )
+                visible.nearest_index_by_key(selection.order_sequence, |row| row.order_sequence())
             })
     }
 
     fn websocket_index_for_selection(&self, selection: &WebSocketSelection) -> Option<usize> {
-        self.websocket_sessions
-            .iter()
+        let visible = self.visible_websocket_sessions();
+        visible
             .position(|row| row.matches_identity(&selection.identity))
             .or_else(|| {
-                nearest_sequence_index(
-                    &self.websocket_sessions,
-                    selection.order_sequence,
-                    WebSocketSessionRow::order_sequence,
-                )
+                visible.nearest_index_by_key(selection.order_sequence, |row| row.order_sequence())
             })
     }
 
     fn restore_event_selection(&mut self, event_sequence: Option<u64>) {
-        let Some(index) = event_sequence
-            .and_then(|sequence| nearest_sequence_index(&self.rows, sequence, |row| row.sequence))
-        else {
+        let Some(index) = event_sequence.and_then(|sequence| {
+            let visible = self.visible_rows();
+            visible.nearest_index_by_key(sequence, |row| row.sequence)
+        }) else {
             return;
         };
-        let len = self.rows.len();
+        let len = self.projection_len(TrafficViewMode::Events);
         self.event_view.select_row(len, index, self.viewport_rows);
     }
 
     fn active_view(&self) -> TrafficActiveView {
         TrafficActiveView::from_state(
             self.view_mode,
-            !self.http_exchanges.is_empty(),
-            !self.websocket_sessions.is_empty(),
-            !self.rows.is_empty(),
+            self.unfiltered_projection_len(TrafficViewMode::Http) > 0,
+            self.unfiltered_projection_len(TrafficViewMode::WebSocket) > 0,
+            self.unfiltered_projection_len(TrafficViewMode::Events) > 0,
         )
     }
 
@@ -1196,6 +1376,10 @@ impl TrafficState {
     }
 
     fn projection_len(&self, mode: TrafficViewMode) -> usize {
+        self.visible_projection.len(mode)
+    }
+
+    fn unfiltered_projection_len(&self, mode: TrafficViewMode) -> usize {
         match mode {
             TrafficViewMode::Http => self.http_exchanges.len(),
             TrafficViewMode::WebSocket => self.websocket_sessions.len(),
@@ -1210,6 +1394,74 @@ impl TrafficState {
             TrafficViewMode::Events => &mut self.event_view,
         }
     }
+}
+
+fn all_indexes(len: usize) -> Vec<usize> {
+    (0..len).collect()
+}
+
+fn matching_indexes<T>(items: &[T], matches: impl Fn(&T) -> bool) -> Vec<usize> {
+    items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| matches(item).then_some(index))
+        .collect()
+}
+
+fn row_matches_search(query: &str, row: &TrafficRow) -> bool {
+    searchable_text_matches(
+        query,
+        [
+            row.sequence.to_string(),
+            row.process.clone(),
+            row.capture_path.to_string(),
+            row.event_type.clone(),
+            row.direction.clone(),
+            row.endpoint.clone(),
+            row.summary.clone(),
+        ],
+    )
+}
+
+fn http_exchange_matches_search(query: &str, exchange: &HttpExchangeRow) -> bool {
+    searchable_text_matches(
+        query,
+        [
+            exchange.sequence.to_string(),
+            exchange.process.clone(),
+            exchange.method.clone(),
+            exchange.target.clone(),
+            exchange.status.clone(),
+            exchange.request_body.clone(),
+            exchange.response_body.clone(),
+            exchange.direction.clone(),
+            exchange.endpoint.clone(),
+            exchange.summary.clone(),
+        ],
+    )
+}
+
+fn websocket_session_matches_search(query: &str, session: &WebSocketSessionRow) -> bool {
+    searchable_text_matches(
+        query,
+        [
+            session.sequence.to_string(),
+            session.process.clone(),
+            session.target.clone(),
+            session.direction.clone(),
+            session.endpoint.clone(),
+            session.frames.to_string(),
+            session.messages.to_string(),
+            session.payload_bytes.to_string(),
+            session.summary.clone(),
+        ],
+    )
+}
+
+fn searchable_text_matches<const N: usize>(query: &str, fields: [String; N]) -> bool {
+    fields
+        .into_iter()
+        .any(|field| field.to_lowercase().contains(query))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1578,20 +1830,6 @@ fn traffic_rows_for_snapshot(snapshot: EventTailSnapshot) -> Vec<TrafficRow> {
     rows
 }
 
-fn nearest_sequence_index<T>(
-    rows: &[T],
-    sequence: u64,
-    row_sequence: impl Fn(&T) -> u64,
-) -> Option<usize> {
-    if rows.is_empty() {
-        return None;
-    }
-    rows.iter()
-        .enumerate()
-        .min_by_key(|(_, row)| row_sequence(row).abs_diff(sequence))
-        .map(|(index, _)| index)
-}
-
 fn omission_summary(omissions: &[EventTailOmission]) -> Option<String> {
     let first = omissions.first()?;
     let suffix = match omissions.len() {
@@ -1773,6 +2011,8 @@ mod tests {
         assert_eq!(traffic.after_sequence, 0);
         assert_eq!(traffic.last_export_sequence(), 2);
         assert!(traffic.rows().is_empty());
+        assert_eq!(traffic.active_row_count(), 0);
+        assert_eq!(traffic.visible_http_exchanges().len(), 0);
         assert_eq!(traffic.status().kind, TrafficStatusKind::Idle);
         assert_eq!(traffic.status().text, "Traffic filter changed");
     }
@@ -1820,6 +2060,8 @@ mod tests {
         assert_eq!(traffic.event_filter_label(), "HTTP");
         assert_eq!(traffic.view_mode_label(), "HTTP");
         assert!(traffic.rows().is_empty());
+        assert_eq!(traffic.active_row_count(), 0);
+        assert_eq!(traffic.visible_http_exchanges().len(), 0);
         assert_eq!(traffic.after_sequence, 0);
         assert_eq!(
             traffic.status().text,
@@ -2058,6 +2300,147 @@ mod tests {
                 .any(|line| line == "Response body: 2 bytes (loaded)")
         );
         assert!(!details.iter().any(|line| line.contains("Raw event detail")));
+    }
+
+    #[test]
+    fn traffic_search_filters_http_exchanges_without_changing_the_view() {
+        let mut traffic = TrafficState::default();
+        traffic.apply_snapshot(tail_snapshot_with_mixed_projection_events());
+
+        assert!(traffic.showing_http_exchanges());
+        assert_eq!(traffic.http_exchanges().len(), 2);
+
+        traffic.set_search_query("/http/2".to_string());
+
+        assert!(traffic.showing_http_exchanges());
+        assert_eq!(traffic.active_row_count(), 1);
+        assert_eq!(traffic.visible_match_count(), 1);
+        assert_eq!(traffic.active_unfiltered_count(), 2);
+        assert_eq!(traffic.visible_http_exchanges()[0].target, "/http/2");
+        assert!(
+            traffic
+                .status()
+                .text
+                .contains("Traffic search matched 1/2 HTTP")
+        );
+
+        traffic.set_search_query("does-not-exist".to_string());
+
+        assert!(traffic.showing_http_exchanges());
+        assert_eq!(traffic.active_row_count(), 0);
+        assert_eq!(traffic.visible_match_count(), 0);
+        assert_eq!(traffic.active_unfiltered_count(), 2);
+        assert_eq!(traffic.visible_http_exchanges().len(), 0);
+
+        assert!(traffic.clear_search_query());
+        assert_eq!(traffic.active_row_count(), 2);
+        assert_eq!(traffic.visible_http_exchanges().len(), 2);
+    }
+
+    #[test]
+    fn traffic_search_filters_raw_event_rows() {
+        let mut traffic = TrafficState::default();
+        traffic.apply_snapshot(tail_snapshot_with_mixed_projection_events());
+        traffic.set_view_mode(TrafficViewMode::Events);
+
+        traffic.set_search_query("gap".to_string());
+
+        assert!(traffic.active_view_mode_is(TrafficViewMode::Events));
+        assert_eq!(traffic.active_row_count(), 1);
+        let row = traffic.selected_row().expect("matching raw event row");
+        assert_eq!(row.event_type, "gap");
+        assert_eq!(row.sequence, 5);
+    }
+
+    #[test]
+    fn traffic_search_filters_websocket_sessions() {
+        let mut traffic = TrafficState::default();
+        traffic.apply_snapshot(tail_snapshot_with_mixed_projection_events());
+        traffic.set_view_mode(TrafficViewMode::WebSocket);
+
+        traffic.set_search_query("/ws/2".to_string());
+
+        assert!(traffic.showing_websocket_sessions());
+        assert_eq!(traffic.active_row_count(), 1);
+        assert_eq!(traffic.visible_websocket_sessions()[0].target, "/ws/2");
+    }
+
+    #[test]
+    fn paused_http_search_selection_survives_new_matching_snapshot() {
+        let mut traffic = TrafficState::default();
+        traffic.set_viewport_rows(2);
+        traffic.apply_snapshot(tail_snapshot_from_records(vec![
+            (
+                1,
+                request_event_with_flow("keep-flow-1", 1, "GET", "/keep/1"),
+            ),
+            (2, request_event_with_flow("other-flow", 2, "GET", "/other")),
+            (
+                3,
+                request_event_with_flow("keep-flow-2", 3, "GET", "/keep/2"),
+            ),
+            (
+                4,
+                request_event_with_flow("keep-flow-3", 4, "GET", "/keep/3"),
+            ),
+        ]));
+        traffic.set_search_query("/keep".to_string());
+        traffic.select_row(1, 2);
+
+        assert!(!traffic.following_tail());
+        assert_eq!(traffic.visible_http_exchanges()[1].target, "/keep/2");
+
+        traffic.apply_snapshot(tail_snapshot_from_records(vec![(
+            5,
+            request_event_with_flow("keep-flow-4", 5, "GET", "/keep/4"),
+        )]));
+
+        assert!(!traffic.following_tail());
+        assert_eq!(traffic.active_row_count(), 4);
+        assert_eq!(traffic.selected_http_exchange_index(), 1);
+        assert_eq!(traffic.visible_http_exchanges()[1].target, "/keep/2");
+    }
+
+    #[test]
+    fn filtered_http_detail_fetch_uses_visible_exchange_sequence() {
+        let mut traffic = TrafficState::default();
+        traffic.apply_snapshot(tail_snapshot_from_records(vec![
+            (
+                1,
+                request_event_with_flow("detail-flow-1", 1, "POST", "/api/first"),
+            ),
+            (2, body_event_with_flow("detail-flow-1", 2, b"first")),
+            (
+                3,
+                request_event_with_flow("detail-flow-2", 3, "POST", "/api/second"),
+            ),
+            (4, body_event_with_flow("detail-flow-2", 4, b"second")),
+        ]));
+
+        traffic.set_search_query("/api/second".to_string());
+
+        assert_eq!(traffic.active_row_count(), 1);
+        assert_eq!(traffic.visible_http_exchanges()[0].target, "/api/second");
+        assert_eq!(traffic.selected_detail_auto_fetch_sequence(), Some(4));
+
+        traffic.mark_detail_loading(4, 77);
+        traffic.apply_detail_load_result(TrafficDetailLoadResult {
+            sequence: 4,
+            request_id: 77,
+            result: Ok(EventDetailSnapshot {
+                sequence: 4,
+                stored_at_unix_ns: 400,
+                payload_schema: SpoolPayloadSchema::EVENT_ENVELOPE_SUBJECT_ORIGIN_JSON.to_string(),
+                payload_bytes: 6,
+                event: body_event_with_flow("detail-flow-2", 4, b"second"),
+            }),
+        });
+
+        let details = traffic
+            .selected_detail_lines()
+            .expect("filtered HTTP exchange detail");
+        assert!(details.iter().any(|line| line == "  Body payload: second"));
+        assert!(!details.iter().any(|line| line == "  Body payload: first"));
     }
 
     #[test]
@@ -3233,12 +3616,18 @@ mod tests {
     }
 
     fn body_event(body: &[u8]) -> EventEnvelope {
+        body_event_with_flow(&test_flow().id.0, 1, body)
+    }
+
+    fn body_event_with_flow(flow_id: &str, sequence: u64, body: &[u8]) -> EventEnvelope {
+        let mut flow = test_flow();
+        flow.id = FlowIdentity(flow_id.to_string());
         EventEnvelope::from_flow(
             Timestamp {
-                monotonic_ns: 1,
-                wall_time_unix_ns: 1,
+                monotonic_ns: sequence,
+                wall_time_unix_ns: sequence as i64,
             },
-            test_flow(),
+            flow,
             CaptureOrigin::from_source(CaptureSource::Replay),
             "test",
             EventKind::HttpBodyChunk(BodyChunk {

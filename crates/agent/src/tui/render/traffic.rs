@@ -197,6 +197,14 @@ fn render_traffic_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, hits: 
         Span::styled("events ", Style::default().fg(Color::Gray)),
         Span::raw(traffic.event_filter_label()),
         Span::raw("   "),
+        Span::styled("search ", Style::default().fg(Color::Gray)),
+        Span::raw(traffic.search_label()),
+        Span::raw(format!(
+            " {}/{}",
+            traffic.visible_match_count(),
+            traffic.active_unfiltered_count()
+        )),
+        Span::raw("   "),
         Span::styled("tail ", Style::default().fg(Color::Gray)),
         Span::raw(format!(
             "{} {}",
@@ -256,6 +264,24 @@ fn render_traffic_action_bar(
             target,
             app.is_hovered(target),
             app.traffic().event_filter_is(filter),
+        );
+    }
+    cursor.render_button(
+        frame,
+        hits,
+        ControlId::SearchTraffic.traffic_action_label(),
+        HitTarget::Control(ControlId::SearchTraffic),
+        app.is_hovered(HitTarget::Control(ControlId::SearchTraffic)),
+        !app.traffic().search_query().is_empty(),
+    );
+    if !app.traffic().search_query().is_empty() {
+        cursor.render_button(
+            frame,
+            hits,
+            ControlId::ClearTrafficSearch.traffic_action_label(),
+            HitTarget::Control(ControlId::ClearTrafficSearch),
+            app.is_hovered(HitTarget::Control(ControlId::ClearTrafficSearch)),
+            false,
         );
     }
     let tail_label = format!("Tail {}", app.traffic().tail_mode_label());
@@ -436,6 +462,7 @@ fn render_http_exchanges(
     let visible_rows = area.height.saturating_sub(3) as usize;
     app.set_traffic_viewport_rows(visible_rows);
     let traffic = app.traffic();
+    let exchanges = traffic.visible_http_exchanges();
     render_traffic_table(
         frame,
         area,
@@ -468,14 +495,16 @@ fn render_http_exchanges(
                 Constraint::Length(HTTP_REMOTE_WIDTH as u16),
                 Constraint::Min(12),
             ],
-            total_len: traffic.http_exchanges().len(),
+            total_len: exchanges.len(),
             scroll: traffic.http_scroll(),
             selected_index: traffic.selected_http_exchange_index(),
             visible_rows,
         },
         |absolute_index| app.is_hovered(HitTarget::TrafficRow(absolute_index)),
         |absolute_index, marker| {
-            let exchange = &traffic.http_exchanges()[absolute_index];
+            let exchange = exchanges
+                .get(absolute_index)
+                .expect("rendered HTTP exchange index is visible");
             Row::new([
                 Cell::from(marker),
                 Cell::from(truncate_to_width(
@@ -505,6 +534,7 @@ fn render_websocket_sessions(
     let visible_rows = area.height.saturating_sub(3) as usize;
     app.set_traffic_viewport_rows(visible_rows);
     let traffic = app.traffic();
+    let sessions = traffic.visible_websocket_sessions();
     render_traffic_table(
         frame,
         area,
@@ -527,14 +557,16 @@ fn render_websocket_sessions(
                 Constraint::Length(10),
                 Constraint::Min(20),
             ],
-            total_len: traffic.websocket_sessions().len(),
+            total_len: sessions.len(),
             scroll: traffic.websocket_scroll(),
             selected_index: traffic.selected_websocket_session_index(),
             visible_rows,
         },
         |absolute_index| app.is_hovered(HitTarget::TrafficRow(absolute_index)),
         |absolute_index, marker| {
-            let session = &traffic.websocket_sessions()[absolute_index];
+            let session = sessions
+                .get(absolute_index)
+                .expect("rendered WebSocket session index is visible");
             Row::new([
                 Cell::from(marker),
                 Cell::from(session.sequence.to_string()),
@@ -560,6 +592,7 @@ fn render_traffic_event_rows(
     let visible_rows = area.height.saturating_sub(3) as usize;
     app.set_traffic_viewport_rows(visible_rows);
     let traffic = app.traffic();
+    let events = traffic.visible_rows();
     render_traffic_table(
         frame,
         area,
@@ -579,14 +612,16 @@ fn render_traffic_event_rows(
                 Constraint::Length(22),
                 Constraint::Min(20),
             ],
-            total_len: traffic.rows().len(),
+            total_len: events.len(),
             scroll: traffic.scroll(),
             selected_index: traffic.selected_index(),
             visible_rows,
         },
         |absolute_index| app.is_hovered(HitTarget::TrafficRow(absolute_index)),
         |absolute_index, marker| {
-            let event = &traffic.rows()[absolute_index];
+            let event = events
+                .get(absolute_index)
+                .expect("rendered traffic event index is visible");
             Row::new([
                 Cell::from(marker),
                 Cell::from(event.sequence.to_string()),
