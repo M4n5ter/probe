@@ -81,6 +81,19 @@ pub enum PipelineHandoffDrainOutcome {
     BudgetExhausted,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct IngressBacklogRecovery {
+    after_sequence: u64,
+    end_sequence: u64,
+    caught_up: bool,
+}
+
+impl IngressBacklogRecovery {
+    pub fn caught_up(&self) -> bool {
+        self.caught_up
+    }
+}
+
 impl PipelineSummary {
     pub fn merge(&mut self, other: Self) {
         self.capture_events_read = self
@@ -498,25 +511,61 @@ where
         cancellation: &CancellationToken,
     ) -> Result<PipelineSummary, PipelineError> {
         let mut total = PipelineSummary::default();
-        let mut after_sequence = self.spool.ingress_cursor(PARSER_INGRESS_CURSOR_OWNER)?;
         if batch_size == 0 {
             return Ok(total);
         }
+        let mut recovery = self.ingress_backlog_recovery()?;
         loop {
-            if cancellation.is_cancelled() {
-                return Ok(total);
-            }
-            let (batch, last_sequence) =
-                self.recover_ingress_journal_after(after_sequence, batch_size, cancellation)?;
-            let recovered = batch.ingress_records_recovered;
-            if let Some(sequence) = last_sequence {
-                after_sequence = sequence;
-            }
+            let batch =
+                self.recover_ingress_backlog_batch(&mut recovery, batch_size, cancellation)?;
             total.merge(batch);
-            if recovered < batch_size as u64 {
+            if recovery.caught_up() || cancellation.is_cancelled() {
                 return Ok(total);
             }
         }
+    }
+
+    pub fn ingress_backlog_recovery(&self) -> Result<IngressBacklogRecovery, PipelineError> {
+        Ok(IngressBacklogRecovery {
+            after_sequence: self.spool.ingress_cursor(PARSER_INGRESS_CURSOR_OWNER)?,
+            end_sequence: self.spool.snapshot()?.last_ingress_sequence,
+            caught_up: false,
+        })
+    }
+
+    pub fn recover_ingress_backlog_batch(
+        &mut self,
+        recovery: &mut IngressBacklogRecovery,
+        batch_size: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<PipelineSummary, PipelineError> {
+        if recovery.caught_up || recovery.after_sequence >= recovery.end_sequence {
+            recovery.caught_up = true;
+            return Ok(PipelineSummary::default());
+        }
+        if batch_size == 0 || cancellation.is_cancelled() {
+            return Ok(PipelineSummary::default());
+        }
+        let limit = batch_size.min(
+            usize::try_from(
+                recovery
+                    .end_sequence
+                    .saturating_sub(recovery.after_sequence),
+            )
+            .unwrap_or(usize::MAX),
+        );
+        let (summary, last_sequence) =
+            self.recover_ingress_journal_after(recovery.after_sequence, limit, cancellation)?;
+        if let Some(sequence) = last_sequence {
+            recovery.after_sequence = sequence;
+        }
+        if !cancellation.is_cancelled()
+            && (summary.ingress_records_recovered < limit as u64
+                || recovery.after_sequence >= recovery.end_sequence)
+        {
+            recovery.caught_up = true;
+        }
+        Ok(summary)
     }
 
     fn recover_ingress_journal_after(

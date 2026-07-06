@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use capture::{CaptureMultiplexer, CaptureProvider, LibpcapProvider, MultiplexedProvider};
 use probe_config::{CaptureBackend, CaptureSelection};
 use probe_core::{CancellationToken, RuntimeMode};
@@ -147,6 +149,7 @@ fn build_live_capture_provider(
     cancellation: CancellationToken,
 ) -> Result<BuiltCaptureProvider, AgentError> {
     plan.require_live_capture()?;
+    let started = Instant::now();
     let outcome = match try_build_live_primary_with_fallback(plan, cancellation.clone())? {
         LiveCaptureOpenAttempt::Open(outcome) => outcome,
         LiveCaptureOpenAttempt::Failed(open_failures) => {
@@ -161,20 +164,24 @@ fn build_live_capture_provider(
             );
         }
     };
+    log_capture_provider_startup_stage(started, "opened live primary backend");
     let descriptor = outcome.descriptor;
     let OpenedLiveCaptureBackend {
         provider: primary,
         provider_details,
     } = outcome.provider;
     let primary = session_secret_auto_binding.wrap(primary);
+    log_capture_provider_startup_stage(started, "applied TLS session secret binding");
     let provider =
         with_tls_plaintext_provider(plan, primary, tls_plaintext_runtime, cancellation.clone())?;
+    log_capture_provider_startup_stage(started, "built TLS plaintext wrapper");
     let provider = with_mitm_plaintext_bridge_provider(
         plan,
         provider,
         l7_mitm_runtime,
         mitm_plaintext_bridge,
     )?;
+    log_capture_provider_startup_stage(started, "built MITM plaintext bridge wrapper");
     Ok(BuiltCaptureProvider {
         provider,
         runtime: CaptureProviderRuntimeSnapshot {
@@ -235,8 +242,10 @@ fn try_open_live_backend_with_fallback<T>(
             return Err(capture_startup_cancelled_error());
         }
         let backend = descriptor.backend;
+        let backend_started = Instant::now();
         match open_backend(backend) {
             Ok(provider) => {
+                log_live_backend_open_attempt(backend, backend_started, Ok(()));
                 return Ok(LiveCaptureOpenAttempt::Open(LiveCaptureOpenOutcome {
                     provider,
                     descriptor,
@@ -244,6 +253,7 @@ fn try_open_live_backend_with_fallback<T>(
                 }));
             }
             Err(error) if plan.effective_config.capture.selection == CaptureSelection::Auto => {
+                log_live_backend_open_attempt(backend, backend_started, Err(error.to_string()));
                 failures.push(CaptureProviderOpenFailureSnapshot {
                     backend,
                     reason: error.to_string(),
@@ -252,10 +262,37 @@ fn try_open_live_backend_with_fallback<T>(
                     return Err(capture_startup_cancelled_error());
                 }
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                log_live_backend_open_attempt(backend, backend_started, Err(error.to_string()));
+                return Err(error);
+            }
         }
     }
     Ok(LiveCaptureOpenAttempt::Failed(failures))
+}
+
+fn log_live_backend_open_attempt(
+    backend: CaptureBackend,
+    started: Instant,
+    result: Result<(), String>,
+) {
+    match result {
+        Ok(()) => eprintln!(
+            "agent startup capture backend {backend:?} opened after {:.3}s",
+            started.elapsed().as_secs_f64()
+        ),
+        Err(error) => eprintln!(
+            "agent startup capture backend {backend:?} failed after {:.3}s: {error}",
+            started.elapsed().as_secs_f64()
+        ),
+    }
+}
+
+fn log_capture_provider_startup_stage(started: Instant, stage: &str) {
+    eprintln!(
+        "agent startup capture provider {stage} after {:.3}s",
+        started.elapsed().as_secs_f64()
+    );
 }
 
 fn no_live_capture_error(

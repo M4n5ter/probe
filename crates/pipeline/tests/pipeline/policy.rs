@@ -904,6 +904,10 @@ impl storage::ExportSpool for ExportFailureAfterFirstSpool {
 }
 
 impl storage::DurableSpool for ExportFailureAfterFirstSpool {
+    fn snapshot(&self) -> Result<storage::SpoolSnapshot, storage::StorageError> {
+        self.inner.snapshot()
+    }
+
     fn append_ingress(
         &self,
         payload: storage::SpoolPayload,

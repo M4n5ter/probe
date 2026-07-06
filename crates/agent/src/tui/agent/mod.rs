@@ -27,7 +27,8 @@ const ADMIN_SHUTDOWN_GRACE_TIMEOUT: Duration = Duration::from_secs(5);
 const MANAGED_AGENT_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const MANAGED_AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const LOG_TAIL_BYTES: u64 = 8 * 1024;
-const READY_SOCKET_ENV: &str = "TRAFFIC_PROBE_READY_SOCKET";
+const DATA_READY_SOCKET_ENV: &str = "TRAFFIC_PROBE_READY_SOCKET";
+const CONTROL_READY_SOCKET_ENV: &str = "TRAFFIC_PROBE_CONTROL_READY_SOCKET";
 
 #[derive(Debug)]
 pub(crate) struct TuiAgentSupervisor {
@@ -324,7 +325,8 @@ async fn spawn_managed_agent_with_cancellation(
         .arg("run")
         .arg("--config")
         .arg(&layout.config_path)
-        .env(READY_SOCKET_ENV, &layout.readiness_path)
+        .env(CONTROL_READY_SOCKET_ENV, &layout.readiness_path)
+        .env_remove(DATA_READY_SOCKET_ENV)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone().map_err(|source| {
             TuiError::AgentSupervisor {

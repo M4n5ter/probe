@@ -40,6 +40,7 @@ use super::admin::{AdminCliCommand, run_admin_command};
 const REPLAY_POLICY_SOURCE_BYTES: u64 = 1024 * 1024;
 const MAX_MAIN_CONFIG_BYTES: u64 = 1024 * 1024;
 const READY_SOCKET_ENV: &str = "TRAFFIC_PROBE_READY_SOCKET";
+const CONTROL_READY_SOCKET_ENV: &str = "TRAFFIC_PROBE_CONTROL_READY_SOCKET";
 
 #[derive(Debug, Parser)]
 #[command(name = "traffic-probe")]
@@ -78,7 +79,7 @@ enum Command {
         width: u16,
         #[arg(long, default_value_t = 36, requires = "snapshot")]
         height: u16,
-        #[arg(long, default_value = "traffic", requires = "snapshot")]
+        #[arg(long, default_value = "traffic")]
         tab: CliTuiTab,
         #[arg(long, requires = "snapshot")]
         open_detail: bool,
@@ -269,7 +270,11 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
                 })
                 .await?;
             } else {
-                run_tui(TuiOptions { config }).await?;
+                run_tui(TuiOptions {
+                    config,
+                    tab: tab.into(),
+                })
+                .await?;
             }
         }
         Command::Admin { socket, command } => {
@@ -313,22 +318,23 @@ fn run_options_from_env(
     Ok(RunOptions {
         max_events,
         config_path,
-        readiness: readiness_from_env()?,
+        readiness: readiness_from_env(READY_SOCKET_ENV)?,
+        control_readiness: readiness_from_env(CONTROL_READY_SOCKET_ENV)?,
     })
 }
 
-fn readiness_from_env() -> Result<ReadinessSignal, AgentError> {
-    let Some(value) = std::env::var_os(READY_SOCKET_ENV) else {
+fn readiness_from_env(name: &'static str) -> Result<ReadinessSignal, AgentError> {
+    let Some(value) = std::env::var_os(name) else {
         return Ok(ReadinessSignal::None);
     };
-    parse_ready_socket(value).map(ReadinessSignal::UnixSocket)
+    parse_ready_socket(name, value).map(ReadinessSignal::UnixSocket)
 }
 
-fn parse_ready_socket(value: OsString) -> Result<PathBuf, AgentError> {
+fn parse_ready_socket(name: &'static str, value: OsString) -> Result<PathBuf, AgentError> {
     let path = PathBuf::from(value);
     if path.as_os_str().is_empty() {
         return Err(AgentError::InvalidReadinessSocket {
-            name: READY_SOCKET_ENV,
+            name,
             value: path.display().to_string(),
         });
     }
@@ -661,9 +667,21 @@ mod tests {
     }
 
     #[test]
-    fn tui_cli_rejects_snapshot_options_without_snapshot_mode() {
+    fn tui_cli_accepts_initial_interactive_tab() {
+        let cli = Cli::try_parse_from(["traffic-probe", "tui", "--tab", "traffic"])
+            .expect("interactive TUI should accept an initial tab");
+
+        let Command::Tui { snapshot, tab, .. } = cli.command else {
+            panic!("expected TUI command");
+        };
+
+        assert!(!snapshot);
+        assert_eq!(tab, CliTuiTab::Traffic);
+    }
+
+    #[test]
+    fn tui_cli_rejects_snapshot_only_options_without_snapshot_mode() {
         for args in [
-            &["traffic-probe", "tui", "--tab", "traffic"][..],
             &["traffic-probe", "tui", "--width", "157"][..],
             &["traffic-probe", "tui", "--height", "45"][..],
             &["traffic-probe", "tui", "--open-detail"][..],
@@ -761,7 +779,7 @@ mod tests {
     #[test]
     fn ready_socket_env_rejects_empty_value() {
         assert!(matches!(
-            parse_ready_socket(OsString::from("")),
+            parse_ready_socket(READY_SOCKET_ENV, OsString::from("")),
             Err(AgentError::InvalidReadinessSocket { .. })
         ));
     }

@@ -675,18 +675,35 @@ fn tls_plaintext_startup_cancelled_error() -> AgentError {
 fn compile_libssl_uprobe_selector(
     plan: &RuntimePlan,
 ) -> Result<Option<probe_core::CompiledSelector>, AgentError> {
-    plan.config
+    let Some((field, selector)) = libssl_uprobe_selector_source(plan) else {
+        return Ok(None);
+    };
+    selector
+        .compile_with_registry(&plan.effective_config.selectors)
+        .map(Some)
+        .map_err(|source| {
+            AgentError::UnsupportedRunConfig(format!(
+                "invalid {field} during runtime build: {source}"
+            ))
+        })
+}
+
+fn libssl_uprobe_selector_source(
+    plan: &RuntimePlan,
+) -> Option<(&'static str, &probe_core::Selector)> {
+    plan.effective_config
         .tls
         .plaintext
         .instrumentation
         .selector
         .as_ref()
-        .map(|selector| selector.compile_with_registry(&plan.config.selectors))
-        .transpose()
-        .map_err(|source| {
-            AgentError::UnsupportedRunConfig(format!(
-                "invalid tls.plaintext.instrumentation.selector during runtime build: {source}"
-            ))
+        .map(|selector| ("tls.plaintext.instrumentation.selector", selector))
+        .or_else(|| {
+            plan.effective_config
+                .capture
+                .deep_observe_selector
+                .as_ref()
+                .map(|selector| ("capture.deep_observe_selector", selector))
         })
 }
 
@@ -789,8 +806,14 @@ mod tests {
         LibsslUprobeAttachProgramLinkOwnershipSnapshot, LibsslUprobeAttachTargetSnapshot,
         LibsslUprobeReconcileTargetBucket, MAX_LIBSSL_RECONCILE_TARGET_SNAPSHOTS_PER_BUCKET,
     };
-    use probe_config::{AgentConfig, CaptureBackend, CaptureSelection};
-    use probe_core::CapabilityState;
+    use probe_config::{
+        AgentConfig, CaptureBackend, CaptureSelection, ObservationDataPathMode,
+        ProcessObservationConfig,
+    };
+    use probe_core::{
+        CapabilityState, Direction, ProcessContext, ProcessIdentity, ProcessSelector, Selector,
+        TrafficSelector,
+    };
     use runtime::{CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry};
 
     use super::*;
@@ -864,6 +887,63 @@ mod tests {
             TlsPlaintextReconcileHealthMode::Available
         );
         assert!(snapshot.reconcile_health.last_attempt.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn libssl_uprobe_selector_inherits_projected_capture_selector()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AgentConfig::default();
+        config.tls.plaintext.instrumentation.enabled = true;
+        config
+            .tls
+            .plaintext
+            .instrumentation
+            .libssl_uprobe_object_path =
+            Some("/var/lib/traffic-probe/artifacts/ebpf/custom-tls-plaintext.bpf.o".into());
+        config.observations.push(process_observation(
+            "/srv/observed-api",
+            ObservationDataPathMode::Auto,
+        ));
+        let plan = runtime_plan_from_config(config, vec![libssl_uprobe_capability()])?;
+
+        let selector = compile_libssl_uprobe_selector(&plan)?
+            .expect("projected capture selector should constrain libssl uprobes");
+
+        assert!(
+            selector.matches_unattributed_flow(&process("/srv/observed-api"), Direction::Outbound)
+        );
+        assert!(
+            !selector.matches_unattributed_flow(&process("/srv/other-api"), Direction::Outbound)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_libssl_uprobe_selector_overrides_projected_capture_selector()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = AgentConfig::default();
+        config.tls.plaintext.instrumentation.enabled = true;
+        config
+            .tls
+            .plaintext
+            .instrumentation
+            .libssl_uprobe_object_path =
+            Some("/var/lib/traffic-probe/artifacts/ebpf/custom-tls-plaintext.bpf.o".into());
+        config.tls.plaintext.instrumentation.selector = Some(process_selector("/srv/tls-api"));
+        config.observations.push(process_observation(
+            "/srv/observed-api",
+            ObservationDataPathMode::Auto,
+        ));
+        let plan = runtime_plan_from_config(config, vec![libssl_uprobe_capability()])?;
+
+        let selector = compile_libssl_uprobe_selector(&plan)?
+            .expect("explicit TLS selector should constrain libssl uprobes");
+
+        assert!(selector.matches_unattributed_flow(&process("/srv/tls-api"), Direction::Outbound));
+        assert!(
+            !selector.matches_unattributed_flow(&process("/srv/observed-api"), Direction::Outbound)
+        );
         Ok(())
     }
 
@@ -1152,6 +1232,53 @@ mod tests {
             platform_capabilities,
         );
         RuntimePlan::build(config, &registry)
+    }
+
+    fn libssl_uprobe_capability() -> CapabilityState {
+        CapabilityState::available(probe_core::CapabilityKind::LibsslUprobe)
+    }
+
+    fn process_observation(
+        exe_path: &str,
+        data_path: ObservationDataPathMode,
+    ) -> ProcessObservationConfig {
+        ProcessObservationConfig {
+            id: format!("exe:{exe_path}"),
+            selector: process_selector(exe_path),
+            data_path,
+            directions: vec![Direction::Inbound, Direction::Outbound],
+        }
+    }
+
+    fn process_selector(exe_path: &str) -> Selector {
+        Selector::term(
+            ProcessSelector {
+                exe_path_globs: vec![exe_path.to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector::default(),
+        )
+    }
+
+    fn process(exe_path: &str) -> ProcessContext {
+        ProcessContext {
+            identity: ProcessIdentity {
+                pid: 42,
+                tgid: 42,
+                start_time_ticks: 1,
+                boot_id: "boot".to_string(),
+                exe_path: exe_path.to_string(),
+                cmdline_hash: "hash".to_string(),
+                uid: 1000,
+                gid: 1000,
+                cgroup: None,
+                systemd_service: None,
+                container_id: None,
+                runtime_hint: None,
+            },
+            name: exe_path.rsplit('/').next().unwrap_or(exe_path).to_string(),
+            cmdline: vec![exe_path.to_string()],
+        }
     }
 
     fn assert_succeeded_reconcile_attempt(

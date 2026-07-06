@@ -1,8 +1,9 @@
-use std::{io::Write, os::unix::net::UnixStream, path::PathBuf, sync::Arc};
+use std::{io::Write, os::unix::net::UnixStream, path::PathBuf, sync::Arc, time::Instant};
 
 use parsers::Http1ParserFactory;
 use pipeline::{
-    CapturePipeline, PipelinePolicySet, PipelineRunOptions, PipelineRuntimeMetrics, PipelineSummary,
+    CapturePipeline, IngressBacklogRecovery, PipelinePolicySet, PipelineRunOptions,
+    PipelineRuntimeMetrics, PipelineSummary,
 };
 use probe_config::AgentConfig;
 use runtime::{RuntimePlan, validate_static_runtime_config};
@@ -58,13 +59,14 @@ use super::handoff::{
     RuntimeGenerationHandoffDrain,
 };
 
-const INGRESS_RECOVERY_BATCH_SIZE: usize = 1_024;
+const LIVE_INGRESS_RECOVERY_BATCH_SIZE: usize = 256;
 const LIVE_CAPTURE_BATCH_POLLS: u64 = 8;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RunOptions {
     pub max_events: Option<u64>,
     pub config_path: Option<PathBuf>,
     pub readiness: ReadinessSignal,
+    pub control_readiness: ReadinessSignal,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -82,6 +84,7 @@ pub(crate) async fn run_live_agent(
         max_events,
         config_path,
         readiness,
+        control_readiness,
     } = options;
     require_runtime_artifacts(&mut agent_config)?;
     validate_static_runtime_config(&agent_config)?;
@@ -246,6 +249,7 @@ pub(crate) async fn run_live_agent(
         shutdown_requested: shutdown_requested.clone(),
         max_events,
         readiness,
+        control_readiness,
     };
     let blocking_run = tokio::task::spawn_blocking(|| blocking_run.run()).await;
     shutdown_signal_task.abort();
@@ -369,6 +373,7 @@ struct BlockingCaptureRun {
     shutdown_requested: shutdown::ShutdownFlag,
     max_events: Option<u64>,
     readiness: ReadinessSignal,
+    control_readiness: ReadinessSignal,
 }
 
 struct BlockingCaptureRunOutput {
@@ -405,6 +410,7 @@ impl BlockingCaptureRun {
             shutdown_requested,
             max_events,
             readiness,
+            control_readiness,
         } = self;
         let mut active_interception_guard = ActiveInterceptionGuard::default();
         let mut storage_retention_worker = None;
@@ -415,26 +421,25 @@ impl BlockingCaptureRun {
             plan_handle.clone(),
             pipeline_metrics.clone(),
         ));
+        let startup_started = Instant::now();
         let summary_result = (|| {
             let mut parser_factory = Http1ParserFactory::default();
-            let mut pipeline = CapturePipeline::new(
+            let pipeline = CapturePipeline::new(
                 spool.as_ref(),
                 &mut parser_factory,
                 policy_set,
                 plan.config.config_version.clone(),
             )
             .with_runtime_metrics(pipeline_metrics);
-            let mut summary = pipeline.recover_ingress_journal_until_idle_with_cancellation(
-                INGRESS_RECOVERY_BATCH_SIZE,
-                &shutdown_requested,
-            )?;
+            let mut ingress_recovery = pipeline.ingress_backlog_recovery()?;
+            let mut summary = PipelineSummary::default();
+            log_startup_stage(startup_started, "initialized pipeline");
+            if signal_configured_readiness(control_readiness)? {
+                log_startup_stage(startup_started, "signaled control-plane readiness");
+            }
             if shutdown::requested(&shutdown_requested) {
                 return Ok(summary);
             }
-            storage_retention_worker = Some(spawn_storage_retention_workers(
-                Arc::clone(&spool),
-                plan_handle.clone(),
-            ));
             let mut pipeline = pipeline.with_enforcement_planner(&mut enforcement_planner);
             active_interception_guard.l7_mitm_backend = start_backend_lifecycle(
                 &plan.enforcement.interception.mitm.backend,
@@ -443,6 +448,7 @@ impl BlockingCaptureRun {
                 &shutdown_requested,
             )
             .map_err(AgentError::L7MitmRuntime)?;
+            log_startup_stage(startup_started, "started L7 MITM backend lifecycle");
             let built_provider = match build_capture_provider_with_cancellation(
                 &plan,
                 Some(&tls_plaintext_runtime),
@@ -454,8 +460,11 @@ impl BlockingCaptureRun {
                 Err(AgentError::StartupCancelled(_)) => return Ok(summary),
                 Err(error) => return Err(error),
             };
+            log_startup_stage(startup_started, "built capture provider");
             capture_runtime.record(built_provider.runtime);
             let mut provider = capture_runtime.observe_capture_input(built_provider.provider);
+            log_startup_stage(startup_started, "recorded capture runtime");
+            let storage_retention_plan_handle = plan_handle.clone();
             let runtime_generation_executor = RuntimeGenerationExecutor::new(
                 runtime_generation.clone(),
                 plan_handle,
@@ -467,7 +476,28 @@ impl BlockingCaptureRun {
             );
             active_interception_guard.transparent_interception =
                 transparent_interception.activate(transparent_interception_setup_scope)?;
-            signal_readiness(readiness)?;
+            log_startup_stage(startup_started, "activated transparent interception");
+            let recovered = recover_live_ingress_backlog_until_caught_up(
+                &mut pipeline,
+                &mut ingress_recovery,
+                &shutdown_requested,
+            )?;
+            summary.merge(recovered);
+            log_startup_stage(startup_started, "recovered startup ingress backlog");
+            if shutdown::requested(&shutdown_requested) || !ingress_recovery.caught_up() {
+                return Ok(summary);
+            }
+            storage_retention_worker = Some(spawn_storage_retention_workers(
+                Arc::clone(&spool),
+                storage_retention_plan_handle,
+            ));
+            log_startup_stage(startup_started, "started storage retention workers");
+            if shutdown::requested(&shutdown_requested) {
+                return Ok(summary);
+            }
+            if signal_configured_readiness(readiness)? {
+                log_startup_stage(startup_started, "signaled data-plane readiness");
+            }
             let mut handoff_drain = RuntimeGenerationHandoffDrain::default();
             loop {
                 if shutdown::requested(&shutdown_requested) {
@@ -587,6 +617,39 @@ fn live_capture_run_options_with_max_polls(
         .with_cancellation_token(shutdown_requested.clone());
     options.max_events = remaining_events;
     Some(options)
+}
+
+fn recover_live_ingress_backlog_until_caught_up<S>(
+    pipeline: &mut CapturePipeline<'_, S>,
+    backlog: &mut IngressBacklogRecovery,
+    shutdown_requested: &shutdown::ShutdownFlag,
+) -> Result<PipelineSummary, pipeline::PipelineError>
+where
+    S: storage::DurableSpool,
+{
+    let mut summary = PipelineSummary::default();
+    while !backlog.caught_up() && !shutdown::requested(shutdown_requested) {
+        let batch = pipeline.recover_ingress_backlog_batch(
+            backlog,
+            LIVE_INGRESS_RECOVERY_BATCH_SIZE,
+            shutdown_requested,
+        )?;
+        summary.merge(batch);
+    }
+    Ok(summary)
+}
+
+fn signal_configured_readiness(readiness: ReadinessSignal) -> Result<bool, AgentError> {
+    let configured = !matches!(readiness, ReadinessSignal::None);
+    signal_readiness(readiness)?;
+    Ok(configured)
+}
+
+fn log_startup_stage(started: Instant, stage: &str) {
+    eprintln!(
+        "agent startup {stage} after {:.3}s",
+        started.elapsed().as_secs_f64()
+    );
 }
 
 #[derive(Default)]
@@ -803,6 +866,7 @@ mod tests {
                                 max_events: None,
                                 config_path: None,
                                 readiness,
+                                control_readiness: ReadinessSignal::None,
                             },
                         ))
                         .map_err(|error| error.to_string())
@@ -831,12 +895,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unix_socket_readiness_is_not_signaled_when_provider_fails_to_open()
+    async fn control_readiness_is_signaled_before_provider_open_failure()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
         let missing_feed_path = temp.path().join("missing-feed.jsonl");
-        let ready_path = temp.path().join("ready.sock");
-        let ready_listener = UnixListener::bind(&ready_path)?;
+        let control_ready_path = temp.path().join("control-ready.sock");
+        let control_ready_listener = UnixListener::bind(&control_ready_path)?;
+        let data_ready_path = temp.path().join("data-ready.sock");
+        let data_ready_listener = UnixListener::bind(&data_ready_path)?;
         let config = plaintext_feed_config(missing_feed_path, temp.path().join("spool"));
 
         let error = run_live_agent(
@@ -844,19 +910,25 @@ mod tests {
             RunOptions {
                 max_events: Some(0),
                 config_path: None,
-                readiness: ReadinessSignal::UnixSocket(ready_path),
+                readiness: ReadinessSignal::UnixSocket(data_ready_path),
+                control_readiness: ReadinessSignal::UnixSocket(control_ready_path),
             },
         )
         .await
-        .expect_err("missing feed should fail before readiness is signaled");
+        .expect_err("missing feed should fail after control readiness and before data readiness");
 
         assert!(
             matches!(error, AgentError::PlaintextFeed(_)),
             "unexpected error: {error:?}"
         );
-        ready_listener.set_nonblocking(true)?;
+        control_ready_listener.set_nonblocking(true)?;
+        let (mut stream, _) = control_ready_listener.accept()?;
+        let mut ready = [0_u8; 6];
+        stream.read_exact(&mut ready)?;
+        assert_eq!(&ready, b"ready\n");
+        data_ready_listener.set_nonblocking(true)?;
         assert!(matches!(
-            ready_listener.accept(),
+            data_ready_listener.accept(),
             Err(error) if error.kind() == ErrorKind::WouldBlock
         ));
         Ok(())

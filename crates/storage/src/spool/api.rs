@@ -85,6 +85,8 @@ pub trait ExportSpool {
 }
 
 pub trait DurableSpool: ExportSpool {
+    fn snapshot(&self) -> Result<SpoolSnapshot, StorageError>;
+
     fn append_ingress(&self, payload: SpoolPayload) -> Result<StoredEvent, StorageError>;
 
     fn read_ingress_batch(

@@ -88,6 +88,108 @@ fn recover_ingress_journal_stops_when_shutdown_is_already_requested()
 }
 
 #[test]
+fn incremental_backlog_recovery_progresses_past_uncheckpointed_prefix()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let spool = storage::FjallSpool::open(temp.path())?;
+    let first = captured_bytes_with_direction(
+        demo_flow_with_ports(50_000, 80, 41),
+        Direction::Outbound,
+        b"GET /cursor-a HTTP/1.1\r\nHost: recovery.test\r\n\r\n",
+    );
+    let second = captured_bytes_with_direction(
+        demo_flow_with_ports(50_001, 80, 42),
+        Direction::Outbound,
+        b"GET /cursor-b HTTP/1.1\r\nHost: recovery.test\r\n\r\n",
+    );
+    spool.append_ingress(capture_event_payload(&first)?)?;
+    spool.append_ingress(capture_event_payload(&second)?)?;
+    let mut parser_factory = Http1ParserFactory::default();
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
+    let mut backlog = pipeline.ingress_backlog_recovery()?;
+
+    let first_batch =
+        pipeline.recover_ingress_backlog_batch(&mut backlog, 1, &CancellationToken::default())?;
+    let second_batch =
+        pipeline.recover_ingress_backlog_batch(&mut backlog, 1, &CancellationToken::default())?;
+    let idle_batch =
+        pipeline.recover_ingress_backlog_batch(&mut backlog, 1, &CancellationToken::default())?;
+
+    assert_eq!(first_batch.ingress_records_recovered, 1);
+    assert_eq!(second_batch.ingress_records_recovered, 1);
+    assert_eq!(idle_batch.ingress_records_recovered, 0);
+    assert!(backlog.caught_up());
+    assert_eq!(spool.ingress_cursor(PARSER_INGRESS_CURSOR_OWNER)?, 0);
+    assert_eq!(count_request_targets(&spool, "/cursor-a")?, 1);
+    assert_eq!(count_request_targets(&spool, "/cursor-b")?, 1);
+    Ok(())
+}
+
+#[test]
+fn incremental_backlog_recovery_does_not_replay_live_records()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let spool = storage::FjallSpool::open(temp.path())?;
+    let backlog_event = captured_bytes_with_direction(
+        demo_flow_with_ports(50_000, 80, 43),
+        Direction::Outbound,
+        b"GET /backlog-only HTTP/1.1\r\nHost: recovery.test\r\n\r\n",
+    );
+    spool.append_ingress(capture_event_payload(&backlog_event)?)?;
+    let mut parser_factory = Http1ParserFactory::default();
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
+    let mut backlog = pipeline.ingress_backlog_recovery()?;
+    let mut provider = SequenceProvider::new(vec![captured_bytes_with_direction(
+        demo_flow_with_ports(50_001, 80, 44),
+        Direction::Outbound,
+        b"GET /live-only HTTP/1.1\r\nHost: recovery.test\r\n\r\n",
+    )]);
+
+    let live = pipeline.run_provider(&mut provider)?;
+    let recovered =
+        pipeline.recover_ingress_backlog_batch(&mut backlog, 16, &CancellationToken::default())?;
+
+    assert_eq!(live.ingress_records_journaled, 1);
+    assert_eq!(live.export_events_written, 1);
+    assert_eq!(recovered.ingress_records_recovered, 1);
+    assert_eq!(recovered.export_events_written, 1);
+    assert_eq!(count_request_targets(&spool, "/backlog-only")?, 1);
+    assert_eq!(count_request_targets(&spool, "/live-only")?, 1);
+    Ok(())
+}
+
+#[test]
+fn incremental_backlog_recovery_keeps_pending_work_after_noop_attempts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let spool = storage::FjallSpool::open(temp.path())?;
+    let backlog_event = captured_bytes_with_direction(
+        demo_flow_with_ports(50_000, 80, 45),
+        Direction::Outbound,
+        b"GET /still-pending HTTP/1.1\r\nHost: recovery.test\r\n\r\n",
+    );
+    spool.append_ingress(capture_event_payload(&backlog_event)?)?;
+    let mut parser_factory = Http1ParserFactory::default();
+    let mut pipeline = CapturePipeline::new(&spool, &mut parser_factory, Vec::new(), "test");
+    let mut backlog = pipeline.ingress_backlog_recovery()?;
+    let cancellation = CancellationToken::default();
+    cancellation.cancel();
+
+    let cancelled = pipeline.recover_ingress_backlog_batch(&mut backlog, 16, &cancellation)?;
+    let zero_batch =
+        pipeline.recover_ingress_backlog_batch(&mut backlog, 0, &CancellationToken::default())?;
+    let recovered =
+        pipeline.recover_ingress_backlog_batch(&mut backlog, 16, &CancellationToken::default())?;
+
+    assert_eq!(cancelled.ingress_records_recovered, 0);
+    assert_eq!(zero_batch.ingress_records_recovered, 0);
+    assert_eq!(recovered.ingress_records_recovered, 1);
+    assert!(backlog.caught_up());
+    assert_eq!(count_request_targets(&spool, "/still-pending")?, 1);
+    Ok(())
+}
+
+#[test]
 fn recover_ingress_journal_replays_policy_outputs_with_stable_event_id()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempdir()?;

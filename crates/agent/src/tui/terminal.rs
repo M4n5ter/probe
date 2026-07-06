@@ -45,6 +45,7 @@ const TRAFFIC_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TuiOptions {
     pub(crate) config: Option<PathBuf>,
+    pub(crate) tab: TuiTab,
 }
 
 pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
@@ -55,6 +56,7 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
         loaded.config.clone(),
         ProcessCatalog::default(),
     );
+    app.select_tab(options.tab);
     let mut supervisor = None;
     let mut pending_process_catalog = Some(spawn_process_catalog_load());
     let mut pending_runtime_reconcile = Some(spawn_startup_runtime_reconcile(app.config().clone()));

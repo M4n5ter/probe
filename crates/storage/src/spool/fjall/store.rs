@@ -179,6 +179,10 @@ impl ExportSpool for FjallSpool {
 }
 
 impl DurableSpool for FjallSpool {
+    fn snapshot(&self) -> Result<SpoolSnapshot, StorageError> {
+        FjallSpool::snapshot(self)
+    }
+
     fn append_ingress(&self, payload: SpoolPayload) -> Result<StoredEvent, StorageError> {
         FjallSpool::append_ingress(self, payload)
     }
