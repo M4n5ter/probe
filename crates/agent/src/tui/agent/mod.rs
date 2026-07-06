@@ -7,7 +7,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use probe_config::{AgentConfig, probe_home_path};
+use probe_config::{
+    AgentConfig, TransparentInterceptionMitmBackendConfig,
+    TransparentInterceptionMitmBackendReadinessProbeConfig, probe_home_path,
+};
 use probe_core::CancellationToken;
 use rustix::{
     fs::{FlockOperation, OFlags, flock},
@@ -27,7 +30,7 @@ const ADMIN_ATTACH_PROBE_DELAY: Duration = Duration::from_millis(200);
 const ADMIN_SHUTDOWN_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const ADMIN_SHUTDOWN_GRACE_TIMEOUT: Duration = Duration::from_secs(5);
 const SHARED_MANAGED_HEALTH_PROBE_INTERVAL: Duration = Duration::from_secs(1);
-const MANAGED_AGENT_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+const MANAGED_AGENT_BASE_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const MANAGED_AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const LOG_TAIL_BYTES: u64 = 8 * 1024;
 const DATA_READY_SOCKET_ENV: &str = "TRAFFIC_PROBE_READY_SOCKET";
@@ -424,6 +427,7 @@ async fn spawn_managed_agent_with_locked_config(
     _config_apply_lock: &TuiManagedConfigApplyLock,
 ) -> Result<TuiAgentSupervisor, TuiError> {
     let _startup_lock = ManagedStartupLock::acquire(&layout, &cancellation).await?;
+    let startup_timeout = managed_agent_startup_timeout(config);
     match probe_admin_socket_with_retries(&layout.socket_path).await {
         AdminSocketProbe::Responding => {
             if shared_managed_runtime_matches(config, &layout)? {
@@ -454,8 +458,8 @@ async fn spawn_managed_agent_with_locked_config(
         .arg("run")
         .arg("--config")
         .arg(&layout.config_path)
-        .env(CONTROL_READY_SOCKET_ENV, &layout.readiness_path)
-        .env_remove(DATA_READY_SOCKET_ENV)
+        .env(DATA_READY_SOCKET_ENV, &layout.readiness_path)
+        .env_remove(CONTROL_READY_SOCKET_ENV)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone().map_err(|source| {
             TuiError::AgentSupervisor {
@@ -477,6 +481,7 @@ async fn spawn_managed_agent_with_locked_config(
         &readiness_listener,
         &layout.socket_path,
         &layout.log_path,
+        startup_timeout,
         &cancellation,
     )
     .await
@@ -853,6 +858,35 @@ fn bind_readiness_socket(path: &Path) -> Result<StdUnixListener, TuiError> {
     Ok(listener)
 }
 
+fn managed_agent_startup_timeout(config: &AgentConfig) -> Duration {
+    MANAGED_AGENT_BASE_STARTUP_TIMEOUT
+        .saturating_add(managed_mitm_backend_readiness_budget(config).unwrap_or(Duration::ZERO))
+}
+
+fn managed_mitm_backend_readiness_budget(config: &AgentConfig) -> Option<Duration> {
+    match &config.enforcement.interception.mitm.backend {
+        TransparentInterceptionMitmBackendConfig::ManagedProcess {
+            readiness_probe, ..
+        }
+        | TransparentInterceptionMitmBackendConfig::ProductProxy {
+            readiness_probe, ..
+        } => Some(readiness_probe_budget(readiness_probe)),
+        TransparentInterceptionMitmBackendConfig::Disabled
+        | TransparentInterceptionMitmBackendConfig::External { .. } => None,
+    }
+}
+
+fn readiness_probe_budget(
+    readiness_probe: &TransparentInterceptionMitmBackendReadinessProbeConfig,
+) -> Duration {
+    let attempts = readiness_probe.failure_threshold;
+    let attempt_timeouts =
+        Duration::from_millis(readiness_probe.timeout_ms).saturating_mul(attempts);
+    let sleeps = Duration::from_millis(readiness_probe.interval_ms)
+        .saturating_mul(attempts.saturating_sub(1));
+    attempt_timeouts.saturating_add(sleeps)
+}
+
 fn runtime_config_suffix() -> String {
     let pid = std::process::id();
     let nanos = SystemTime::now()
@@ -867,9 +901,10 @@ async fn wait_for_managed_agent(
     readiness_listener: &StdUnixListener,
     admin_socket_path: &Path,
     log_path: &Path,
+    startup_timeout: Duration,
     cancellation: &CancellationToken,
 ) -> Result<(), TuiError> {
-    let deadline = Instant::now() + MANAGED_AGENT_STARTUP_TIMEOUT;
+    let deadline = Instant::now() + startup_timeout;
     loop {
         if cancellation.is_cancelled() {
             return Err(TuiError::ManagedAgentStartupCancelled);
@@ -1174,6 +1209,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn managed_agent_startup_timeout_honors_managed_mitm_readiness_budget() {
+        let mut config = AgentConfig::default();
+        config.enforcement.interception.mitm.backend =
+            TransparentInterceptionMitmBackendConfig::managed_process(
+                slow_readiness_probe(),
+                Default::default(),
+            );
+
+        assert_eq!(
+            managed_agent_startup_timeout(&config),
+            MANAGED_AGENT_BASE_STARTUP_TIMEOUT.saturating_add(slow_readiness_budget())
+        );
+    }
+
+    #[test]
+    fn managed_agent_startup_timeout_honors_product_proxy_readiness_budget() {
+        let mut config = AgentConfig::default();
+        config.enforcement.interception.mitm.backend =
+            TransparentInterceptionMitmBackendConfig::product_proxy(
+                slow_readiness_probe(),
+                Default::default(),
+            );
+
+        assert_eq!(
+            managed_agent_startup_timeout(&config),
+            MANAGED_AGENT_BASE_STARTUP_TIMEOUT.saturating_add(slow_readiness_budget())
+        );
+    }
+
+    #[test]
+    fn managed_agent_startup_timeout_does_not_wait_for_external_mitm_health_probe() {
+        let mut config = AgentConfig::default();
+        config.enforcement.interception.mitm.backend =
+            TransparentInterceptionMitmBackendConfig::external(slow_readiness_probe());
+
+        assert_eq!(
+            managed_agent_startup_timeout(&config),
+            MANAGED_AGENT_BASE_STARTUP_TIMEOUT
+        );
+    }
+
     #[tokio::test]
     async fn admin_socket_probe_uses_lightweight_ping() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
@@ -1462,5 +1539,18 @@ mod tests {
             log_path: runtime_dir.join("agent.log"),
             runtime_dir,
         }
+    }
+
+    fn slow_readiness_probe() -> TransparentInterceptionMitmBackendReadinessProbeConfig {
+        TransparentInterceptionMitmBackendReadinessProbeConfig {
+            target: Some("127.0.0.1:15002".to_string()),
+            interval_ms: 60_000,
+            timeout_ms: 5_000,
+            failure_threshold: 3,
+        }
+    }
+
+    fn slow_readiness_budget() -> Duration {
+        Duration::from_millis((5_000 * 3) + (60_000 * 2))
     }
 }
