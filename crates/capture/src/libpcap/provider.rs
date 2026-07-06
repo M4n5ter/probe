@@ -603,8 +603,10 @@ mod tests {
             source_port: 50_000,
             destination_port: 80,
             sequence,
+            acknowledgment: 0,
             flags: TcpFlags {
                 syn: false,
+                ack: true,
                 fin: false,
                 rst: false,
             },

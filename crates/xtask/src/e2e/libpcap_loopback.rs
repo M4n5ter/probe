@@ -2,7 +2,9 @@ use std::{collections::BTreeSet, fs, path::Path, process::ExitCode};
 
 use capture::CaptureEvent;
 use probe_config::{AgentConfig, CaptureSelection, PolicyConfig};
-use probe_core::{CaptureProviderKind, CaptureSource, Direction, EventEnvelope, EventKind};
+use probe_core::{
+    CaptureProviderKind, CaptureSource, Direction, EventEnvelope, EventKind, HttpHeaders,
+};
 use storage::{FjallSpool, StoredEvent};
 
 use super::{
@@ -28,6 +30,7 @@ const REQUESTS: usize = 2;
 const REQUEST_BODY_BYTES: usize = 96;
 const RESPONSE_BODY_BYTES: usize = 48;
 const WRITE_CHUNKS: usize = 3;
+const POST_EXCHANGE_DELAY_MS: u64 = 500;
 
 pub(crate) fn run() -> ExitCode {
     match run_inner() {
@@ -83,6 +86,7 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut ready_signal = UnixSocketReadySignal::bind(agent_ready_socket_path)?;
     let mut agent = supervisor.watch(spawn_agent(&config_path, &ready_signal)?, "agent");
     wait_for_agent_ready(agent.child_mut(), &mut ready_signal)?;
+    let expected_fixture_pid = fixture_ready.pid;
     start_http1_loopback_fixture(&fixture_start_path, &fixture_ready.start_nonce)?;
     let fixture_result = wait_for_http1_loopback_fixture_exit(fixture.child_mut());
     fixture.unwatch();
@@ -97,7 +101,7 @@ fn run_at(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let agent_result = stop_running_child(agent.child_mut(), "agent");
     agent.unwatch();
     let spool_result = match (&fixture_result, &agent_result) {
-        (Ok(()), Ok(())) => assert_spool_outputs(&spool_path),
+        (Ok(()), Ok(())) => assert_spool_outputs(&spool_path, expected_fixture_pid),
         _ => Ok(()),
     };
     merge_run_results(fixture_result, progress_result, agent_result, spool_result)?;
@@ -114,7 +118,7 @@ fn fixture_config() -> PlainHttp1LoopbackFixtureConfig {
             response_body_bytes: RESPONSE_BODY_BYTES,
             write_chunks: WRITE_CHUNKS,
             connect_write_delay_ms: 0,
-            post_exchange_delay_ms: 0,
+            post_exchange_delay_ms: POST_EXCHANGE_DELAY_MS,
         },
         accept_read_delay_ms: 0,
         vector_first_payload_slice_bytes: None,
@@ -180,7 +184,10 @@ fn write_agent_config(
     Ok(())
 }
 
-fn assert_spool_outputs(spool_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn assert_spool_outputs(
+    spool_path: &Path,
+    expected_fixture_pid: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
     let spool = FjallSpool::open(spool_path)?;
     let ingress = spool.read_ingress_batch_after(0, 256)?;
     if ingress.is_empty() {
@@ -194,7 +201,7 @@ fn assert_spool_outputs(spool_path: &Path) -> Result<(), Box<dyn std::error::Err
         .map(decode_envelope)
         .collect::<Result<Vec<_>, _>>()?;
     assert_no_policy_runtime_errors(&envelopes)?;
-    assert_expected_requests(&envelopes)?;
+    assert_expected_requests(&envelopes, expected_fixture_pid)?;
     assert_expected_policy_alerts(&envelopes)?;
 
     println!(
@@ -231,31 +238,148 @@ fn assert_libpcap_ingress(events: &[StoredEvent]) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-fn assert_expected_requests(envelopes: &[EventEnvelope]) -> Result<(), Box<dyn std::error::Error>> {
-    let observed = envelopes
-        .iter()
-        .filter_map(|envelope| match envelope.kind() {
-            EventKind::HttpRequestHeaders(headers)
-                if envelope.origin().source() == CaptureSource::Libpcap
-                    && envelope.origin().provider() == CaptureProviderKind::Libpcap
-                    && headers.direction == Direction::Outbound
-                    && headers.method.as_deref() == Some("POST") =>
-            {
-                headers.target.clone()
-            }
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
+fn assert_expected_requests(
+    envelopes: &[EventEnvelope],
+    expected_fixture_pid: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let observed = libpcap_http_request_targets(envelopes);
     let expected = expected_targets();
-    if observed.is_superset(&expected) {
+    if !observed.is_superset(&expected) {
+        let event_summaries = libpcap_event_summaries(envelopes);
+        return Err(e2e_error(format!(
+            "missing libpcap HTTP request targets; expected at least {:?}, observed {:?}, libpcap events {:?}",
+            expected, observed, event_summaries
+        ))
+        .into());
+    }
+
+    let attributed = attributed_libpcap_http_request_targets(envelopes, expected_fixture_pid);
+    if attributed.is_superset(&expected) {
         return Ok(());
     }
 
+    let observed_flows = envelopes
+        .iter()
+        .filter_map(|envelope| {
+            let flow = envelope.flow()?;
+            Some(format!(
+                "{}:{} pid={} process={} confidence={}",
+                flow.local.address,
+                flow.local.port,
+                flow.process.identity.pid,
+                flow.process.name,
+                flow.attribution_confidence
+            ))
+        })
+        .collect::<BTreeSet<_>>();
     Err(e2e_error(format!(
-        "missing libpcap HTTP request targets; expected at least {:?}, observed {:?}",
-        expected, observed
+        "missing attributed libpcap HTTP request targets; expected at least {:?}, attributed {:?}, observed flows {:?}, libpcap events {:?}",
+        expected,
+        attributed,
+        observed_flows,
+        libpcap_event_summaries(envelopes)
     ))
     .into())
+}
+
+fn libpcap_http_request_targets(envelopes: &[EventEnvelope]) -> BTreeSet<String> {
+    envelopes
+        .iter()
+        .filter_map(|envelope| libpcap_inbound_post_request(envelope)?.target.clone())
+        .collect()
+}
+
+fn libpcap_event_summaries(envelopes: &[EventEnvelope]) -> BTreeSet<String> {
+    envelopes
+        .iter()
+        .filter(|envelope| {
+            envelope.origin().source() == CaptureSource::Libpcap
+                && envelope.origin().provider() == CaptureProviderKind::Libpcap
+        })
+        .map(libpcap_event_summary)
+        .collect()
+}
+
+fn libpcap_event_summary(envelope: &EventEnvelope) -> String {
+    let flow = envelope.flow();
+    let process = flow
+        .map(|flow| {
+            format!(
+                "pid={} process={} confidence={}",
+                flow.process.identity.pid, flow.process.name, flow.attribution_confidence
+            )
+        })
+        .unwrap_or_else(|| "provider".to_string());
+    let endpoints = flow
+        .map(|flow| {
+            format!(
+                "local={}:{} remote={}:{}",
+                flow.local.address, flow.local.port, flow.remote.address, flow.remote.port
+            )
+        })
+        .unwrap_or_default();
+    let summary = match envelope.kind() {
+        EventKind::HttpRequestHeaders(headers) => format!(
+            "method={:?} target={:?}",
+            headers.method.as_deref(),
+            headers.target.as_deref()
+        ),
+        EventKind::HttpResponseHeaders(headers) => {
+            format!("status={:?} reason={:?}", headers.status, headers.reason)
+        }
+        EventKind::HttpBodyChunk(chunk) => {
+            format!("body offset={} bytes={}", chunk.offset, chunk.data.len())
+        }
+        EventKind::Gap(gap) => format!(
+            "gap expected_offset={} next_offset={:?} reason={}",
+            gap.expected_offset, gap.next_offset, gap.reason
+        ),
+        EventKind::ProtocolError(error) => format!("protocol_error {}", error.reason),
+        other => other.name().to_string(),
+    };
+    let direction = envelope
+        .kind()
+        .direction()
+        .map(|direction| format!(" direction={direction:?}"))
+        .unwrap_or_default();
+    format!(
+        "{}{} {} {} {}",
+        envelope.kind().name(),
+        direction,
+        process,
+        endpoints,
+        summary
+    )
+}
+
+fn attributed_libpcap_http_request_targets(
+    envelopes: &[EventEnvelope],
+    expected_fixture_pid: u32,
+) -> BTreeSet<String> {
+    envelopes
+        .iter()
+        .filter_map(|envelope| {
+            let headers = libpcap_inbound_post_request(envelope)?;
+            let flow = envelope.flow()?;
+            (flow.attribution_confidence > 0 && flow.process.identity.pid == expected_fixture_pid)
+                .then(|| headers.target.clone())
+                .flatten()
+        })
+        .collect()
+}
+
+fn libpcap_inbound_post_request(envelope: &EventEnvelope) -> Option<&HttpHeaders> {
+    match envelope.kind() {
+        EventKind::HttpRequestHeaders(headers)
+            if envelope.origin().source() == CaptureSource::Libpcap
+                && envelope.origin().provider() == CaptureProviderKind::Libpcap
+                && headers.direction == Direction::Inbound
+                && headers.method.as_deref() == Some("POST") =>
+        {
+            Some(headers)
+        }
+        _ => None,
+    }
 }
 
 fn assert_expected_policy_alerts(

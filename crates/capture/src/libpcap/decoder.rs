@@ -12,6 +12,7 @@ pub(super) struct DecodedTcpSegment<'a> {
     pub(super) source_port: u16,
     pub(super) destination_port: u16,
     pub(super) sequence: u32,
+    pub(super) acknowledgment: u32,
     pub(super) flags: TcpFlags,
     pub(super) payload: &'a [u8],
 }
@@ -38,6 +39,14 @@ impl<'a> DecodedTcpSegment<'a> {
 
     pub(super) fn has_syn(&self) -> bool {
         self.flags.syn
+    }
+
+    pub(super) fn has_syn_ack(&self) -> bool {
+        self.flags.syn && self.flags.ack
+    }
+
+    pub(super) fn acknowledges_syn_sequence(&self, sequence: u32) -> bool {
+        self.flags.ack && self.acknowledgment == tcp_seq::advance(sequence, 1)
     }
 
     pub(super) fn has_fin(&self) -> bool {
@@ -69,6 +78,7 @@ enum IpPacket<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct TcpFlags {
     pub(super) syn: bool,
+    pub(super) ack: bool,
     pub(super) fin: bool,
     pub(super) rst: bool,
 }
@@ -77,6 +87,7 @@ impl TcpFlags {
     fn from_byte(flags: u8) -> Self {
         Self {
             syn: flags & 0x02 != 0,
+            ack: flags & 0x10 != 0,
             fin: flags & 0x01 != 0,
             rst: flags & 0x04 != 0,
         }
@@ -254,6 +265,7 @@ fn decode_tcp_segment(
         source_port: u16::from_be_bytes([tcp[0], tcp[1]]),
         destination_port: u16::from_be_bytes([tcp[2], tcp[3]]),
         sequence: u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]),
+        acknowledgment: u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]]),
         flags: TcpFlags::from_byte(tcp[13]),
         payload,
     })
@@ -271,8 +283,10 @@ mod tests {
             source_port: 50_000,
             destination_port: 80,
             sequence: 41,
+            acknowledgment: 0,
             flags: TcpFlags {
                 syn: true,
+                ack: true,
                 fin: true,
                 rst: false,
             },
@@ -280,8 +294,10 @@ mod tests {
         };
         let pure_fin = DecodedTcpSegment {
             sequence: 108,
+            acknowledgment: 0,
             flags: TcpFlags {
                 syn: false,
+                ack: true,
                 fin: true,
                 rst: false,
             },
@@ -559,6 +575,23 @@ mod tests {
 
         assert!(decoded.payload.is_empty());
         assert!(decoded.has_syn());
+        assert!(decoded.has_lifecycle_signal());
+    }
+
+    #[test]
+    fn decodes_empty_syn_ack_segment_for_flow_lifecycle() {
+        let mut packet = ipv4_tcp_packet([10, 0, 0, 2], [10, 0, 0, 1], 80, 50_000, 200, b"");
+        packet[28..32].copy_from_slice(&101u32.to_be_bytes());
+        packet[33] = 0x12;
+
+        let decoded = DecodedTcpSegment::decode(Linktype::IPV4, &packet)
+            .expect("expected tcp syn-ack segment");
+
+        assert!(decoded.payload.is_empty());
+        assert!(decoded.has_syn());
+        assert!(decoded.has_syn_ack());
+        assert_eq!(decoded.acknowledgment, 101);
+        assert!(decoded.acknowledges_syn_sequence(100));
         assert!(decoded.has_lifecycle_signal());
     }
 

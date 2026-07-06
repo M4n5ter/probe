@@ -81,11 +81,22 @@ impl FlowRecord {
 
     pub(super) fn syn_sequence_matches(&self, decoded: &DecodedTcpSegment<'_>) -> bool {
         let direction = self.direction_for(decoded);
-        match direction {
-            Direction::Outbound => self.local_syn,
-            Direction::Inbound => self.remote_syn,
+        self.syn_sequence_for(direction)
+            .is_some_and(|sequence| sequence == decoded.sequence)
+    }
+
+    pub(super) fn syn_belongs_to_existing_flow(&self, decoded: &DecodedTcpSegment<'_>) -> bool {
+        if !decoded.has_syn() {
+            return false;
         }
-        .is_some_and(|sequence| sequence == decoded.sequence)
+        let direction = self.direction_for(decoded);
+        if self.syn_sequence_for(direction).is_some() {
+            return self.syn_sequence_matches(decoded);
+        }
+        self.syn_sequence_for(opposite_direction(direction))
+            .is_some_and(|sequence| {
+                decoded.has_syn_ack() && decoded.acknowledges_syn_sequence(sequence)
+            })
     }
 
     pub(super) fn payload_starts_after_close(
@@ -124,6 +135,20 @@ impl FlowRecord {
             Direction::Outbound => self.local_syn.get_or_insert(sequence),
             Direction::Inbound => self.remote_syn.get_or_insert(sequence),
         };
+    }
+
+    fn syn_sequence_for(&self, direction: Direction) -> Option<u32> {
+        match direction {
+            Direction::Outbound => self.local_syn,
+            Direction::Inbound => self.remote_syn,
+        }
+    }
+}
+
+fn opposite_direction(direction: Direction) -> Direction {
+    match direction {
+        Direction::Outbound => Direction::Inbound,
+        Direction::Inbound => Direction::Outbound,
     }
 }
 
