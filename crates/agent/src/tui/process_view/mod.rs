@@ -36,16 +36,8 @@ impl ProcessViewState {
         &self.filter
     }
 
-    pub(crate) fn monitored_exe_paths(&self) -> &BTreeSet<String> {
-        &self.monitored_exe_paths
-    }
-
-    pub(crate) fn monitored_process_count(&self, catalog: &ProcessCatalog) -> usize {
-        catalog
-            .entries()
-            .iter()
-            .filter(|process| self.monitors_process(process.selector_key().as_deref()))
-            .count()
+    pub(crate) fn monitored_scope_count(&self) -> usize {
+        self.monitored_exe_paths.len()
     }
 
     pub(crate) fn monitors_process(&self, selector_key: Option<&str>) -> bool {
@@ -57,15 +49,7 @@ impl ProcessViewState {
         exe_paths: impl IntoIterator<Item = String>,
         catalog: &ProcessCatalog,
     ) {
-        let live_keys = catalog
-            .entries()
-            .iter()
-            .filter_map(|entry| entry.selector_key())
-            .collect::<BTreeSet<_>>();
-        self.monitored_exe_paths = exe_paths
-            .into_iter()
-            .filter(|exe_path| live_keys.contains(exe_path))
-            .collect();
+        self.monitored_exe_paths = exe_paths.into_iter().collect();
         if self.filter.is_empty()
             && let Some(index) = catalog
                 .entries()

@@ -153,14 +153,6 @@ struct TrafficRefreshIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum TrafficFilterSelector {
-    Ready(ProcessTrafficSelector),
-    NoProcessCatalogEntries,
-    NoSelectedProcess,
-    UnavailableSelectedProcess,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 enum RuntimeGenerationRefreshGate {
     ApplyTraffic,
     HoldTraffic { message: String },
@@ -453,13 +445,11 @@ impl TuiApp {
     }
 
     pub(crate) fn traffic_filter_label(&self) -> String {
-        let monitored = self.process_view.monitored_process_count(&self.processes);
+        let monitored = self.process_view.monitored_scope_count();
         if monitored > 0 {
             return format!("{monitored} watched processes");
         }
-        self.selected_process_name()
-            .map(|name| format!("focused process: {name}"))
-            .unwrap_or_else(|| "no process selected".to_string())
+        "all processes".to_string()
     }
 
     pub(crate) fn process_is_monitored(&self, index: usize) -> bool {
@@ -864,27 +854,7 @@ impl TuiApp {
             }
             return None;
         };
-        let selector_set = match self.traffic_filter_selector() {
-            TrafficFilterSelector::Ready(selector_set) => selector_set,
-            TrafficFilterSelector::NoProcessCatalogEntries => {
-                let message = "No readable process entries are available; keeping the current traffic view unchanged";
-                self.traffic.mark_refresh_paused(message);
-                self.status = StatusMessage::warning(message);
-                return None;
-            }
-            TrafficFilterSelector::NoSelectedProcess => {
-                let message = "No process is selected; traffic filter was not changed";
-                self.traffic.mark_filter_unavailable(message);
-                self.status = StatusMessage::warning(message);
-                return None;
-            }
-            TrafficFilterSelector::UnavailableSelectedProcess => {
-                let message = "Selected process has no readable executable path; traffic filter was not changed";
-                self.traffic.mark_filter_unavailable(message);
-                self.status = StatusMessage::warning(message);
-                return None;
-            }
-        };
+        let selector_set = self.traffic_filter_selector();
         let traffic = self.traffic.begin_refresh(
             socket_path.clone(),
             selector_set.selector,
@@ -973,14 +943,13 @@ impl TuiApp {
     fn is_current_traffic_refresh_identity(&self, identity: &TrafficRefreshIdentity) -> bool {
         self.runtime_epoch == identity.runtime_epoch
             && self.runtime_attachment.active_socket_path() == Some(identity.socket_path.as_path())
-            && matches!(
-                self.traffic_filter_selector(),
-                TrafficFilterSelector::Ready(selector_set)
-                    if traffic_refresh_selector_key(
-                        &selector_set.selector,
-                        selector_set.unknown_process_candidate_selector.as_ref(),
-                    ) == identity.selector_key
-            )
+            && {
+                let selector_set = self.traffic_filter_selector();
+                traffic_refresh_selector_key(
+                    selector_set.selector.as_ref(),
+                    selector_set.unknown_process_candidate_selector.as_ref(),
+                ) == identity.selector_key
+            }
     }
 
     fn runtime_generation_refresh_gate(
@@ -1472,47 +1441,28 @@ impl TuiApp {
             .get(self.process_view.selected_index()?)
     }
 
-    fn traffic_filter_selector(&self) -> TrafficFilterSelector {
+    fn traffic_filter_selector(&self) -> ProcessTrafficSelector {
+        let watched_exe_paths = process_observation_exe_paths(&self.config);
         if let Some(selector) = self
             .processes
-            .traffic_selector_for_exe_paths(self.process_view.monitored_exe_paths().iter().cloned())
+            .traffic_selector_for_exe_paths(watched_exe_paths)
         {
-            return TrafficFilterSelector::Ready(selector);
+            return selector;
         }
-        if self.processes.entries().is_empty() {
-            return TrafficFilterSelector::NoProcessCatalogEntries;
-        }
-        let Some(process) = self.selected_process() else {
-            return TrafficFilterSelector::NoSelectedProcess;
-        };
-        self.processes
-            .traffic_selector_for_entry(process)
-            .map(TrafficFilterSelector::Ready)
-            .unwrap_or(TrafficFilterSelector::UnavailableSelectedProcess)
+        ProcessTrafficSelector::all_processes()
     }
 
     #[cfg(test)]
     fn ready_traffic_filter_selector(&self) -> Option<probe_core::Selector> {
-        match self.traffic_filter_selector() {
-            TrafficFilterSelector::Ready(selector_set) => Some(selector_set.selector),
-            TrafficFilterSelector::NoProcessCatalogEntries
-            | TrafficFilterSelector::NoSelectedProcess
-            | TrafficFilterSelector::UnavailableSelectedProcess => None,
-        }
+        self.traffic_filter_selector().selector
     }
 
     #[cfg(test)]
     fn ready_unknown_process_candidate_selector(
         &self,
     ) -> Option<crate::admin::UnknownProcessCandidateSelector> {
-        match self.traffic_filter_selector() {
-            TrafficFilterSelector::Ready(selector_set) => {
-                selector_set.unknown_process_candidate_selector
-            }
-            TrafficFilterSelector::NoProcessCatalogEntries
-            | TrafficFilterSelector::NoSelectedProcess
-            | TrafficFilterSelector::UnavailableSelectedProcess => None,
-        }
+        self.traffic_filter_selector()
+            .unknown_process_candidate_selector
     }
 
     fn open_traffic_detail(&mut self) -> Option<TuiEffect> {
@@ -2349,13 +2299,16 @@ mod tests {
 
     #[test]
     fn traffic_filter_builds_listener_port_unknown_process_candidate_selector() {
-        let app = TuiApp::new(
+        let mut app = TuiApp::new(
             PathBuf::from("/tmp/agent.toml"),
             AgentConfig::default(),
             ProcessCatalog::from_entries([process(42, "backend", "/app/backend")])
                 .with_listener_ports("/app/backend", [8080, 8081]),
         );
 
+        let effect = app.handle_action(TuiAction::Click(HitTarget::ProcessMonitor(0)));
+
+        assert_eq!(expect_save_status(effect).kind, StatusKind::Saved);
         let candidate = app
             .ready_unknown_process_candidate_selector()
             .expect("listener ports should produce a weak candidate selector");
@@ -2374,7 +2327,7 @@ mod tests {
         assert_eq!(expect_save_status(remove_effect).kind, StatusKind::Saved);
         assert!(!app.process_is_monitored(1));
         assert!(app.config.observations.is_empty());
-        assert_eq!(app.traffic_filter_label(), "focused process: nginx");
+        assert_eq!(app.traffic_filter_label(), "all processes");
     }
 
     #[test]
@@ -2468,7 +2421,7 @@ mod tests {
     }
 
     #[test]
-    fn config_reload_prunes_watched_processes_that_are_no_longer_visible() {
+    fn config_reload_preserves_watched_scope_when_process_is_not_visible() {
         let mut app = multi_process_app();
         let first_effect = app.handle_action(TuiAction::Click(HitTarget::ProcessMonitor(0)));
         let second_effect = app.handle_action(TuiAction::Click(HitTarget::ProcessMonitor(1)));
@@ -2481,14 +2434,32 @@ mod tests {
         );
 
         assert!(!app.process_is_monitored(0));
-        assert_eq!(app.traffic_filter_label(), "focused process: python");
-        let Some(probe_core::Selector::Match { term }) = app.ready_traffic_filter_selector() else {
-            panic!("traffic selector should fall back to the focused process");
+        assert_eq!(app.traffic_filter_label(), "2 watched processes");
+        let Some(probe_core::Selector::Any { selectors }) = app.ready_traffic_filter_selector()
+        else {
+            panic!("watched process scope should remain active without a visible process row");
         };
-        assert_eq!(
-            term.process.exe_path_globs,
-            ["/usr/bin/python3".to_string()]
+        assert_eq!(selectors.len(), 2);
+    }
+
+    #[test]
+    fn traffic_filter_uses_configured_observation_scope_without_process_catalog_match() {
+        let mut config = AgentConfig::default();
+        config
+            .observations
+            .push(process_observation("/app/backend"));
+        let app = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            config,
+            ProcessCatalog::default(),
         );
+
+        assert_eq!(app.traffic_filter_label(), "1 watched processes");
+        assert_eq!(
+            app.ready_traffic_filter_selector(),
+            Some(selector_for_exe_path("/app/backend".to_string()))
+        );
+        assert!(app.ready_unknown_process_candidate_selector().is_none());
     }
 
     #[test]
@@ -2541,7 +2512,7 @@ mod tests {
     }
 
     #[test]
-    fn traffic_view_fails_closed_when_selected_process_has_no_selector() {
+    fn traffic_view_uses_all_processes_when_selected_process_has_no_selector() {
         let config = AgentConfig::default();
         let mut app = TuiApp::new(
             PathBuf::from("/tmp/agent.toml"),
@@ -2563,18 +2534,13 @@ mod tests {
 
         let request = app.begin_traffic_refresh();
 
-        assert!(request.is_none());
+        assert!(request.is_some());
         assert!(app.traffic().rows().is_empty());
-        assert_eq!(app.status().kind, StatusKind::Warning);
-        assert!(
-            app.status()
-                .text
-                .contains("Selected process has no readable executable path")
-        );
+        assert_eq!(app.ready_traffic_filter_selector(), None);
     }
 
     #[test]
-    fn traffic_selector_resolution_distinguishes_empty_catalog_from_unavailable_process() {
+    fn traffic_selector_defaults_to_all_processes_without_explicit_watch() {
         let empty_catalog = TuiApp::new(
             PathBuf::from("/tmp/agent.toml"),
             AgentConfig::default(),
@@ -2582,7 +2548,7 @@ mod tests {
         );
         assert_eq!(
             empty_catalog.traffic_filter_selector(),
-            TrafficFilterSelector::NoProcessCatalogEntries
+            ProcessTrafficSelector::all_processes()
         );
 
         let unavailable = TuiApp::new(
@@ -2600,7 +2566,7 @@ mod tests {
         );
         assert_eq!(
             unavailable.traffic_filter_selector(),
-            TrafficFilterSelector::UnavailableSelectedProcess
+            ProcessTrafficSelector::all_processes()
         );
     }
 
@@ -2621,7 +2587,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_traffic_refresh_is_stale_after_focused_process_changes() {
+    fn pending_traffic_refresh_is_stale_after_watched_process_changes() {
         let mut app = multi_process_app();
         app.attach_agent(RuntimeAttachment::existing(PathBuf::from(
             "/tmp/admin.sock",
@@ -2629,10 +2595,10 @@ mod tests {
 
         let request = app
             .begin_traffic_refresh()
-            .expect("selected process should produce a traffic selector");
+            .expect("all-process traffic selector should be available");
         assert!(app.is_current_traffic_refresh_identity(&request.identity));
 
-        app.handle_action(TuiAction::Click(HitTarget::Process(1)));
+        app.handle_action(TuiAction::Click(HitTarget::ProcessMonitor(1)));
 
         assert!(!app.is_current_traffic_refresh_identity(&request.identity));
     }
@@ -2645,7 +2611,7 @@ mod tests {
 
         let request = app
             .begin_traffic_refresh()
-            .expect("selected process should produce a traffic selector");
+            .expect("traffic selector should be available");
         assert!(app.is_current_traffic_refresh_identity(&request.identity));
 
         app.attach_agent(RuntimeAttachment::existing(socket_path));
@@ -2661,7 +2627,7 @@ mod tests {
 
         let request = app
             .begin_traffic_refresh()
-            .expect("selected process should produce a traffic selector");
+            .expect("traffic selector should be available");
         assert!(app.is_current_traffic_refresh_identity(&request.identity));
 
         app.note_runtime_config_reloaded();
@@ -2677,7 +2643,7 @@ mod tests {
         )));
         let request = app
             .begin_traffic_refresh()
-            .expect("selected process should produce a traffic selector");
+            .expect("traffic selector should be available");
         assert!(app.is_current_traffic_refresh_identity(&request.identity));
 
         app.note_runtime_generation_queued(7);
@@ -2694,7 +2660,7 @@ mod tests {
         app.note_runtime_generation_queued(7);
         let request = app
             .begin_traffic_refresh()
-            .expect("selected process should produce a traffic selector");
+            .expect("traffic selector should be available");
 
         app.apply_traffic_refresh_result(TrafficRefreshLoadResult {
             identity: request.identity.clone(),
@@ -2724,7 +2690,7 @@ mod tests {
         app.note_runtime_generation_queued(7);
         let request = app
             .begin_traffic_refresh()
-            .expect("selected process should produce a traffic selector");
+            .expect("traffic selector should be available");
 
         app.apply_traffic_refresh_result(TrafficRefreshLoadResult {
             identity: request.identity.clone(),
@@ -2752,7 +2718,7 @@ mod tests {
         app.note_runtime_generation_queued(7);
         let superseding = app
             .begin_traffic_refresh()
-            .expect("selected process should produce a traffic selector");
+            .expect("traffic selector should be available");
         app.apply_traffic_refresh_result(TrafficRefreshLoadResult {
             identity: superseding.identity.clone(),
             diagnostics: Ok(runtime_generation_diagnostics_with_pending(
@@ -2771,7 +2737,7 @@ mod tests {
 
         let after_failure = app
             .begin_traffic_refresh()
-            .expect("selected process should produce a traffic selector");
+            .expect("traffic selector should be available");
         app.apply_traffic_refresh_result(TrafficRefreshLoadResult {
             identity: after_failure.identity.clone(),
             diagnostics: Ok(runtime_generation_diagnostics_with_failed_outcome(
@@ -2796,7 +2762,7 @@ mod tests {
         app.note_runtime_generation_queued(7);
         let request = app
             .begin_traffic_refresh()
-            .expect("selected process should produce a traffic selector");
+            .expect("traffic selector should be available");
         assert!(app.is_current_traffic_refresh_identity(&request.identity));
 
         app.apply_traffic_refresh_result(TrafficRefreshLoadResult {
@@ -2830,7 +2796,7 @@ mod tests {
         app.note_runtime_generation_queued(7);
         let request = app
             .begin_traffic_refresh()
-            .expect("selected process should produce a traffic selector");
+            .expect("traffic selector should be available");
 
         app.apply_traffic_refresh_result(TrafficRefreshLoadResult {
             identity: request.identity.clone(),
@@ -2855,7 +2821,7 @@ mod tests {
         )));
         let first = app
             .begin_traffic_refresh()
-            .expect("selected process should produce a traffic selector");
+            .expect("traffic selector should be available");
         app.apply_traffic_refresh_result(TrafficRefreshLoadResult {
             identity: first.identity.clone(),
             diagnostics: Ok(stable_runtime_generation_diagnostics(1, "current")),
@@ -2866,7 +2832,7 @@ mod tests {
         });
         let second = app
             .begin_traffic_refresh()
-            .expect("selected process should produce a traffic selector");
+            .expect("traffic selector should be available");
         assert!(app.is_current_traffic_refresh_identity(&second.identity));
 
         app.apply_traffic_refresh_result(TrafficRefreshLoadResult {
@@ -2895,7 +2861,7 @@ mod tests {
         )));
         let request = app
             .begin_traffic_refresh()
-            .expect("selected process should produce a traffic selector");
+            .expect("traffic selector should be available");
 
         app.apply_traffic_refresh_result(TrafficRefreshLoadResult {
             identity: request.identity.clone(),
@@ -2945,7 +2911,7 @@ mod tests {
         )));
         let request = app
             .begin_traffic_refresh()
-            .expect("selected process should produce a traffic selector");
+            .expect("traffic selector should be available");
 
         app.apply_traffic_refresh_result(TrafficRefreshLoadResult {
             identity: request.identity.clone(),
@@ -3243,7 +3209,7 @@ mod tests {
     }
 
     #[test]
-    fn traffic_refresh_without_process_catalog_preserves_current_view() {
+    fn traffic_refresh_without_process_catalog_uses_all_processes() {
         let mut app = TuiApp::new(
             PathBuf::from("/tmp/agent.toml"),
             AgentConfig::default(),
@@ -3257,13 +3223,9 @@ mod tests {
 
         let request = app.begin_traffic_refresh();
 
-        assert!(request.is_none());
-        assert_eq!(app.traffic().rows().len(), 1);
-        assert_eq!(app.status().kind, StatusKind::Warning);
-        assert_eq!(
-            app.status().text,
-            "No readable process entries are available; keeping the current traffic view unchanged"
-        );
+        assert_eq!(app.ready_traffic_filter_selector(), None);
+        assert!(request.is_some());
+        assert!(app.traffic().rows().is_empty());
     }
 
     fn stable_runtime_generation_diagnostics(

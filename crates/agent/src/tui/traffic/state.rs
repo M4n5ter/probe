@@ -66,7 +66,7 @@ pub(crate) async fn load_traffic_detail(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrafficRefreshRequest {
     socket_path: PathBuf,
-    selector: Selector,
+    selector: Option<Selector>,
     unknown_process_candidate_selector: Option<UnknownProcessCandidateSelector>,
     selector_key: String,
     after_sequence: u64,
@@ -862,11 +862,13 @@ impl TrafficState {
     pub(crate) fn begin_refresh(
         &mut self,
         socket_path: PathBuf,
-        selector: Selector,
+        selector: Option<Selector>,
         unknown_process_candidate_selector: Option<UnknownProcessCandidateSelector>,
     ) -> TrafficRefreshRequest {
-        let selector_key =
-            traffic_refresh_selector_key(&selector, unknown_process_candidate_selector.as_ref());
+        let selector_key = traffic_refresh_selector_key(
+            selector.as_ref(),
+            unknown_process_candidate_selector.as_ref(),
+        );
         if Some(selector_key.clone()) != self.selector_key {
             self.reset_for_selector(selector_key);
         }
@@ -1044,24 +1046,6 @@ impl TrafficState {
                 CaptureDiagnosticMessage::Error(message) => TrafficStatus::error(message),
             };
         }
-    }
-
-    pub(crate) fn mark_filter_unavailable(&mut self, message: impl Into<String>) {
-        self.after_sequence = 0;
-        self.latest_window = true;
-        self.selector_key = None;
-        self.rows.clear();
-        self.http_exchanges.clear();
-        self.websocket_sessions.clear();
-        self.visible_projection.clear();
-        self.event_view.reset();
-        self.http_view.reset();
-        self.websocket_view.reset();
-        self.follow_tail = true;
-        self.clear_detail_state();
-        self.attribution_mode = EventTailAttributionMode::Strict;
-        self.empty_filter_diagnostics = None;
-        self.status = TrafficStatus::error(message);
     }
 
     pub(crate) fn move_selection(&mut self, delta: isize, visible_rows: usize) {
@@ -1881,10 +1865,12 @@ pub(crate) fn traffic_selector_key(selector: &Selector) -> String {
 }
 
 pub(crate) fn traffic_refresh_selector_key(
-    selector: &Selector,
+    selector: Option<&Selector>,
     unknown_process_candidate_selector: Option<&UnknownProcessCandidateSelector>,
 ) -> String {
-    let selector = traffic_selector_key(selector);
+    let selector = selector
+        .map(traffic_selector_key)
+        .unwrap_or_else(|| "-".to_string());
     let candidate = unknown_process_candidate_selector
         .and_then(|selector| serde_json::to_string(selector).ok())
         .unwrap_or_else(|| "-".to_string());
@@ -2129,8 +2115,7 @@ mod tests {
     #[test]
     fn stale_refresh_result_is_ignored_after_event_filter_changes() {
         let mut traffic = TrafficState::default();
-        let request =
-            traffic.begin_refresh(PathBuf::from("/tmp/admin.sock"), Selector::default(), None);
+        let request = traffic.begin_refresh(PathBuf::from("/tmp/admin.sock"), None, None);
 
         traffic.cycle_event_filter();
         let applied = traffic.apply_refresh_result(TrafficRefreshResult {
@@ -3169,12 +3154,16 @@ mod tests {
     }
 
     #[test]
-    fn stale_detail_result_after_filter_unavailable_is_ignored() {
+    fn stale_detail_result_after_selector_reset_is_ignored() {
         let mut traffic = TrafficState::default();
         traffic.apply_snapshot(tail_snapshot_with_response_budget_omission());
         traffic.mark_detail_loading(2, 11);
 
-        traffic.mark_filter_unavailable("Selected process has no readable executable path");
+        traffic.begin_refresh(
+            PathBuf::from("/tmp/admin.sock"),
+            Some(Selector::default()),
+            None,
+        );
 
         assert!(!traffic.apply_detail_load_result(TrafficDetailLoadResult {
             sequence: 2,
@@ -3188,7 +3177,7 @@ mod tests {
             }),
         }));
         assert!(traffic.selected_detail_lines().is_none());
-        assert_eq!(traffic.status().kind, TrafficStatusKind::Error);
+        assert_eq!(traffic.status().kind, TrafficStatusKind::Idle);
     }
 
     fn fallback_capture_snapshot() -> CaptureStatusSnapshot {

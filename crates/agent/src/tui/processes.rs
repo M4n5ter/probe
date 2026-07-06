@@ -207,13 +207,6 @@ impl ProcessCatalog {
         &self.entries
     }
 
-    pub(crate) fn traffic_selector_for_entry(
-        &self,
-        entry: &ProcessEntry,
-    ) -> Option<ProcessTrafficSelector> {
-        self.traffic_scope.selector_for_entry(entry)
-    }
-
     pub(crate) fn traffic_selector_for_exe_paths(
         &self,
         exe_paths: impl IntoIterator<Item = String>,

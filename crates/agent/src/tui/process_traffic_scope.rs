@@ -5,11 +5,11 @@ use probe_core::Selector;
 
 use crate::admin::UnknownProcessCandidateSelector;
 
-use super::processes::{ProcessEntry, selector_for_exe_path};
+use super::processes::selector_for_exe_path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProcessTrafficSelector {
-    pub(crate) selector: Selector,
+    pub(crate) selector: Option<Selector>,
     pub(crate) unknown_process_candidate_selector: Option<UnknownProcessCandidateSelector>,
 }
 
@@ -29,17 +29,9 @@ impl ProcessTrafficScope {
         &self.diagnostics
     }
 
-    pub(crate) fn selector_for_entry(
-        &self,
-        entry: &ProcessEntry,
-    ) -> Option<ProcessTrafficSelector> {
-        let selector_key = entry.selector_key()?;
-        Some(self.selector_for_exe_path(selector_key))
-    }
-
     pub(crate) fn selector_for_exe_path(&self, exe_path: String) -> ProcessTrafficSelector {
         ProcessTrafficSelector {
-            selector: selector_for_exe_path(exe_path.clone()),
+            selector: Some(selector_for_exe_path(exe_path.clone())),
             unknown_process_candidate_selector: self.unknown_process_candidate_selector(&exe_path),
         }
     }
@@ -96,6 +88,15 @@ impl ProcessTrafficScope {
     }
 }
 
+impl ProcessTrafficSelector {
+    pub(crate) fn all_processes() -> Self {
+        Self {
+            selector: None,
+            unknown_process_candidate_selector: None,
+        }
+    }
+}
+
 fn listener_ports_by_exe_path(lookup: TcpListenerProcessLookup) -> BTreeMap<String, Vec<u16>> {
     let mut ports_by_exe_path = BTreeMap::<String, BTreeSet<u16>>::new();
     for listener in lookup.listeners {
@@ -129,7 +130,7 @@ fn merge_selector_sets(selector_sets: Vec<ProcessTrafficSelector>) -> ProcessTra
         }
     }
     ProcessTrafficSelector {
-        selector: merge_selectors(selectors),
+        selector: merge_optional_selectors(selectors),
         unknown_process_candidate_selector: merge_unknown_process_candidate_selectors(
             unknown_process_candidate_selectors,
         ),
@@ -162,6 +163,11 @@ fn merge_selectors(selectors: Vec<Selector>) -> Selector {
         },
         None => first,
     }
+}
+
+fn merge_optional_selectors(selectors: Vec<Option<Selector>>) -> Option<Selector> {
+    let selectors = selectors.into_iter().flatten().collect::<Vec<_>>();
+    (!selectors.is_empty()).then(|| merge_selectors(selectors))
 }
 
 #[cfg(test)]

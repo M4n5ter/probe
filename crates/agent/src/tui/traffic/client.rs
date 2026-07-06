@@ -20,7 +20,7 @@ pub(super) async fn request_tail_events(
     socket_path: &Path,
     after_sequence: u64,
     latest: bool,
-    selector: Selector,
+    selector: Option<Selector>,
     unknown_process_candidate_selector: Option<UnknownProcessCandidateSelector>,
     event_types: &[EventType],
 ) -> Result<EventTailSnapshot, TrafficClientError> {
@@ -66,7 +66,7 @@ struct TailEventsWireRequest<'a> {
     socket_path: &'a Path,
     after_sequence: u64,
     latest: bool,
-    selector: Selector,
+    selector: Option<Selector>,
     unknown_process_candidate_selector: Option<UnknownProcessCandidateSelector>,
     event_types: &'a [EventType],
     scan_limit: usize,
@@ -91,7 +91,7 @@ async fn request_tail_events_with_limit(
             latest: request.latest,
             limit,
             scan_limit: Some(request.scan_limit),
-            selector: Some(request.selector.clone()),
+            selector: request.selector.clone(),
             unknown_process_candidate_selector: request.unknown_process_candidate_selector.clone(),
             event_types: request.event_types.to_vec(),
         },
@@ -246,6 +246,7 @@ mod tests {
             let mut first = accept_request(&listener).await?;
             let first_request = read_request(&mut first).await?;
             assert_eq!(first_request["limit"], json!(LIVE_TAIL_LIMIT));
+            assert!(first_request["selector"].is_null());
             assert_eq!(
                 first_request["scan_limit"],
                 json!(default_tail_scan_limit(false))
@@ -259,6 +260,7 @@ mod tests {
                 second_request["limit"],
                 json!(LIVE_TAIL_LIMIT / TAIL_RETRY_DIVISOR)
             );
+            assert!(second_request["selector"].is_null());
             assert_eq!(
                 second_request["scan_limit"],
                 json!(default_tail_scan_limit(false))
@@ -272,8 +274,7 @@ mod tests {
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
 
-        let tail =
-            request_tail_events(&socket_path, 0, false, Selector::default(), None, &[]).await?;
+        let tail = request_tail_events(&socket_path, 0, false, None, None, &[]).await?;
 
         assert_eq!(tail.limit, LIVE_TAIL_LIMIT / TAIL_RETRY_DIVISOR);
         assert_eq!(tail.scan_limit, default_tail_scan_limit(false));
@@ -291,6 +292,7 @@ mod tests {
             let mut stream = accept_request(&listener).await?;
             let request = read_request(&mut stream).await?;
             assert_eq!(request["latest"], json!(true));
+            assert!(request["selector"].is_null());
             assert_eq!(request["limit"], json!(INITIAL_TAIL_LIMIT));
             assert_eq!(request["scan_limit"], json!(default_tail_scan_limit(true)));
             write_tail_response(
@@ -302,8 +304,7 @@ mod tests {
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
 
-        let tail =
-            request_tail_events(&socket_path, 0, true, Selector::default(), None, &[]).await?;
+        let tail = request_tail_events(&socket_path, 0, true, None, None, &[]).await?;
 
         assert_eq!(tail.limit, INITIAL_TAIL_LIMIT);
         assert_eq!(tail.scan_limit, default_tail_scan_limit(true));
@@ -322,6 +323,7 @@ mod tests {
             let request = read_request(&mut stream).await?;
             assert_eq!(request["latest"], json!(true));
             assert_eq!(request["event_types"], json!(["http_request_headers"]));
+            assert!(request["selector"].is_object());
             assert_eq!(request["limit"], json!(1_024));
             assert_eq!(request["scan_limit"], json!(default_tail_scan_limit(true)));
             write_tail_response(&mut stream, 1_024, default_tail_scan_limit(true)).await?;
@@ -332,7 +334,7 @@ mod tests {
             &socket_path,
             0,
             true,
-            Selector::default(),
+            Some(Selector::default()),
             None,
             &[EventType::HttpRequestHeaders],
         )
@@ -372,7 +374,8 @@ mod tests {
                 .expect("bounded candidate ports should be valid");
 
         let tail =
-            request_tail_events(&socket_path, 0, false, selector, Some(candidate), &[]).await?;
+            request_tail_events(&socket_path, 0, false, Some(selector), Some(candidate), &[])
+                .await?;
 
         assert_eq!(tail.limit, LIVE_TAIL_LIMIT);
         server.await??;
@@ -397,7 +400,7 @@ mod tests {
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
 
-        let error = request_tail_events(&socket_path, 0, false, Selector::default(), None, &[])
+        let error = request_tail_events(&socket_path, 0, false, None, None, &[])
             .await
             .expect_err("tail_events should report final response budget");
 
