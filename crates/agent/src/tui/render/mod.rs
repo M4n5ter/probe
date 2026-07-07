@@ -167,7 +167,7 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let config = app.config();
     let mut lines = vec![
         overview_line("Agent", config.agent_id.clone(), Color::Gray),
-        overview_line("Runtime", app.runtime_agent_status(), Color::Gray),
+        overview_line("Runtime", app.runtime_agent_summary(), Color::Gray),
         overview_line(
             "Config",
             format!(

@@ -107,5 +107,12 @@ pub trait ProcessResolver {
         Ok(None)
     }
 
+    fn resolve_unique_tcp_listener_owner_by_port(
+        &mut self,
+        _local_port: u16,
+    ) -> Result<Option<ResolvedProcess>, CaptureError> {
+        Ok(None)
+    }
+
     fn invalidate_cached_resolution(&mut self) {}
 }

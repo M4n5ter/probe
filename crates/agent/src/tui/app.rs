@@ -513,6 +513,17 @@ impl TuiApp {
         self.runtime_attachment.status_text()
     }
 
+    pub(crate) fn runtime_agent_summary(&self) -> String {
+        self.runtime_attachment.summary_text()
+    }
+
+    pub(crate) fn inactive_runtime_status_text(&self) -> String {
+        format!(
+            "No active agent admin socket is attached; {}",
+            self.runtime_agent_summary()
+        )
+    }
+
     pub(crate) fn overview_data_path_lines(&self) -> Vec<DataPathOverviewLine> {
         self.data_path_diagnostics
             .overview_lines(self.traffic.rows().is_empty())
@@ -537,7 +548,14 @@ impl TuiApp {
         }
         let mut lines = self.data_path_diagnostics.detail_lines();
         lines.insert(0, format!("Traffic: {}", self.traffic.status().text));
-        lines.insert(0, format!("Agent: {}", self.runtime_agent_status()));
+        lines.insert(0, format!("Agent: {}", self.runtime_agent_summary()));
+        if self.active_admin_socket_path().is_none() {
+            lines.insert(
+                2,
+                "Live traffic: unavailable until the TUI managed agent starts or attaches"
+                    .to_string(),
+            );
+        }
         lines.push("Actions: select a process, then choose Auto, eBPF, or libpcap to observe inbound and outbound traffic".to_string());
         fit_lines(lines, max_lines.max(1))
     }
@@ -584,12 +602,14 @@ impl TuiApp {
     ) {
         let raw_message = message.into();
         let failure_kind = classify_runtime_detach_message(&raw_message);
-        let status = StatusMessage::error(raw_message);
-        let reason = status.text.clone();
-        self.runtime_attachment = match log_path {
-            Some(log_path) => RuntimeAttachment::lost_managed(status.text.clone(), log_path),
-            None => RuntimeAttachment::lost(status.text.clone()),
+        let reason = raw_message.clone();
+        let display_message = StatusMessage::error(raw_message).text;
+        let runtime_attachment = match log_path {
+            Some(log_path) => RuntimeAttachment::lost_managed(display_message, log_path),
+            None => RuntimeAttachment::lost(display_message),
         };
+        let status = StatusMessage::error(runtime_attachment.summary_text());
+        self.runtime_attachment = runtime_attachment;
         self.runtime_generation_identity = None;
         self.runtime_generation_reload_pending = None;
         self.invalidate_runtime_reads();
@@ -880,14 +900,11 @@ impl TuiApp {
             if self.runtime_attachment.is_starting() {
                 let message = format!(
                     "Waiting for TUI agent admin socket; {}",
-                    self.runtime_agent_status()
+                    self.runtime_agent_summary()
                 );
                 self.mark_traffic_refresh_waiting_for_runtime(StatusMessage::info(message));
             } else {
-                let message = format!(
-                    "No active agent admin socket is attached; {}",
-                    self.runtime_agent_status()
-                );
+                let message = self.inactive_runtime_status_text();
                 self.traffic.mark_admin_unavailable(message.clone());
                 if matches!(
                     self.data_path_diagnostics,
@@ -1096,7 +1113,7 @@ impl TuiApp {
         else {
             let message = format!(
                 "Cannot load full event detail {sequence}: {}",
-                self.runtime_agent_status()
+                self.inactive_runtime_status_text()
             );
             self.traffic.mark_detail_failed(sequence, message.clone());
             self.status = StatusMessage::warning(message);
@@ -3411,6 +3428,42 @@ mod tests {
                     .value
                     .contains("No active agent admin socket is attached")
         }));
+        assert!(app.traffic_preview_lines(12).iter().any(|line| line
+            == "Live traffic: unavailable until the TUI managed agent starts or attaches"));
+    }
+
+    #[test]
+    fn traffic_detail_without_runtime_uses_compact_managed_agent_status() {
+        let mut app = TuiApp::new(
+            PathBuf::from("/tmp/agent.toml"),
+            AgentConfig::default(),
+            ProcessCatalog::default(),
+        );
+        app.attach_agent(RuntimeAttachment::managed(
+            PathBuf::from("/tmp/admin.sock"),
+            Some(42),
+            PathBuf::from("/tmp/tui-agent.log"),
+        ));
+        app.detach_agent(format!(
+            "TUI managed agent exited during startup: {}",
+            "startup tail ".repeat(80)
+        ));
+
+        let request = app.begin_traffic_detail_load(99);
+
+        assert!(request.is_none());
+        assert_eq!(app.status().kind, StatusKind::Warning);
+        assert!(
+            app.status()
+                .text
+                .contains("Cannot load full event detail 99")
+        );
+        assert!(
+            app.status()
+                .text
+                .contains("TUI managed agent unavailable; log /tmp/tui-agent.log")
+        );
+        assert!(!app.status().text.contains("startup tail"));
     }
 
     #[test]

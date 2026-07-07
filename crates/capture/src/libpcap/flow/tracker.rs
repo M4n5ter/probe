@@ -429,13 +429,8 @@ mod tests {
             payload: b"GET / HTTP/1.1\r\n\r\n",
         };
         let mut resolver: Option<Box<dyn ProcessResolver>> =
-            Some(Box::new(ConnectionAndListenerResolver {
-                connection: TcpConnection::new(
-                    TcpEndpoint::new(Ipv4Addr::new(10, 0, 0, 1).into(), 50_000),
-                    TcpEndpoint::new(Ipv4Addr::new(10, 0, 0, 2).into(), 80),
-                ),
+            Some(Box::new(EndpointOnlyListenerResolver {
                 listener: TcpEndpoint::new(Ipv4Addr::new(10, 0, 0, 2).into(), 80),
-                connection_process: demo_process(7, "client"),
                 listener_process: demo_process(42, "server"),
             }));
         let mut tracker = FlowTracker::default();
@@ -450,6 +445,73 @@ mod tests {
         assert_eq!(observed.flow.process.identity.pid, 42);
         assert_eq!(observed.flow.process.name, "server");
         assert_eq!(observed.attribution_confidence, 60);
+    }
+
+    #[test]
+    fn exact_connection_attribution_outranks_unrelated_port_listener() {
+        let request = DecodedTcpSegment {
+            source: ipv4(10, 0, 0, 2),
+            destination: ipv4(93, 184, 216, 34),
+            source_port: 50_000,
+            destination_port: 80,
+            sequence: 100,
+            acknowledgment: 0,
+            flags: default_flags(),
+            payload: b"GET / HTTP/1.1\r\n\r\n",
+        };
+        let mut resolver: Option<Box<dyn ProcessResolver>> =
+            Some(Box::new(ConnectionAndPortListenerResolver {
+                connection: TcpConnection::new(
+                    TcpEndpoint::new(Ipv4Addr::new(10, 0, 0, 2).into(), 50_000),
+                    TcpEndpoint::new(Ipv4Addr::new(93, 184, 216, 34).into(), 80),
+                ),
+                port: 80,
+                connection_process: demo_process(7, "client"),
+                listener_process: demo_process(42, "local-server"),
+            }));
+        let mut tracker = FlowTracker::default();
+
+        let observed = tracker
+            .observe(&request, timestamp(1, 1), &mut resolver)
+            .payload;
+
+        assert_eq!(observed.direction, Direction::Outbound);
+        assert_eq!(observed.flow.local.address, "10.0.0.2");
+        assert_eq!(observed.flow.remote.address, "93.184.216.34");
+        assert_eq!(observed.flow.process.identity.pid, 7);
+        assert_eq!(observed.flow.process.name, "client");
+        assert_eq!(observed.attribution_confidence, 65);
+    }
+
+    #[test]
+    fn listener_port_resolution_handles_rewritten_listener_addresses() {
+        let request = DecodedTcpSegment {
+            source: ipv4(10, 0, 0, 1),
+            destination: ipv4(10, 0, 0, 2),
+            source_port: 50_000,
+            destination_port: 80,
+            sequence: 100,
+            acknowledgment: 0,
+            flags: default_flags(),
+            payload: b"GET / HTTP/1.1\r\n\r\n",
+        };
+        let mut resolver: Option<Box<dyn ProcessResolver>> =
+            Some(Box::new(PortOnlyListenerResolver {
+                port: 80,
+                listener_process: demo_process(42, "server"),
+            }));
+        let mut tracker = FlowTracker::default();
+
+        let observed = tracker
+            .observe(&request, timestamp(1, 1), &mut resolver)
+            .payload;
+
+        assert_eq!(observed.direction, Direction::Inbound);
+        assert_eq!(observed.flow.local.address, "10.0.0.2");
+        assert_eq!(observed.flow.remote.address, "10.0.0.1");
+        assert_eq!(observed.flow.process.identity.pid, 42);
+        assert_eq!(observed.flow.process.name, "server");
+        assert_eq!(observed.attribution_confidence, 55);
     }
 
     #[test]
@@ -474,11 +536,11 @@ mod tests {
         let mut resolver: Option<Box<dyn ProcessResolver>> =
             Some(Box::new(ConnectionAndListenerResolver {
                 connection: TcpConnection::new(
-                    TcpEndpoint::new(Ipv4Addr::new(10, 0, 0, 1).into(), 50_000),
                     TcpEndpoint::new(Ipv4Addr::new(10, 0, 0, 2).into(), 44_977),
+                    TcpEndpoint::new(Ipv4Addr::new(10, 0, 0, 1).into(), 50_000),
                 ),
                 listener: TcpEndpoint::new(Ipv4Addr::new(10, 0, 0, 2).into(), 44_977),
-                connection_process: demo_process(7, "client"),
+                connection_process: demo_process(42, "server"),
                 listener_process: demo_process(42, "server"),
             }));
         let mut tracker = FlowTracker::default();
@@ -581,11 +643,11 @@ mod tests {
         let mut resolver: Option<Box<dyn ProcessResolver>> =
             Some(Box::new(ConnectionAndListenerResolver {
                 connection: TcpConnection::new(
-                    TcpEndpoint::new(Ipv4Addr::new(10, 0, 0, 1).into(), 50_000),
                     TcpEndpoint::new(Ipv4Addr::new(10, 0, 0, 2).into(), 44_977),
+                    TcpEndpoint::new(Ipv4Addr::new(10, 0, 0, 1).into(), 50_000),
                 ),
                 listener: TcpEndpoint::new(Ipv4Addr::new(10, 0, 0, 2).into(), 44_977),
-                connection_process: demo_process(7, "client"),
+                connection_process: demo_process(42, "server"),
                 listener_process: demo_process(42, "server"),
             }));
         let mut tracker = FlowTracker::default();
@@ -1259,6 +1321,97 @@ mod tests {
             Ok((local_endpoint == self.listener).then(|| ResolvedProcess {
                 process: self.listener_process.clone(),
                 confidence: 60,
+            }))
+        }
+    }
+
+    struct EndpointOnlyListenerResolver {
+        listener: TcpEndpoint,
+        listener_process: ProcessContext,
+    }
+
+    impl ProcessResolver for EndpointOnlyListenerResolver {
+        fn resolve_tcp_process(
+            &mut self,
+            _connection: TcpConnection,
+        ) -> Result<Option<ResolvedProcess>, crate::CaptureError> {
+            Ok(None)
+        }
+
+        fn resolve_tcp_listener(
+            &mut self,
+            local_endpoint: TcpEndpoint,
+        ) -> Result<Option<ResolvedProcess>, crate::CaptureError> {
+            Ok((local_endpoint == self.listener).then(|| ResolvedProcess {
+                process: self.listener_process.clone(),
+                confidence: 60,
+            }))
+        }
+    }
+
+    struct PortOnlyListenerResolver {
+        port: u16,
+        listener_process: ProcessContext,
+    }
+
+    impl ProcessResolver for PortOnlyListenerResolver {
+        fn resolve_tcp_process(
+            &mut self,
+            _connection: TcpConnection,
+        ) -> Result<Option<ResolvedProcess>, crate::CaptureError> {
+            Ok(None)
+        }
+
+        fn resolve_tcp_listener(
+            &mut self,
+            _local_endpoint: TcpEndpoint,
+        ) -> Result<Option<ResolvedProcess>, crate::CaptureError> {
+            Ok(None)
+        }
+
+        fn resolve_unique_tcp_listener_owner_by_port(
+            &mut self,
+            local_port: u16,
+        ) -> Result<Option<ResolvedProcess>, crate::CaptureError> {
+            Ok((local_port == self.port).then(|| ResolvedProcess {
+                process: self.listener_process.clone(),
+                confidence: 55,
+            }))
+        }
+    }
+
+    struct ConnectionAndPortListenerResolver {
+        connection: TcpConnection,
+        port: u16,
+        connection_process: ProcessContext,
+        listener_process: ProcessContext,
+    }
+
+    impl ProcessResolver for ConnectionAndPortListenerResolver {
+        fn resolve_tcp_process(
+            &mut self,
+            connection: TcpConnection,
+        ) -> Result<Option<ResolvedProcess>, crate::CaptureError> {
+            Ok((connection == self.connection).then(|| ResolvedProcess {
+                process: self.connection_process.clone(),
+                confidence: 65,
+            }))
+        }
+
+        fn resolve_tcp_listener(
+            &mut self,
+            _local_endpoint: TcpEndpoint,
+        ) -> Result<Option<ResolvedProcess>, crate::CaptureError> {
+            Ok(None)
+        }
+
+        fn resolve_unique_tcp_listener_owner_by_port(
+            &mut self,
+            local_port: u16,
+        ) -> Result<Option<ResolvedProcess>, crate::CaptureError> {
+            Ok((local_port == self.port).then(|| ResolvedProcess {
+                process: self.listener_process.clone(),
+                confidence: 55,
             }))
         }
     }

@@ -980,7 +980,13 @@ mod tests {
         assert!(app.runtime_agent_status().contains("startup failed"));
         assert!(!app.runtime_agent_status().contains("Starting or attaching"));
         assert!(app.begin_traffic_refresh().is_none());
-        assert!(app.status().text.contains("TUI agent is still unavailable"));
+        assert!(app.status().text.contains("No active agent admin socket"));
+        assert!(
+            app.status()
+                .text
+                .contains("TUI managed agent unavailable; log /tmp/tui-agent.log")
+        );
+        assert!(!app.status().text.contains("startup failed"));
         assert!(
             !app.status()
                 .text

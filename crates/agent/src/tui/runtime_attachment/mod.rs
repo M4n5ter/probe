@@ -120,4 +120,34 @@ impl RuntimeAttachment {
             },
         }
     }
+
+    pub(crate) fn summary_text(&self) -> String {
+        match self {
+            Self::LostManaged { log_path, .. } => {
+                format!("TUI managed agent unavailable; log {}", log_path.display())
+            }
+            Self::Lost { message } => message.clone(),
+            Self::Detached { message } | Self::Starting { message } => message.clone(),
+            Self::Existing { .. } | Self::Managed { .. } => self.status_text(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lost_managed_summary_points_to_log_without_inlining_failure_tail() {
+        let attachment = RuntimeAttachment::lost_managed(
+            "TUI managed agent exited during startup: long failure tail",
+            PathBuf::from("/tmp/probe-agent.log"),
+        );
+
+        assert_eq!(
+            attachment.summary_text(),
+            "TUI managed agent unavailable; log /tmp/probe-agent.log"
+        );
+        assert!(attachment.status_text().contains("long failure tail"));
+    }
 }

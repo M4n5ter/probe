@@ -50,7 +50,8 @@ pub(crate) async fn run_tui_snapshot(options: TuiSnapshotOptions) -> Result<(), 
             Some(supervisor)
         }
         Err(error) => {
-            app.detach_agent(error.to_string());
+            let log_path = error.managed_agent_log_path().map(PathBuf::from);
+            app.detach_agent_with_log(error.to_string(), log_path);
             None
         }
     };

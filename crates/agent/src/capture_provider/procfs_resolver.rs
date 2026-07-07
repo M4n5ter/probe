@@ -59,6 +59,16 @@ impl ProcessResolver for ProcfsTcpProcessResolver {
             .map_err(|error| CaptureError::provider("procfs_socket_attribution", error.to_string()))
     }
 
+    fn resolve_unique_tcp_listener_owner_by_port(
+        &mut self,
+        local_port: u16,
+    ) -> Result<Option<ResolvedProcess>, CaptureError> {
+        self.resolver
+            .resolve_tcp_listeners_by_local_port(local_port)
+            .map(libpcap_best_effort_unique_attributed_listener_owner)
+            .map_err(|error| CaptureError::provider("procfs_socket_attribution", error.to_string()))
+    }
+
     fn invalidate_cached_resolution(&mut self) {
         self.resolver.invalidate_snapshot();
     }
