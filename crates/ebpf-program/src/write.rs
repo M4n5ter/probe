@@ -56,13 +56,7 @@ pub(crate) fn capture_kernel_transfer_write_gap(
     fd: i32,
     pending: &mut EbpfPendingSocketWriteSample,
 ) {
-    reset_pending_write_sample(
-        pending,
-        fd,
-        0,
-        0,
-        EBPF_SOCKET_WRITE_KERNEL_TRANSFER,
-    );
+    reset_pending_write_sample(pending, fd, 0, 0, EBPF_SOCKET_WRITE_KERNEL_TRANSFER);
 }
 
 fn capture_write_sample_from_plan(
@@ -277,13 +271,7 @@ mod tests {
             _reserved: [0; 4],
             buffer: [0; EBPF_SOCKET_WRITE_SAMPLE_BYTES],
         };
-        reset_pending_write_sample(
-            &mut pending,
-            7,
-            original_len,
-            captured.len() as u16,
-            flags,
-        );
+        reset_pending_write_sample(&mut pending, 7, original_len, captured.len() as u16, flags);
         pending.buffer[..captured.len()].copy_from_slice(captured);
         pending
     }

@@ -4,7 +4,7 @@ use runtime::{CaptureEvidenceMode, CaptureInputSource, CapturePlanMode};
 use crate::{
     status::{
         CaptureCandidateStatusSnapshot, CaptureOpenFailureStatusSnapshot, CaptureStatusSnapshot,
-        EbpfExpectedContractStatusSnapshot,
+        EbpfExpectedContractStatusSnapshot, EbpfProcessPayloadStatusSnapshot,
     },
     tui::{
         copy::{MITM_PLAINTEXT_COVERAGE, MITM_PROXY_DATA_PATH_LABEL},
@@ -20,6 +20,7 @@ pub(super) struct CaptureDiagnostics {
     provider_reported: bool,
     input_activity_reported: bool,
     source: CaptureDiagnosticsSource,
+    ebpf_payload: Option<EbpfPayloadDiagnostics>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,11 +33,16 @@ impl CaptureDiagnostics {
     pub(super) fn new(snapshot: CaptureStatusSnapshot) -> Self {
         let provider_reported = snapshot.provider.is_some();
         let input_activity_reported = snapshot.input_activity.is_some();
+        let ebpf_payload = snapshot
+            .ebpf_process_payload
+            .as_ref()
+            .map(EbpfPayloadDiagnostics::from_status);
         Self {
             snapshot,
             provider_reported,
             input_activity_reported,
             source: CaptureDiagnosticsSource::LocalProjection,
+            ebpf_payload,
         }
     }
 
@@ -45,11 +51,16 @@ impl CaptureDiagnostics {
         provider_reported: bool,
         input_activity_reported: bool,
     ) -> Self {
+        let ebpf_payload = snapshot
+            .ebpf_process_payload
+            .as_ref()
+            .map(EbpfPayloadDiagnostics::from_status);
         Self {
             snapshot,
             provider_reported,
             input_activity_reported,
             source: CaptureDiagnosticsSource::AdminStatus,
+            ebpf_payload,
         }
     }
 
@@ -88,6 +99,9 @@ impl CaptureDiagnostics {
                 "Capture {} is starting; waiting for provider",
                 self.selected_backend_label()
             )));
+        }
+        if traffic_empty && let Some(message) = self.ebpf_payload_authorization_status_message() {
+            return Some(message);
         }
         if traffic_empty && let Some(message) = self.capture_loss_status_message() {
             return Some(message);
@@ -193,6 +207,9 @@ impl CaptureDiagnostics {
                 lines.push(format!("last input signal: {}", signal.kind()));
             }
         }
+        if let Some(payload) = &self.ebpf_payload {
+            lines.extend(payload.detail_lines());
+        }
         if !self.snapshot.candidates.is_empty() {
             lines.push("provider candidates:".to_string());
             lines.extend(self.snapshot.candidates.iter().map(|candidate| {
@@ -264,6 +281,19 @@ impl CaptureDiagnostics {
             activity.output_loss_events,
             provider_summary
         )))
+    }
+
+    fn ebpf_payload_authorization_status_message(&self) -> Option<CaptureDiagnosticMessage> {
+        if self.snapshot.selected_backend != Some(CaptureBackend::Ebpf) {
+            return None;
+        }
+        let payload = self.ebpf_payload.as_ref()?;
+        if !payload.has_payload_attempts() || payload.has_authorized_payload() {
+            return None;
+        }
+        Some(CaptureDiagnosticMessage::Warning(
+            payload.authorization_warning(),
+        ))
     }
 
     pub(super) fn using_live_host(&self) -> bool {
@@ -390,6 +420,102 @@ fn unique_backend_names(backends: Vec<CaptureBackend>) -> Vec<&'static str> {
         }
         names
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct EbpfPayloadDiagnostics {
+    selector_configured: bool,
+    scanned_processes: u64,
+    matched_processes: u64,
+    allowed_processes: u64,
+    write_attempt: u64,
+    write_process_allowance: u64,
+    write_submitted: u64,
+    write_no_allowance: u64,
+    read_attempt: u64,
+    read_process_allowance: u64,
+    read_submitted: u64,
+    read_no_allowance: u64,
+}
+
+impl EbpfPayloadDiagnostics {
+    fn from_status(status: &EbpfProcessPayloadStatusSnapshot) -> Self {
+        let allowance = &status.process_payload_allowance;
+        let counters = &status.payload_gate_counters.counters;
+        Self {
+            selector_configured: allowance.selector_configured,
+            scanned_processes: allowance.scanned_processes,
+            matched_processes: allowance.matched_processes,
+            allowed_processes: allowance.allowed_processes,
+            write_attempt: counter(counters, "write_attempt"),
+            write_process_allowance: counter(counters, "write_process_allowance"),
+            write_submitted: counter(counters, "write_submitted"),
+            write_no_allowance: counter(counters, "write_no_allowance"),
+            read_attempt: counter(counters, "read_attempt"),
+            read_process_allowance: counter(counters, "read_process_allowance"),
+            read_submitted: counter(counters, "read_submitted"),
+            read_no_allowance: counter(counters, "read_no_allowance"),
+        }
+    }
+
+    fn has_payload_attempts(&self) -> bool {
+        self.write_attempt > 0 || self.read_attempt > 0
+    }
+
+    fn has_authorized_payload(&self) -> bool {
+        self.write_process_allowance > 0
+            || self.read_process_allowance > 0
+            || self.write_submitted > 0
+            || self.read_submitted > 0
+    }
+
+    fn authorization_warning(&self) -> String {
+        let reason = if self.selector_configured {
+            "process selector matched startup processes, but kernel payload syscalls are not matching the authorized process keys"
+        } else {
+            "no process selector is configured for payload sampling"
+        };
+        format!(
+            "eBPF payload tracepoints are active but no payload samples are authorized; {reason}; check the selected process, PID namespace mapping, or reapply observation after the target process starts"
+        )
+    }
+
+    fn detail_lines(&self) -> Vec<String> {
+        vec![
+            format!(
+                "eBPF process payload allowance: selector_configured={}, scanned={}, matched={}, allowed={}",
+                self.selector_configured,
+                self.scanned_processes,
+                self.matched_processes,
+                self.allowed_processes
+            ),
+            format!(
+                "eBPF payload gates: write_attempt={}, write_process_allowance={}, write_submitted={}, write_no_allowance={}",
+                self.write_attempt,
+                self.write_process_allowance,
+                self.write_submitted,
+                self.write_no_allowance
+            ),
+            format!(
+                "eBPF payload gates: read_attempt={}, read_process_allowance={}, read_submitted={}, read_no_allowance={}",
+                self.read_attempt,
+                self.read_process_allowance,
+                self.read_submitted,
+                self.read_no_allowance
+            ),
+        ]
+    }
+}
+
+fn counter(
+    counters: &[crate::status::EbpfProcessPayloadGateCounterStatusSnapshot],
+    name: &str,
+) -> u64 {
+    counters
+        .iter()
+        .find(|counter| counter.name == name)
+        .map(|counter| counter.count)
+        .unwrap_or_default()
 }
 
 fn input_loss_provider_summary(

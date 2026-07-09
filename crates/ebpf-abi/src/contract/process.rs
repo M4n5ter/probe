@@ -168,6 +168,12 @@ pub const EBPF_PROCESS_OUTPUT_LOSSES_MAP_NAME: &str = "TRAFFIC_PROBE_PROCESS_OUT
 pub const EBPF_PROCESS_OUTPUT_LOSSES_MAX_ENTRIES: u32 = 1;
 pub const EBPF_PROCESS_OUTPUT_LOSS_KEY_BYTES: u32 = core::mem::size_of::<u32>() as u32;
 pub const EBPF_PROCESS_OUTPUT_LOSS_VALUE_BYTES: u32 = core::mem::size_of::<u64>() as u32;
+pub const EBPF_PROCESS_PAYLOAD_GATE_STATS_MAP_NAME: &str =
+    "TRAFFIC_PROBE_PROCESS_PAYLOAD_GATE_STATS";
+pub const EBPF_PROCESS_PAYLOAD_GATE_STATS_MAX_ENTRIES: u32 =
+    EBPF_PROCESS_PAYLOAD_GATE_KINDS.len() as u32;
+pub const EBPF_PROCESS_PAYLOAD_GATE_STAT_KEY_BYTES: u32 = core::mem::size_of::<u32>() as u32;
+pub const EBPF_PROCESS_PAYLOAD_GATE_STAT_VALUE_BYTES: u32 = core::mem::size_of::<u64>() as u32;
 pub const EBPF_PROCESS_TRACEPOINT_FIRINGS_MAP_NAME: &str =
     "TRAFFIC_PROBE_PROCESS_TRACEPOINT_FIRINGS";
 pub const EBPF_PROCESS_TRACEPOINT_FIRINGS_MAX_ENTRIES: u32 =
@@ -176,6 +182,139 @@ pub const EBPF_PROCESS_TRACEPOINT_FIRING_KEY_BYTES: u32 = core::mem::size_of::<u
 pub const EBPF_PROCESS_TRACEPOINT_FIRING_VALUE_BYTES: u32 = core::mem::size_of::<u64>() as u32;
 pub const EBPF_PENDING_SOCKET_READ_LOGICAL_LEN_UNKNOWN: u32 = 1 << 0;
 pub const EBPF_PENDING_SOCKET_READ_SOURCE_IOVEC: u32 = 1 << 1;
+
+pub const EBPF_PROCESS_PAYLOAD_GATE_KINDS: [EbpfProcessPayloadGateKind; 38] = [
+    EbpfProcessPayloadGateKind::WriteAttempt,
+    EbpfProcessPayloadGateKind::WriteSocketAllowance,
+    EbpfProcessPayloadGateKind::WriteProcessAllowance,
+    EbpfProcessPayloadGateKind::WriteNoAllowance,
+    EbpfProcessPayloadGateKind::WriteScratchUnavailable,
+    EbpfProcessPayloadGateKind::WritePlanSkipped,
+    EbpfProcessPayloadGateKind::WritePendingInserted,
+    EbpfProcessPayloadGateKind::WritePendingInsertFailed,
+    EbpfProcessPayloadGateKind::WriteExit,
+    EbpfProcessPayloadGateKind::WriteMissingPending,
+    EbpfProcessPayloadGateKind::WriteLeaseInvalid,
+    EbpfProcessPayloadGateKind::WriteLeaseZeroGeneration,
+    EbpfProcessPayloadGateKind::WriteLeaseNoProcessAllowance,
+    EbpfProcessPayloadGateKind::WriteLeaseDirectionDenied,
+    EbpfProcessPayloadGateKind::WriteLeaseGenerationMismatch,
+    EbpfProcessPayloadGateKind::WriteLeaseValidated,
+    EbpfProcessPayloadGateKind::WriteResultSkipped,
+    EbpfProcessPayloadGateKind::WriteEventScratchUnavailable,
+    EbpfProcessPayloadGateKind::WriteCopyFailed,
+    EbpfProcessPayloadGateKind::WriteSubmitted,
+    EbpfProcessPayloadGateKind::ReadAttempt,
+    EbpfProcessPayloadGateKind::ReadSocketAllowance,
+    EbpfProcessPayloadGateKind::ReadProcessAllowance,
+    EbpfProcessPayloadGateKind::ReadNoAllowance,
+    EbpfProcessPayloadGateKind::ReadPlanSkipped,
+    EbpfProcessPayloadGateKind::ReadPendingInserted,
+    EbpfProcessPayloadGateKind::ReadPendingInsertFailed,
+    EbpfProcessPayloadGateKind::ReadExit,
+    EbpfProcessPayloadGateKind::ReadMissingPending,
+    EbpfProcessPayloadGateKind::ReadLeaseInvalid,
+    EbpfProcessPayloadGateKind::ReadLeaseZeroGeneration,
+    EbpfProcessPayloadGateKind::ReadLeaseNoProcessAllowance,
+    EbpfProcessPayloadGateKind::ReadLeaseDirectionDenied,
+    EbpfProcessPayloadGateKind::ReadLeaseGenerationMismatch,
+    EbpfProcessPayloadGateKind::ReadLeaseValidated,
+    EbpfProcessPayloadGateKind::ReadEventScratchUnavailable,
+    EbpfProcessPayloadGateKind::ReadResultSkipped,
+    EbpfProcessPayloadGateKind::ReadSubmitted,
+];
+
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EbpfProcessPayloadGateKind {
+    WriteAttempt = 0,
+    WriteSocketAllowance = 1,
+    WriteProcessAllowance = 2,
+    WriteNoAllowance = 3,
+    WriteScratchUnavailable = 4,
+    WritePlanSkipped = 5,
+    WritePendingInserted = 6,
+    WritePendingInsertFailed = 7,
+    WriteExit = 8,
+    WriteMissingPending = 9,
+    WriteLeaseInvalid = 10,
+    WriteLeaseZeroGeneration = 11,
+    WriteLeaseNoProcessAllowance = 12,
+    WriteLeaseDirectionDenied = 13,
+    WriteLeaseGenerationMismatch = 14,
+    WriteLeaseValidated = 15,
+    WriteResultSkipped = 16,
+    WriteEventScratchUnavailable = 17,
+    WriteCopyFailed = 18,
+    WriteSubmitted = 19,
+    ReadAttempt = 20,
+    ReadSocketAllowance = 21,
+    ReadProcessAllowance = 22,
+    ReadNoAllowance = 23,
+    ReadPlanSkipped = 24,
+    ReadPendingInserted = 25,
+    ReadPendingInsertFailed = 26,
+    ReadExit = 27,
+    ReadMissingPending = 28,
+    ReadLeaseInvalid = 29,
+    ReadLeaseZeroGeneration = 30,
+    ReadLeaseNoProcessAllowance = 31,
+    ReadLeaseDirectionDenied = 32,
+    ReadLeaseGenerationMismatch = 33,
+    ReadLeaseValidated = 34,
+    ReadEventScratchUnavailable = 35,
+    ReadResultSkipped = 36,
+    ReadSubmitted = 37,
+}
+
+impl EbpfProcessPayloadGateKind {
+    pub const fn counter_index(self) -> u32 {
+        self as u32
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::WriteAttempt => "write_attempt",
+            Self::WriteSocketAllowance => "write_socket_allowance",
+            Self::WriteProcessAllowance => "write_process_allowance",
+            Self::WriteNoAllowance => "write_no_allowance",
+            Self::WriteScratchUnavailable => "write_scratch_unavailable",
+            Self::WritePlanSkipped => "write_plan_skipped",
+            Self::WritePendingInserted => "write_pending_inserted",
+            Self::WritePendingInsertFailed => "write_pending_insert_failed",
+            Self::WriteExit => "write_exit",
+            Self::WriteMissingPending => "write_missing_pending",
+            Self::WriteLeaseInvalid => "write_lease_invalid",
+            Self::WriteLeaseZeroGeneration => "write_lease_zero_generation",
+            Self::WriteLeaseNoProcessAllowance => "write_lease_no_process_allowance",
+            Self::WriteLeaseDirectionDenied => "write_lease_direction_denied",
+            Self::WriteLeaseGenerationMismatch => "write_lease_generation_mismatch",
+            Self::WriteLeaseValidated => "write_lease_validated",
+            Self::WriteResultSkipped => "write_result_skipped",
+            Self::WriteEventScratchUnavailable => "write_event_scratch_unavailable",
+            Self::WriteCopyFailed => "write_copy_failed",
+            Self::WriteSubmitted => "write_submitted",
+            Self::ReadAttempt => "read_attempt",
+            Self::ReadSocketAllowance => "read_socket_allowance",
+            Self::ReadProcessAllowance => "read_process_allowance",
+            Self::ReadNoAllowance => "read_no_allowance",
+            Self::ReadPlanSkipped => "read_plan_skipped",
+            Self::ReadPendingInserted => "read_pending_inserted",
+            Self::ReadPendingInsertFailed => "read_pending_insert_failed",
+            Self::ReadExit => "read_exit",
+            Self::ReadMissingPending => "read_missing_pending",
+            Self::ReadLeaseInvalid => "read_lease_invalid",
+            Self::ReadLeaseZeroGeneration => "read_lease_zero_generation",
+            Self::ReadLeaseNoProcessAllowance => "read_lease_no_process_allowance",
+            Self::ReadLeaseDirectionDenied => "read_lease_direction_denied",
+            Self::ReadLeaseGenerationMismatch => "read_lease_generation_mismatch",
+            Self::ReadLeaseValidated => "read_lease_validated",
+            Self::ReadEventScratchUnavailable => "read_event_scratch_unavailable",
+            Self::ReadResultSkipped => "read_result_skipped",
+            Self::ReadSubmitted => "read_submitted",
+        }
+    }
+}
 
 pub const EBPF_PROCESS_TRACEPOINT_SPECS: [EbpfProcessTracepointSpec; 34] = [
     EbpfProcessTracepointSpec {
@@ -397,7 +536,30 @@ pub const EBPF_PROCESS_OPTIONAL_TRACEPOINT_PAIR_SPECS: [EbpfProcessOptionalTrace
     },
 ];
 
-pub const EBPF_PROCESS_MAP_SPECS: [EbpfMapSpec; 14] = [
+pub const EBPF_PROCESS_OPTIONAL_TRACEPOINT_SPECS: [EbpfProcessOptionalTracepointSpec; 5] = [
+    EbpfProcessOptionalTracepointSpec {
+        family_name: "dup",
+        role: EbpfProcessTracepointRole::DupEnter,
+    },
+    EbpfProcessOptionalTracepointSpec {
+        family_name: "dup2",
+        role: EbpfProcessTracepointRole::Dup2Enter,
+    },
+    EbpfProcessOptionalTracepointSpec {
+        family_name: "dup3",
+        role: EbpfProcessTracepointRole::Dup3Enter,
+    },
+    EbpfProcessOptionalTracepointSpec {
+        family_name: "fcntl_fd_duplication",
+        role: EbpfProcessTracepointRole::FcntlEnter,
+    },
+    EbpfProcessOptionalTracepointSpec {
+        family_name: "close_range",
+        role: EbpfProcessTracepointRole::CloseRangeEnter,
+    },
+];
+
+pub const EBPF_PROCESS_MAP_SPECS: [EbpfMapSpec; 15] = [
     EbpfMapSpec {
         name: EBPF_EVENTS_MAP_NAME,
         kind: EbpfMapKind::Ringbuf,
@@ -503,6 +665,14 @@ pub const EBPF_PROCESS_MAP_SPECS: [EbpfMapSpec; 14] = [
         map_flags: 0,
     },
     EbpfMapSpec {
+        name: EBPF_PROCESS_PAYLOAD_GATE_STATS_MAP_NAME,
+        kind: EbpfMapKind::PerCpuArray,
+        key_size: EBPF_PROCESS_PAYLOAD_GATE_STAT_KEY_BYTES,
+        value_size: EBPF_PROCESS_PAYLOAD_GATE_STAT_VALUE_BYTES,
+        max_entries: EBPF_PROCESS_PAYLOAD_GATE_STATS_MAX_ENTRIES,
+        map_flags: 0,
+    },
+    EbpfMapSpec {
         name: EBPF_PROCESS_TRACEPOINT_FIRINGS_MAP_NAME,
         kind: EbpfMapKind::PerCpuArray,
         key_size: EBPF_PROCESS_TRACEPOINT_FIRING_KEY_BYTES,
@@ -559,6 +729,30 @@ impl EbpfProcessOptionalTracepointPairSpec {
 
     pub fn contains_role(self, role: EbpfProcessTracepointRole) -> bool {
         self.enter == role || self.exit == role
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EbpfProcessOptionalTracepointSpec {
+    family_name: &'static str,
+    role: EbpfProcessTracepointRole,
+}
+
+impl EbpfProcessOptionalTracepointSpec {
+    pub fn family_name(self) -> &'static str {
+        self.family_name
+    }
+
+    pub fn role(self) -> EbpfProcessTracepointRole {
+        self.role
+    }
+
+    pub fn tracepoint_spec(self) -> &'static EbpfProcessTracepointSpec {
+        self.role.spec()
+    }
+
+    pub fn contains_role(self, role: EbpfProcessTracepointRole) -> bool {
+        self.role == role
     }
 }
 
@@ -623,7 +817,13 @@ impl EbpfProcessTracepointRole {
     }
 
     pub fn has_optional_attach(self) -> bool {
-        self.optional_pair_spec().is_some()
+        self.optional_tracepoint_spec().is_some() || self.optional_pair_spec().is_some()
+    }
+
+    pub fn optional_tracepoint_spec(self) -> Option<EbpfProcessOptionalTracepointSpec> {
+        EBPF_PROCESS_OPTIONAL_TRACEPOINT_SPECS
+            .into_iter()
+            .find(|spec| spec.contains_role(self))
     }
 
     pub fn optional_pair_spec(self) -> Option<EbpfProcessOptionalTracepointPairSpec> {
@@ -798,7 +998,7 @@ mod tests {
 
     #[test]
     fn process_map_specs_are_unique_and_layout_complete() {
-        assert_eq!(EBPF_PROCESS_MAP_SPECS.len(), 14);
+        assert_eq!(EBPF_PROCESS_MAP_SPECS.len(), 15);
         assert_unique(EBPF_PROCESS_MAP_SPECS.map(|spec| spec.name));
 
         assert_map_layout(
@@ -891,6 +1091,13 @@ mod tests {
             4,
             8,
             1,
+        );
+        assert_map_layout(
+            process_map(EBPF_PROCESS_PAYLOAD_GATE_STATS_MAP_NAME),
+            EbpfMapKind::PerCpuArray,
+            4,
+            8,
+            EBPF_PROCESS_PAYLOAD_GATE_KINDS.len() as u32,
         );
         assert_map_layout(
             process_map(EBPF_PROCESS_TRACEPOINT_FIRINGS_MAP_NAME),
@@ -987,6 +1194,32 @@ mod tests {
             ])
         );
         assert!(!EbpfProcessTracepointRole::WriteEnter.has_optional_attach());
+    }
+
+    #[test]
+    fn fd_table_maintenance_tracepoints_are_optional_kernel_features() {
+        assert_eq!(EBPF_PROCESS_OPTIONAL_TRACEPOINT_SPECS.len(), 5);
+        assert_unique(EBPF_PROCESS_OPTIONAL_TRACEPOINT_SPECS.map(|spec| spec.family_name()));
+
+        let mut optional_roles = BTreeSet::new();
+        for optional in EBPF_PROCESS_OPTIONAL_TRACEPOINT_SPECS {
+            assert!(optional_roles.insert(optional.role()));
+            assert_eq!(optional.role().spec(), optional.tracepoint_spec());
+            assert!(optional.role().has_optional_attach());
+            assert_eq!(optional.role().optional_tracepoint_spec(), Some(optional));
+        }
+
+        assert_eq!(
+            optional_roles,
+            BTreeSet::from([
+                EbpfProcessTracepointRole::DupEnter,
+                EbpfProcessTracepointRole::Dup2Enter,
+                EbpfProcessTracepointRole::Dup3Enter,
+                EbpfProcessTracepointRole::FcntlEnter,
+                EbpfProcessTracepointRole::CloseRangeEnter,
+            ])
+        );
+        assert!(!EbpfProcessTracepointRole::ConnectEnter.has_optional_attach());
     }
 
     #[test]

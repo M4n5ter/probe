@@ -44,11 +44,15 @@ pub(crate) fn accept_observation_from_result(
     ctx: &TracePointContext,
     attempt: EbpfPendingSocketAcceptAttempt,
 ) -> Option<AcceptObservationResult> {
+    Some(accept_observation(accepted_fd_from_result(ctx)?, attempt))
+}
+
+pub(crate) fn accepted_fd_from_result(ctx: &TracePointContext) -> Option<i32> {
     let accepted_fd = syscall_result_from_tracepoint(ctx)?;
     if accepted_fd < 0 || accepted_fd > i64::from(i32::MAX) {
         return None;
     }
-    Some(accept_observation(accepted_fd as i32, attempt))
+    Some(accepted_fd as i32)
 }
 
 fn accept_observation(

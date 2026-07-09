@@ -2,7 +2,7 @@ use std::{
     fs,
     net::{SocketAddr, TcpListener as StdTcpListener},
     os::unix::{
-        fs::{FileTypeExt, MetadataExt, PermissionsExt},
+        fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
         net::UnixStream as StdUnixStream,
     },
     path::{Path, PathBuf},
@@ -74,6 +74,7 @@ pub(super) fn bind_admin_socket(path: &Path) -> Result<UnixListener, AdminError>
     if path.as_os_str().is_empty() {
         return Err(AdminError::EmptySocketPath);
     }
+    ensure_admin_socket_parent(path)?;
     validate_admin_socket_parent(path)?;
     remove_stale_admin_socket(path)?;
     let listener = UnixListener::bind(path).map_err(|source| AdminError::SocketFile {
@@ -115,6 +116,30 @@ pub(super) fn bind_prometheus_listener(
     })
 }
 
+fn ensure_admin_socket_parent(path: &Path) -> Result<(), AdminError> {
+    let parent = admin_socket_parent(path)?;
+    match fs::symlink_metadata(parent) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true);
+            builder.mode(0o700);
+            builder.create(parent).or_else(|source| {
+                if source.kind() == std::io::ErrorKind::AlreadyExists {
+                    Ok(())
+                } else {
+                    Err(source)
+                }
+            })
+        }
+        Err(error) => Err(error),
+    }
+    .map_err(|source| AdminError::SocketFile {
+        path: parent.display().to_string(),
+        source,
+    })
+}
+
 fn set_private_admin_socket_permissions(path: &Path) -> Result<(), AdminError> {
     fs::set_permissions(path, fs::Permissions::from_mode(ADMIN_SOCKET_MODE)).map_err(|source| {
         AdminError::SocketFile {
@@ -125,12 +150,7 @@ fn set_private_admin_socket_permissions(path: &Path) -> Result<(), AdminError> {
 }
 
 fn validate_admin_socket_parent(path: &Path) -> Result<(), AdminError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| AdminError::UnsafeSocketParent {
-            path: path.display().to_string(),
-            reason: "socket path has no parent directory".to_string(),
-        })?;
+    let parent = admin_socket_parent(path)?;
     let metadata = fs::symlink_metadata(parent).map_err(|source| AdminError::SocketFile {
         path: parent.display().to_string(),
         source,
@@ -165,6 +185,13 @@ fn validate_admin_socket_parent(path: &Path) -> Result<(), AdminError> {
         });
     }
     Ok(())
+}
+
+fn admin_socket_parent(path: &Path) -> Result<&Path, AdminError> {
+    path.parent().ok_or_else(|| AdminError::UnsafeSocketParent {
+        path: path.display().to_string(),
+        reason: "socket path has no parent directory".to_string(),
+    })
 }
 
 fn validate_admin_socket_mode(path: &Path) -> Result<(), AdminError> {
@@ -237,6 +264,45 @@ mod tests {
         let mode = fs::symlink_metadata(&socket_path)?.permissions().mode() & 0o777;
 
         assert_eq!(mode, ADMIN_SOCKET_MODE);
+        drop(listener);
+        fs::remove_file(&socket_path)?;
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_socket_creates_missing_private_parent() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = test_dir("admin-create-parent")?;
+        let socket_parent = temp.join("run");
+        let socket_path = socket_parent.join("admin.sock");
+
+        let listener = bind_admin_socket(&socket_path)?;
+        let parent_mode = fs::symlink_metadata(&socket_parent)?.permissions().mode() & 0o777;
+        let socket_mode = fs::symlink_metadata(&socket_path)?.permissions().mode() & 0o777;
+
+        assert_eq!(parent_mode, 0o700);
+        assert_eq!(socket_mode, ADMIN_SOCKET_MODE);
+        drop(listener);
+        fs::remove_file(&socket_path)?;
+        fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_socket_creates_missing_private_ancestors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = test_dir("admin-create-ancestors")?;
+        let probe_home = temp.join("probe-home");
+        let socket_parent = probe_home.join("run");
+        let socket_path = socket_parent.join("admin.sock");
+
+        let listener = bind_admin_socket(&socket_path)?;
+        let parent_mode = fs::symlink_metadata(&socket_parent)?.permissions().mode() & 0o777;
+        let socket_mode = fs::symlink_metadata(&socket_path)?.permissions().mode() & 0o777;
+
+        assert_eq!(parent_mode, 0o700);
+        assert_eq!(socket_mode, ADMIN_SOCKET_MODE);
         drop(listener);
         fs::remove_file(&socket_path)?;
         fs::remove_dir_all(temp)?;

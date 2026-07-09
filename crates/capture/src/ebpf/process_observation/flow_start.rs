@@ -4,10 +4,10 @@ use probe_core::{ProcessContext, Timestamp};
 
 use crate::{CaptureError, CaptureEvent};
 
-use super::bridge::process_hint_from_observed;
+use super::bridge::resolve_observed_process;
 use super::{
-    EbpfAcceptTracepointObservation, EbpfConnectTracepointObservation, EbpfProcessLifecycleKind,
-    EbpfSocketFlowResolver, accept_opened_event_from_observation,
+    EbpfAcceptTracepointObservation, EbpfConnectTracepointObservation, EbpfObservedProcess,
+    EbpfProcessLifecycleKind, EbpfSocketFlowResolver, accept_opened_event_from_observation,
     connect_opened_event_from_observation, descriptor_lease::DescriptorLease,
     observed_accept_opened_event_from_observation, observed_connect_opened_event_from_observation,
     unresolved_accept_gap_from_observation, unresolved_connect_gap_from_observation,
@@ -56,14 +56,16 @@ impl PendingEbpfFlowStart {
         &self,
         timestamp: Timestamp,
         resolver: &mut dyn EbpfSocketFlowResolver,
-    ) -> Option<CaptureEvent> {
+    ) -> Result<Option<CaptureEvent>, CaptureError> {
         let resolved_process = self.resolved_process(resolver);
         match self {
-            Self::Connect(connect) => {
-                observed_connect_opened_event_from_observation(connect, timestamp, resolved_process)
-            }
+            Self::Connect(connect) => Ok(observed_connect_opened_event_from_observation(
+                connect,
+                timestamp,
+                resolved_process,
+            )),
             Self::Accept(accept) => {
-                observed_accept_opened_event_from_observation(accept, timestamp, resolved_process)
+                observed_accept_opened_event_from_observation(accept, timestamp, resolver)
             }
         }
     }
@@ -137,17 +139,18 @@ impl PendingEbpfFlowStart {
         )
     }
 
+    pub(super) fn observed_process(&self) -> &EbpfObservedProcess {
+        match self {
+            Self::Connect(connect) => &connect.process,
+            Self::Accept(accept) => &accept.process,
+        }
+    }
+
     fn resolved_process(
         &self,
         resolver: &mut dyn EbpfSocketFlowResolver,
     ) -> Option<ProcessContext> {
-        if let Some(hint) = match self {
-            Self::Connect(connect) => process_hint_from_observed(&connect.process),
-            Self::Accept(accept) => process_hint_from_observed(&accept.process),
-        } {
-            return unique_process(resolver.resolve_processes_by_hint(hint).ok()?);
-        }
-        resolver.resolve_process(self.tgid()).ok().flatten()
+        resolve_observed_process(resolver, self.observed_process())
     }
 
     fn invalid_descriptor_lease_reason(&self) -> String {
@@ -195,10 +198,4 @@ impl PendingEbpfFlowStart {
             Self::Accept(accept) => accept.fd_generation,
         }
     }
-}
-
-fn unique_process(candidates: impl IntoIterator<Item = ProcessContext>) -> Option<ProcessContext> {
-    let mut candidates = candidates.into_iter();
-    let process = candidates.next()?;
-    candidates.next().is_none().then_some(process)
 }

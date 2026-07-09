@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::capture_provider::{
     CaptureInputActivityRuntimeSnapshot, CaptureProviderRuntimeDetailsSnapshot,
-    CaptureProviderRuntimeSnapshot,
+    CaptureProviderRuntimeSnapshot, EbpfProcessPayloadAllowanceRuntimeSnapshot,
+    EbpfProcessPayloadGateRuntimeSnapshot,
 };
 
 use super::TRAFFIC_STATUS_REASON_MAX_CHARS;
@@ -32,7 +33,86 @@ pub struct CaptureStatusSnapshot {
     #[serde(default, skip_deserializing)]
     pub provider: Option<CaptureProviderRuntimeDetailsSnapshot>,
     #[serde(default)]
+    pub ebpf_process_payload: Option<EbpfProcessPayloadStatusSnapshot>,
+    #[serde(default)]
     pub input_activity: Option<CaptureInputActivityRuntimeSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EbpfProcessPayloadStatusSnapshot {
+    pub process_payload_allowance: EbpfProcessPayloadAllowanceStatusSnapshot,
+    pub payload_gate_counters: EbpfProcessPayloadGateStatusSnapshot,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EbpfProcessPayloadAllowanceStatusSnapshot {
+    pub selector_configured: bool,
+    pub scanned_processes: u64,
+    pub matched_processes: u64,
+    pub allowed_processes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EbpfProcessPayloadGateStatusSnapshot {
+    pub mode: RuntimeMode,
+    pub total_count: u64,
+    #[serde(default)]
+    pub counters: Vec<EbpfProcessPayloadGateCounterStatusSnapshot>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EbpfProcessPayloadGateCounterStatusSnapshot {
+    pub name: String,
+    pub count: u64,
+}
+
+impl EbpfProcessPayloadStatusSnapshot {
+    pub(crate) fn from_provider(provider: &CaptureProviderRuntimeDetailsSnapshot) -> Option<Self> {
+        match provider {
+            CaptureProviderRuntimeDetailsSnapshot::EbpfProcessObservation {
+                process_payload_allowance,
+                payload_gate_counters,
+                ..
+            } => Some(Self {
+                process_payload_allowance: EbpfProcessPayloadAllowanceStatusSnapshot::from_runtime(
+                    process_payload_allowance,
+                ),
+                payload_gate_counters: EbpfProcessPayloadGateStatusSnapshot::from_runtime(
+                    payload_gate_counters,
+                ),
+            }),
+        }
+    }
+}
+
+impl EbpfProcessPayloadAllowanceStatusSnapshot {
+    fn from_runtime(snapshot: &EbpfProcessPayloadAllowanceRuntimeSnapshot) -> Self {
+        Self {
+            selector_configured: snapshot.selector_configured,
+            scanned_processes: snapshot.scanned_processes,
+            matched_processes: snapshot.matched_processes,
+            allowed_processes: snapshot.allowed_processes,
+        }
+    }
+}
+
+impl EbpfProcessPayloadGateStatusSnapshot {
+    fn from_runtime(snapshot: &EbpfProcessPayloadGateRuntimeSnapshot) -> Self {
+        Self {
+            mode: snapshot.mode,
+            total_count: snapshot.total_count,
+            counters: snapshot
+                .counters
+                .iter()
+                .map(|counter| EbpfProcessPayloadGateCounterStatusSnapshot {
+                    name: counter.name.to_string(),
+                    count: counter.count,
+                })
+                .collect(),
+            reason: snapshot.reason.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +157,9 @@ pub(in crate::status) fn capture_status(
                 .provider
                 .clone()
                 .map(|provider| provider.with_input_activity(input_activity.as_ref()));
+            let ebpf_process_payload = provider
+                .as_ref()
+                .and_then(EbpfProcessPayloadStatusSnapshot::from_provider);
             CaptureStatusSnapshot {
                 selection: plan.capture.selection,
                 selected_backend: Some(runtime.selected_backend),
@@ -98,6 +181,7 @@ pub(in crate::status) fn capture_status(
                     })
                     .collect(),
                 provider,
+                ebpf_process_payload,
                 input_activity,
             }
         }
@@ -115,6 +199,7 @@ pub(in crate::status) fn capture_status(
             auto_mitm_plaintext_bridge_candidate: auto_mitm_plaintext_bridge_candidate(plan),
             open_failures: Vec::new(),
             provider: None,
+            ebpf_process_payload: None,
             input_activity: None,
         },
     }
@@ -218,7 +303,8 @@ mod tests {
     use super::*;
     use crate::capture_provider::{
         CaptureInputPollActivityRuntimeSnapshot, CaptureInputProviderActivityRuntimeSnapshot,
-        CaptureInputSignalRuntimeSnapshot,
+        CaptureInputSignalRuntimeSnapshot, EbpfProcessPayloadAllowanceRuntimeSnapshot,
+        EbpfProcessPayloadGateCounterRuntimeSnapshot, EbpfProcessPayloadGateRuntimeSnapshot,
     };
 
     #[test]
@@ -355,6 +441,18 @@ mod tests {
             serde_json::json!("sys_enter_connect")
         );
         assert_eq!(
+            provider["optional_tracepoints"][0]["family_name"],
+            serde_json::json!("dup2")
+        );
+        assert_eq!(
+            provider["optional_tracepoints"][0]["mode"],
+            serde_json::json!("unavailable")
+        );
+        assert_eq!(
+            provider["optional_tracepoints"][0]["tracepoint_name"],
+            serde_json::json!("sys_enter_dup2")
+        );
+        assert_eq!(
             provider["optional_tracepoint_pairs"][0]["family_name"],
             serde_json::json!("sendfile")
         );
@@ -370,6 +468,39 @@ mod tests {
             provider["optional_tracepoint_pairs"][0]["exit_tracepoint_name"],
             serde_json::json!("sys_exit_sendfile")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_projection_preserves_ebpf_payload_diagnostics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let plan = auto_plan_with_degraded_ebpf_and_available_libpcap()?;
+        let runtime = CaptureProviderRuntimeSnapshot {
+            selected_backend: CaptureBackend::Ebpf,
+            selected_input_source: CaptureInputSource::LiveHost,
+            plan_mode: CapturePlanMode::Live,
+            provider_runtime_mode: RuntimeMode::Degraded,
+            evidence_mode: CaptureEvidenceMode::BestEffort,
+            evidence_reason: Some("eBPF provider is best-effort".to_string()),
+            reason: Some("kernel socket-object lifetime is best-effort".to_string()),
+            open_failures: Vec::new(),
+            provider: Some(ebpf_process_observation_details_with_payload_counters()),
+        };
+
+        let status = capture_status_for_traffic_projection(&plan, Some(&runtime), None);
+
+        let payload = status
+            .ebpf_process_payload
+            .expect("traffic projection should preserve eBPF payload diagnostics");
+        assert!(payload.process_payload_allowance.selector_configured);
+        assert_eq!(payload.process_payload_allowance.allowed_processes, 1);
+        assert_eq!(payload.payload_gate_counters.total_count, 14);
+        assert_eq!(payload.payload_gate_counters.counters.len(), 4);
+        assert_eq!(
+            payload.payload_gate_counters.counters[0].name,
+            "write_attempt"
+        );
+        assert_eq!(payload.payload_gate_counters.counters[0].count, 4);
         Ok(())
     }
 
@@ -440,7 +571,7 @@ mod tests {
 
     fn ebpf_process_observation_details() -> CaptureProviderRuntimeDetailsSnapshot {
         CaptureProviderRuntimeDetailsSnapshot::ebpf_process_observation(
-            capture::EbpfProcessObservationProbeSnapshot::from_link_ownership_and_optional_pairs(
+            capture::EbpfProcessObservationProbeSnapshot::from_link_ownership_and_optional_tracepoints(
                 capture::EbpfProcessObservationLinkOwnershipSnapshot::owned_by_programs([
                     capture::EbpfProcessObservationProgramLinkOwnershipSnapshot::new(
                         "connect_enter",
@@ -456,12 +587,57 @@ mod tests {
                     ),
                 ]),
                 [
+                    capture::EbpfProcessObservationOptionalTracepointSnapshot::kernel_missing(
+                        capture::EBPF_PROCESS_OPTIONAL_TRACEPOINT_SPECS[1],
+                    ),
+                ],
+                [
                     capture::EbpfProcessObservationOptionalTracepointPairSnapshot::attached(
                         capture::EBPF_PROCESS_OPTIONAL_TRACEPOINT_PAIR_SPECS[0],
                     ),
                 ],
             ),
         )
+    }
+
+    fn ebpf_process_observation_details_with_payload_counters()
+    -> CaptureProviderRuntimeDetailsSnapshot {
+        let mut details = ebpf_process_observation_details();
+        let CaptureProviderRuntimeDetailsSnapshot::EbpfProcessObservation {
+            process_payload_allowance,
+            payload_gate_counters,
+            ..
+        } = &mut details;
+        *process_payload_allowance = EbpfProcessPayloadAllowanceRuntimeSnapshot {
+            selector_configured: true,
+            scanned_processes: 10,
+            matched_processes: 1,
+            allowed_processes: 1,
+        };
+        *payload_gate_counters = EbpfProcessPayloadGateRuntimeSnapshot {
+            mode: RuntimeMode::Available,
+            total_count: 14,
+            counters: vec![
+                EbpfProcessPayloadGateCounterRuntimeSnapshot {
+                    name: "write_attempt",
+                    count: 4,
+                },
+                EbpfProcessPayloadGateCounterRuntimeSnapshot {
+                    name: "write_no_allowance",
+                    count: 4,
+                },
+                EbpfProcessPayloadGateCounterRuntimeSnapshot {
+                    name: "read_attempt",
+                    count: 3,
+                },
+                EbpfProcessPayloadGateCounterRuntimeSnapshot {
+                    name: "read_no_allowance",
+                    count: 3,
+                },
+            ],
+            reason: Some("payload gate counters available".to_string()),
+        };
+        details
     }
 
     fn auto_plan_with_degraded_ebpf_and_available_libpcap()

@@ -54,7 +54,7 @@ impl DescriptorLease {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct DescriptorLeaseKey {
     tgid: u32,
     fd: i32,

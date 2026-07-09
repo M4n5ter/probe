@@ -8,10 +8,9 @@ use ebpf_abi::{
 use super::payload::{
     PayloadAttemptSource, PayloadBufferAttempt, PayloadFdKind, PayloadIovecAttempt,
     PayloadLogicalLen, PayloadSamplePlan, clamp_u64_to_u32, iovec_payload_source_from_tracepoint,
-    msghdr_payload_source_from_tracepoint, payload_read_flag_bits,
-    payload_sample_plan_from_source, read_payload_prefix_from_attempt,
-    read_payload_prefix_from_iovec, single_buffer_payload_source_from_tracepoint,
-    syscall_result_from_tracepoint,
+    msghdr_payload_source_from_tracepoint, payload_read_flag_bits, payload_sample_plan_from_source,
+    read_payload_prefix_from_attempt, read_payload_prefix_from_iovec,
+    single_buffer_payload_source_from_tracepoint, syscall_result_from_tracepoint,
 };
 
 pub(crate) fn read_source_from_tracepoint(ctx: &TracePointContext) -> Option<PayloadAttemptSource> {
@@ -173,13 +172,11 @@ mod tests {
 
     #[test]
     fn pending_iovec_attempt_keeps_iovec_source_for_exit_sampling() {
-        let attempt = pending_read_iovec_attempt(
-            PayloadIovecAttempt {
-                fd: 7,
-                user_iovec: 0x1000,
-                iovlen: 9,
-            },
-        );
+        let attempt = pending_read_iovec_attempt(PayloadIovecAttempt {
+            fd: 7,
+            user_iovec: 0x1000,
+            iovlen: 9,
+        });
 
         assert_eq!(attempt.fd, 7);
         assert_eq!(attempt.fd_generation, 0);

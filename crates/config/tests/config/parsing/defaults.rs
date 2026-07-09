@@ -52,7 +52,7 @@ fn minimal_config_uses_defaults() -> Result<(), Box<dyn std::error::Error>> {
         config.enforcement.policy.source,
         EnforcementPolicySourceConfig::None
     );
-    assert!(!config.admin.enabled);
+    assert!(config.admin.enabled);
     assert_eq!(config.admin.socket_path, default_admin_socket_path());
     assert!(!config.tls.plaintext.instrumentation.enabled);
     assert_eq!(config.tls.plaintext.instrumentation.selector, None);

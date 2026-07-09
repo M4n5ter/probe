@@ -1,4 +1,4 @@
-use crate::{CaptureError, EbpfProcessObservationTracepointFiring};
+use crate::{CaptureError, EbpfProcessObservationTracepointFiring, EbpfProcessPayloadGateCounter};
 
 use super::{
     EbpfProcessObservation, EbpfProcessObservationProbe,
@@ -35,6 +35,12 @@ pub(super) trait EbpfObservationSource {
     fn process_tracepoint_firings(
         &mut self,
     ) -> Result<Option<Vec<EbpfProcessObservationTracepointFiring>>, CaptureError> {
+        Ok(None)
+    }
+
+    fn process_payload_gate_counters(
+        &mut self,
+    ) -> Result<Option<Vec<EbpfProcessPayloadGateCounter>>, CaptureError> {
         Ok(None)
     }
 }
@@ -94,6 +100,15 @@ impl EbpfObservationSource for ProbeObservationSource {
     ) -> Result<Option<Vec<EbpfProcessObservationTracepointFiring>>, CaptureError> {
         self.probe
             .process_tracepoint_firings()
+            .map(Some)
+            .map_err(|error| CaptureError::provider("ebpf", error.to_string()))
+    }
+
+    fn process_payload_gate_counters(
+        &mut self,
+    ) -> Result<Option<Vec<EbpfProcessPayloadGateCounter>>, CaptureError> {
+        self.probe
+            .process_payload_gate_counters()
             .map(Some)
             .map_err(|error| CaptureError::provider("ebpf", error.to_string()))
     }

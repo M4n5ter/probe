@@ -40,6 +40,9 @@ socket_path = "admin.sock"
 fn validation_rejects_invalid_prometheus_listener() -> Result<(), Box<dyn std::error::Error>> {
     let without_admin = AgentConfig::from_toml_str(
         r#"
+[admin]
+enabled = false
+
 [admin.prometheus]
 enabled = true
 "#,

@@ -3,11 +3,13 @@ use probe_core::{Direction, FlowContext};
 use crate::bounded_recency::{BoundedInsertDisplacement, BoundedRecencyMap};
 
 use super::{
-    EbpfCloseRangeTracepointObservation, EbpfCloseTracepointObservation, EbpfSocketReadObservation,
-    EbpfSocketWriteObservation,
+    EbpfCloseRangeTracepointObservation, EbpfSocketReadObservation, EbpfSocketWriteObservation,
     descriptor_lease::{DescriptorLease, DescriptorLeaseKey},
     payload_direction::PayloadDirections,
 };
+
+#[cfg(test)]
+use super::EbpfCloseTracepointObservation;
 
 pub(super) struct TrackedEbpfFlows {
     by_lease: BoundedRecencyMap<DescriptorLeaseKey, TrackedEbpfFlow>,
@@ -18,6 +20,7 @@ pub(super) struct TrackedEbpfFlow {
     pub inbound_stream_offset: u64,
     pub outbound_stream_offset: u64,
     payload_directions: PayloadDirections,
+    socket_payload_allowance: bool,
 }
 
 pub(super) enum TrackedEbpfFlowDisplacement {
@@ -48,9 +51,24 @@ impl TrackedEbpfFlows {
         flow: FlowContext,
         payload_directions: PayloadDirections,
     ) -> Option<TrackedEbpfFlowDisplacement> {
-        self.insert(lease.key(), flow, payload_directions)
+        self.insert(
+            lease.key(),
+            flow,
+            payload_directions,
+            !payload_directions.is_empty(),
+        )
     }
 
+    pub(super) fn insert_recovered_flow(
+        &mut self,
+        key: DescriptorLeaseKey,
+        flow: FlowContext,
+        payload_directions: PayloadDirections,
+    ) -> Option<TrackedEbpfFlowDisplacement> {
+        self.insert(key, flow, payload_directions, false)
+    }
+
+    #[cfg(test)]
     pub(super) fn remove_close(
         &mut self,
         close: &EbpfCloseTracepointObservation,
@@ -63,10 +81,14 @@ impl TrackedEbpfFlows {
         None
     }
 
-    pub(super) fn remove_close_range(
-        &mut self,
+    pub(super) fn remove_key(&mut self, key: DescriptorLeaseKey) -> Option<TrackedEbpfFlow> {
+        self.remove(key)
+    }
+
+    pub(super) fn close_range_keys(
+        &self,
         close_range: &EbpfCloseRangeTracepointObservation,
-    ) -> Vec<TrackedEbpfFlow> {
+    ) -> Vec<DescriptorLeaseKey> {
         let mut keys = self
             .by_lease
             .keys()
@@ -74,7 +96,16 @@ impl TrackedEbpfFlows {
             .filter(|key| key.is_in_close_range(close_range))
             .collect::<Vec<_>>();
         keys.sort_by_key(|key| (key.fd(), key.fd_generation()));
-        keys.into_iter()
+        keys
+    }
+
+    #[cfg(test)]
+    pub(super) fn remove_close_range(
+        &mut self,
+        close_range: &EbpfCloseRangeTracepointObservation,
+    ) -> Vec<TrackedEbpfFlow> {
+        self.close_range_keys(close_range)
+            .into_iter()
             .filter_map(|key| self.remove(key))
             .collect()
     }
@@ -105,13 +136,16 @@ impl TrackedEbpfFlows {
             .any(|tracked| !tracked.payload_directions.is_empty())
     }
 
-    pub(super) fn has_payload_allowance_for_allow_map_key(&self, key: DescriptorLeaseKey) -> bool {
+    pub(super) fn has_socket_payload_allowance_for_allow_map_key(
+        &self,
+        key: DescriptorLeaseKey,
+    ) -> bool {
         self.by_lease.keys().any(|tracked_key| {
             tracked_key.has_same_allow_map_key(key)
                 && self
                     .by_lease
                     .get(tracked_key)
-                    .is_some_and(TrackedEbpfFlow::has_payload_allowance)
+                    .is_some_and(TrackedEbpfFlow::owns_socket_payload_allowance)
         })
     }
 
@@ -144,12 +178,14 @@ impl TrackedEbpfFlows {
         key: DescriptorLeaseKey,
         flow: FlowContext,
         payload_directions: PayloadDirections,
+        socket_payload_allowance: bool,
     ) -> Option<TrackedEbpfFlowDisplacement> {
         let tracked = TrackedEbpfFlow {
             flow,
             inbound_stream_offset: 0,
             outbound_stream_offset: 0,
             payload_directions,
+            socket_payload_allowance,
         };
         self.by_lease
             .insert_displacing(key, tracked)
@@ -226,8 +262,11 @@ impl TrackedEbpfFlowDisplacement {
         }
     }
 
-    pub(super) fn should_revoke_allow_map_key(&self, retained_payload_allowance: bool) -> bool {
-        self.tracked_flow().has_payload_allowance() && !retained_payload_allowance
+    pub(super) fn should_revoke_socket_allow_map_key(
+        &self,
+        retained_socket_payload_allowance: bool,
+    ) -> bool {
+        self.tracked_flow().owns_socket_payload_allowance() && !retained_socket_payload_allowance
     }
 
     fn tracked_flow(&self) -> &TrackedEbpfFlow {
@@ -244,8 +283,8 @@ impl TrackedEbpfFlow {
         self.payload_directions.allows(direction)
     }
 
-    fn has_payload_allowance(&self) -> bool {
-        !self.payload_directions.is_empty()
+    fn owns_socket_payload_allowance(&self) -> bool {
+        self.socket_payload_allowance
     }
 
     pub(super) fn payload_directions(&self) -> PayloadDirections {

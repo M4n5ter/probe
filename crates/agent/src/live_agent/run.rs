@@ -1037,6 +1037,7 @@ mod tests {
         config.capture.selection = CaptureSelection::PlaintextFeed;
         config.capture.plaintext_feed.path = Some(feed_path);
         config.storage.path = spool_path;
+        config.admin.enabled = false;
         config
     }
 }

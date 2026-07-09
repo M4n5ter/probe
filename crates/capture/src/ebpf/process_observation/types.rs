@@ -1,4 +1,4 @@
-use ebpf_abi::EbpfProcessTracepointSpec;
+use ebpf_abi::{EbpfProcessPayloadGateKind, EbpfProcessTracepointSpec};
 use probe_core::TcpEndpoint;
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +17,16 @@ pub enum EbpfProcessObservation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EbpfProcessObservationRuntimeDiagnostics {
     pub tracepoints: Result<EbpfProcessObservationTracepointDiagnostics, String>,
+    pub process_payload_allowance: EbpfProcessPayloadAllowanceDiagnostics,
+    pub payload_gates: Result<Vec<EbpfProcessPayloadGateCounter>, String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EbpfProcessPayloadAllowanceDiagnostics {
+    pub selector_configured: bool,
+    pub scanned_processes: u64,
+    pub matched_processes: u64,
+    pub allowed_processes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +41,21 @@ pub struct EbpfProcessObservationTracepointFiring {
     pub category: &'static str,
     pub tracepoint_name: &'static str,
     pub firing_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EbpfProcessPayloadGateCounter {
+    pub name: &'static str,
+    pub count: u64,
+}
+
+impl EbpfProcessPayloadGateCounter {
+    pub(crate) fn from_kind(kind: EbpfProcessPayloadGateKind, count: u64) -> Self {
+        Self {
+            name: kind.name(),
+            count,
+        }
+    }
 }
 
 impl EbpfProcessObservationTracepointFiring {

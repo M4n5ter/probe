@@ -617,9 +617,9 @@ fn default_unix_http_transport() -> ExporterTransportConfig {
 
 fn selector_state(has_selector: bool, process: Option<&str>) -> String {
     match (has_selector, process) {
-        (true, Some(process)) => format!("configured; selected process: {process}"),
+        (true, Some(process)) => format!("configured; cursor process: {process}"),
         (true, None) => "configured".to_string(),
-        (false, Some(process)) => format!("not configured; selected process: {process}"),
+        (false, Some(process)) => format!("not configured; cursor process: {process}"),
         (false, None) => "not configured".to_string(),
     }
 }

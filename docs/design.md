@@ -66,9 +66,10 @@ eBPF / procfs 现状：
   bounded multi-iovec prefix syscall result sample。
 - 内核读取 payload 有两条 allow path：
   descriptor path 校验 fd-table epoch、active fd generation 与 read/write direction mask；
-  process path 只校验 TGID-level allowance。唯一 process-hint 属于 userspace resolver 的候选消歧过程，
-  resolver 只有在候选唯一且匹配时才写入 TGID-level allowance。只有 socket-specific syscall 可以在缺少当前 fd
-  generation 时基于 TGID-level allowance 创建 `(current_tgid, fd)` 的临时 socket descriptor 视图。
+  process path 只校验 TGID-level allowance。userspace 只会基于 direct TGID resolution 或 tracepoint 可证明的
+  observed process metadata 写入 TGID-level allowance；unique process-hint 不会授权 process-wide payload capture。
+  只有 socket-specific syscall 可以在缺少当前 fd generation 时基于 TGID-level allowance 创建 `(current_tgid, fd)`
+  的临时 socket descriptor 视图。
 - vector syscall 在固定 scan limit 内跳过 zero-length iovec，并把落在固定 verifier-friendly append slot
   边界上的非空 iovec segment 拼接为 bounded prefix；
   若连续 prefix 没有落在可追加 slot 边界，则在该 prefix 处截断，不跳过字节后继续拼接。
@@ -2008,8 +2009,8 @@ BTF 或 eBPF 主程序不可用时：
   - bounded sample record 必须表达 original length、captured length、truncated/read-failed flags 和 gap 语义。
   - outbound kernel-transfer records 必须表达 byte-count gap，不把无 userspace buffer 的路径伪装成 payload sample。
   - process records 携带 fd-table epoch 和 descriptor generation；descriptor payload allowance 同时校验两者。
-    kernel process payload allowance 只按 TGID 校验；unique process-hint 只用于 userspace resolver 在 lifecycle
-    阶段选择是否写入 TGID allowance。flow-start payload capture 只通过 descriptor/socket allow map 开启。
+    kernel process payload allowance 只按 TGID 校验；userspace 只会基于 direct TGID resolution 或 tracepoint 可证明的
+    observed process metadata 写入 TGID allowance。flow-start payload capture 只通过 descriptor/socket allow map 开启。
   - process lifecycle records 只携带公共 process metadata 和 command，具体语义由 typed event kind 表达。
   - 仍缺 kernel-side socket cookie、precise flow-specific lost-event record 和超出 bounded scan/sample 的
     scatter/gather collector。

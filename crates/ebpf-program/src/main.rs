@@ -18,23 +18,25 @@ use aya_ebpf::{
 };
 use ebpf_abi::{
     EBPF_ALLOWED_PROCESS_TGIDS_MAX_ENTRIES, EBPF_ALLOWED_SOCKET_FDS_MAX_ENTRIES,
-    EBPF_FD_TABLE_EPOCHS_MAX_ENTRIES,
-    EBPF_PENDING_ACCEPTS_MAX_ENTRIES, EBPF_PENDING_CONNECTS_MAX_ENTRIES,
-    EBPF_PENDING_READS_MAX_ENTRIES, EBPF_PENDING_WRITE_SCRATCH_MAX_ENTRIES,
-    EBPF_PENDING_WRITES_MAX_ENTRIES, EBPF_PROCESS_EVENT_SCRATCH_MAX_ENTRIES,
-    EBPF_PROCESS_OUTPUT_LOSSES_MAX_ENTRIES, EBPF_PROCESS_READ_EVENT_SCRATCH_MAX_ENTRIES,
+    EBPF_FD_TABLE_EPOCHS_MAX_ENTRIES, EBPF_PENDING_ACCEPTS_MAX_ENTRIES,
+    EBPF_PENDING_CONNECTS_MAX_ENTRIES, EBPF_PENDING_READS_MAX_ENTRIES,
+    EBPF_PENDING_WRITE_SCRATCH_MAX_ENTRIES, EBPF_PENDING_WRITES_MAX_ENTRIES,
+    EBPF_PROCESS_EVENT_SCRATCH_MAX_ENTRIES, EBPF_PROCESS_OUTPUT_LOSSES_MAX_ENTRIES,
+    EBPF_PROCESS_PAYLOAD_GATE_STATS_MAX_ENTRIES, EBPF_PROCESS_READ_EVENT_SCRATCH_MAX_ENTRIES,
     EBPF_PROCESS_TRACEPOINT_FIRINGS_MAX_ENTRIES, EBPF_RING_BUFFER_BYTES,
     EBPF_SOCKET_FD_GENERATIONS_MAX_ENTRIES, EBPF_SOCKET_PAYLOAD_ALLOW_READ,
-    EBPF_SOCKET_PAYLOAD_ALLOW_WRITE,
-    EbpfAcceptTracepointRecord, EbpfCloseObservation, EbpfCloseRangeTracepointRecord,
-    EbpfCloseTracepointRecord, EbpfConnectTracepointRecord, EbpfPendingSocketAcceptAttempt,
-    EbpfPendingSocketConnectAttempt, EbpfPendingSocketReadAttempt, EbpfPendingSocketWriteSample,
-    EbpfProcessLifecycleRecord, EbpfProcessPayloadAllowance, EbpfProcessProbeMetadata,
-    EbpfProcessTracepointRole, EbpfSocketFdKey, EbpfSocketPayloadAllowance,
-    EbpfSocketReadSampleRecord, EbpfSocketWriteSampleRecord,
+    EBPF_SOCKET_PAYLOAD_ALLOW_WRITE, EbpfAcceptTracepointRecord, EbpfCloseObservation,
+    EbpfCloseRangeTracepointRecord, EbpfCloseTracepointRecord, EbpfConnectTracepointRecord,
+    EbpfPendingSocketAcceptAttempt, EbpfPendingSocketConnectAttempt, EbpfPendingSocketReadAttempt,
+    EbpfPendingSocketWriteSample, EbpfProcessLifecycleRecord, EbpfProcessPayloadAllowance,
+    EbpfProcessPayloadGateKind, EbpfProcessProbeMetadata, EbpfProcessTracepointRole,
+    EbpfSocketFdKey, EbpfSocketPayloadAllowance, EbpfSocketReadSampleRecord,
+    EbpfSocketWriteSampleRecord,
 };
 
-use accept::{accept_attempt_from_tracepoint, accept_observation_from_result};
+use accept::{
+    accept_attempt_from_tracepoint, accept_observation_from_result, accepted_fd_from_result,
+};
 use close::{close_observation_from_tracepoint, close_range_observation_from_tracepoint};
 use connect::{connect_attempt_from_tracepoint, connect_observation_from_result};
 use read::{
@@ -101,6 +103,10 @@ static TRAFFIC_PROBE_PROCESS_READ_EVENT_SCRATCH: PerCpuArray<EbpfSocketReadSampl
 #[map(name = "TRAFFIC_PROBE_PROCESS_OUTPUT_LOSSES")]
 static TRAFFIC_PROBE_PROCESS_OUTPUT_LOSSES: PerCpuArray<u64> =
     PerCpuArray::with_max_entries(EBPF_PROCESS_OUTPUT_LOSSES_MAX_ENTRIES, 0);
+
+#[map(name = "TRAFFIC_PROBE_PROCESS_PAYLOAD_GATE_STATS")]
+static TRAFFIC_PROBE_PROCESS_PAYLOAD_GATE_STATS: PerCpuArray<u64> =
+    PerCpuArray::with_max_entries(EBPF_PROCESS_PAYLOAD_GATE_STATS_MAX_ENTRIES, 0);
 
 #[map(name = "TRAFFIC_PROBE_PROCESS_TRACEPOINT_FIRINGS")]
 static TRAFFIC_PROBE_PROCESS_TRACEPOINT_FIRINGS: PerCpuArray<u64> =
@@ -396,6 +402,7 @@ fn record_accept_attempt(ctx: TracePointContext) {
 
 fn emit_accept_observation(ctx: TracePointContext) {
     let key = bpf_get_current_pid_tgid();
+    let accepted_lease = open_accepted_socket_fd_from_result(&ctx);
     let Some(attempt) = (unsafe { TRAFFIC_PROBE_PENDING_ACCEPTS.get(&key).copied() }) else {
         return;
     };
@@ -404,7 +411,8 @@ fn emit_accept_observation(ctx: TracePointContext) {
         return;
     };
     let metadata = process_metadata(&ctx);
-    let lease = open_socket_fd_lease(metadata.tgid, accept.observation.fd);
+    let lease = accepted_lease
+        .unwrap_or_else(|| open_socket_fd_lease(metadata.tgid, accept.observation.fd));
     let observation = accept
         .observation
         .with_descriptor_lease(lease.fd_table_epoch, lease.fd_generation);
@@ -418,6 +426,12 @@ fn emit_accept_observation(ctx: TracePointContext) {
         accept.flags,
     );
     submit_process_event(&event);
+}
+
+fn open_accepted_socket_fd_from_result(ctx: &TracePointContext) -> Option<SocketFdLease> {
+    let fd = accepted_fd_from_result(ctx)?;
+    let metadata = process_metadata(ctx);
+    Some(open_socket_fd_lease(metadata.tgid, fd))
 }
 
 fn emit_close_attempt(ctx: TracePointContext) {
@@ -519,59 +533,105 @@ fn record_sendfile_attempt(ctx: TracePointContext) {
 }
 
 fn record_write_payload_attempt(source: payload::PayloadAttemptSource) {
+    record_payload_gate_stat(EbpfProcessPayloadGateKind::WriteAttempt);
     let Some(lease) =
         allowed_socket_payload_lease(source.fd, EBPF_SOCKET_PAYLOAD_ALLOW_WRITE, source.fd_kind())
     else {
+        record_payload_gate_stat(EbpfProcessPayloadGateKind::WriteNoAllowance);
         return;
     };
+    record_payload_allowance_stat(
+        lease.source,
+        EbpfProcessPayloadGateKind::WriteSocketAllowance,
+        EbpfProcessPayloadGateKind::WriteProcessAllowance,
+    );
     let Some(pending) = pending_write_scratch() else {
+        record_payload_gate_stat(EbpfProcessPayloadGateKind::WriteScratchUnavailable);
         return;
     };
     if capture_write_sample_from_source(source, pending).is_none() {
+        record_payload_gate_stat(EbpfProcessPayloadGateKind::WritePlanSkipped);
         return;
     }
     pending.fd_generation = lease.fd_generation;
     let key = bpf_get_current_pid_tgid();
-    let _ = TRAFFIC_PROBE_PENDING_WRITES.insert(&key, pending, 0);
+    if TRAFFIC_PROBE_PENDING_WRITES
+        .insert(&key, pending, 0)
+        .is_ok()
+    {
+        record_payload_gate_stat(EbpfProcessPayloadGateKind::WritePendingInserted);
+    } else {
+        record_payload_gate_stat(EbpfProcessPayloadGateKind::WritePendingInsertFailed);
+    }
 }
 
 fn record_kernel_transfer_write_gap(fd: i32) {
-    let Some(lease) =
-        allowed_socket_payload_lease(fd, EBPF_SOCKET_PAYLOAD_ALLOW_WRITE, payload::PayloadFdKind::Generic)
-    else {
+    let Some(lease) = allowed_socket_payload_lease(
+        fd,
+        EBPF_SOCKET_PAYLOAD_ALLOW_WRITE,
+        payload::PayloadFdKind::Generic,
+    ) else {
+        record_payload_gate_stat(EbpfProcessPayloadGateKind::WriteNoAllowance);
         return;
     };
+    record_payload_allowance_stat(
+        lease.source,
+        EbpfProcessPayloadGateKind::WriteSocketAllowance,
+        EbpfProcessPayloadGateKind::WriteProcessAllowance,
+    );
     let Some(pending) = pending_write_scratch() else {
+        record_payload_gate_stat(EbpfProcessPayloadGateKind::WriteScratchUnavailable);
         return;
     };
     capture_kernel_transfer_write_gap(fd, pending);
     pending.fd_generation = lease.fd_generation;
     let key = bpf_get_current_pid_tgid();
-    let _ = TRAFFIC_PROBE_PENDING_WRITES.insert(&key, pending, 0);
+    if TRAFFIC_PROBE_PENDING_WRITES
+        .insert(&key, pending, 0)
+        .is_ok()
+    {
+        record_payload_gate_stat(EbpfProcessPayloadGateKind::WritePendingInserted);
+    } else {
+        record_payload_gate_stat(EbpfProcessPayloadGateKind::WritePendingInsertFailed);
+    }
 }
 
 fn emit_write_sample(ctx: TracePointContext) {
+    record_payload_gate_stat(EbpfProcessPayloadGateKind::WriteExit);
     let key = bpf_get_current_pid_tgid();
     let Some(pending_ptr) = TRAFFIC_PROBE_PENDING_WRITES.get_ptr_mut(&key) else {
+        record_payload_gate_stat(EbpfProcessPayloadGateKind::WriteMissingPending);
         return;
     };
     let pending = unsafe { &mut *pending_ptr };
-    if validate_socket_payload_lease(pending.fd, EBPF_SOCKET_PAYLOAD_ALLOW_WRITE)
-        .is_none_or(|lease| lease.fd_generation != pending.fd_generation)
-    {
-        let _ = TRAFFIC_PROBE_PENDING_WRITES.remove(&key);
-        return;
+    match validate_pending_payload_lease(
+        pending.fd,
+        EBPF_SOCKET_PAYLOAD_ALLOW_WRITE,
+        pending.fd_generation,
+    ) {
+        PayloadLeaseValidation::Valid => {
+            record_payload_gate_stat(EbpfProcessPayloadGateKind::WriteLeaseValidated);
+        }
+        PayloadLeaseValidation::Invalid(reason) => {
+            record_payload_gate_stat(EbpfProcessPayloadGateKind::WriteLeaseInvalid);
+            record_payload_gate_stat(write_lease_invalid_gate(reason));
+            let _ = TRAFFIC_PROBE_PENDING_WRITES.remove(&key);
+            return;
+        }
     }
     if trim_write_sample_to_result(&ctx, pending).is_none() {
+        record_payload_gate_stat(EbpfProcessPayloadGateKind::WriteResultSkipped);
         let _ = TRAFFIC_PROBE_PENDING_WRITES.remove(&key);
         return;
     };
     let Some(event) = scratch_event() else {
+        record_payload_gate_stat(EbpfProcessPayloadGateKind::WriteEventScratchUnavailable);
         let _ = TRAFFIC_PROBE_PENDING_WRITES.remove(&key);
         return;
     };
     event.clear_sample();
     if !copy_captured_write_prefix(event, pending) {
+        record_payload_gate_stat(EbpfProcessPayloadGateKind::WriteCopyFailed);
         let _ = TRAFFIC_PROBE_PENDING_WRITES.remove(&key);
         return;
     }
@@ -581,6 +641,7 @@ fn emit_write_sample(ctx: TracePointContext) {
         pending.flags,
     );
     submit_process_event(event);
+    record_payload_gate_stat(EbpfProcessPayloadGateKind::WriteSubmitted);
     let _ = TRAFFIC_PROBE_PENDING_WRITES.remove(&key);
 }
 
@@ -613,39 +674,68 @@ fn record_recvmsg_attempt(ctx: TracePointContext) {
 }
 
 fn record_read_payload_attempt(source: payload::PayloadAttemptSource) {
+    record_payload_gate_stat(EbpfProcessPayloadGateKind::ReadAttempt);
     let Some(lease) =
         allowed_socket_payload_lease(source.fd, EBPF_SOCKET_PAYLOAD_ALLOW_READ, source.fd_kind())
     else {
+        record_payload_gate_stat(EbpfProcessPayloadGateKind::ReadNoAllowance);
         return;
     };
+    record_payload_allowance_stat(
+        lease.source,
+        EbpfProcessPayloadGateKind::ReadSocketAllowance,
+        EbpfProcessPayloadGateKind::ReadProcessAllowance,
+    );
     let Some(mut attempt) = pending_read_attempt_from_source(source) else {
+        record_payload_gate_stat(EbpfProcessPayloadGateKind::ReadPlanSkipped);
         return;
     };
     attempt.fd_generation = lease.fd_generation;
     let key = bpf_get_current_pid_tgid();
-    let _ = TRAFFIC_PROBE_PENDING_READS.insert(&key, &attempt, 0);
+    if TRAFFIC_PROBE_PENDING_READS
+        .insert(&key, &attempt, 0)
+        .is_ok()
+    {
+        record_payload_gate_stat(EbpfProcessPayloadGateKind::ReadPendingInserted);
+    } else {
+        record_payload_gate_stat(EbpfProcessPayloadGateKind::ReadPendingInsertFailed);
+    }
 }
 
 fn emit_read_sample(ctx: TracePointContext) {
+    record_payload_gate_stat(EbpfProcessPayloadGateKind::ReadExit);
     let key = bpf_get_current_pid_tgid();
     let Some(attempt) = (unsafe { TRAFFIC_PROBE_PENDING_READS.get(&key).copied() }) else {
+        record_payload_gate_stat(EbpfProcessPayloadGateKind::ReadMissingPending);
         return;
     };
-    if validate_socket_payload_lease(attempt.fd, EBPF_SOCKET_PAYLOAD_ALLOW_READ)
-        .is_none_or(|lease| lease.fd_generation != attempt.fd_generation)
-    {
-        let _ = TRAFFIC_PROBE_PENDING_READS.remove(&key);
-        return;
+    match validate_pending_payload_lease(
+        attempt.fd,
+        EBPF_SOCKET_PAYLOAD_ALLOW_READ,
+        attempt.fd_generation,
+    ) {
+        PayloadLeaseValidation::Valid => {
+            record_payload_gate_stat(EbpfProcessPayloadGateKind::ReadLeaseValidated);
+        }
+        PayloadLeaseValidation::Invalid(reason) => {
+            record_payload_gate_stat(EbpfProcessPayloadGateKind::ReadLeaseInvalid);
+            record_payload_gate_stat(read_lease_invalid_gate(reason));
+            let _ = TRAFFIC_PROBE_PENDING_READS.remove(&key);
+            return;
+        }
     }
     let Some(event) = read_scratch_event() else {
+        record_payload_gate_stat(EbpfProcessPayloadGateKind::ReadEventScratchUnavailable);
         let _ = TRAFFIC_PROBE_PENDING_READS.remove(&key);
         return;
     };
     if capture_read_sample_from_result(&ctx, attempt, event).is_none() {
+        record_payload_gate_stat(EbpfProcessPayloadGateKind::ReadResultSkipped);
         let _ = TRAFFIC_PROBE_PENDING_READS.remove(&key);
         return;
     }
     submit_process_event(event);
+    record_payload_gate_stat(EbpfProcessPayloadGateKind::ReadSubmitted);
     let _ = TRAFFIC_PROBE_PENDING_READS.remove(&key);
 }
 
@@ -671,6 +761,27 @@ fn record_tracepoint_firing(role: EbpfProcessTracepointRole) {
     };
     unsafe {
         *firings = (*firings).saturating_add(1);
+    }
+}
+
+fn record_payload_allowance_stat(
+    source: SocketFdLeaseSource,
+    socket_kind: EbpfProcessPayloadGateKind,
+    process_kind: EbpfProcessPayloadGateKind,
+) {
+    match source {
+        SocketFdLeaseSource::SocketAllowance => record_payload_gate_stat(socket_kind),
+        SocketFdLeaseSource::ProcessAllowance => record_payload_gate_stat(process_kind),
+    }
+}
+
+fn record_payload_gate_stat(kind: EbpfProcessPayloadGateKind) {
+    let Some(counter) = TRAFFIC_PROBE_PROCESS_PAYLOAD_GATE_STATS.get_ptr_mut(kind.counter_index())
+    else {
+        return;
+    };
+    unsafe {
+        *counter = (*counter).saturating_add(1);
     }
 }
 
@@ -720,6 +831,13 @@ fn process_metadata(ctx: &impl EbpfContext) -> EbpfProcessProbeMetadata {
 struct SocketFdLease {
     fd_table_epoch: u64,
     fd_generation: u64,
+    source: SocketFdLeaseSource,
+}
+
+#[derive(Clone, Copy)]
+enum SocketFdLeaseSource {
+    SocketAllowance,
+    ProcessAllowance,
 }
 
 fn allowed_socket_payload_lease(
@@ -731,45 +849,115 @@ fn allowed_socket_payload_lease(
         return None;
     }
     let tgid = current_tgid();
-    let key = EbpfSocketFdKey::new(tgid, fd);
-    if let Some(allowance) = unsafe { TRAFFIC_PROBE_ALLOWED_SOCKET_FDS.get(&key).copied() } {
-        if allowance.fd_table_epoch != 0
-            && allowance.fd_generation != 0
-            && allowance.allows(direction)
-            && current_fd_table_epoch(tgid).is_some_and(|epoch| epoch == allowance.fd_table_epoch)
-            && current_active_socket_fd_generation(tgid, fd)
-                .is_some_and(|generation| generation == allowance.fd_generation)
-        {
-            return Some(SocketFdLease {
-                fd_table_epoch: allowance.fd_table_epoch,
-                fd_generation: allowance.fd_generation,
-            });
-        }
+    if let Some(lease) = strict_socket_payload_lease(tgid, fd, direction) {
+        return Some(lease);
     }
     allowed_process_payload_lease(tgid, fd, direction, fd_kind)
 }
 
-fn validate_socket_payload_lease(fd: i32, direction: u8) -> Option<SocketFdLease> {
-    if fd < 0 {
-        return None;
+fn validate_pending_payload_lease(
+    fd: i32,
+    direction: u8,
+    pending_fd_generation: u64,
+) -> PayloadLeaseValidation {
+    if fd < 0 || pending_fd_generation == 0 {
+        return PayloadLeaseValidation::Invalid(PayloadLeaseInvalidReason::ZeroGeneration);
     }
     let tgid = current_tgid();
+    if let Some(lease) = strict_socket_payload_lease(tgid, fd, direction)
+        && lease.fd_generation == pending_fd_generation
+    {
+        return PayloadLeaseValidation::Valid;
+    }
+    validate_process_payload_lease(tgid, fd, direction, pending_fd_generation)
+}
+
+fn strict_socket_payload_lease(tgid: u32, fd: i32, direction: u8) -> Option<SocketFdLease> {
     let key = EbpfSocketFdKey::new(tgid, fd);
-    if let Some(allowance) = unsafe { TRAFFIC_PROBE_ALLOWED_SOCKET_FDS.get(&key).copied() } {
-        if allowance.fd_table_epoch != 0
-            && allowance.fd_generation != 0
-            && allowance.allows(direction)
-            && current_fd_table_epoch(tgid).is_some_and(|epoch| epoch == allowance.fd_table_epoch)
-            && current_active_socket_fd_generation(tgid, fd)
-                .is_some_and(|generation| generation == allowance.fd_generation)
-        {
-            return Some(SocketFdLease {
-                fd_table_epoch: allowance.fd_table_epoch,
-                fd_generation: allowance.fd_generation,
-            });
+    if let Some(allowance) = unsafe { TRAFFIC_PROBE_ALLOWED_SOCKET_FDS.get(&key).copied() }
+        && allowance.fd_table_epoch != 0
+        && allowance.fd_generation != 0
+        && allowance.allows(direction)
+        && current_fd_table_epoch(tgid).is_some_and(|epoch| epoch == allowance.fd_table_epoch)
+        && current_active_socket_fd_generation(tgid, fd)
+            .is_some_and(|generation| generation == allowance.fd_generation)
+    {
+        return Some(SocketFdLease {
+            fd_table_epoch: allowance.fd_table_epoch,
+            fd_generation: allowance.fd_generation,
+            source: SocketFdLeaseSource::SocketAllowance,
+        });
+    }
+    None
+}
+
+fn validate_process_payload_lease(
+    tgid: u32,
+    fd: i32,
+    direction: u8,
+    pending_fd_generation: u64,
+) -> PayloadLeaseValidation {
+    if fd < 0 || pending_fd_generation == 0 {
+        return PayloadLeaseValidation::Invalid(PayloadLeaseInvalidReason::ZeroGeneration);
+    }
+    let Some(allowance) = allowed_process_payload_allowance(tgid) else {
+        return PayloadLeaseValidation::Invalid(PayloadLeaseInvalidReason::NoProcessAllowance);
+    };
+    if !allowance.allows(direction) {
+        return PayloadLeaseValidation::Invalid(PayloadLeaseInvalidReason::DirectionDenied);
+    }
+    if current_active_socket_fd_generation(tgid, fd) != Some(pending_fd_generation) {
+        return PayloadLeaseValidation::Invalid(PayloadLeaseInvalidReason::GenerationMismatch);
+    }
+    PayloadLeaseValidation::Valid
+}
+
+#[derive(Clone, Copy)]
+enum PayloadLeaseValidation {
+    Valid,
+    Invalid(PayloadLeaseInvalidReason),
+}
+
+#[derive(Clone, Copy)]
+enum PayloadLeaseInvalidReason {
+    ZeroGeneration,
+    NoProcessAllowance,
+    DirectionDenied,
+    GenerationMismatch,
+}
+
+fn write_lease_invalid_gate(reason: PayloadLeaseInvalidReason) -> EbpfProcessPayloadGateKind {
+    match reason {
+        PayloadLeaseInvalidReason::ZeroGeneration => {
+            EbpfProcessPayloadGateKind::WriteLeaseZeroGeneration
+        }
+        PayloadLeaseInvalidReason::NoProcessAllowance => {
+            EbpfProcessPayloadGateKind::WriteLeaseNoProcessAllowance
+        }
+        PayloadLeaseInvalidReason::DirectionDenied => {
+            EbpfProcessPayloadGateKind::WriteLeaseDirectionDenied
+        }
+        PayloadLeaseInvalidReason::GenerationMismatch => {
+            EbpfProcessPayloadGateKind::WriteLeaseGenerationMismatch
         }
     }
-    allowed_existing_process_payload_lease(tgid, fd, direction)
+}
+
+fn read_lease_invalid_gate(reason: PayloadLeaseInvalidReason) -> EbpfProcessPayloadGateKind {
+    match reason {
+        PayloadLeaseInvalidReason::ZeroGeneration => {
+            EbpfProcessPayloadGateKind::ReadLeaseZeroGeneration
+        }
+        PayloadLeaseInvalidReason::NoProcessAllowance => {
+            EbpfProcessPayloadGateKind::ReadLeaseNoProcessAllowance
+        }
+        PayloadLeaseInvalidReason::DirectionDenied => {
+            EbpfProcessPayloadGateKind::ReadLeaseDirectionDenied
+        }
+        PayloadLeaseInvalidReason::GenerationMismatch => {
+            EbpfProcessPayloadGateKind::ReadLeaseGenerationMismatch
+        }
+    }
 }
 
 fn allowed_process_payload_lease(
@@ -778,8 +966,16 @@ fn allowed_process_payload_lease(
     direction: u8,
     fd_kind: payload::PayloadFdKind,
 ) -> Option<SocketFdLease> {
-    if let Some(lease) = allowed_existing_process_payload_lease(tgid, fd, direction) {
-        return Some(lease);
+    let allowance = allowed_process_payload_allowance(tgid)?;
+    if !allowance.allows(direction) {
+        return None;
+    }
+    if let Some(fd_generation) = current_active_socket_fd_generation(tgid, fd) {
+        return Some(SocketFdLease {
+            fd_table_epoch: current_fd_table_epoch(tgid)?,
+            fd_generation,
+            source: SocketFdLeaseSource::ProcessAllowance,
+        });
     }
     if !fd_kind.is_socket() {
         return None;
@@ -791,25 +987,8 @@ fn allowed_process_payload_lease(
     Some(SocketFdLease {
         fd_table_epoch,
         fd_generation: next_socket_fd_generation(tgid, fd)?,
+        source: SocketFdLeaseSource::ProcessAllowance,
     })
-}
-
-fn allowed_existing_process_payload_lease(
-    tgid: u32,
-    fd: i32,
-    direction: u8,
-) -> Option<SocketFdLease> {
-    let allowance = allowed_process_payload_allowance(tgid)?;
-    if !allowance.allows(direction) {
-        return None;
-    }
-    if let Some(fd_generation) = current_active_socket_fd_generation(tgid, fd) {
-        return Some(SocketFdLease {
-            fd_table_epoch: current_fd_table_epoch(tgid)?,
-            fd_generation,
-        });
-    }
-    None
 }
 
 fn allowed_process_payload_allowance(tgid: u32) -> Option<EbpfProcessPayloadAllowance> {
@@ -854,6 +1033,7 @@ fn open_socket_fd_lease(tgid: u32, fd: i32) -> SocketFdLease {
     SocketFdLease {
         fd_table_epoch: ensure_fd_table_epoch(tgid),
         fd_generation: next_socket_fd_generation(tgid, fd).unwrap_or(0),
+        source: SocketFdLeaseSource::SocketAllowance,
     }
 }
 

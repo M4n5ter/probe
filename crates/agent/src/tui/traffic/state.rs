@@ -1108,14 +1108,16 @@ impl TrafficState {
         &mut self,
         message: Option<CaptureDiagnosticMessage>,
     ) {
-        if self.status.kind != TrafficStatusKind::Error
-            && let Some(message) = message
-        {
-            self.status = match message {
-                CaptureDiagnosticMessage::Info(message) => TrafficStatus::idle(message),
-                CaptureDiagnosticMessage::Warning(message) => TrafficStatus::warning(message),
-                CaptureDiagnosticMessage::Error(message) => TrafficStatus::error(message),
-            };
+        let Some(message) = message else {
+            return;
+        };
+        let status = match message {
+            CaptureDiagnosticMessage::Info(message) => TrafficStatus::idle(message),
+            CaptureDiagnosticMessage::Warning(message) => TrafficStatus::warning(message),
+            CaptureDiagnosticMessage::Error(message) => TrafficStatus::error(message),
+        };
+        if should_apply_runtime_status(status.kind, self.status.kind) {
+            self.status = status;
         }
     }
 
@@ -1741,6 +1743,12 @@ impl EmptyFilterDiagnostics {
     }
 
     fn status_line(&self) -> String {
+        if self.connection_lifecycle_only() {
+            return format!(
+                "{} view is empty; capture is seeing connection lifecycle events but no parsed HTTP/WebSocket payload",
+                self.filter_label
+            );
+        }
         format!(
             "{} view is empty; saw {} matching event(s) outside this filter: {}",
             self.filter_label,
@@ -1750,15 +1758,29 @@ impl EmptyFilterDiagnostics {
     }
 
     fn lines(&self) -> Vec<String> {
-        vec![
+        let mut lines = vec![
             "Current traffic view is filtered".to_string(),
             format!("View: {}", self.filter_label),
             format!("Scanned records: {}", self.scanned),
             format!("Matching events outside this view: {}", self.event_count),
             format!("Event types: {}", self.type_summary()),
-            "Use Events to switch to All or Diagnostics when parsed protocol rows are empty"
-                .to_string(),
-        ]
+        ];
+        if self.connection_lifecycle_only() {
+            lines.push(
+                "Capture is seeing TCP connection lifecycle events, but no parsed HTTP/WebSocket payload matched this view"
+                    .to_string(),
+            );
+            lines.push(
+                "Use All or Diagnostics to inspect lifecycle events; use libpcap or MITM when eBPF payload sampling is unavailable"
+                    .to_string(),
+            );
+        } else {
+            lines.push(
+                "Use Events to switch to All or Diagnostics when parsed protocol rows are empty"
+                    .to_string(),
+            );
+        }
+        lines
     }
 
     fn type_summary(&self) -> String {
@@ -1767,6 +1789,16 @@ impl EmptyFilterDiagnostics {
             .map(|(event_type, count)| format!("{event_type}={count}"))
             .collect::<Vec<_>>()
             .join(", ")
+    }
+
+    fn connection_lifecycle_only(&self) -> bool {
+        !self.type_counts.is_empty()
+            && self.type_counts.iter().all(|(event_type, _)| {
+                matches!(
+                    event_type.as_str(),
+                    "connection_opened" | "connection_closed"
+                )
+            })
     }
 }
 
@@ -1907,6 +1939,20 @@ impl TrafficStatus {
             text: terminal_safe_inline_text(text),
         }
     }
+}
+
+fn traffic_status_priority(kind: TrafficStatusKind) -> u8 {
+    match kind {
+        TrafficStatusKind::Idle | TrafficStatusKind::Active => 0,
+        TrafficStatusKind::Warning => 1,
+        TrafficStatusKind::Error => 2,
+    }
+}
+
+fn should_apply_runtime_status(next: TrafficStatusKind, current: TrafficStatusKind) -> bool {
+    let next = traffic_status_priority(next);
+    let current = traffic_status_priority(current);
+    next > current || (next == 0 && current == 0)
 }
 
 fn traffic_status_for_snapshot(
@@ -2189,6 +2235,81 @@ mod tests {
             lines
                 .iter()
                 .any(|line| line.contains("switch to All or Diagnostics"))
+        );
+    }
+
+    #[test]
+    fn empty_filtered_view_explains_connection_lifecycle_without_parsed_payload() {
+        let mut traffic = TrafficState::default();
+        let empty_filtered = empty_tail_snapshot(2);
+        let diagnostics = EmptyFilterDiagnostics::from_snapshot(
+            "Parsed",
+            tail_snapshot_with_connection_lifecycle_events(1..=2),
+        );
+
+        traffic.apply_snapshot(empty_filtered);
+        traffic.apply_empty_filter_diagnostics(diagnostics);
+
+        assert!(traffic.rows().is_empty());
+        assert_eq!(traffic.status().kind, TrafficStatusKind::Warning);
+        assert_eq!(
+            traffic.status().text,
+            "Parsed view is empty; capture is seeing connection lifecycle events but no parsed HTTP/WebSocket payload"
+        );
+        let lines = traffic.detail_preview_lines(12);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("no parsed HTTP/WebSocket payload"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Use All or Diagnostics"))
+        );
+    }
+
+    #[test]
+    fn runtime_info_does_not_overwrite_empty_filter_warning() {
+        let mut traffic = TrafficState::default();
+        let empty_filtered = empty_tail_snapshot(2);
+        let diagnostics = EmptyFilterDiagnostics::from_snapshot(
+            "Parsed",
+            tail_snapshot_with_connection_lifecycle_events(1..=2),
+        );
+
+        traffic.apply_snapshot(empty_filtered);
+        traffic.apply_empty_filter_diagnostics(diagnostics);
+        traffic.apply_runtime_diagnostic_message(Some(CaptureDiagnosticMessage::Info(
+            "capture ebpf selected, mode=live".to_string(),
+        )));
+
+        assert_eq!(traffic.status().kind, TrafficStatusKind::Warning);
+        assert_eq!(
+            traffic.status().text,
+            "Parsed view is empty; capture is seeing connection lifecycle events but no parsed HTTP/WebSocket payload"
+        );
+    }
+
+    #[test]
+    fn runtime_warning_does_not_overwrite_empty_filter_warning() {
+        let mut traffic = TrafficState::default();
+        let empty_filtered = empty_tail_snapshot(2);
+        let diagnostics = EmptyFilterDiagnostics::from_snapshot(
+            "Parsed",
+            tail_snapshot_with_connection_lifecycle_events(1..=2),
+        );
+
+        traffic.apply_snapshot(empty_filtered);
+        traffic.apply_empty_filter_diagnostics(diagnostics);
+        traffic.apply_runtime_diagnostic_message(Some(CaptureDiagnosticMessage::Warning(
+            "MITM proxy data path is unavailable".to_string(),
+        )));
+
+        assert_eq!(traffic.status().kind, TrafficStatusKind::Warning);
+        assert_eq!(
+            traffic.status().text,
+            "Parsed view is empty; capture is seeing connection lifecycle events but no parsed HTTP/WebSocket payload"
         );
     }
 
@@ -3488,6 +3609,7 @@ mod tests {
                 reason: "permission denied".to_string(),
             }],
             provider: None,
+            ebpf_process_payload: None,
             input_activity: None,
         }
     }
@@ -3514,6 +3636,7 @@ mod tests {
             auto_mitm_plaintext_bridge_candidate: None,
             open_failures: Vec::new(),
             provider: None,
+            ebpf_process_payload: None,
             input_activity: None,
         }
     }
@@ -3570,6 +3693,31 @@ mod tests {
         let last_export_sequence = *range.end();
         let events = range
             .map(|sequence| tail_record(sequence, sequence * 100, gap_event(sequence)))
+            .collect::<Vec<_>>();
+        tail_snapshot(
+            after_sequence,
+            last_export_sequence,
+            events.len(),
+            events.len(),
+            tail_budget(4096, 0, false),
+            events,
+            Vec::new(),
+        )
+    }
+
+    fn tail_snapshot_with_connection_lifecycle_events(
+        range: std::ops::RangeInclusive<u64>,
+    ) -> EventTailSnapshot {
+        let after_sequence = range.start().saturating_sub(1);
+        let last_export_sequence = *range.end();
+        let events = range
+            .map(|sequence| {
+                tail_record(
+                    sequence,
+                    sequence * 100,
+                    connection_lifecycle_event(sequence),
+                )
+            })
             .collect::<Vec<_>>();
         tail_snapshot(
             after_sequence,
@@ -4005,6 +4153,24 @@ mod tests {
                 next_offset: Some(sequence + 1),
                 reason: "test gap".to_string(),
             }),
+        )
+    }
+
+    fn connection_lifecycle_event(sequence: u64) -> EventEnvelope {
+        let kind = if sequence.is_multiple_of(2) {
+            EventKind::ConnectionClosed
+        } else {
+            EventKind::ConnectionOpened
+        };
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: sequence,
+                wall_time_unix_ns: sequence as i64,
+            },
+            test_flow(),
+            CaptureOrigin::from_source(CaptureSource::Replay),
+            "test",
+            kind,
         )
     }
 

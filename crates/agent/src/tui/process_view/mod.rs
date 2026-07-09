@@ -8,7 +8,7 @@ pub(crate) struct ProcessViewState {
     scroll: usize,
     filter: String,
     visible_rows: usize,
-    monitored_exe_paths: BTreeSet<String>,
+    monitored_process_keys: BTreeSet<String>,
 }
 
 impl Default for ProcessViewState {
@@ -18,7 +18,7 @@ impl Default for ProcessViewState {
             scroll: 0,
             filter: String::new(),
             visible_rows: 12,
-            monitored_exe_paths: BTreeSet::new(),
+            monitored_process_keys: BTreeSet::new(),
         }
     }
 }
@@ -37,19 +37,19 @@ impl ProcessViewState {
     }
 
     pub(crate) fn monitored_scope_count(&self) -> usize {
-        self.monitored_exe_paths.len()
+        self.monitored_process_keys.len()
     }
 
     pub(crate) fn monitors_process(&self, selector_key: Option<&str>) -> bool {
-        selector_key.is_some_and(|key| self.monitored_exe_paths.contains(key))
+        selector_key.is_some_and(|key| self.monitored_process_keys.contains(key))
     }
 
     pub(crate) fn replace_monitors(
         &mut self,
-        exe_paths: impl IntoIterator<Item = String>,
+        process_keys: impl IntoIterator<Item = String>,
         catalog: &ProcessCatalog,
     ) {
-        self.monitored_exe_paths = exe_paths.into_iter().collect();
+        self.monitored_process_keys = process_keys.into_iter().collect();
         if self.filter.is_empty()
             && let Some(index) = catalog
                 .entries()
@@ -97,8 +97,8 @@ impl ProcessViewState {
         else {
             return false;
         };
-        self.monitored_exe_paths.clear();
-        self.monitored_exe_paths.insert(key);
+        self.monitored_process_keys.clear();
+        self.monitored_process_keys.insert(key);
         self.select(index, catalog);
         true
     }
@@ -112,10 +112,10 @@ impl ProcessViewState {
             .entries()
             .get(index)
             .and_then(|entry| entry.selector_key())?;
-        let monitored = if self.monitored_exe_paths.remove(&key) {
+        let monitored = if self.monitored_process_keys.remove(&key) {
             false
         } else {
-            self.monitored_exe_paths.insert(key);
+            self.monitored_process_keys.insert(key);
             true
         };
         self.select(index, catalog);
@@ -232,11 +232,11 @@ mod tests {
         let mut view = ProcessViewState::default();
         view.set_viewport_rows(2, &catalog);
 
-        view.replace_monitors(["/app/backend".to_string()], &catalog);
+        view.replace_monitors(["pid:4".to_string()], &catalog);
 
         assert_eq!(view.selected_index(), Some(3));
         assert_eq!(view.scroll(), 2);
-        assert!(view.monitors_process(Some("/app/backend")));
+        assert!(view.monitors_process(Some("pid:4")));
     }
 
     #[test]

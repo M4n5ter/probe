@@ -13,7 +13,8 @@ mod tracked_flow;
 mod types;
 
 pub use bridge::{
-    EbpfProcessHint, EbpfResolvedSocketFlow, EbpfSocketFlowLookup, EbpfSocketFlowResolver,
+    EbpfListenSocketLookup, EbpfProcessHint, EbpfResolvedListenSocket, EbpfResolvedSocketFlow,
+    EbpfSocketFlowLookup, EbpfSocketFlowResolver,
 };
 pub(crate) use bridge::{
     accept_opened_event_from_observation, connect_opened_event_from_observation,
@@ -26,7 +27,9 @@ pub use payload_authorization::{
 pub use probe::{
     EbpfProcessObservationLinkOwnershipSnapshot,
     EbpfProcessObservationOptionalTracepointPairSnapshot,
-    EbpfProcessObservationOptionalTracepointPairState, EbpfProcessObservationProbe,
+    EbpfProcessObservationOptionalTracepointPairState,
+    EbpfProcessObservationOptionalTracepointSnapshot,
+    EbpfProcessObservationOptionalTracepointState, EbpfProcessObservationProbe,
     EbpfProcessObservationProbeConfig, EbpfProcessObservationProbeError,
     EbpfProcessObservationProbeSnapshot, EbpfProcessObservationProgramLinkOwnershipSnapshot,
 };
@@ -39,5 +42,6 @@ pub use types::{
     EbpfProcessObservationActiveTracepointLivenessProgram,
     EbpfProcessObservationActiveTracepointLivenessState, EbpfProcessObservationRuntimeDiagnostics,
     EbpfProcessObservationTracepointDiagnostics, EbpfProcessObservationTracepointFiring,
-    EbpfSocketEndpoint, EbpfSocketReadObservation, EbpfSocketWriteObservation,
+    EbpfProcessPayloadAllowanceDiagnostics, EbpfProcessPayloadGateCounter, EbpfSocketEndpoint,
+    EbpfSocketReadObservation, EbpfSocketWriteObservation,
 };

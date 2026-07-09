@@ -15,9 +15,12 @@ pub(crate) use activity::{
 pub(super) use factory::{
     CaptureProviderPreflight, build_capture_provider, build_capture_provider_with_cancellation,
 };
+#[cfg(test)]
+pub(crate) use runtime::EbpfProcessPayloadGateCounterRuntimeSnapshot;
 pub(crate) use runtime::{
     CaptureProviderOpenFailureSnapshot, CaptureProviderRuntimeDetailsSnapshot,
     CaptureProviderRuntimeSnapshot, CaptureProviderRuntimeState,
+    EbpfProcessPayloadAllowanceRuntimeSnapshot, EbpfProcessPayloadGateRuntimeSnapshot,
 };
 
 pub(super) struct OpenedLiveCaptureBackend {

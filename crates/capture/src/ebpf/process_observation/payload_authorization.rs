@@ -24,6 +24,36 @@ impl ProcessPayloadSampleAuthorization {
         Self::new(tgid, payload_directions)
     }
 
+    pub fn from_process_prefilter_selector(
+        tgid: u32,
+        process: &ProcessContext,
+        selector: &CompiledSelector,
+    ) -> Option<Self> {
+        let mut payload_directions = PayloadDirections::empty();
+        if selector.may_match_process_direction(process, Direction::Inbound) {
+            payload_directions.insert(Direction::Inbound);
+        }
+        if selector.may_match_process_direction(process, Direction::Outbound) {
+            payload_directions.insert(Direction::Outbound);
+        }
+        Self::new(tgid, payload_directions)
+    }
+
+    pub fn from_observed_process_prefilter_selector(
+        tgid: u32,
+        process: &ProcessContext,
+        selector: &CompiledSelector,
+    ) -> Option<Self> {
+        let mut payload_directions = PayloadDirections::empty();
+        if selector.may_match_observed_process_direction(process, Direction::Inbound) {
+            payload_directions.insert(Direction::Inbound);
+        }
+        if selector.may_match_observed_process_direction(process, Direction::Outbound) {
+            payload_directions.insert(Direction::Outbound);
+        }
+        Self::new(tgid, payload_directions)
+    }
+
     fn new(tgid: u32, payload_directions: PayloadDirections) -> Option<Self> {
         (tgid != 0 && !payload_directions.is_empty()).then_some(Self {
             tgid,
@@ -84,7 +114,7 @@ impl SocketPayloadSampleAuthorization {
     }
 }
 
-fn payload_directions_for_flow(
+pub(super) fn payload_directions_for_flow(
     flow: &FlowContext,
     selector: &CompiledSelector,
 ) -> PayloadDirections {
@@ -293,6 +323,42 @@ mod tests {
         );
 
         assert!(authorization.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn process_prefilter_authorization_allows_port_scoped_process_selector()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let selector = Selector::term(
+            ProcessSelector {
+                names: vec!["curl".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector {
+                local_ports: vec![8080],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        )
+        .compile()?;
+
+        let authorization = ProcessPayloadSampleAuthorization::from_process_prefilter_selector(
+            100,
+            &flow().process,
+            &selector,
+        )
+        .expect("expected process prefilter authorization");
+
+        assert!(
+            authorization
+                .payload_directions()
+                .allows(Direction::Inbound)
+        );
+        assert!(
+            !authorization
+                .payload_directions()
+                .allows(Direction::Outbound)
+        );
         Ok(())
     }
 

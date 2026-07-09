@@ -1,11 +1,11 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     time::{Duration, Instant},
 };
 
 use probe_core::{
-    CancellationToken, CapabilityKind, CapabilityState, CaptureSource, CompiledSelector,
-    FlowContext, ProcessContext, Timestamp,
+    CancellationToken, CapabilityKind, CapabilityState, CaptureSource, CompiledSelector, Direction,
+    FlowContext, Timestamp,
 };
 
 use crate::output_loss::OutputLossTracker;
@@ -13,18 +13,21 @@ use crate::{
     CaptureError, CaptureEvent, CapturePoll, CaptureProvider, CaptureProviderRuntimeDiagnostics,
     EbpfProcessObservationActiveTracepointLiveness, EbpfProcessObservationRuntimeDiagnostics,
     EbpfProcessObservationTracepointDiagnostics, EbpfProcessObservationTracepointFiring,
+    EbpfProcessPayloadAllowanceDiagnostics, EbpfProcessPayloadGateCounter,
 };
 
 use super::super::{
     EbpfCloseRangeTracepointObservation, EbpfCloseTracepointObservation, EbpfObservedProcess,
     EbpfProcessLifecycleKind, EbpfProcessLifecycleObservation, EbpfProcessObservation,
     EbpfProcessObservationProbe, EbpfProcessObservationProbeConfig,
-    EbpfProcessObservationProbeSnapshot, EbpfSocketFlowResolver,
+    EbpfProcessObservationProbeSnapshot, EbpfSocketFlowResolver, EbpfSocketReadObservation,
+    EbpfSocketWriteObservation,
     active_liveness::{
         active_tracepoint_liveness_from_firings, trigger_safe_active_tracepoint_liveness_probe,
     },
-    bridge::{output_loss_event, process_hint_from_observed},
+    bridge::{output_loss_event, pending_payload_queue_loss_event},
     clock::EbpfObservationClock,
+    descriptor_lease::DescriptorLeaseKey,
     flow_start::{PendingEbpfFlowResolution, PendingEbpfFlowStart},
     observation_source::{EbpfObservationSource, ProbeObservationSource},
     payload_authorization::{ProcessPayloadSampleAuthorization, SocketPayloadSampleAuthorization},
@@ -34,19 +37,50 @@ use super::super::{
         write_events,
     },
     payload_direction::PayloadDirections,
-    tracked_flow::{TrackedEbpfFlow, TrackedEbpfFlows},
+    tracked_flow::{TrackedEbpfFlowDisplacement, TrackedEbpfFlows},
+};
+
+use super::{
+    payload_recovery::PayloadFlowRecovery,
+    process_payload_allowance::{
+        process_payload_authorization_for_observed_process, sync_current_process_payload_allowance,
+        sync_process_payload_allowance_for_flow_start,
+    },
 };
 
 const DEFAULT_RESOLUTION_RETRIES: u32 = 20;
 const DEFAULT_RESOLUTION_RETRY_SLEEP: Duration = Duration::from_millis(5);
 const DEFAULT_RUNTIME_DIAGNOSTICS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const DEFAULT_CLOSE_DRAIN_GRACE: Duration = Duration::from_millis(250);
 const MAX_TRACKED_EBPF_FLOWS: usize = 8192;
 const MAX_PENDING_EBPF_FLOW_RESOLUTIONS: usize = 8192;
+const MAX_PENDING_EBPF_PAYLOADS: usize = 8192;
 
 #[derive(Debug, Clone, Copy)]
 enum PendingFlowRetryDelay {
     Respect,
     Ignore,
+}
+
+struct PendingClosedEbpfFlow {
+    key: DescriptorLeaseKey,
+    release_at: Instant,
+}
+
+struct PendingEbpfPayloadObservation {
+    key: DescriptorLeaseKey,
+    timestamp: Timestamp,
+    payload: PendingEbpfPayload,
+}
+
+enum PendingEbpfPayload {
+    Write(EbpfSocketWriteObservation),
+    Read(EbpfSocketReadObservation),
+}
+
+enum PendingCloseRelease {
+    DueOnly,
+    Any,
 }
 
 pub struct EbpfProcessObservationProvider {
@@ -58,7 +92,12 @@ pub struct EbpfProcessObservationProvider {
     stop_when_idle: bool,
     deep_observe_selector: Option<CompiledSelector>,
     process_payload_selector: Option<CompiledSelector>,
+    process_payload_allowance: EbpfProcessPayloadAllowanceDiagnostics,
     tracked_flows: TrackedEbpfFlows,
+    pending_closed_flows: VecDeque<PendingClosedEbpfFlow>,
+    pending_closed_keys: HashSet<DescriptorLeaseKey>,
+    close_drain_grace: Duration,
+    pending_payloads: VecDeque<PendingEbpfPayloadObservation>,
     pending_flows: VecDeque<PendingEbpfFlowResolution>,
     pending_events: VecDeque<CaptureEvent>,
     handoff_boundary_emitted: bool,
@@ -95,7 +134,7 @@ impl EbpfProcessObservationProvider {
         let probe_snapshot = probe.probe_snapshot();
         let observations: Box<dyn EbpfObservationSource> =
             Box::new(ProbeObservationSource { probe });
-        Ok(Self {
+        let mut provider = Self {
             observations,
             resolver,
             clock: EbpfObservationClock::default(),
@@ -104,14 +143,25 @@ impl EbpfProcessObservationProvider {
             stop_when_idle: false,
             deep_observe_selector,
             process_payload_selector,
+            process_payload_allowance: EbpfProcessPayloadAllowanceDiagnostics::default(),
             tracked_flows: TrackedEbpfFlows::bounded(MAX_TRACKED_EBPF_FLOWS),
+            pending_closed_flows: VecDeque::new(),
+            pending_closed_keys: HashSet::new(),
+            close_drain_grace: DEFAULT_CLOSE_DRAIN_GRACE,
+            pending_payloads: VecDeque::new(),
             pending_flows: VecDeque::new(),
             pending_events: VecDeque::new(),
             handoff_boundary_emitted: false,
             output_loss: OutputLossTracker::default(),
             probe_snapshot,
             runtime_diagnostics: EbpfProcessObservationRuntimeDiagnosticsCache::default(),
-        })
+        };
+        provider.process_payload_allowance = sync_current_process_payload_allowance(
+            provider.resolver.as_mut(),
+            provider.observations.as_mut(),
+            provider.process_payload_selector.as_ref(),
+        )?;
+        Ok(provider)
     }
 
     pub fn probe_snapshot(&self) -> EbpfProcessObservationProbeSnapshot {
@@ -139,21 +189,32 @@ impl EbpfProcessObservationProvider {
         {
             return Ok(CapturePoll::event(event));
         }
-        if !self.pending_flows.is_empty() {
-            return self.poll_pending_flow_resolution();
+        if let Some(poll) = self.poll_ready_pending_flow_resolution()? {
+            return Ok(poll);
         }
         if let Some(observation) = self.observations.next_observation()? {
             self.output_loss.record_observation();
             return self.poll_observation(observation);
         }
+        if let Some(event) = self.due_pending_close_event() {
+            return Ok(CapturePoll::event(event));
+        }
+        if let Some(poll) = self.poll_ready_pending_flow_resolution()? {
+            return Ok(poll);
+        }
         if let Some(event) = self.output_loss_events()? {
             return Ok(CapturePoll::event(event));
         }
-        Ok(if self.stop_when_idle {
-            CapturePoll::Finished
-        } else {
-            CapturePoll::Idle
-        })
+        Ok(
+            if self.stop_when_idle
+                && self.pending_flows.is_empty()
+                && self.pending_closed_flows.is_empty()
+            {
+                CapturePoll::Finished
+            } else {
+                CapturePoll::Idle
+            },
+        )
     }
 
     fn poll_observation(
@@ -167,13 +228,13 @@ impl EbpfProcessObservationProvider {
             EbpfProcessObservation::Accept(accept) => {
                 self.begin_flow_resolution(PendingEbpfFlowStart::Accept(accept))
             }
-            EbpfProcessObservation::Close(close) => Ok(self
-                .close_event(&close)
-                .map(CapturePoll::event)
-                .unwrap_or(CapturePoll::Progress)),
+            EbpfProcessObservation::Close(close) => {
+                self.defer_close_event(&close);
+                Ok(CapturePoll::Progress)
+            }
             EbpfProcessObservation::CloseRange(close_range) => {
-                let events = self.close_range_events(&close_range);
-                Ok(self.queue_events(events))
+                self.defer_close_range_events(&close_range);
+                Ok(CapturePoll::Progress)
             }
             EbpfProcessObservation::ProcessLifecycle(lifecycle) => {
                 self.sync_process_payload_allowance_for_lifecycle(&lifecycle)?;
@@ -182,12 +243,12 @@ impl EbpfProcessObservationProvider {
             }
             EbpfProcessObservation::Write(write) => {
                 let timestamp = self.clock.next_timestamp();
-                let events = write_events(&mut self.tracked_flows, &write, timestamp);
+                let events = self.write_events_with_recovery(&write, timestamp)?;
                 Ok(self.queue_events(events))
             }
             EbpfProcessObservation::Read(read) => {
                 let timestamp = self.clock.next_timestamp();
-                let events = read_events(&mut self.tracked_flows, &read, timestamp);
+                let events = self.read_events_with_recovery(&read, timestamp)?;
                 Ok(self.queue_events(events))
             }
         }
@@ -205,22 +266,41 @@ impl EbpfProcessObservationProvider {
         &mut self,
         flow_start: PendingEbpfFlowStart,
     ) -> Result<CapturePoll, CaptureError> {
-        let timestamp = self.clock.next_timestamp();
-        if flow_start.descriptor_lease().is_none() {
+        let Some(lease) = flow_start.descriptor_lease() else {
+            let timestamp = self.clock.next_timestamp();
             return Ok(CapturePoll::event(
                 flow_start.invalid_descriptor_lease_gap(timestamp, self.resolver.as_mut()),
             ));
+        };
+        if let Some(close_event) = self.release_pending_close_for_reused_descriptor(lease.key()) {
+            sync_process_payload_allowance_for_flow_start(
+                self.resolver.as_mut(),
+                self.observations.as_mut(),
+                &flow_start,
+                self.process_payload_selector.as_ref(),
+            )?;
+            let timestamp = self.clock.next_timestamp();
+            self.pending_flows
+                .push_front(PendingEbpfFlowResolution::new(flow_start, timestamp));
+            return Ok(CapturePoll::event(close_event));
         }
+        let timestamp = self.clock.next_timestamp();
+        sync_process_payload_allowance_for_flow_start(
+            self.resolver.as_mut(),
+            self.observations.as_mut(),
+            &flow_start,
+            self.process_payload_selector.as_ref(),
+        )?;
         self.poll_pending_flow_resolution_attempt(PendingEbpfFlowResolution::new(
             flow_start, timestamp,
         ))
     }
 
-    fn poll_pending_flow_resolution(&mut self) -> Result<CapturePoll, CaptureError> {
+    fn poll_ready_pending_flow_resolution(&mut self) -> Result<Option<CapturePoll>, CaptureError> {
         let pending_count = self.pending_flows.len();
         for _ in 0..pending_count {
             let Some(pending) = self.pending_flows.pop_front() else {
-                return Ok(CapturePoll::Idle);
+                return Ok(None);
             };
             if pending
                 .retry_at
@@ -229,9 +309,9 @@ impl EbpfProcessObservationProvider {
                 self.pending_flows.push_back(pending);
                 continue;
             }
-            return self.poll_pending_flow_resolution_attempt(pending);
+            return self.poll_pending_flow_resolution_attempt(pending).map(Some);
         }
-        Ok(CapturePoll::Idle)
+        Ok(None)
     }
 
     fn poll_pending_flow_resolution_attempt(
@@ -282,7 +362,7 @@ impl EbpfProcessObservationProvider {
         }
         if let Some(event) = pending
             .flow_start
-            .observed_opened_event(pending.timestamp, self.resolver.as_mut())
+            .observed_opened_event(pending.timestamp, self.resolver.as_mut())?
         {
             self.track_flow_start_event(&pending.flow_start, &event)?;
             Ok(CapturePoll::event(event))
@@ -345,21 +425,157 @@ impl EbpfProcessObservationProvider {
                 self.tracked_flows
                     .insert_flow(lease, flow.clone(), payload_directions)
             {
-                let displaced_key = displacement.key();
-                let retained_payload_allowance = self
-                    .tracked_flows
-                    .has_payload_allowance_for_allow_map_key(displaced_key);
-                if displacement.should_revoke_allow_map_key(retained_payload_allowance) {
-                    self.observations
-                        .revoke_socket_payload_sample(displaced_key)?;
-                }
-                self.pending_events
-                    .extend(tracked_flow_displacement_gap_events(
-                        displacement,
-                        *timestamp,
-                    ));
+                self.record_tracked_flow_displacement(displacement, *timestamp)?;
             }
+            self.drain_pending_payloads_for_key(lease.key());
         }
+        Ok(())
+    }
+
+    fn drain_pending_payloads_for_key(&mut self, key: DescriptorLeaseKey) {
+        let mut retained = VecDeque::with_capacity(self.pending_payloads.len());
+        while let Some(pending) = self.pending_payloads.pop_front() {
+            if pending.key != key {
+                retained.push_back(pending);
+                continue;
+            }
+            let events = match &pending.payload {
+                PendingEbpfPayload::Write(write) => {
+                    write_events(&mut self.tracked_flows, write, pending.timestamp)
+                }
+                PendingEbpfPayload::Read(read) => {
+                    read_events(&mut self.tracked_flows, read, pending.timestamp)
+                }
+            };
+            self.pending_events.extend(events);
+        }
+        self.pending_payloads = retained;
+    }
+
+    fn write_events_with_recovery(
+        &mut self,
+        write: &EbpfSocketWriteObservation,
+        timestamp: Timestamp,
+    ) -> Result<Vec<CaptureEvent>, CaptureError> {
+        let events = write_events(&mut self.tracked_flows, write, timestamp);
+        if !events.is_empty() {
+            return Ok(events);
+        }
+        let Some(mut recovery_events) = self.recover_payload_events(
+            DescriptorLeaseKey::from_write(write),
+            Direction::Outbound,
+            &write.process,
+            write.fd,
+            timestamp,
+        )?
+        else {
+            self.defer_payload_observation(
+                DescriptorLeaseKey::from_write(write),
+                timestamp,
+                PendingEbpfPayload::Write(write.clone()),
+            );
+            return Ok(Vec::new());
+        };
+        let payload_events = write_events(&mut self.tracked_flows, write, timestamp);
+        recovery_events.extend(payload_events);
+        Ok(recovery_events)
+    }
+
+    fn read_events_with_recovery(
+        &mut self,
+        read: &EbpfSocketReadObservation,
+        timestamp: Timestamp,
+    ) -> Result<Vec<CaptureEvent>, CaptureError> {
+        let events = read_events(&mut self.tracked_flows, read, timestamp);
+        if !events.is_empty() {
+            return Ok(events);
+        }
+        let Some(mut recovery_events) = self.recover_payload_events(
+            DescriptorLeaseKey::from_read(read),
+            Direction::Inbound,
+            &read.process,
+            read.fd,
+            timestamp,
+        )?
+        else {
+            self.defer_payload_observation(
+                DescriptorLeaseKey::from_read(read),
+                timestamp,
+                PendingEbpfPayload::Read(read.clone()),
+            );
+            return Ok(Vec::new());
+        };
+        let payload_events = read_events(&mut self.tracked_flows, read, timestamp);
+        recovery_events.extend(payload_events);
+        Ok(recovery_events)
+    }
+
+    fn defer_payload_observation(
+        &mut self,
+        key: Option<DescriptorLeaseKey>,
+        timestamp: Timestamp,
+        payload: PendingEbpfPayload,
+    ) {
+        let Some(key) = key else {
+            return;
+        };
+        if self.pending_payloads.len() >= MAX_PENDING_EBPF_PAYLOADS {
+            self.pending_payloads.pop_front();
+            self.pending_events
+                .push_back(pending_payload_queue_loss_event(timestamp, 1));
+        }
+        self.pending_payloads
+            .push_back(PendingEbpfPayloadObservation {
+                key,
+                timestamp,
+                payload,
+            });
+    }
+
+    fn recover_payload_events(
+        &mut self,
+        key: Option<DescriptorLeaseKey>,
+        direction: Direction,
+        process: &EbpfObservedProcess,
+        fd: i32,
+        timestamp: Timestamp,
+    ) -> Result<Option<Vec<CaptureEvent>>, CaptureError> {
+        let outcome = {
+            let mut recovery = PayloadFlowRecovery::new(
+                &mut self.tracked_flows,
+                self.resolver.as_mut(),
+                self.deep_observe_selector.as_ref(),
+            );
+            recovery.recover(key, direction, process, fd, timestamp)?
+        };
+        let Some(outcome) = outcome else {
+            return Ok(None);
+        };
+        if let Some(displacement) = outcome.displacement {
+            self.record_tracked_flow_displacement(displacement, timestamp)?;
+        }
+        Ok(Some(outcome.prefix_events))
+    }
+
+    fn record_tracked_flow_displacement(
+        &mut self,
+        displacement: TrackedEbpfFlowDisplacement,
+        timestamp: Timestamp,
+    ) -> Result<(), CaptureError> {
+        let displaced_key = displacement.key();
+        self.forget_pending_close_key(displaced_key);
+        let retained_socket_payload_allowance = self
+            .tracked_flows
+            .has_socket_payload_allowance_for_allow_map_key(displaced_key);
+        if displacement.should_revoke_socket_allow_map_key(retained_socket_payload_allowance) {
+            self.observations
+                .revoke_socket_payload_sample(displaced_key)?;
+        }
+        self.pending_events
+            .extend(tracked_flow_displacement_gap_events(
+                displacement,
+                timestamp,
+            ));
         Ok(())
     }
 
@@ -396,17 +612,85 @@ impl EbpfProcessObservationProvider {
         self.pending_events.pop_front()
     }
 
-    fn close_event(&mut self, close: &EbpfCloseTracepointObservation) -> Option<CaptureEvent> {
-        let flow = self.tracked_flows.remove_close(close)?.flow;
-        Some(connection_closed_event(self.clock.next_timestamp(), flow))
+    fn defer_close_event(&mut self, close: &EbpfCloseTracepointObservation) {
+        if let Some(key) = DescriptorLeaseKey::from_close(close) {
+            self.defer_close_key(key);
+        }
     }
 
-    fn close_range_events(
+    fn defer_close_range_events(&mut self, close_range: &EbpfCloseRangeTracepointObservation) {
+        for key in self.tracked_flows.close_range_keys(close_range) {
+            self.defer_close_key(key);
+        }
+    }
+
+    fn defer_close_key(&mut self, key: DescriptorLeaseKey) {
+        if !self.pending_closed_keys.insert(key) {
+            return;
+        }
+        self.pending_closed_flows.push_back(PendingClosedEbpfFlow {
+            key,
+            release_at: Instant::now() + self.close_drain_grace,
+        });
+    }
+
+    fn due_pending_close_event(&mut self) -> Option<CaptureEvent> {
+        self.pop_pending_close_event(PendingCloseRelease::DueOnly)
+    }
+
+    fn next_pending_close_event(&mut self) -> Option<CaptureEvent> {
+        self.pop_pending_close_event(PendingCloseRelease::Any)
+    }
+
+    fn release_pending_close_for_reused_descriptor(
         &mut self,
-        close_range: &EbpfCloseRangeTracepointObservation,
-    ) -> Vec<CaptureEvent> {
-        let removed = self.tracked_flows.remove_close_range(close_range);
-        self.connection_closed_events(removed)
+        reused_key: DescriptorLeaseKey,
+    ) -> Option<CaptureEvent> {
+        let pending_count = self.pending_closed_flows.len();
+        for _ in 0..pending_count {
+            let pending = self.pending_closed_flows.pop_front()?;
+            if !pending.key.has_same_allow_map_key(reused_key) {
+                self.pending_closed_flows.push_back(pending);
+                continue;
+            }
+            self.pending_closed_keys.remove(&pending.key);
+            if let Some(tracked) = self.tracked_flows.remove_key(pending.key) {
+                return Some(connection_closed_event(
+                    self.clock.next_timestamp(),
+                    tracked.flow,
+                ));
+            }
+        }
+        None
+    }
+
+    fn pop_pending_close_event(&mut self, release: PendingCloseRelease) -> Option<CaptureEvent> {
+        let pending_count = self.pending_closed_flows.len();
+        for _ in 0..pending_count {
+            let pending = self.pending_closed_flows.pop_front()?;
+            if matches!(release, PendingCloseRelease::DueOnly)
+                && Instant::now() < pending.release_at
+            {
+                self.pending_closed_flows.push_back(pending);
+                continue;
+            }
+            self.pending_closed_keys.remove(&pending.key);
+            if let Some(tracked) = self.tracked_flows.remove_key(pending.key) {
+                return Some(connection_closed_event(
+                    self.clock.next_timestamp(),
+                    tracked.flow,
+                ));
+            }
+        }
+        None
+    }
+
+    fn forget_pending_close_key(&mut self, key: DescriptorLeaseKey) {
+        if !self.pending_closed_keys.remove(&key) {
+            return;
+        }
+        self.pending_closed_flows
+            .retain(|pending| pending.key != key);
     }
 
     fn process_lifecycle_events(
@@ -436,7 +720,7 @@ impl EbpfProcessObservationProvider {
         &mut self,
         lifecycle: &EbpfProcessLifecycleObservation,
     ) -> Result<(), CaptureError> {
-        let Some(selector) = self.process_payload_selector.clone() else {
+        let Some(selector) = self.process_payload_selector.as_ref() else {
             return Ok(());
         };
         match lifecycle.kind {
@@ -444,9 +728,10 @@ impl EbpfProcessObservationProvider {
                 .observations
                 .revoke_process_payload_sample(lifecycle.process.tgid),
             EbpfProcessLifecycleKind::Exec => {
-                let authorization = self.process_payload_authorization_for_observed_process(
+                let authorization = process_payload_authorization_for_observed_process(
+                    self.resolver.as_mut(),
                     &lifecycle.process,
-                    &selector,
+                    selector,
                 );
                 match authorization {
                     Some(authorization) => self
@@ -457,28 +742,6 @@ impl EbpfProcessObservationProvider {
                         .revoke_process_payload_sample(lifecycle.process.tgid),
                 }
             }
-        }
-    }
-
-    fn process_payload_authorization_for_observed_process(
-        &mut self,
-        process: &EbpfObservedProcess,
-        selector: &CompiledSelector,
-    ) -> Option<ProcessPayloadSampleAuthorization> {
-        if let Some(hint) = process_hint_from_observed(process) {
-            let candidates = self.resolver.resolve_processes_by_hint(hint).ok()?;
-            return unique_process_payload_authorization(process.tgid, candidates, selector);
-        }
-
-        match self.resolver.resolve_process(process.tgid) {
-            Ok(Some(resolved_process)) => {
-                ProcessPayloadSampleAuthorization::from_unattributed_selector(
-                    process.tgid,
-                    &resolved_process,
-                    selector,
-                )
-            }
-            Ok(None) | Err(_) => None,
         }
     }
 
@@ -509,17 +772,6 @@ impl EbpfProcessObservationProvider {
         self.pending_flows = retained;
         events
     }
-
-    fn connection_closed_events(&mut self, removed: Vec<TrackedEbpfFlow>) -> Vec<CaptureEvent> {
-        if removed.is_empty() {
-            return Vec::new();
-        }
-        let timestamp = self.clock.next_timestamp();
-        removed
-            .into_iter()
-            .map(|tracked| connection_closed_event(timestamp, tracked.flow))
-            .collect()
-    }
 }
 
 struct EbpfProcessObservationRuntimeDiagnosticsCache {
@@ -538,6 +790,10 @@ impl Default for EbpfProcessObservationRuntimeDiagnosticsCache {
                 tracepoints: Err(
                     "process tracepoint diagnostics have not been read yet".to_string()
                 ),
+                process_payload_allowance: EbpfProcessPayloadAllowanceDiagnostics::default(),
+                payload_gates: Err(
+                    "process payload gate diagnostics have not been read yet".to_string()
+                ),
             },
             active_liveness: None,
         }
@@ -548,6 +804,7 @@ impl EbpfProcessObservationRuntimeDiagnosticsCache {
     fn snapshot(
         &mut self,
         observations: &mut dyn EbpfObservationSource,
+        process_payload_allowance: EbpfProcessPayloadAllowanceDiagnostics,
     ) -> EbpfProcessObservationRuntimeDiagnostics {
         let now = Instant::now();
         if self
@@ -557,18 +814,28 @@ impl EbpfProcessObservationRuntimeDiagnosticsCache {
             return self.snapshot.clone();
         }
         self.last_refresh = Some(now);
+        let payload_gates = process_payload_gate_diagnostics(observations);
         self.snapshot = match observations.process_tracepoint_firings() {
             Ok(Some(tracepoint_firings)) => {
-                self.snapshot_from_available_tracepoint_firings(observations, tracepoint_firings)
+                self.snapshot_from_available_tracepoint_firings(
+                    observations,
+                    tracepoint_firings,
+                    process_payload_allowance,
+                    payload_gates,
+                )
             }
             Ok(None) => EbpfProcessObservationRuntimeDiagnostics {
                 tracepoints: Err(
                     "process tracepoint firing diagnostics are not available for this observation source"
                         .to_string(),
                 ),
+                process_payload_allowance,
+                payload_gates,
             },
             Err(error) => EbpfProcessObservationRuntimeDiagnostics {
                 tracepoints: Err(error.to_string()),
+                process_payload_allowance,
+                payload_gates,
             },
         };
         self.snapshot.clone()
@@ -578,6 +845,8 @@ impl EbpfProcessObservationRuntimeDiagnosticsCache {
         &mut self,
         observations: &mut dyn EbpfObservationSource,
         before_firings: Vec<EbpfProcessObservationTracepointFiring>,
+        process_payload_allowance: EbpfProcessPayloadAllowanceDiagnostics,
+        payload_gates: Result<Vec<EbpfProcessPayloadGateCounter>, String>,
     ) -> EbpfProcessObservationRuntimeDiagnostics {
         let Some(active_liveness) = &self.active_liveness else {
             let (tracepoint_firings, active_liveness) =
@@ -590,6 +859,8 @@ impl EbpfProcessObservationRuntimeDiagnosticsCache {
                     firings: tracepoint_firings,
                     active_liveness,
                 }),
+                process_payload_allowance,
+                payload_gates,
             };
         };
         EbpfProcessObservationRuntimeDiagnostics {
@@ -597,7 +868,22 @@ impl EbpfProcessObservationRuntimeDiagnosticsCache {
                 firings: before_firings,
                 active_liveness: Ok(active_liveness.clone()),
             }),
+            process_payload_allowance,
+            payload_gates,
         }
+    }
+}
+
+fn process_payload_gate_diagnostics(
+    observations: &mut dyn EbpfObservationSource,
+) -> Result<Vec<EbpfProcessPayloadGateCounter>, String> {
+    match observations.process_payload_gate_counters() {
+        Ok(Some(counters)) => Ok(counters),
+        Ok(None) => Err(
+            "process payload gate diagnostics are not available for this observation source"
+                .to_string(),
+        ),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -641,19 +927,6 @@ fn run_active_liveness_probe(
     }
 }
 
-fn unique_process_payload_authorization(
-    observed_tgid: u32,
-    candidates: impl IntoIterator<Item = ProcessContext>,
-    selector: &CompiledSelector,
-) -> Option<ProcessPayloadSampleAuthorization> {
-    let mut candidates = candidates.into_iter();
-    let process = candidates.next()?;
-    if candidates.next().is_some() {
-        return None;
-    }
-    ProcessPayloadSampleAuthorization::from_unattributed_selector(observed_tgid, &process, selector)
-}
-
 fn connection_closed_event(timestamp: Timestamp, flow: FlowContext) -> CaptureEvent {
     CaptureEvent::ConnectionClosed {
         timestamp,
@@ -672,13 +945,14 @@ impl CaptureProvider for EbpfProcessObservationProvider {
             CapabilityKind::Ebpf,
             "eBPF provider emits connect and accept/accept4 flow-start observations with descriptor leases, \
              prefers procfs-resolved socket metadata when available, falls back to degraded observed flows when \
-             kernel tracepoints provide a remote endpoint before procfs resolution succeeds, uses direct TGID or \
-             unique process-hint procfs matches for process lifecycle payload allowance when observed kernel TGIDs \
-             are hidden from host procfs or collide with unrelated host PIDs, binds flow-start payload capture through \
+             kernel tracepoints provide a remote endpoint before procfs resolution succeeds, seeds startup and \
+             flow-start process payload allowance from procfs selectors, recovers tracked flows at payload time \
+             from descriptor leases when a flow-start event was missed, uses direct TGID resolution or \
+             tracepoint-provable observed process metadata for process lifecycle payload allowance, binds flow-start payload capture through \
              descriptor/socket allow maps, emits selector-authorized always-degraded outbound single-buffer and \
              bounded multi-iovec prefix syscall argument samples, outbound available sendfile family kernel-transfer \
              byte-count gaps, inbound single-buffer and bounded multi-iovec prefix syscall result samples bound to \
-             descriptor generation, descriptor-generation close/plain \
+             descriptor generation, drain-aware descriptor-generation close/plain \
              close_range lifecycle events, TGID-level process exit/exec cancellation of pending flow resolution plus \
              lifecycle boundary gaps for active payload-tracked flows, userspace tracked-flow displacement as \
              event-local terminal provider-state boundary gaps, output ring-buffer failure conversion to degraded \
@@ -699,6 +973,9 @@ impl CaptureProvider for EbpfProcessObservationProvider {
         if let Some(event) = self.pending_events.pop_front() {
             return Ok(CapturePoll::event(event));
         }
+        if let Some(event) = self.next_pending_close_event() {
+            return Ok(CapturePoll::event(event));
+        }
         if self.output_loss.should_check_during_drain()
             && let Some(event) = self.output_loss_events()?
         {
@@ -706,6 +983,9 @@ impl CaptureProvider for EbpfProcessObservationProvider {
         }
         if !self.pending_flows.is_empty() {
             return self.drain_pending_flow_resolution_before_handoff();
+        }
+        if let Some(event) = self.next_pending_close_event() {
+            return Ok(CapturePoll::event(event));
         }
         if let Some(event) = self.output_loss_events()? {
             return Ok(CapturePoll::event(event));
@@ -718,8 +998,10 @@ impl CaptureProvider for EbpfProcessObservationProvider {
 
     fn runtime_diagnostics(&mut self) -> CaptureProviderRuntimeDiagnostics {
         CaptureProviderRuntimeDiagnostics::from_ebpf_process_observation(
-            self.runtime_diagnostics
-                .snapshot(self.observations.as_mut()),
+            self.runtime_diagnostics.snapshot(
+                self.observations.as_mut(),
+                self.process_payload_allowance.clone(),
+            ),
         )
     }
 }
@@ -779,7 +1061,12 @@ mod tests {
                 stop_when_idle: true,
                 process_payload_selector: deep_observe_selector.clone(),
                 deep_observe_selector,
+                process_payload_allowance: EbpfProcessPayloadAllowanceDiagnostics::default(),
                 tracked_flows: TrackedEbpfFlows::bounded(MAX_TRACKED_EBPF_FLOWS),
+                pending_closed_flows: VecDeque::new(),
+                pending_closed_keys: HashSet::new(),
+                close_drain_grace: DEFAULT_CLOSE_DRAIN_GRACE,
+                pending_payloads: VecDeque::new(),
                 pending_flows: VecDeque::new(),
                 pending_events: VecDeque::new(),
                 handoff_boundary_emitted: false,
@@ -806,6 +1093,15 @@ mod tests {
             self.tracked_flows = TrackedEbpfFlows::bounded(max_tracked_flows);
             self
         }
+
+        fn sync_current_process_payload_allowance_for_test(&mut self) -> Result<(), CaptureError> {
+            self.process_payload_allowance = sync_current_process_payload_allowance(
+                self.resolver.as_mut(),
+                self.observations.as_mut(),
+                self.process_payload_selector.as_ref(),
+            )?;
+            Ok(())
+        }
     }
 
     struct VecObservationSource {
@@ -815,6 +1111,34 @@ mod tests {
     impl EbpfObservationSource for VecObservationSource {
         fn next_observation(&mut self) -> Result<Option<EbpfProcessObservation>, CaptureError> {
             Ok(self.observations.pop_front())
+        }
+
+        fn allow_socket_payload_sample(
+            &mut self,
+            _authorization: SocketPayloadSampleAuthorization,
+        ) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
+        fn allow_process_payload_sample(
+            &mut self,
+            _authorization: ProcessPayloadSampleAuthorization,
+        ) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
+        fn revoke_process_payload_sample(&mut self, _tgid: u32) -> Result<(), CaptureError> {
+            Ok(())
+        }
+    }
+
+    struct ScriptedObservationSource {
+        observations: VecDeque<Option<EbpfProcessObservation>>,
+    }
+
+    impl EbpfObservationSource for ScriptedObservationSource {
+        fn next_observation(&mut self) -> Result<Option<EbpfProcessObservation>, CaptureError> {
+            Ok(self.observations.pop_front().flatten())
         }
 
         fn allow_socket_payload_sample(
@@ -1059,6 +1383,146 @@ mod tests {
     }
 
     #[test]
+    fn inbound_read_payload_recovers_flow_without_flow_start_observation() -> TestResult {
+        let (local, remote) = inbound_loopback();
+        let process = observed_process(101, 100);
+        let observations = [EbpfProcessObservation::Read(EbpfSocketReadObservation {
+            process,
+            fd: 9,
+            fd_generation: 10,
+            original_len: 5,
+            buffer: b"GET /".to_vec(),
+            truncated: false,
+            read_failed: false,
+        })];
+        let selector = local_port_selector([443], [Direction::Inbound])?;
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source_from_observations(observations),
+            static_resolver(local, remote),
+            Some(selector),
+        );
+
+        let (_, opened) = expect_connection_opened(&mut provider)?;
+        let gap = expect_gap(&mut provider)?;
+        let bytes = expect_bytes(&mut provider)?;
+
+        assert_eq!(opened.local.port, 443);
+        assert_eq!(opened.remote.port, 50_000);
+        assert_eq!(gap.flow.id, opened.id);
+        assert_eq!(gap.gap.direction, Direction::Inbound);
+        assert_eq!(gap.gap.expected_offset, 0);
+        assert_eq!(gap.gap.next_offset, None);
+        assert!(gap.gap.reason.contains("recovered this flow"));
+        assert_eq!(bytes.direction, Direction::Inbound);
+        assert_eq!(bytes.flow.id, opened.id);
+        assert_eq!(bytes.bytes.as_ref(), b"GET /");
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_write_payload_recovers_flow_without_flow_start_observation() -> TestResult {
+        let (local, remote) = outbound_loopback();
+        let process = observed_process(101, 100);
+        let observations = [EbpfProcessObservation::Write(EbpfSocketWriteObservation {
+            process,
+            fd: 7,
+            fd_generation: 10,
+            original_len: 5,
+            buffer: b"GET /".to_vec(),
+            truncated: false,
+            read_failed: false,
+            kernel_transfer: false,
+        })];
+        let selector = deep_observe_selector([443], [Direction::Outbound])?;
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source_from_observations(observations),
+            static_resolver(local, remote),
+            Some(selector),
+        );
+
+        let (_, opened) = expect_connection_opened(&mut provider)?;
+        let gap = expect_gap(&mut provider)?;
+        let bytes = expect_bytes(&mut provider)?;
+
+        assert_eq!(opened.local.port, 50_000);
+        assert_eq!(opened.remote.port, 443);
+        assert_eq!(gap.flow.id, opened.id);
+        assert_eq!(gap.gap.direction, Direction::Outbound);
+        assert_eq!(gap.gap.expected_offset, 0);
+        assert_eq!(gap.gap.next_offset, None);
+        assert!(gap.gap.reason.contains("recovered this flow"));
+        assert_eq!(bytes.direction, Direction::Outbound);
+        assert_eq!(bytes.flow.id, opened.id);
+        assert_eq!(bytes.bytes.as_ref(), b"GET /");
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn payload_recovery_respects_current_direction_selector() -> TestResult {
+        let (local, remote) = inbound_loopback();
+        let process = observed_process(101, 100);
+        let observations = [EbpfProcessObservation::Read(EbpfSocketReadObservation {
+            process,
+            fd: 9,
+            fd_generation: 10,
+            original_len: 5,
+            buffer: b"GET /".to_vec(),
+            truncated: false,
+            read_failed: false,
+        })];
+        let selector = local_port_selector([443], [Direction::Outbound])?;
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source_from_observations(observations),
+            static_resolver(local, remote),
+            Some(selector),
+        );
+
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn degraded_connect_payload_does_not_authorize_by_hinted_process_identity() -> TestResult {
+        let client_process = observed_process_named(201, 200, "python3");
+        let server_process = named_process(100, "python3");
+        let remote = loopback_endpoint(18_083);
+        let observations = [
+            connect_observation(client_process.clone(), 7, remote),
+            EbpfProcessObservation::Write(EbpfSocketWriteObservation {
+                process: client_process,
+                fd: 7,
+                fd_generation: 10,
+                original_len: 6,
+                buffer: b"GET /\n".to_vec(),
+                truncated: false,
+                read_failed: false,
+                kernel_transfer: false,
+            }),
+        ];
+        let selector = process_selector([server_process.identity.pid])?;
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source_from_observations(observations),
+            Box::new(HintProcessResolver {
+                direct_process: None,
+                hinted_processes: vec![server_process],
+            }),
+            Some(selector),
+        );
+
+        let (_, opened) = expect_connection_opened(&mut provider)?;
+
+        assert_eq!(opened.process.identity.pid, 200);
+        assert_eq!(opened.process.name, "python3");
+        assert_eq!(opened.local.port, 0);
+        assert_eq!(opened.remote.port, 18_083);
+        assert_eq!(opened.attribution_confidence, 0);
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn pending_flow_resolution_precedes_later_payload_observations() -> TestResult {
         let (local, remote) = inbound_loopback();
         let process = observed_process(101, 100);
@@ -1109,6 +1573,53 @@ mod tests {
         assert_eq!(bytes.flow.local.port, 443);
         assert_eq!(bytes.flow.remote.port, 50_000);
         assert_eq!(bytes.bytes.as_ref(), b"GET /");
+        Ok(())
+    }
+
+    #[test]
+    fn pending_flow_waiting_for_retry_does_not_block_later_observation() -> TestResult {
+        let (local, remote) = inbound_loopback();
+        let process = observed_process(101, 100);
+        let observations = [
+            missing_accept_observation(process.clone(), 9, 3),
+            EbpfProcessObservation::Read(EbpfSocketReadObservation {
+                process,
+                fd: 9,
+                fd_generation: 10,
+                original_len: 5,
+                buffer: b"GET /".to_vec(),
+                truncated: false,
+                read_failed: false,
+            }),
+        ];
+        let selector = Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                local_ports: vec![443],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        )
+        .compile()?;
+        let resolver = Box::new(RetryResolver {
+            calls: 0,
+            resolved: EbpfResolvedSocketFlow {
+                process: demo_process(),
+                confidence: 90,
+                connection: TcpConnection::new(local, remote),
+                socket_cookie: None,
+            },
+        });
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source_from_observations(observations),
+            resolver,
+            Some(selector),
+        );
+        provider.resolution_retries = 1;
+        provider.resolution_retry_sleep = Duration::from_secs(60);
+
+        assert!(matches!(provider.poll_next()?, CapturePoll::Progress));
+        assert!(!matches!(provider.poll_next()?, CapturePoll::Idle));
         Ok(())
     }
 
@@ -1172,7 +1683,7 @@ mod tests {
         assert_eq!(flow.id, first_flow_id);
 
         let (timestamp, flow) = expect_connection_closed(&mut provider)?;
-        assert_eq!(timestamp.monotonic_ns, 3);
+        assert_eq!(timestamp.monotonic_ns, 4);
         assert_eq!(flow.id, second_flow_id);
         assert!(provider.next()?.is_none());
         Ok(())
@@ -1293,7 +1804,80 @@ mod tests {
     }
 
     #[test]
-    fn flow_start_does_not_grant_process_payload_allowance_from_hint_candidate() -> TestResult {
+    fn startup_seeds_existing_process_payload_allowance() -> TestResult {
+        let allowed = Arc::new(Mutex::new(Vec::new()));
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let source = ProcessRecordingObservationSource {
+            observations: VecDeque::new(),
+            allowed: Arc::clone(&allowed),
+            revoked: Arc::clone(&revoked),
+        };
+        let mut ignored = demo_process();
+        ignored.identity.pid = 101;
+        ignored.identity.tgid = 101;
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source,
+            Box::new(ProcessListResolver {
+                processes: vec![demo_process(), ignored],
+            }),
+            Some(process_selector([100])?),
+        );
+
+        provider.sync_current_process_payload_allowance_for_test()?;
+
+        assert_eq!(
+            allowed
+                .lock()
+                .expect("allowed process lock poisoned")
+                .as_slice(),
+            &[100]
+        );
+        assert!(
+            revoked
+                .lock()
+                .expect("revoked process lock poisoned")
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn startup_preauthorizes_flow_dependent_process_payload_selector() -> TestResult {
+        let allowed = Arc::new(Mutex::new(Vec::new()));
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let source = ProcessRecordingObservationSource {
+            observations: VecDeque::new(),
+            allowed: Arc::clone(&allowed),
+            revoked: Arc::clone(&revoked),
+        };
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source,
+            Box::new(ProcessListResolver {
+                processes: vec![demo_process()],
+            }),
+            Some(process_remote_port_selector([100], [443])?),
+        );
+
+        provider.sync_current_process_payload_allowance_for_test()?;
+
+        assert_eq!(
+            allowed
+                .lock()
+                .expect("allowed process lock poisoned")
+                .as_slice(),
+            &[100]
+        );
+        assert!(
+            revoked
+                .lock()
+                .expect("revoked process lock poisoned")
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flow_start_rejects_process_payload_allowance_from_unique_hint_candidate() -> TestResult {
         let (_, remote) = inbound_loopback();
         let process = observed_process_named(101, 4_271, "curl");
         let allowed = Arc::new(Mutex::new(Vec::new()));
@@ -1330,8 +1914,90 @@ mod tests {
     }
 
     #[test]
-    fn observed_flow_start_prefers_unique_hint_candidate_over_colliding_direct_tgid() -> TestResult
+    fn flow_start_skips_process_payload_allowance_when_hint_candidates_are_ambiguous() -> TestResult
     {
+        let (_, remote) = inbound_loopback();
+        let process = observed_process_named(101, 4_271, "curl");
+        let allowed = Arc::new(Mutex::new(Vec::new()));
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let source = ProcessRecordingObservationSource {
+            observations: VecDeque::from([accept_observation(process, 9, 3, remote)]),
+            allowed: Arc::clone(&allowed),
+            revoked: Arc::clone(&revoked),
+        };
+        let mut other = demo_process();
+        other.identity.pid = 101;
+        other.identity.tgid = 101;
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source,
+            Box::new(HintProcessResolver {
+                direct_process: None,
+                hinted_processes: vec![demo_process(), other],
+            }),
+            Some(process_selector([100, 101])?),
+        );
+
+        let _ = provider.poll_next()?;
+
+        assert!(
+            allowed
+                .lock()
+                .expect("allowed process lock poisoned")
+                .is_empty()
+        );
+        assert!(
+            revoked
+                .lock()
+                .expect("revoked process lock poisoned")
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flow_start_rejects_exe_selector_from_unique_hint_candidate() -> TestResult {
+        let (_, remote) = inbound_loopback();
+        let observed_tgid = 4_271;
+        let process = observed_process_named(101, observed_tgid, "curl");
+        let allowed = Arc::new(Mutex::new(Vec::new()));
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let source = ProcessRecordingObservationSource {
+            observations: VecDeque::from([accept_observation(process, 9, 3, remote)]),
+            allowed: Arc::clone(&allowed),
+            revoked: Arc::clone(&revoked),
+        };
+        let mut other = demo_process();
+        other.identity.pid = 101;
+        other.identity.tgid = 101;
+        other.identity.exe_path = "/opt/curl".to_string();
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source,
+            Box::new(HintProcessResolver {
+                direct_process: None,
+                hinted_processes: vec![demo_process(), other],
+            }),
+            Some(process_exe_selector(["/usr/bin/curl"])?),
+        );
+
+        let _ = provider.poll_next()?;
+
+        assert!(
+            allowed
+                .lock()
+                .expect("allowed process lock poisoned")
+                .is_empty()
+        );
+        assert!(
+            revoked
+                .lock()
+                .expect("revoked process lock poisoned")
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn observed_flow_start_rejects_unique_hint_candidate_when_direct_tgid_collides() -> TestResult {
         let (_, remote) = inbound_loopback();
         let observed_tgid = 4_271;
         let process = observed_process_named(101, observed_tgid, "curl");
@@ -1351,15 +2017,15 @@ mod tests {
 
         let (_, flow) = expect_connection_opened(&mut provider)?;
 
-        assert_eq!(flow.process.identity.pid, 100);
-        assert_eq!(flow.process.identity.tgid, 100);
+        assert_eq!(flow.process.identity.pid, observed_tgid);
+        assert_eq!(flow.process.identity.tgid, observed_tgid);
         assert_eq!(flow.process.name, "curl");
         assert_eq!(flow.attribution_confidence, 0);
         Ok(())
     }
 
     #[test]
-    fn process_exec_authorizes_observed_tgid_from_unique_hint_candidate() -> TestResult {
+    fn process_exec_rejects_process_payload_allowance_from_unique_hint_candidate() -> TestResult {
         let observed_tgid = 4_271;
         let process = observed_process_named(101, observed_tgid, "curl");
         let allowed = Arc::new(Mutex::new(Vec::new()));
@@ -1380,18 +2046,18 @@ mod tests {
 
         assert!(matches!(provider.poll_next()?, CapturePoll::Progress));
 
-        assert_eq!(
+        assert!(
             allowed
                 .lock()
                 .expect("allowed process lock poisoned")
-                .as_slice(),
-            &[observed_tgid]
+                .is_empty()
         );
-        assert!(
+        assert_eq!(
             revoked
                 .lock()
                 .expect("revoked process lock poisoned")
-                .is_empty()
+                .as_slice(),
+            &[observed_tgid]
         );
         Ok(())
     }
@@ -1432,6 +2098,48 @@ mod tests {
                 .expect("revoked process lock poisoned")
                 .as_slice(),
             &[4_271]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn process_exec_authorizes_observed_command_when_procfs_resolution_is_ambiguous() -> TestResult
+    {
+        let observed_tgid = 4_271;
+        let process = observed_process_named(101, observed_tgid, "curl");
+        let allowed = Arc::new(Mutex::new(Vec::new()));
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let source = ProcessRecordingObservationSource {
+            observations: VecDeque::from([process_exec_observation(process)]),
+            allowed: Arc::clone(&allowed),
+            revoked: Arc::clone(&revoked),
+        };
+        let mut other = demo_process();
+        other.identity.pid = 101;
+        other.identity.tgid = 101;
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source,
+            Box::new(HintProcessResolver {
+                direct_process: None,
+                hinted_processes: vec![demo_process(), other],
+            }),
+            Some(process_name_selector(["curl"])?),
+        );
+
+        assert!(matches!(provider.poll_next()?, CapturePoll::Progress));
+
+        assert_eq!(
+            allowed
+                .lock()
+                .expect("allowed process lock poisoned")
+                .as_slice(),
+            &[observed_tgid]
+        );
+        assert!(
+            revoked
+                .lock()
+                .expect("revoked process lock poisoned")
+                .is_empty()
         );
         Ok(())
     }
@@ -1478,7 +2186,7 @@ mod tests {
     }
 
     #[test]
-    fn process_exec_rejects_flow_dependent_process_payload_selector() -> TestResult {
+    fn process_exec_preauthorizes_flow_dependent_process_payload_selector() -> TestResult {
         let process = observed_process(101, 100);
         let allowed = Arc::new(Mutex::new(Vec::new()));
         let revoked = Arc::new(Mutex::new(Vec::new()));
@@ -1496,25 +2204,26 @@ mod tests {
         );
 
         assert!(matches!(provider.poll_next()?, CapturePoll::Progress));
-        assert!(
+        assert_eq!(
             allowed
                 .lock()
                 .expect("allowed process lock poisoned")
-                .is_empty()
+                .as_slice(),
+            &[100]
         );
-        assert_eq!(
+        assert!(
             revoked
                 .lock()
                 .expect("revoked process lock poisoned")
-                .as_slice(),
-            &[100]
+                .is_empty()
         );
         Ok(())
     }
 
     #[test]
-    fn process_exec_revokes_payload_allowance_when_process_resolution_fails() -> TestResult {
-        let process = observed_process(101, 100);
+    fn process_exec_revokes_payload_allowance_when_required_metadata_resolution_fails() -> TestResult
+    {
+        let process = observed_process_named(101, 100, "curl");
         let allowed = Arc::new(Mutex::new(Vec::new()));
         let revoked = Arc::new(Mutex::new(Vec::new()));
         let source = ProcessRecordingObservationSource {
@@ -1525,7 +2234,7 @@ mod tests {
         let mut provider = EbpfProcessObservationProvider::from_source_for_test(
             source,
             Box::new(FailingProcessIdentityResolver),
-            Some(process_selector([100])?),
+            Some(process_exe_selector(["/usr/bin/curl"])?),
         );
 
         assert!(matches!(provider.poll_next()?, CapturePoll::Progress));
@@ -2045,6 +2754,127 @@ mod tests {
     }
 
     #[test]
+    fn late_payload_after_close_is_emitted_before_deferred_connection_closed() -> TestResult {
+        let (local, remote) = inbound_loopback();
+        let process = observed_process(101, 100);
+        let payload = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
+        let observations = [
+            accept_observation(process.clone(), 9, 3, remote),
+            close_observation(process.clone(), 9),
+            EbpfProcessObservation::Write(EbpfSocketWriteObservation {
+                process,
+                fd: 9,
+                fd_generation: 10,
+                original_len: payload.len() as u32,
+                buffer: payload.to_vec(),
+                truncated: false,
+                read_failed: false,
+                kernel_transfer: false,
+            }),
+        ];
+        let selector = local_port_selector([443], [Direction::Outbound])?;
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source_from_observations(observations),
+            static_resolver(local, remote),
+            Some(selector),
+        );
+        provider.close_drain_grace = Duration::ZERO;
+
+        let (_, opened) = expect_connection_opened(&mut provider)?;
+        let bytes = expect_bytes(&mut provider)?;
+        let (_, closed) = expect_connection_closed(&mut provider)?;
+
+        assert_eq!(bytes.flow.id, opened.id);
+        assert_eq!(bytes.bytes.as_ref(), payload);
+        assert_eq!(closed.id, opened.id);
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn close_grace_keeps_flow_across_idle_before_late_payload() -> TestResult {
+        let (local, remote) = inbound_loopback();
+        let process = observed_process(101, 100);
+        let payload = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
+        let observations = [
+            Some(accept_observation(process.clone(), 9, 3, remote)),
+            Some(close_observation(process.clone(), 9)),
+            None,
+            Some(EbpfProcessObservation::Write(EbpfSocketWriteObservation {
+                process,
+                fd: 9,
+                fd_generation: 10,
+                original_len: payload.len() as u32,
+                buffer: payload.to_vec(),
+                truncated: false,
+                read_failed: false,
+                kernel_transfer: false,
+            })),
+        ];
+        let selector = local_port_selector([443], [Direction::Outbound])?;
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            ScriptedObservationSource {
+                observations: observations.into_iter().collect(),
+            },
+            static_resolver(local, remote),
+            Some(selector),
+        );
+        provider.close_drain_grace = Duration::from_secs(60);
+
+        let (_, opened) = expect_connection_opened(&mut provider)?;
+        assert!(matches!(provider.poll_next()?, CapturePoll::Progress));
+        assert!(matches!(provider.poll_next()?, CapturePoll::Idle));
+        let bytes = expect_bytes(&mut provider)?;
+        let CapturePoll::Event(closed) = provider.drain_before_handoff()? else {
+            panic!("handoff drain should release deferred close");
+        };
+        let CaptureEvent::ConnectionClosed { flow: closed, .. } = *closed else {
+            panic!("handoff drain should emit connection closed");
+        };
+
+        assert_eq!(bytes.flow.id, opened.id);
+        assert_eq!(bytes.bytes.as_ref(), payload);
+        assert_eq!(closed.id, opened.id);
+        Ok(())
+    }
+
+    #[test]
+    fn payload_before_flow_start_is_emitted_after_connection_opened() -> TestResult {
+        let (_, remote) = outbound_loopback();
+        let process = observed_process(101, 100);
+        let payload = b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n";
+        let observations = [
+            EbpfProcessObservation::Write(EbpfSocketWriteObservation {
+                process: process.clone(),
+                fd: 7,
+                fd_generation: 10,
+                original_len: payload.len() as u32,
+                buffer: payload.to_vec(),
+                truncated: false,
+                read_failed: false,
+                kernel_transfer: false,
+            }),
+            connect_observation(process, 7, remote),
+        ];
+        let selector = deep_observe_selector([443], [Direction::Outbound])?;
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source_from_observations(observations),
+            Box::new(StaticResolver { resolved: None }),
+            Some(selector),
+        );
+
+        let (_, opened) = expect_connection_opened(&mut provider)?;
+        let bytes = expect_bytes(&mut provider)?;
+
+        assert_eq!(opened.remote.port, 443);
+        assert_eq!(bytes.flow.id, opened.id);
+        assert_eq!(bytes.direction, Direction::Outbound);
+        assert_eq!(bytes.bytes.as_ref(), payload);
+        assert!(provider.next()?.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn emits_gap_instead_of_unclosable_flow_for_invalid_descriptor_lease() -> TestResult {
         let (_, remote) = outbound_loopback();
         let observation =
@@ -2122,7 +2952,7 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_flow_resolution_emits_gap_before_later_flow_start() -> TestResult {
+    fn unresolved_flow_waiting_for_retry_allows_later_flow_start_before_gap() -> TestResult {
         let (local, remote) = outbound_loopback();
         let process = observed_process(101, 100);
         let observations = [
@@ -2141,15 +2971,16 @@ mod tests {
         let mut provider =
             EbpfProcessObservationProvider::from_observations_for_test(observations, resolver);
         provider.resolution_retries = 1;
-
-        let Some(CaptureEvent::Gap(gap)) = provider.next()? else {
-            panic!("expected unresolved flow gap before later flow start");
-        };
-        assert!(gap.gap.reason.contains("fd=7"));
+        provider.resolution_retry_sleep = Duration::from_millis(1);
 
         let (_, flow) = expect_connection_opened(&mut provider)?;
         assert_eq!(flow.local.port, 50_000);
         assert_eq!(flow.remote.port, 443);
+
+        let Some(CaptureEvent::Gap(gap)) = provider.next()? else {
+            panic!("expected unresolved flow gap after later flow start");
+        };
+        assert!(gap.gap.reason.contains("fd=7"));
         assert!(provider.next()?.is_none());
         Ok(())
     }
@@ -2214,6 +3045,72 @@ mod tests {
         let second = expect_output_loss(provider.poll_next()?);
         assert_eq!(second.loss.lost_events, 3);
         assert!(matches!(provider.poll_next()?, CapturePoll::Idle));
+        Ok(())
+    }
+
+    #[test]
+    fn pending_payload_queue_overflow_emits_loss_event() -> TestResult {
+        let key = DescriptorLeaseKey::from_observed(100, 7, 10)
+            .expect("test descriptor lease should be valid");
+        let mut provider = EbpfProcessObservationProvider::from_source_for_test(
+            source_from_observations([]),
+            Box::new(StaticResolver { resolved: None }),
+            None,
+        );
+
+        for index in 0..MAX_PENDING_EBPF_PAYLOADS {
+            provider
+                .pending_payloads
+                .push_back(PendingEbpfPayloadObservation {
+                    key,
+                    timestamp: Timestamp {
+                        monotonic_ns: index as u64,
+                        wall_time_unix_ns: index as i64,
+                    },
+                    payload: PendingEbpfPayload::Write(EbpfSocketWriteObservation {
+                        process: observed_process(101, 100),
+                        fd: 7,
+                        fd_generation: 10,
+                        original_len: 1,
+                        buffer: vec![b'x'],
+                        truncated: false,
+                        read_failed: false,
+                        kernel_transfer: false,
+                    }),
+                });
+        }
+
+        provider.defer_payload_observation(
+            Some(key),
+            Timestamp {
+                monotonic_ns: 9_999,
+                wall_time_unix_ns: 9_999,
+            },
+            PendingEbpfPayload::Read(EbpfSocketReadObservation {
+                process: observed_process(101, 100),
+                fd: 7,
+                fd_generation: 10,
+                original_len: 1,
+                buffer: vec![b'y'],
+                truncated: false,
+                read_failed: false,
+            }),
+        );
+
+        assert_eq!(provider.pending_payloads.len(), MAX_PENDING_EBPF_PAYLOADS);
+        let oldest = provider
+            .pending_payloads
+            .front()
+            .expect("pending payload queue should remain non-empty");
+        assert_eq!(oldest.timestamp.monotonic_ns, 1);
+
+        let loss = expect_output_loss(provider.poll_next()?);
+        assert_eq!(loss.loss.lost_events, 1);
+        assert!(
+            loss.loss
+                .reason
+                .contains("pending payload queue dropped 1 event(s)")
+        );
         Ok(())
     }
 
@@ -2571,6 +3468,10 @@ mod tests {
         ) -> Result<Option<EbpfResolvedSocketFlow>, CaptureError> {
             Ok(self.resolved.clone())
         }
+
+        fn resolve_processes(&mut self) -> Result<Vec<ProcessContext>, CaptureError> {
+            Ok(Vec::new())
+        }
     }
 
     struct ProcessIdentityResolver {
@@ -2588,6 +3489,10 @@ mod tests {
         fn resolve_process(&mut self, _tgid: u32) -> Result<Option<ProcessContext>, CaptureError> {
             Ok(self.process.clone())
         }
+
+        fn resolve_processes(&mut self) -> Result<Vec<ProcessContext>, CaptureError> {
+            Ok(Vec::new())
+        }
     }
 
     struct ProcessOnlyResolver {
@@ -2604,6 +3509,27 @@ mod tests {
 
         fn resolve_process(&mut self, _tgid: u32) -> Result<Option<ProcessContext>, CaptureError> {
             Ok(Some(self.process.clone()))
+        }
+
+        fn resolve_processes(&mut self) -> Result<Vec<ProcessContext>, CaptureError> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct ProcessListResolver {
+        processes: Vec<ProcessContext>,
+    }
+
+    impl EbpfSocketFlowResolver for ProcessListResolver {
+        fn resolve_socket_flow(
+            &mut self,
+            _lookup: EbpfSocketFlowLookup,
+        ) -> Result<Option<EbpfResolvedSocketFlow>, CaptureError> {
+            Ok(None)
+        }
+
+        fn resolve_processes(&mut self) -> Result<Vec<ProcessContext>, CaptureError> {
+            Ok(self.processes.clone())
         }
     }
 
@@ -2639,6 +3565,10 @@ mod tests {
                 .cloned()
                 .collect())
         }
+
+        fn resolve_processes(&mut self) -> Result<Vec<ProcessContext>, CaptureError> {
+            Ok(Vec::new())
+        }
     }
 
     struct FailingProcessIdentityResolver;
@@ -2656,6 +3586,10 @@ mod tests {
                 "procfs",
                 "process table unavailable",
             ))
+        }
+
+        fn resolve_processes(&mut self) -> Result<Vec<ProcessContext>, CaptureError> {
+            Ok(Vec::new())
         }
     }
 
@@ -2681,6 +3615,10 @@ mod tests {
                 socket_cookie: Some(u64::from(fd)),
             }))
         }
+
+        fn resolve_processes(&mut self) -> Result<Vec<ProcessContext>, CaptureError> {
+            Ok(Vec::new())
+        }
     }
 
     struct RetryResolver {
@@ -2699,6 +3637,10 @@ mod tests {
             }
             Ok(Some(self.resolved.clone()))
         }
+
+        fn resolve_processes(&mut self) -> Result<Vec<ProcessContext>, CaptureError> {
+            Ok(Vec::new())
+        }
     }
 
     struct FdSelectiveResolver {
@@ -2715,6 +3657,10 @@ mod tests {
                 return Ok(None);
             }
             Ok(Some(self.resolved.clone()))
+        }
+
+        fn resolve_processes(&mut self) -> Result<Vec<ProcessContext>, CaptureError> {
+            Ok(Vec::new())
         }
     }
 
@@ -3013,12 +3959,53 @@ mod tests {
         .compile()
     }
 
+    fn local_port_selector(
+        local_ports: impl IntoIterator<Item = u16>,
+        directions: impl IntoIterator<Item = Direction>,
+    ) -> Result<CompiledSelector, probe_core::SelectorError> {
+        Selector::term(
+            ProcessSelector::default(),
+            TrafficSelector {
+                local_ports: local_ports.into_iter().collect(),
+                directions: directions.into_iter().collect(),
+                ..TrafficSelector::default()
+            },
+        )
+        .compile()
+    }
+
     fn process_selector(
         pids: impl IntoIterator<Item = u32>,
     ) -> Result<CompiledSelector, probe_core::SelectorError> {
         Selector::term(
             ProcessSelector {
                 pids: pids.into_iter().collect(),
+                ..ProcessSelector::default()
+            },
+            TrafficSelector::default(),
+        )
+        .compile()
+    }
+
+    fn process_name_selector<'a>(
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> Result<CompiledSelector, probe_core::SelectorError> {
+        Selector::term(
+            ProcessSelector {
+                names: names.into_iter().map(str::to_string).collect(),
+                ..ProcessSelector::default()
+            },
+            TrafficSelector::default(),
+        )
+        .compile()
+    }
+
+    fn process_exe_selector<'a>(
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> Result<CompiledSelector, probe_core::SelectorError> {
+        Selector::term(
+            ProcessSelector {
+                exe_path_globs: paths.into_iter().map(str::to_string).collect(),
                 ..ProcessSelector::default()
             },
             TrafficSelector::default(),
@@ -3211,13 +4198,17 @@ mod tests {
     }
 
     fn demo_process() -> ProcessContext {
+        named_process(100, "curl")
+    }
+
+    fn named_process(pid: u32, name: &str) -> ProcessContext {
         ProcessContext {
             identity: ProcessIdentity {
-                pid: 100,
-                tgid: 100,
+                pid,
+                tgid: pid,
                 start_time_ticks: 1234,
                 boot_id: "boot".to_string(),
-                exe_path: "/usr/bin/curl".to_string(),
+                exe_path: format!("/usr/bin/{name}"),
                 cmdline_hash: "cmd".to_string(),
                 uid: 1000,
                 gid: 1000,
@@ -3226,8 +4217,8 @@ mod tests {
                 container_id: None,
                 runtime_hint: None,
             },
-            name: "curl".to_string(),
-            cmdline: vec!["curl".to_string()],
+            name: name.to_string(),
+            cmdline: vec![name.to_string()],
         }
     }
 }

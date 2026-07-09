@@ -183,7 +183,7 @@ mode = "audit_only"
 backend = "none"
 
 [admin]
-enabled = false
+enabled = true
 socket_path = "{}"
 "#,
         default_storage_path().display(),
@@ -1005,7 +1005,7 @@ codec = "zstd"
             DEFAULT_RUNTIME_RELOAD_WATCH_DEBOUNCE_MS
         );
         assert_eq!(loaded.config.enforcement.mode, EnforcementMode::AuditOnly);
-        assert!(!loaded.config.admin.enabled);
+        assert!(loaded.config.admin.enabled);
         assert_eq!(loaded.config.admin.socket_path, default_admin_socket_path());
         assert!(loaded.source.contains("[runtime_reload]"));
         assert!(loaded.source.contains("[admin]"));

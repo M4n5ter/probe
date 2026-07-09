@@ -6,8 +6,11 @@ use capture::{
     EbpfProcessObservationActiveTracepointLivenessState,
     EbpfProcessObservationLinkOwnershipSnapshot,
     EbpfProcessObservationOptionalTracepointPairSnapshot,
-    EbpfProcessObservationOptionalTracepointPairState, EbpfProcessObservationProbeSnapshot,
+    EbpfProcessObservationOptionalTracepointPairState,
+    EbpfProcessObservationOptionalTracepointSnapshot,
+    EbpfProcessObservationOptionalTracepointState, EbpfProcessObservationProbeSnapshot,
     EbpfProcessObservationTracepointDiagnostics, EbpfProcessObservationTracepointFiring,
+    EbpfProcessPayloadAllowanceDiagnostics, EbpfProcessPayloadGateCounter,
 };
 use probe_config::CaptureBackend;
 use probe_core::{CaptureProviderKind, RuntimeMode};
@@ -45,7 +48,10 @@ pub(crate) enum CaptureProviderRuntimeDetailsSnapshot {
         link_ownership: EbpfProcessObservationLinkOwnershipRuntimeSnapshot,
         tracepoint_firings: EbpfProcessObservationTracepointFiringRuntimeSnapshot,
         tracepoint_liveness: EbpfProcessObservationTracepointLivenessRuntimeSnapshot,
+        process_payload_allowance: EbpfProcessPayloadAllowanceRuntimeSnapshot,
+        payload_gate_counters: EbpfProcessPayloadGateRuntimeSnapshot,
         kernel_liveness: EbpfProcessObservationKernelLivenessRuntimeSnapshot,
+        optional_tracepoints: Vec<EbpfProcessObservationOptionalTracepointRuntimeSnapshot>,
         optional_tracepoint_pairs: Vec<EbpfProcessObservationOptionalTracepointPairRuntimeSnapshot>,
     },
 }
@@ -83,6 +89,28 @@ pub(crate) struct EbpfProcessObservationTracepointFiringProgramRuntimeSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct EbpfProcessPayloadGateRuntimeSnapshot {
+    pub(crate) mode: RuntimeMode,
+    pub(crate) total_count: u64,
+    pub(crate) counters: Vec<EbpfProcessPayloadGateCounterRuntimeSnapshot>,
+    pub(crate) reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct EbpfProcessPayloadGateCounterRuntimeSnapshot {
+    pub(crate) name: &'static str,
+    pub(crate) count: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct EbpfProcessPayloadAllowanceRuntimeSnapshot {
+    pub(crate) selector_configured: bool,
+    pub(crate) scanned_processes: u64,
+    pub(crate) matched_processes: u64,
+    pub(crate) allowed_processes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct EbpfProcessObservationTracepointLivenessRuntimeSnapshot {
     pub(crate) diagnostics_available: bool,
     pub(crate) mode: RuntimeMode,
@@ -116,6 +144,15 @@ pub(crate) enum EbpfProcessObservationTracepointLivenessProgramState {
 pub(crate) struct EbpfProcessObservationKernelLivenessRuntimeSnapshot {
     pub(crate) mode: RuntimeMode,
     pub(crate) reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct EbpfProcessObservationOptionalTracepointRuntimeSnapshot {
+    pub(crate) family_name: &'static str,
+    pub(crate) mode: RuntimeMode,
+    pub(crate) category: &'static str,
+    pub(crate) tracepoint_name: &'static str,
+    pub(crate) reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -165,7 +202,10 @@ impl CaptureProviderRuntimeDetailsSnapshot {
                 link_ownership,
                 tracepoint_firings,
                 tracepoint_liveness,
+                process_payload_allowance,
+                payload_gate_counters,
                 kernel_liveness,
+                optional_tracepoints,
                 optional_tracepoint_pairs,
             } => Self::EbpfProcessObservation {
                 link_ownership: EbpfProcessObservationLinkOwnershipRuntimeSnapshot {
@@ -198,10 +238,35 @@ impl CaptureProviderRuntimeDetailsSnapshot {
                         reason_max_chars,
                     ),
                 },
+                process_payload_allowance: process_payload_allowance.clone(),
+                payload_gate_counters: EbpfProcessPayloadGateRuntimeSnapshot {
+                    mode: payload_gate_counters.mode,
+                    total_count: payload_gate_counters.total_count,
+                    counters: payload_gate_counters.counters.clone(),
+                    reason: compact_optional_runtime_reason(
+                        payload_gate_counters.reason.as_deref(),
+                        reason_max_chars,
+                    ),
+                },
                 kernel_liveness: EbpfProcessObservationKernelLivenessRuntimeSnapshot {
                     mode: kernel_liveness.mode,
                     reason: compact_runtime_reason(&kernel_liveness.reason, reason_max_chars),
                 },
+                optional_tracepoints: optional_tracepoints
+                    .iter()
+                    .map(
+                        |tracepoint| EbpfProcessObservationOptionalTracepointRuntimeSnapshot {
+                            family_name: tracepoint.family_name,
+                            mode: tracepoint.mode,
+                            category: tracepoint.category,
+                            tracepoint_name: tracepoint.tracepoint_name,
+                            reason: compact_optional_runtime_reason(
+                                tracepoint.reason.as_deref(),
+                                reason_max_chars,
+                            ),
+                        },
+                    )
+                    .collect(),
                 optional_tracepoint_pairs: optional_tracepoint_pairs
                     .iter()
                     .map(
@@ -224,11 +289,12 @@ impl CaptureProviderRuntimeDetailsSnapshot {
     }
 
     pub(crate) fn ebpf_process_observation(probe: EbpfProcessObservationProbeSnapshot) -> Self {
-        let (link_ownership, optional_tracepoint_pairs) = probe.into_parts();
+        let (link_ownership, optional_tracepoints, optional_tracepoint_pairs) = probe.into_parts();
         let tracepoint_firings =
             EbpfProcessObservationTracepointFiringRuntimeSnapshot::not_reported();
         let tracepoint_liveness =
             EbpfProcessObservationTracepointLivenessRuntimeSnapshot::not_reported();
+        let payload_gate_counters = EbpfProcessPayloadGateRuntimeSnapshot::not_reported();
         let kernel_liveness = EbpfProcessObservationKernelLivenessRuntimeSnapshot::from_capture(
             &link_ownership,
             &tracepoint_firings,
@@ -240,7 +306,13 @@ impl CaptureProviderRuntimeDetailsSnapshot {
             ),
             tracepoint_firings,
             tracepoint_liveness,
+            process_payload_allowance: EbpfProcessPayloadAllowanceRuntimeSnapshot::default(),
+            payload_gate_counters,
             kernel_liveness,
+            optional_tracepoints: optional_tracepoints
+                .into_iter()
+                .map(EbpfProcessObservationOptionalTracepointRuntimeSnapshot::from_capture)
+                .collect(),
             optional_tracepoint_pairs: optional_tracepoint_pairs
                 .into_iter()
                 .map(EbpfProcessObservationOptionalTracepointPairRuntimeSnapshot::from_capture)
@@ -275,6 +347,8 @@ impl CaptureProviderRuntimeDetailsSnapshot {
             link_ownership,
             tracepoint_firings,
             tracepoint_liveness,
+            process_payload_allowance,
+            payload_gate_counters,
             kernel_liveness,
             ..
         } = self;
@@ -282,6 +356,11 @@ impl CaptureProviderRuntimeDetailsSnapshot {
             tracepoint_runtime_snapshots_from_diagnostics(diagnostics.tracepoints);
         *tracepoint_firings = updated_tracepoint_firings;
         *tracepoint_liveness = updated_tracepoint_liveness;
+        *process_payload_allowance = EbpfProcessPayloadAllowanceRuntimeSnapshot::from_capture(
+            diagnostics.process_payload_allowance,
+        );
+        *payload_gate_counters =
+            EbpfProcessPayloadGateRuntimeSnapshot::from_diagnostics(diagnostics.payload_gates);
         *kernel_liveness = EbpfProcessObservationKernelLivenessRuntimeSnapshot::from_runtime(
             link_ownership,
             tracepoint_firings,
@@ -425,6 +504,65 @@ impl EbpfProcessObservationTracepointFiringRuntimeSnapshot {
                 "kernel-side process eBPF tracepoint firing counters were read from the provider"
                     .to_string(),
             ),
+        }
+    }
+}
+
+impl EbpfProcessPayloadGateRuntimeSnapshot {
+    fn not_reported() -> Self {
+        Self {
+            mode: RuntimeMode::Unavailable,
+            total_count: 0,
+            counters: Vec::new(),
+            reason: Some(
+                "process eBPF payload gate diagnostics have not been observed".to_string(),
+            ),
+        }
+    }
+
+    fn from_diagnostics(diagnostics: Result<Vec<EbpfProcessPayloadGateCounter>, String>) -> Self {
+        match diagnostics {
+            Ok(counters) => Self::from_counters(counters),
+            Err(reason) => Self {
+                mode: RuntimeMode::Unavailable,
+                total_count: 0,
+                counters: Vec::new(),
+                reason: Some(reason),
+            },
+        }
+    }
+
+    fn from_counters(counters: Vec<EbpfProcessPayloadGateCounter>) -> Self {
+        let counters = counters
+            .into_iter()
+            .map(|counter| EbpfProcessPayloadGateCounterRuntimeSnapshot {
+                name: counter.name,
+                count: counter.count,
+            })
+            .collect::<Vec<_>>();
+        let total_count = counters
+            .iter()
+            .map(|counter| counter.count)
+            .fold(0_u64, u64::saturating_add);
+        Self {
+            mode: RuntimeMode::Available,
+            total_count,
+            counters,
+            reason: Some(
+                "kernel-side process eBPF payload gate counters were read from the provider"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+impl EbpfProcessPayloadAllowanceRuntimeSnapshot {
+    fn from_capture(diagnostics: EbpfProcessPayloadAllowanceDiagnostics) -> Self {
+        Self {
+            selector_configured: diagnostics.selector_configured,
+            scanned_processes: diagnostics.scanned_processes,
+            matched_processes: diagnostics.matched_processes,
+            allowed_processes: diagnostics.allowed_processes,
         }
     }
 }
@@ -623,6 +761,34 @@ impl EbpfProcessObservationLinkOwnershipRuntimeSnapshot {
                 "userspace process eBPF loader holds committed tracepoint links".to_string(),
             ),
         }
+    }
+}
+
+impl EbpfProcessObservationOptionalTracepointRuntimeSnapshot {
+    fn from_capture(tracepoint: EbpfProcessObservationOptionalTracepointSnapshot) -> Self {
+        let (mode, reason) = optional_tracepoint_mode_and_reason(tracepoint.state());
+        Self {
+            family_name: tracepoint.family_name(),
+            mode,
+            category: tracepoint.category(),
+            tracepoint_name: tracepoint.tracepoint_name(),
+            reason: Some(reason.to_string()),
+        }
+    }
+}
+
+fn optional_tracepoint_mode_and_reason(
+    state: EbpfProcessObservationOptionalTracepointState,
+) -> (RuntimeMode, &'static str) {
+    match state {
+        EbpfProcessObservationOptionalTracepointState::Attached => (
+            RuntimeMode::Available,
+            "kernel exposes this optional tracepoint and the loader attached it",
+        ),
+        EbpfProcessObservationOptionalTracepointState::KernelMissing => (
+            RuntimeMode::Unavailable,
+            "kernel does not expose this optional tracepoint",
+        ),
     }
 }
 
@@ -901,10 +1067,33 @@ mod tests {
                 programs: repeated_liveness_programs(10_000),
                 reason: Some("liveness details".repeat(1_000)),
             },
+            process_payload_allowance: EbpfProcessPayloadAllowanceRuntimeSnapshot::default(),
+            payload_gate_counters: EbpfProcessPayloadGateRuntimeSnapshot {
+                mode: RuntimeMode::Available,
+                total_count: 4,
+                counters: vec![
+                    EbpfProcessPayloadGateCounterRuntimeSnapshot {
+                        name: "write_attempt",
+                        count: 3,
+                    },
+                    EbpfProcessPayloadGateCounterRuntimeSnapshot {
+                        name: "read_attempt",
+                        count: 1,
+                    },
+                ],
+                reason: Some("payload gates".repeat(1_000)),
+            },
             kernel_liveness: EbpfProcessObservationKernelLivenessRuntimeSnapshot {
                 mode: RuntimeMode::Degraded,
                 reason: "kernel liveness".repeat(1_000),
             },
+            optional_tracepoints: vec![EbpfProcessObservationOptionalTracepointRuntimeSnapshot {
+                family_name: "dup2",
+                mode: RuntimeMode::Unavailable,
+                category: "syscalls",
+                tracepoint_name: "sys_enter_dup2",
+                reason: Some("optional tracepoint reason".repeat(1_000)),
+            }],
             optional_tracepoint_pairs: vec![
                 EbpfProcessObservationOptionalTracepointPairRuntimeSnapshot {
                     family_name: "tcp_retransmit",
@@ -941,7 +1130,9 @@ mod tests {
             link_ownership,
             tracepoint_firings,
             tracepoint_liveness,
+            payload_gate_counters,
             kernel_liveness,
+            optional_tracepoints,
             optional_tracepoint_pairs,
             ..
         } = compact
@@ -962,6 +1153,8 @@ mod tests {
         assert!(tracepoint_firings.programs.is_empty());
         assert_eq!(tracepoint_liveness.not_advanced_program_count, 9_999);
         assert!(tracepoint_liveness.programs.is_empty());
+        assert_eq!(payload_gate_counters.total_count, 4);
+        assert_eq!(payload_gate_counters.counters.len(), 2);
         assert!(
             link_ownership
                 .reason
@@ -983,7 +1176,22 @@ mod tests {
                 .len()
                 <= REASON_MAX_CHARS
         );
+        assert!(
+            payload_gate_counters
+                .reason
+                .expect("payload gate reason should be preserved")
+                .len()
+                <= REASON_MAX_CHARS
+        );
         assert!(kernel_liveness.reason.len() <= REASON_MAX_CHARS);
+        assert!(
+            optional_tracepoints[0]
+                .reason
+                .as_ref()
+                .expect("optional tracepoint reason should be preserved")
+                .len()
+                <= REASON_MAX_CHARS
+        );
         assert!(
             optional_tracepoint_pairs[0]
                 .reason
@@ -1056,6 +1264,8 @@ mod tests {
                             }],
                         }),
                     }),
+                    process_payload_allowance: EbpfProcessPayloadAllowanceDiagnostics::default(),
+                    payload_gates: Ok(Vec::new()),
                 },
             )
         }
@@ -1087,7 +1297,7 @@ mod tests {
     fn ebpf_runtime_snapshot() -> CaptureProviderRuntimeSnapshot {
         CaptureProviderRuntimeSnapshot {
             provider: Some(CaptureProviderRuntimeDetailsSnapshot::ebpf_process_observation(
-                capture::EbpfProcessObservationProbeSnapshot::from_link_ownership_and_optional_pairs(
+                capture::EbpfProcessObservationProbeSnapshot::from_link_ownership_and_optional_tracepoints(
                     capture::EbpfProcessObservationLinkOwnershipSnapshot::owned_by_programs([
                         capture::EbpfProcessObservationProgramLinkOwnershipSnapshot::new(
                             "connect_enter",
@@ -1096,6 +1306,7 @@ mod tests {
                             1,
                         ),
                     ]),
+                    [],
                     [],
                 ),
             )),

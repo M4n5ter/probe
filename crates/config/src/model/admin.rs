@@ -21,7 +21,7 @@ pub struct AdminConfig {
 impl Default for AdminConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             socket_path: default_admin_socket_path(),
             prometheus: AdminPrometheusConfig::default(),
         }

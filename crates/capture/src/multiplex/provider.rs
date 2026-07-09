@@ -239,6 +239,7 @@ mod tests {
     use crate::{
         CaptureEvent, CapturedBytes, EbpfProcessObservationRuntimeDiagnostics,
         EbpfProcessObservationTracepointDiagnostics, EbpfProcessObservationTracepointFiring,
+        EbpfProcessPayloadAllowanceDiagnostics,
     };
 
     use super::*;
@@ -621,6 +622,8 @@ mod tests {
                                 .to_string(),
                         ),
                     }),
+                    process_payload_allowance: EbpfProcessPayloadAllowanceDiagnostics::default(),
+                    payload_gates: Ok(Vec::new()),
                 },
             )
         }

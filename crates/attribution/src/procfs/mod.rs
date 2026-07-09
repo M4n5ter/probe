@@ -14,6 +14,7 @@ pub use listener::{
 };
 pub use process::{ProcessAttributor, ProcfsAttributor};
 pub use socket::{
-    ProcfsSocketResolver, SocketFdConnectionContext, SocketFdLookup, SocketProcessContext,
-    SocketProcessHint, TcpListenerProcessLookup, TcpUnattributedListener,
+    ProcfsSocketResolver, SocketFdConnectionContext, SocketFdLookup, SocketListenFdContext,
+    SocketListenFdLookup, SocketProcessContext, SocketProcessHint, TcpListenerProcessLookup,
+    TcpUnattributedListener,
 };

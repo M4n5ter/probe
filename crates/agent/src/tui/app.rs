@@ -13,7 +13,7 @@ use super::fields::{
 use super::hit::{HitTarget, ScrollTarget};
 use super::log_tail::{DEFAULT_TAIL_BYTES, last_non_empty_lines, read_text_tail};
 use super::observation_setup::{
-    ProcessObservationMode, process_observation_exe_paths, remove_process_observation,
+    ProcessObservationMode, process_observation_pids, remove_process_observation,
     replace_process_observations_with, upsert_process_observation,
 };
 use super::process_traffic_scope::ProcessTrafficSelector;
@@ -830,9 +830,7 @@ impl TuiApp {
             ),
             Some(false) => self.remove_process_observation_at_index(index),
             None => {
-                self.status = StatusMessage::warning(
-                    "Selected process has no readable executable path; observation was not changed",
-                );
+                self.status = StatusMessage::warning("Selected process cannot be observed");
                 None
             }
         }
@@ -1299,26 +1297,18 @@ impl TuiApp {
             self.status = StatusMessage::warning("No selected process");
             return None;
         };
-        let Some(selector) = process.selector() else {
-            self.status = StatusMessage::warning(
-                "Selected process has no readable executable path; observation was not changed",
-            );
-            return None;
-        };
-        let Some(exe_path) = process.selector_key() else {
-            self.status = StatusMessage::warning(
-                "Selected process has no readable executable path; observation was not changed",
-            );
+        let Some((key, selector)) = process.selector_key().zip(process.selector()) else {
+            self.status = StatusMessage::warning("Selected process cannot be observed");
             return None;
         };
         let process_name = process.name.clone();
         match monitor_mode {
             MonitorMode::Keep => {
-                upsert_process_observation(&mut self.config, &exe_path, selector, mode);
+                upsert_process_observation(&mut self.config, &key, selector, mode);
                 self.process_view.select(index, &self.processes);
             }
             MonitorMode::Single => {
-                replace_process_observations_with(&mut self.config, &exe_path, selector, mode);
+                replace_process_observations_with(&mut self.config, &key, selector, mode);
                 self.process_view.set_single_monitor(index, &self.processes);
             }
         }
@@ -1338,15 +1328,13 @@ impl TuiApp {
             self.status = StatusMessage::warning("No selected process");
             return None;
         };
-        let Some(exe_path) = process.selector_key() else {
-            self.status = StatusMessage::warning(
-                "Selected process has no readable executable path; observation was not changed",
-            );
+        let Some(key) = process.selector_key() else {
+            self.status = StatusMessage::warning("Selected process cannot be observed");
             return None;
         };
         let process_name = process.name.clone();
         self.process_view.select(index, &self.processes);
-        if !remove_process_observation(&mut self.config, &exe_path) {
+        if !remove_process_observation(&mut self.config, &key) {
             self.traffic = TrafficState::default();
             self.clear_traffic_popup();
             self.status = StatusMessage::info(self.traffic_filter_label());
@@ -1505,11 +1493,8 @@ impl TuiApp {
     }
 
     fn traffic_filter_selector(&self) -> ProcessTrafficSelector {
-        let watched_exe_paths = process_observation_exe_paths(&self.config);
-        if let Some(selector) = self
-            .processes
-            .traffic_selector_for_exe_paths(watched_exe_paths)
-        {
+        let watched_pids = process_observation_pids(&self.config);
+        if let Some(selector) = self.processes.traffic_selector_for_pids(watched_pids) {
             return selector;
         }
         ProcessTrafficSelector::all_processes()
@@ -1723,7 +1708,7 @@ impl TuiApp {
             .and_then(|index| self.processes.entries().get(index))
             .map(|process| {
                 format!(
-                    "Selected process {} has no readable executable path; selector was not changed",
+                    "Selected process {} cannot be observed; selector was not changed",
                     process.name
                 )
             })
@@ -1751,9 +1736,11 @@ impl TuiApp {
     }
 
     fn sync_process_monitors_from_config(&mut self) {
-        let exe_paths = process_observation_exe_paths(&self.config);
+        let process_keys = process_observation_pids(&self.config)
+            .into_iter()
+            .map(|pid| format!("pid:{pid}"));
         self.process_view
-            .replace_monitors(exe_paths, &self.processes);
+            .replace_monitors(process_keys, &self.processes);
     }
 
     fn clamp_selection(&mut self) {
@@ -1855,7 +1842,7 @@ mod tests {
         super::{
             controls::{ControlId, FocusTarget},
             copy::MITM_PLAINTEXT_COVERAGE,
-            processes::{ProcessCatalog, ProcessEntry, selector_for_exe_path},
+            processes::{ProcessCatalog, ProcessEntry, selector_for_pid},
             runtime_attachment::RuntimeAttachment,
             text::INLINE_TEXT_MAX_CHARS,
             traffic::TrafficStatusKind,
@@ -1915,11 +1902,12 @@ mod tests {
         let probe_core::Selector::Match { term } = selector else {
             panic!("process selector should be a match selector");
         };
-        assert_eq!(term.process.exe_path_globs, ["/usr/bin/curl".to_string()]);
+        assert_eq!(term.process.pids, [42]);
+        assert!(term.process.exe_path_globs.is_empty());
     }
 
     #[test]
-    fn process_scope_fails_closed_when_executable_path_is_unreadable() {
+    fn process_scope_uses_pid_when_executable_path_is_unreadable() {
         let mut app = TuiApp::new(
             PathBuf::from("/tmp/agent.toml"),
             AgentConfig::default(),
@@ -1938,9 +1926,15 @@ mod tests {
 
         app.handle_action(TuiAction::NextValue);
 
-        assert!(app.config.capture.deep_observe_selector.is_none());
-        assert_eq!(app.status().kind, StatusKind::Warning);
-        assert!(!app.dirty());
+        let Some(selector) = &app.config.capture.deep_observe_selector else {
+            panic!("capture selector should be configured from selected pid");
+        };
+        let probe_core::Selector::Match { term } = selector else {
+            panic!("process selector should be a match selector");
+        };
+        assert_eq!(term.process.pids, [42]);
+        assert_eq!(app.status().kind, StatusKind::Info);
+        assert!(app.dirty());
     }
 
     #[test]
@@ -2052,7 +2046,7 @@ mod tests {
         assert_eq!(app.config.capture.selection, CaptureSelection::Auto);
         assert!(app.config.capture.deep_observe_selector.is_none());
         assert_eq!(app.config.observations.len(), 1);
-        assert_eq!(app.config.observations[0].id, "exe:/usr/sbin/nginx");
+        assert_eq!(app.config.observations[0].id, "pid:2");
         assert_eq!(
             app.config.observations[0].data_path,
             probe_config::ObservationDataPathMode::Libpcap
@@ -2107,7 +2101,7 @@ mod tests {
         assert!(app.process_is_monitored(1));
         assert_eq!(app.traffic_filter_label(), "1 watched processes");
         assert_eq!(app.config.observations.len(), 1);
-        assert_eq!(app.config.observations[0].id, "exe:/usr/sbin/nginx");
+        assert_eq!(app.config.observations[0].id, "pid:2");
         assert_eq!(
             app.config.observations[0].data_path,
             ObservationDataPathMode::Auto
@@ -2426,7 +2420,7 @@ mod tests {
     }
 
     #[test]
-    fn process_observation_fails_closed_without_executable_path() {
+    fn process_observation_can_target_pid_without_executable_path() {
         let mut app = TuiApp::new(
             PathBuf::from("/tmp/agent.toml"),
             AgentConfig::default(),
@@ -2443,10 +2437,11 @@ mod tests {
         app.select_tab(TuiTab::Traffic);
         let effect = app.handle_action(TuiAction::ObserveAuto);
 
-        assert_eq!(effect, None);
-        assert!(!app.dirty());
-        assert_eq!(app.status().kind, StatusKind::Warning);
-        assert!(app.status().text.contains("no readable executable path"));
+        assert_eq!(expect_save_status(effect).kind, StatusKind::Saved);
+        assert!(app.dirty());
+        assert_eq!(app.config.observations.len(), 1);
+        assert_eq!(app.config.observations[0].id, "pid:42");
+        assert_eq!(app.config.observations[0].selector, selector_for_pid(42));
     }
 
     #[test]
@@ -2543,11 +2538,8 @@ mod tests {
         assert!(!app.process_is_monitored(0));
         assert!(app.process_is_monitored(1));
         assert_eq!(app.config.observations.len(), 1);
-        assert_eq!(app.config.observations[0].id, "exe:/usr/sbin/nginx");
-        assert_eq!(
-            app.config.observations[0].selector,
-            selector_for_exe_path("/usr/sbin/nginx".to_string())
-        );
+        assert_eq!(app.config.observations[0].id, "pid:2");
+        assert_eq!(app.config.observations[0].selector, selector_for_pid(2));
     }
 
     #[test]
@@ -2555,13 +2547,13 @@ mod tests {
         let mut config = AgentConfig::default();
         config
             .observations
-            .push(named_process_observation("backend-a", "/usr/sbin/nginx"));
+            .push(named_process_observation("backend-a", 2));
         config
             .observations
-            .push(named_process_observation("backend-b", "/usr/sbin/nginx"));
+            .push(named_process_observation("backend-b", 2));
         config
             .observations
-            .push(named_process_observation("curl", "/usr/bin/curl"));
+            .push(named_process_observation("curl", 1));
         let mut app = multi_process_app_with_config(config);
 
         let effect = app.handle_action(TuiAction::Click(HitTarget::TrafficProcess(1)));
@@ -2570,18 +2562,13 @@ mod tests {
         assert!(app.process_is_monitored(1));
         assert_eq!(app.config.observations.len(), 1);
         assert_eq!(app.config.observations[0].id, "backend-a");
-        assert_eq!(
-            app.config.observations[0].selector,
-            selector_for_exe_path("/usr/sbin/nginx".to_string())
-        );
+        assert_eq!(app.config.observations[0].selector, selector_for_pid(2));
     }
 
     #[test]
     fn app_initializes_process_monitors_from_observations() {
         let mut config = AgentConfig::default();
-        config
-            .observations
-            .push(process_observation("/usr/sbin/nginx"));
+        config.observations.push(process_observation(2));
 
         let app = multi_process_app_with_config(config);
 
@@ -2596,7 +2583,7 @@ mod tests {
         let mut config = AgentConfig::default();
         config
             .observations
-            .push(named_process_observation("backend", "/usr/sbin/nginx"));
+            .push(named_process_observation("backend", 2));
 
         let app = multi_process_app_with_config(config);
 
@@ -2611,7 +2598,7 @@ mod tests {
         let mut config = AgentConfig::default();
         config
             .observations
-            .push(named_process_observation("backend", "/usr/sbin/nginx"));
+            .push(named_process_observation("backend", 2));
         let mut app = multi_process_app_with_config(config);
 
         let effect = app.handle_action(TuiAction::Click(HitTarget::ProcessMonitor(1)));
@@ -2646,9 +2633,7 @@ mod tests {
     #[test]
     fn traffic_filter_uses_configured_observation_scope_without_process_catalog_match() {
         let mut config = AgentConfig::default();
-        config
-            .observations
-            .push(process_observation("/app/backend"));
+        config.observations.push(process_observation(42));
         let app = TuiApp::new(
             PathBuf::from("/tmp/agent.toml"),
             config,
@@ -2658,7 +2643,7 @@ mod tests {
         assert_eq!(app.traffic_filter_label(), "1 watched processes");
         assert_eq!(
             app.ready_traffic_filter_selector(),
-            Some(selector_for_exe_path("/app/backend".to_string()))
+            Some(selector_for_pid(42))
         );
         assert!(app.ready_unknown_process_candidate_selector().is_none());
     }
@@ -3835,14 +3820,14 @@ mod tests {
         }
     }
 
-    fn process_observation(exe_path: &str) -> ProcessObservationConfig {
-        named_process_observation(&format!("exe:{exe_path}"), exe_path)
+    fn process_observation(pid: u32) -> ProcessObservationConfig {
+        named_process_observation(&format!("pid:{pid}"), pid)
     }
 
-    fn named_process_observation(id: &str, exe_path: &str) -> ProcessObservationConfig {
+    fn named_process_observation(id: &str, pid: u32) -> ProcessObservationConfig {
         ProcessObservationConfig {
             id: id.to_string(),
-            selector: selector_for_exe_path(exe_path.to_string()),
+            selector: selector_for_pid(pid),
             data_path: ObservationDataPathMode::Auto,
             directions: vec![
                 probe_core::Direction::Inbound,

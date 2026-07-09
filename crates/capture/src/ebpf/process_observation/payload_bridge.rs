@@ -162,6 +162,21 @@ pub(super) fn tracked_flow_displacement_gap_events(
         .collect()
 }
 
+pub(super) fn recovered_payload_flow_boundary_gap_event(
+    timestamp: Timestamp,
+    flow: FlowContext,
+    direction: Direction,
+) -> CaptureEvent {
+    ebpf_provider_state_boundary_gap(
+        timestamp,
+        flow,
+        direction,
+        0,
+        "eBPF process observation recovered this flow from a payload sample after the flow-start observation was unavailable; bytes before this sample and the next stream offset are unknown"
+            .to_string(),
+    )
+}
+
 struct PayloadSample<'a> {
     timestamp: Timestamp,
     direction: Direction,

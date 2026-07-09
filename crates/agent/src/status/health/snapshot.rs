@@ -379,6 +379,7 @@ mod tests {
             auto_mitm_plaintext_bridge_candidate: None,
             open_failures: Vec::new(),
             provider: None,
+            ebpf_process_payload: None,
             input_activity: None,
         };
 
@@ -404,6 +405,7 @@ mod tests {
             auto_mitm_plaintext_bridge_candidate: None,
             open_failures: Vec::new(),
             provider: None,
+            ebpf_process_payload: None,
             input_activity: None,
         };
 

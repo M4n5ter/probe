@@ -1,8 +1,4 @@
-use std::{
-    collections::BTreeSet,
-    fmt,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeSet, fmt, path::PathBuf};
 
 use attribution::{ProcessAttributor, ProcfsAttributor};
 use probe_core::ProcessContext;
@@ -38,22 +34,15 @@ impl fmt::Debug for ProcessEntry {
 
 impl ProcessEntry {
     pub(crate) fn selector_key(&self) -> Option<String> {
-        self.exe_path
-            .as_ref()
-            .and_then(|path| path.to_str())
-            .map(str::to_string)
+        Some(process_observation_key_for_pid(self.pid))
     }
 
     pub(crate) fn selector(&self) -> Option<Selector> {
-        self.selector_key().map(selector_for_exe_path)
+        Some(selector_for_pid(self.pid))
     }
 
     pub(crate) fn observation_scope_label(&self) -> &'static str {
-        if self.selector().is_some() {
-            "exe"
-        } else {
-            "-"
-        }
+        "pid"
     }
 
     pub(crate) fn argv_summary(&self, max_chars: usize) -> String {
@@ -149,6 +138,20 @@ pub(crate) fn selector_for_exe_path(exe_path: String) -> Selector {
     )
 }
 
+pub(crate) fn process_observation_key_for_pid(pid: u32) -> String {
+    format!("pid:{pid}")
+}
+
+pub(crate) fn selector_for_pid(pid: u32) -> Selector {
+    Selector::term(
+        ProcessSelector {
+            pids: vec![pid],
+            ..ProcessSelector::default()
+        },
+        TrafficSelector::default(),
+    )
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ProcessCatalog {
     entries: Vec<ProcessEntry>,
@@ -211,19 +214,39 @@ impl ProcessCatalog {
         &self.entries
     }
 
-    pub(crate) fn traffic_selector_for_exe_paths(
+    pub(crate) fn traffic_selector_for_pids(
         &self,
-        exe_paths: impl IntoIterator<Item = String>,
+        pids: impl IntoIterator<Item = u32>,
     ) -> Option<ProcessTrafficSelector> {
-        let exe_paths = exe_paths.into_iter().collect::<Vec<_>>();
-        let mut selector = self
+        let pids = pids.into_iter().collect::<Vec<_>>();
+        if pids.is_empty() {
+            return None;
+        }
+        let selector = merge_pid_selectors(pids.iter().copied());
+        let exe_paths = exe_paths_for_pids(&self.entries, &pids);
+        let exe_path_selector = self
             .traffic_scope
-            .selector_for_exe_paths(exe_paths.iter().cloned())?;
-        selector.unknown_process_candidate_scope = candidate_scope_label_for_exe_paths(
+            .selector_for_exe_paths(exe_paths.iter().cloned());
+        let unknown_process_candidate_selector = exe_path_selector
+            .as_ref()
+            .and_then(|selector| selector.unknown_process_candidate_selector.clone());
+        let unknown_process_candidate_exe_paths = if unknown_process_candidate_selector.is_some() {
+            exe_path_selector
+                .map(|selector| selector.unknown_process_candidate_exe_paths)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let unknown_process_candidate_scope = candidate_scope_label_for_exe_paths(
             &self.entries,
-            &selector.unknown_process_candidate_exe_paths,
+            &unknown_process_candidate_exe_paths,
         );
-        Some(selector)
+        Some(ProcessTrafficSelector {
+            selector: Some(selector),
+            unknown_process_candidate_selector,
+            unknown_process_candidate_scope,
+            unknown_process_candidate_exe_paths,
+        })
     }
 
     #[cfg(test)]
@@ -282,32 +305,42 @@ fn candidate_scope_label_for_exe_paths(
         return None;
     }
     let requested = exe_paths.iter().cloned().collect::<BTreeSet<_>>();
-    let mut matched = BTreeSet::new();
-    let mut labels = BTreeSet::new();
-    for process in entries {
-        let Some(exe_path) = process.selector_key() else {
-            continue;
-        };
-        if requested.contains(&exe_path) {
-            matched.insert(exe_path);
-            labels.insert(process.name.clone());
-        }
-    }
-    for exe_path in exe_paths {
-        if !matched.contains(exe_path) {
-            labels.insert(candidate_label_from_exe_path(exe_path));
-        }
-    }
+    let labels = entries
+        .iter()
+        .filter(|process| {
+            process_exe_path(process)
+                .as_ref()
+                .is_some_and(|exe_path| requested.contains(exe_path))
+        })
+        .map(|process| process.name.clone())
+        .collect::<BTreeSet<_>>();
     (!labels.is_empty()).then(|| labels.into_iter().collect::<Vec<_>>().join(", "))
 }
 
-fn candidate_label_from_exe_path(exe_path: &str) -> String {
-    Path::new(exe_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
+fn exe_paths_for_pids(entries: &[ProcessEntry], pids: &[u32]) -> Vec<String> {
+    let requested = pids.iter().copied().collect::<BTreeSet<_>>();
+    entries
+        .iter()
+        .filter(|process| requested.contains(&process.pid))
+        .filter_map(process_exe_path)
+        .collect()
+}
+
+fn process_exe_path(process: &ProcessEntry) -> Option<String> {
+    process
+        .exe_path
+        .as_ref()
+        .and_then(|path| path.to_str())
         .map(str::to_string)
-        .unwrap_or_else(|| exe_path.to_string())
+}
+
+fn merge_pid_selectors(pids: impl IntoIterator<Item = u32>) -> Selector {
+    let selectors = pids.into_iter().map(selector_for_pid).collect::<Vec<_>>();
+    match selectors.as_slice() {
+        [] => Selector::default(),
+        [selector] => selector.clone(),
+        _ => Selector::Any { selectors },
+    }
 }
 
 #[cfg(test)]
@@ -364,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn process_entry_selector_prefers_executable_path_when_available() {
+    fn process_entry_selector_targets_pid() {
         let entry = ProcessEntry {
             pid: 7,
             name: "curl".to_string(),
@@ -376,18 +409,19 @@ mod tests {
         };
 
         let Some(selector) = entry.selector() else {
-            panic!("executable path should produce a safe selector");
+            panic!("process entry should produce a pid selector");
         };
 
         let Selector::Match { term } = selector else {
             panic!("process entry should create a match selector");
         };
-        assert_eq!(term.process.exe_path_globs, ["/usr/bin/curl".to_string()]);
+        assert_eq!(term.process.pids, [7]);
+        assert!(term.process.exe_path_globs.is_empty());
         assert!(term.process.names.is_empty());
     }
 
     #[test]
-    fn process_entry_without_executable_path_does_not_broaden_capture_to_process_name() {
+    fn process_entry_without_executable_path_still_targets_pid() {
         let entry = ProcessEntry {
             pid: 7,
             name: "python".to_string(),
@@ -398,8 +432,11 @@ mod tests {
             cgroup_path: None,
         };
 
-        assert_eq!(entry.selector(), None);
-        assert_eq!(entry.observation_scope_label(), "-");
+        let Some(Selector::Match { term }) = entry.selector() else {
+            panic!("process entry should create a pid selector");
+        };
+        assert_eq!(term.process.pids, [7]);
+        assert_eq!(entry.observation_scope_label(), "pid");
         assert_eq!(entry.argv_summary(96), "python");
     }
 

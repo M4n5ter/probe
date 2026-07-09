@@ -132,11 +132,27 @@ pub struct SocketFdConnectionContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocketListenFdContext {
+    pub process: ProcessContext,
+    pub confidence: u8,
+    pub socket_inode: u64,
+    pub local: TcpEndpoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SocketFdLookup {
     pub tgid: u32,
     pub thread_pid: u32,
     pub fd: i32,
     pub expected_remote_endpoint: Option<TcpEndpoint>,
+    pub process_hint: Option<SocketProcessHint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocketListenFdLookup {
+    pub tgid: u32,
+    pub thread_pid: u32,
+    pub fd: i32,
     pub process_hint: Option<SocketProcessHint>,
 }
 
@@ -287,6 +303,18 @@ impl ProcfsSocketResolver {
             .identify_tcp_fd_in_snapshot(lookup, snapshot)
     }
 
+    pub fn resolve_tcp_listen_fd(
+        &mut self,
+        lookup: SocketListenFdLookup,
+    ) -> Result<Option<SocketListenFdContext>, AttributionError> {
+        self.refresh_listener_snapshot_if_needed()?;
+        let Some(snapshot) = self.snapshot.as_ref().map(|cached| &cached.snapshot) else {
+            return Ok(None);
+        };
+        self.attributor
+            .identify_tcp_listen_fd_in_snapshot(lookup, snapshot)
+    }
+
     pub fn resolve_process(&self, pid: u32) -> Result<Option<ProcessContext>, AttributionError> {
         self.attributor.identify_process(pid)
     }
@@ -296,6 +324,10 @@ impl ProcfsSocketResolver {
         hint: SocketProcessHint,
     ) -> Result<Vec<ProcessContext>, AttributionError> {
         self.attributor.identify_processes_by_hint(&hint)
+    }
+
+    pub fn resolve_processes(&self) -> Result<Vec<ProcessContext>, AttributionError> {
+        self.attributor.identify_processes()
     }
 
     fn refresh_snapshot_if_needed(&mut self) -> Result<(), AttributionError> {
@@ -566,8 +598,73 @@ impl ProcfsSocketAttributor {
         Ok(None)
     }
 
+    fn identify_tcp_listen_fd_in_snapshot(
+        &self,
+        lookup: SocketListenFdLookup,
+        snapshot: &ProcfsSocketSnapshot,
+    ) -> Result<Option<SocketListenFdContext>, AttributionError> {
+        let fd_lookup = SocketFdLookup {
+            tgid: lookup.tgid,
+            thread_pid: lookup.thread_pid,
+            fd: lookup.fd,
+            expected_remote_endpoint: None,
+            process_hint: lookup.process_hint,
+        };
+        let candidate_scan =
+            socket_fd_candidates_for_lookup(&self.process_attributor.proc_root, &fd_lookup)?;
+        if !candidate_scan.complete && candidate_scan.candidates.is_empty() {
+            return Ok(None);
+        }
+        let mut matched = None;
+        for candidate in candidate_scan.candidates {
+            let Some(listener) = snapshot
+                .tcp_listeners
+                .iter()
+                .find(|listener| listener.inode == candidate.inode)
+            else {
+                continue;
+            };
+            let Some(process) = self.identify_fd_candidate_process(&candidate, &fd_lookup)? else {
+                continue;
+            };
+            if let Some(hint) = &fd_lookup.process_hint
+                && !process_matches_hint(&process, hint)
+            {
+                continue;
+            }
+            let resolved = (
+                process,
+                fd_candidate_confidence(candidate.source),
+                candidate.inode,
+                listener.local,
+            );
+            if matched.replace(resolved).is_some() {
+                return Ok(None);
+            }
+        }
+        Ok(matched.map(
+            |(process, confidence, socket_inode, local)| SocketListenFdContext {
+                process,
+                confidence,
+                socket_inode,
+                local,
+            },
+        ))
+    }
+
     fn identify_process(&self, pid: u32) -> Result<Option<ProcessContext>, AttributionError> {
         self.process_attributor.identify_if_present(pid)
+    }
+
+    fn identify_processes(&self) -> Result<Vec<ProcessContext>, AttributionError> {
+        let mut processes = Vec::new();
+        for pid in self.process_attributor.process_ids()? {
+            let Some(process) = self.process_attributor.identify_if_present(pid)? else {
+                continue;
+            };
+            push_unique_process(&mut processes, process);
+        }
+        Ok(processes)
     }
 
     fn identify_processes_by_hint(
@@ -582,12 +679,7 @@ impl ProcfsSocketAttributor {
             if !process_matches_hint(&process, hint) {
                 continue;
             }
-            if !processes
-                .iter()
-                .any(|existing: &ProcessContext| existing.identity == process.identity)
-            {
-                processes.push(process);
-            }
+            push_unique_process(&mut processes, process);
         }
         Ok(processes)
     }
@@ -823,6 +915,15 @@ fn process_matches_hint(process: &ProcessContext, hint: &SocketProcessHint) -> b
     process.identity.uid == hint.uid
         && process.identity.gid == hint.gid
         && process.name == hint.name
+}
+
+fn push_unique_process(processes: &mut Vec<ProcessContext>, process: ProcessContext) {
+    if !processes
+        .iter()
+        .any(|existing| existing.identity == process.identity)
+    {
+        processes.push(process);
+    }
 }
 
 fn fd_candidate_confidence(source: SocketFdCandidateSource) -> u8 {
@@ -1189,6 +1290,33 @@ mod tests {
                 .iter()
                 .all(|listener| listener.observed.socket_inode == 424_242)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_tcp_listen_fd_local_endpoint() -> Result<(), Box<dyn std::error::Error>> {
+        let proc = FakeProc::new()?;
+        proc.write_tcp_table(&[tcp_line(0, "0100007F:20FB", "00000000:0000", "0A", 424_242)])?;
+        proc.write_process_with_socket(321, "python3", 424_242)?;
+        let mut resolver = ProcfsSocketResolver::with_paths(proc.root(), proc.boot_id_path());
+
+        let resolved = resolver
+            .resolve_tcp_listen_fd(SocketListenFdLookup {
+                tgid: 321,
+                thread_pid: 321,
+                fd: 7,
+                process_hint: Some(SocketProcessHint {
+                    name: "python3".to_string(),
+                    uid: 1000,
+                    gid: 1000,
+                }),
+            })?
+            .expect("listen fd should resolve");
+
+        assert_eq!(resolved.process.identity.pid, 321);
+        assert_eq!(resolved.process.name, "python3");
+        assert_eq!(resolved.socket_inode, 424_242);
+        assert_eq!(resolved.local.port, 8443);
         Ok(())
     }
 

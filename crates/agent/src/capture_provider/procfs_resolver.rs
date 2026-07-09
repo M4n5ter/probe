@@ -1,7 +1,8 @@
 use attribution::{ProcfsSocketResolver, TcpListenerProcessLookup};
 use capture::{
-    CaptureError, EbpfProcessHint, EbpfResolvedSocketFlow, EbpfSocketFlowLookup,
-    EbpfSocketFlowResolver, ProcessResolver, ResolvedProcess,
+    CaptureError, EbpfListenSocketLookup, EbpfProcessHint, EbpfResolvedListenSocket,
+    EbpfResolvedSocketFlow, EbpfSocketFlowLookup, EbpfSocketFlowResolver, ProcessResolver,
+    ResolvedProcess,
 };
 use probe_core::{CapabilityKind, ProcessContext, RuntimeMode, TcpConnection, TcpEndpoint};
 use runtime::RuntimePlan;
@@ -127,6 +128,33 @@ impl EbpfSocketFlowResolver for ProcfsTcpProcessResolver {
             .map_err(|error| CaptureError::provider("procfs_socket_attribution", error.to_string()))
     }
 
+    fn resolve_listen_socket(
+        &mut self,
+        lookup: EbpfListenSocketLookup,
+    ) -> Result<Option<EbpfResolvedListenSocket>, CaptureError> {
+        self.resolver
+            .resolve_tcp_listen_fd(attribution::SocketListenFdLookup {
+                tgid: lookup.tgid,
+                thread_pid: lookup.thread_pid,
+                fd: lookup.fd,
+                process_hint: lookup
+                    .process_hint
+                    .map(|hint| attribution::SocketProcessHint {
+                        name: hint.name,
+                        uid: hint.uid,
+                        gid: hint.gid,
+                    }),
+            })
+            .map(|resolved| {
+                resolved.map(|resolved| EbpfResolvedListenSocket {
+                    process: resolved.process,
+                    confidence: resolved.confidence,
+                    local: resolved.local,
+                })
+            })
+            .map_err(|error| CaptureError::provider("procfs_socket_attribution", error.to_string()))
+    }
+
     fn resolve_process(&mut self, tgid: u32) -> Result<Option<ProcessContext>, CaptureError> {
         self.resolver
             .resolve_process(tgid)
@@ -143,6 +171,12 @@ impl EbpfSocketFlowResolver for ProcfsTcpProcessResolver {
                 uid: hint.uid,
                 gid: hint.gid,
             })
+            .map_err(|error| CaptureError::provider("procfs_socket_attribution", error.to_string()))
+    }
+
+    fn resolve_processes(&mut self) -> Result<Vec<ProcessContext>, CaptureError> {
+        self.resolver
+            .resolve_processes()
             .map_err(|error| CaptureError::provider("procfs_socket_attribution", error.to_string()))
     }
 

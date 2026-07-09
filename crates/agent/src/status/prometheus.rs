@@ -844,7 +844,10 @@ fn write_capture_provider(output: &mut String, snapshot: &AgentStatusSnapshot) {
         link_ownership,
         tracepoint_firings,
         tracepoint_liveness,
+        process_payload_allowance,
+        payload_gate_counters,
         kernel_liveness,
+        optional_tracepoints,
         optional_tracepoint_pairs,
     }) = &snapshot.capture.provider
     else {
@@ -890,6 +893,30 @@ fn write_capture_provider(output: &mut String, snapshot: &AgentStatusSnapshot) {
             &[],
             0,
         );
+        write_family(
+            output,
+            "traffic_probe_ebpf_process_observation_payload_gate_metrics_available",
+            "gauge",
+            "Whether eBPF process observation payload gate metrics are present in this snapshot.",
+        );
+        write_sample(
+            output,
+            "traffic_probe_ebpf_process_observation_payload_gate_metrics_available",
+            &[],
+            0,
+        );
+        write_family(
+            output,
+            "traffic_probe_ebpf_process_payload_allowance_selector_configured",
+            "gauge",
+            "Whether eBPF process payload allowance seeding has a process payload selector.",
+        );
+        write_sample(
+            output,
+            "traffic_probe_ebpf_process_payload_allowance_selector_configured",
+            &[],
+            0,
+        );
         return;
     };
     write_sample(
@@ -920,6 +947,71 @@ fn write_capture_provider(output: &mut String, snapshot: &AgentStatusSnapshot) {
         "traffic_probe_ebpf_process_observation_owned_links",
         &[],
         link_ownership.owned_link_count,
+    );
+
+    write_family(
+        output,
+        "traffic_probe_ebpf_process_observation_payload_gate_metrics_available",
+        "gauge",
+        "Whether eBPF process observation payload gate metrics are present in this snapshot.",
+    );
+    write_sample(
+        output,
+        "traffic_probe_ebpf_process_observation_payload_gate_metrics_available",
+        &[],
+        matches!(payload_gate_counters.mode, RuntimeMode::Available) as u64,
+    );
+
+    write_family(
+        output,
+        "traffic_probe_ebpf_process_observation_payload_gate_counter",
+        "counter",
+        "eBPF process observation payload gate counter by gate name.",
+    );
+    for counter in &payload_gate_counters.counters {
+        write_sample(
+            output,
+            "traffic_probe_ebpf_process_observation_payload_gate_counter",
+            &[("gate", counter.name)],
+            counter.count,
+        );
+    }
+
+    write_family(
+        output,
+        "traffic_probe_ebpf_process_payload_allowance_selector_configured",
+        "gauge",
+        "Whether eBPF process payload allowance seeding has a process payload selector.",
+    );
+    write_sample(
+        output,
+        "traffic_probe_ebpf_process_payload_allowance_selector_configured",
+        &[],
+        process_payload_allowance.selector_configured as u64,
+    );
+    write_family(
+        output,
+        "traffic_probe_ebpf_process_payload_allowance_processes",
+        "gauge",
+        "eBPF process payload allowance startup seeding process counts by stage.",
+    );
+    write_sample(
+        output,
+        "traffic_probe_ebpf_process_payload_allowance_processes",
+        &[("stage", "scanned")],
+        process_payload_allowance.scanned_processes,
+    );
+    write_sample(
+        output,
+        "traffic_probe_ebpf_process_payload_allowance_processes",
+        &[("stage", "matched")],
+        process_payload_allowance.matched_processes,
+    );
+    write_sample(
+        output,
+        "traffic_probe_ebpf_process_payload_allowance_processes",
+        &[("stage", "allowed")],
+        process_payload_allowance.allowed_processes,
     );
 
     write_family(
@@ -1064,6 +1156,27 @@ fn write_capture_provider(output: &mut String, snapshot: &AgentStatusSnapshot) {
                     ("tracepoint", program.tracepoint_name),
                 ],
                 program.firing_count,
+            );
+        }
+    }
+
+    write_family(
+        output,
+        "traffic_probe_ebpf_process_observation_optional_tracepoint_mode",
+        "gauge",
+        "Optional eBPF process observation tracepoint availability as a one-hot gauge.",
+    );
+    for tracepoint in optional_tracepoints {
+        for mode in OPTIONAL_TRACEPOINT_PAIR_MODES {
+            write_sample(
+                output,
+                "traffic_probe_ebpf_process_observation_optional_tracepoint_mode",
+                &[
+                    ("family", tracepoint.family_name),
+                    ("tracepoint", tracepoint.tracepoint_name),
+                    ("mode", mode.wire_name()),
+                ],
+                u64::from(tracepoint.mode == mode),
             );
         }
     }
@@ -1315,7 +1428,7 @@ mod tests {
         EbpfProcessObservationActiveTracepointLivenessProgram,
         EbpfProcessObservationActiveTracepointLivenessState,
         EbpfProcessObservationRuntimeDiagnostics, EbpfProcessObservationTracepointDiagnostics,
-        EbpfProcessObservationTracepointFiring,
+        EbpfProcessObservationTracepointFiring, EbpfProcessPayloadAllowanceDiagnostics,
     };
     use probe_core::CapabilityState;
 
@@ -1631,7 +1744,7 @@ mod tests {
                     reason: Some("kernel observer is best-effort".to_string()),
                     open_failures: Vec::new(),
                     provider: Some(CaptureProviderRuntimeDetailsSnapshot::ebpf_process_observation(
-                        capture::EbpfProcessObservationProbeSnapshot::from_link_ownership_and_optional_pairs(
+                        capture::EbpfProcessObservationProbeSnapshot::from_link_ownership_and_optional_tracepoints(
                             capture::EbpfProcessObservationLinkOwnershipSnapshot::owned_by_programs([
                                     capture::EbpfProcessObservationProgramLinkOwnershipSnapshot::new(
                                         "connect_enter",
@@ -1646,6 +1759,9 @@ mod tests {
                                         1,
                                     ),
                                 ]),
+                            [capture::EbpfProcessObservationOptionalTracepointSnapshot::kernel_missing(
+                                capture::EBPF_PROCESS_OPTIONAL_TRACEPOINT_SPECS[1],
+                            )],
                             [capture::EbpfProcessObservationOptionalTracepointPairSnapshot::kernel_missing(
                                 capture::EBPF_PROCESS_OPTIONAL_TRACEPOINT_PAIR_SPECS[0],
                             )],
@@ -1766,7 +1882,7 @@ mod tests {
             reason: Some("kernel observer is best-effort".to_string()),
             open_failures: Vec::new(),
             provider: Some(CaptureProviderRuntimeDetailsSnapshot::ebpf_process_observation(
-                capture::EbpfProcessObservationProbeSnapshot::from_link_ownership_and_optional_pairs(
+                capture::EbpfProcessObservationProbeSnapshot::from_link_ownership_and_optional_tracepoints(
                     capture::EbpfProcessObservationLinkOwnershipSnapshot::owned_by_programs([
                         capture::EbpfProcessObservationProgramLinkOwnershipSnapshot::new(
                             "connect_enter",
@@ -1775,6 +1891,7 @@ mod tests {
                             1,
                         ),
                     ]),
+                    [],
                     [],
                 ),
             )),
@@ -2311,6 +2428,8 @@ mod tests {
                         ],
                         }),
                     }),
+                    process_payload_allowance: EbpfProcessPayloadAllowanceDiagnostics::default(),
+                    payload_gates: Ok(Vec::new()),
                 },
             )
         }

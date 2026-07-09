@@ -253,6 +253,30 @@ impl CompiledSelector {
     pub fn may_match_process(&self, process: &ProcessContext) -> bool {
         self.node.may_match_process(process)
     }
+
+    /// Returns false only when `process` and `direction` can be ruled out before full flow
+    /// attribution.
+    ///
+    /// This is a conservative prefilter for payload capture. Ports and addresses are intentionally
+    /// left to final flow/event selection because they are unknown at syscall entry for generic
+    /// process-level payload sampling.
+    pub fn may_match_process_direction(
+        &self,
+        process: &ProcessContext,
+        direction: Direction,
+    ) -> bool {
+        self.node.may_match_process_direction(process, direction)
+    }
+
+    pub fn may_match_observed_process_direction(
+        &self,
+        process: &ProcessContext,
+        direction: Direction,
+    ) -> bool {
+        self.node
+            .may_match_observed_process_direction(process, direction)
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Clone)]
@@ -379,6 +403,42 @@ impl CompiledSelectorNode {
             // Negated subtrees can depend on traffic dimensions that are unknown before a flow
             // exists, so process-scoped pruning must not treat them as definitive misses.
             Self::Not(_) => true,
+        }
+    }
+
+    fn may_match_process_direction(&self, process: &ProcessContext, direction: Direction) -> bool {
+        match self {
+            Self::Match(term) => term.may_match_process_direction(process, direction),
+            Self::All(selectors) => selectors
+                .iter()
+                .all(|selector| selector.may_match_process_direction(process, direction)),
+            Self::Any(selectors) => selectors
+                .iter()
+                .any(|selector| selector.may_match_process_direction(process, direction)),
+            Self::Not(_) => true,
+        }
+    }
+
+    fn may_match_observed_process_direction(
+        &self,
+        process: &ProcessContext,
+        direction: Direction,
+    ) -> Option<bool> {
+        match self {
+            Self::Match(term) => term.may_match_observed_process_direction(process, direction),
+            Self::All(selectors) => {
+                all_selector_matches(selectors.iter().map(|selector| {
+                    selector.may_match_observed_process_direction(process, direction)
+                }))
+            }
+            Self::Any(selectors) => {
+                any_selector_matches(selectors.iter().map(|selector| {
+                    selector.may_match_observed_process_direction(process, direction)
+                }))
+            }
+            Self::Not(selector) => selector
+                .may_match_observed_process_direction(process, direction)
+                .map(|matched| !matched),
         }
     }
 }
@@ -527,6 +587,47 @@ impl CompiledSelectorTerm {
 
     fn may_match_process(&self, process: &ProcessContext) -> bool {
         self.matches_process_with_unknowns(process).unwrap_or(true)
+    }
+
+    fn may_match_process_direction(&self, process: &ProcessContext, direction: Direction) -> bool {
+        if !self.may_match_process(process) {
+            return false;
+        }
+        let directions = &self.term.traffic.directions;
+        directions.is_empty() || directions.contains(&direction)
+    }
+
+    fn may_match_observed_process_direction(
+        &self,
+        process: &ProcessContext,
+        direction: Direction,
+    ) -> Option<bool> {
+        let directions = &self.term.traffic.directions;
+        all_selector_matches(
+            [
+                self.matches_observed_process(process),
+                Some(directions.is_empty() || directions.contains(&direction)),
+            ]
+            .into_iter(),
+        )
+    }
+
+    fn matches_observed_process(&self, process: &ProcessContext) -> Option<bool> {
+        let spec = &self.term.process;
+        all_selector_matches(
+            [
+                Some(spec.pids.is_empty() || spec.pids.contains(&process.identity.pid)),
+                Some(spec.uids.is_empty() || spec.uids.contains(&process.identity.uid)),
+                Some(spec.gids.is_empty() || spec.gids.contains(&process.identity.gid)),
+                Some(spec.names.is_empty() || spec.names.contains(&process.name)),
+                spec.exe_path_globs.is_empty().then_some(true),
+                spec.cmdline_regexes.is_empty().then_some(true),
+                spec.systemd_services.is_empty().then_some(true),
+                spec.container_ids.is_empty().then_some(true),
+                spec.cgroup_paths.is_empty().then_some(true),
+            ]
+            .into_iter(),
+        )
     }
 
     fn matches_process_with_unknowns(&self, process: &ProcessContext) -> Option<bool> {
@@ -1195,6 +1296,97 @@ mod tests {
 
         assert!(traffic_only.may_match_process(&process));
         assert!(negated_process.may_match_process(&process));
+        Ok(())
+    }
+
+    #[test]
+    fn process_direction_prefilter_ignores_unknown_ports_but_keeps_direction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let selector = Selector::term(
+            ProcessSelector {
+                names: vec!["demo".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector {
+                local_ports: vec![8080],
+                directions: vec![Direction::Inbound],
+                ..TrafficSelector::default()
+            },
+        )
+        .compile()?;
+        let matching = demo_flow().process;
+        let mut non_matching = matching.clone();
+        non_matching.name = "other".to_string();
+
+        assert!(selector.may_match_process_direction(&matching, Direction::Inbound));
+        assert!(!selector.may_match_process_direction(&matching, Direction::Outbound));
+        assert!(!selector.may_match_process_direction(&non_matching, Direction::Inbound));
+        Ok(())
+    }
+
+    #[test]
+    fn observed_process_prefilter_requires_tracepoint_provable_process_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pid_with_unknown_port = Selector::term(
+            ProcessSelector {
+                pids: vec![42],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector {
+                remote_ports: vec![443],
+                directions: vec![Direction::Outbound],
+                ..TrafficSelector::default()
+            },
+        )
+        .compile()?;
+        let exe_path = Selector::term(
+            ProcessSelector {
+                exe_path_globs: vec!["/usr/bin/demo".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector::default(),
+        )
+        .compile()?;
+        let cmdline = Selector::term(
+            ProcessSelector {
+                cmdline_regexes: vec!["--tenant managed".to_string()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector::default(),
+        )
+        .compile()?;
+        let process = partial_process();
+
+        assert!(
+            pid_with_unknown_port
+                .may_match_observed_process_direction(&process, Direction::Outbound)
+        );
+        assert!(
+            !pid_with_unknown_port
+                .may_match_observed_process_direction(&process, Direction::Inbound)
+        );
+        assert!(!exe_path.may_match_observed_process_direction(&process, Direction::Outbound));
+        assert!(!cmdline.may_match_observed_process_direction(&process, Direction::Outbound));
+        Ok(())
+    }
+
+    #[test]
+    fn observed_process_prefilter_does_not_invert_unprovable_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let selector = Selector::Not {
+            selector: Box::new(Selector::term(
+                ProcessSelector {
+                    exe_path_globs: vec!["/usr/bin/demo".to_string()],
+                    ..ProcessSelector::default()
+                },
+                TrafficSelector::default(),
+            )),
+        }
+        .compile()?;
+
+        assert!(
+            !selector.may_match_observed_process_direction(&partial_process(), Direction::Outbound)
+        );
         Ok(())
     }
 

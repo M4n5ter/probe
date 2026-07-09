@@ -16,7 +16,8 @@ pub(crate) const TRAFFIC_STATUS_REASON_MAX_CHARS: usize = 2048;
 
 pub(crate) use capture::{
     CaptureCandidateStatusSnapshot, CaptureOpenFailureStatusSnapshot, CaptureStatusSnapshot,
-    EbpfExpectedContractStatusSnapshot,
+    EbpfExpectedContractStatusSnapshot, EbpfProcessPayloadGateCounterStatusSnapshot,
+    EbpfProcessPayloadStatusSnapshot,
 };
 pub(crate) use enforcement::{EnforcementStatusMode, EnforcementStatusSnapshot};
 pub(crate) use metrics::MetricsSnapshot;

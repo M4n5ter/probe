@@ -1266,6 +1266,92 @@ mod tests {
     }
 
     #[test]
+    fn traffic_diagnostics_warn_when_ebpf_payload_is_not_authorized()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "kind": "traffic_status",
+                "projection": {
+                "capture": {
+                    "selection": "auto",
+                    "selected_backend": "ebpf",
+                    "selected_input_source": "live_host",
+                    "provider_runtime_mode": "available",
+                    "mode": "live",
+                    "reason": null,
+                    "candidates": [],
+                    "open_failures": [],
+                    "provider": {
+                        "kind": "ebpf_process_observation",
+                        "process_payload_allowance": {
+                            "selector_configured": true,
+                            "scanned_processes": 10,
+                            "matched_processes": 1,
+                            "allowed_processes": 1
+                        },
+                        "payload_gate_counters": {
+                            "mode": "available",
+                            "total_count": 14,
+                            "reason": "payload gate counters available",
+                            "counters": [
+                                {"name": "write_attempt", "count": 4},
+                                {"name": "write_process_allowance", "count": 0},
+                                {"name": "write_submitted", "count": 0},
+                                {"name": "write_no_allowance", "count": 4},
+                                {"name": "read_attempt", "count": 10},
+                                {"name": "read_process_allowance", "count": 0},
+                                {"name": "read_submitted", "count": 0},
+                                {"name": "read_no_allowance", "count": 10}
+                            ]
+                        }
+                    },
+                    "ebpf_process_payload": {
+                        "process_payload_allowance": {
+                            "selector_configured": true,
+                            "scanned_processes": 10,
+                            "matched_processes": 1,
+                            "allowed_processes": 1
+                        },
+                        "payload_gate_counters": {
+                            "mode": "available",
+                            "total_count": 14,
+                            "reason": "payload gate counters available",
+                            "counters": [
+                                {"name": "write_attempt", "count": 4},
+                                {"name": "write_process_allowance", "count": 0},
+                                {"name": "write_submitted", "count": 0},
+                                {"name": "write_no_allowance", "count": 4},
+                                {"name": "read_attempt", "count": 10},
+                                {"name": "read_process_allowance", "count": 0},
+                                {"name": "read_submitted", "count": 0},
+                                {"name": "read_no_allowance", "count": 10}
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+
+        let Some(CaptureDiagnosticMessage::Warning(message)) = diagnostics.status_message(true)
+        else {
+            panic!("expected eBPF payload authorization warning");
+        };
+        assert!(message.contains("eBPF payload tracepoints are active"));
+        assert!(message.contains("PID namespace mapping"));
+        let lines = diagnostics.detail_lines();
+        assert_detail_line(
+            &lines,
+            "eBPF process payload allowance: selector_configured=true, scanned=10, matched=1, allowed=1",
+        );
+        assert_detail_line(
+            &lines,
+            "eBPF payload gates: read_attempt=10, read_process_allowance=0, read_submitted=0, read_no_allowance=10",
+        );
+        Ok(())
+    }
+
+    #[test]
     fn traffic_diagnostics_warn_when_empty_traffic_has_capture_loss()
     -> Result<(), Box<dyn std::error::Error>> {
         let response = json!({
