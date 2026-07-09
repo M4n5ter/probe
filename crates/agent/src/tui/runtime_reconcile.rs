@@ -513,8 +513,9 @@ pub(super) async fn cancel_pending_runtime_reconcile(pending: Option<PendingRunt
 async fn stop_reconcile_supervisor(result: Result<RuntimeReconcileResult, tokio::task::JoinError>) {
     if let Ok(result) = result
         && let Some(supervisor) = result.supervisor
+        && let Err(error) = supervisor.stop().await
     {
-        supervisor.stop().await;
+        eprintln!("failed to stop TUI runtime reconcile agent: {error}");
     }
 }
 

@@ -86,6 +86,8 @@ pub(crate) enum AgentError {
     AdminClient(#[from] crate::admin::AdminClientError),
     #[error("admin command failed: {0}")]
     AdminCommand(String),
+    #[error("failed to write stdout: {0}")]
+    Stdout(#[source] std::io::Error),
     #[error("TUI error: {0}")]
     Tui(#[from] crate::tui::TuiError),
     #[error("{0}")]

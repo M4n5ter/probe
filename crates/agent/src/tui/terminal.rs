@@ -131,7 +131,7 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
                 };
                 if let Some(message) = agent_exit {
                     if let Some(supervisor) = supervisor.take() {
-                        supervisor.stop().await;
+                        stop_supervisor_after_tui(supervisor, "after managed agent exit").await;
                     }
                     app.detach_agent(message);
                 }
@@ -237,13 +237,19 @@ pub(crate) async fn run_tui(options: TuiOptions) -> Result<(), TuiError> {
     }
     .await;
     if let Some(supervisor) = supervisor {
-        supervisor.stop().await;
+        stop_supervisor_after_tui(supervisor, "during TUI shutdown").await;
     }
     result
 }
 
 struct PendingTrafficRefresh {
     task: tokio::task::JoinHandle<TrafficRefreshLoadResult>,
+}
+
+async fn stop_supervisor_after_tui(supervisor: TuiAgentSupervisor, action: &'static str) {
+    if let Err(error) = supervisor.stop().await {
+        eprintln!("failed to stop TUI agent {action}: {error}");
+    }
 }
 
 fn traffic_refresh_waiting_for_runtime(

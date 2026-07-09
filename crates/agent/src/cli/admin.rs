@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use crate::{
     admin::{AdminRequest, send_admin_json_request},
+    cli::output::{write_pretty_json_stdout, write_stdout},
     error::AgentError,
     event_type_groups,
 };
@@ -66,10 +67,10 @@ pub(super) async fn run_admin_command(
     if print_prometheus
         && let Some(metrics) = response.get("metrics").and_then(|metrics| metrics.as_str())
     {
-        print!("{metrics}");
+        write_stdout(metrics.as_bytes())?;
         return Ok(());
     }
-    println!("{}", serde_json::to_string_pretty(&response)?);
+    write_pretty_json_stdout(&response)?;
     if let Some(message) = action_error {
         return Err(AgentError::AdminCommand(message));
     }

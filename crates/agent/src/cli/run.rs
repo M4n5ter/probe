@@ -34,10 +34,13 @@ use crate::{
         capability_matrix_for_config,
     },
     status::{build_status_snapshot, collect_spool_status},
-    tui::{TuiOptions, TuiSnapshotOptions, TuiTab, run_tui, run_tui_snapshot},
+    tui::{TuiOptions, TuiSnapshotOptions, TuiTab, render_tui_snapshot, run_tui},
 };
 
-use super::admin::{AdminCliCommand, run_admin_command};
+use super::{
+    admin::{AdminCliCommand, run_admin_command},
+    output::{write_pretty_json_stdout, write_stdout, write_stdout_line},
+};
 
 const REPLAY_POLICY_SOURCE_BYTES: u64 = 1024 * 1024;
 const MAX_MAIN_CONFIG_BYTES: u64 = 1024 * 1024;
@@ -256,20 +259,20 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
                 None => AgentConfig::default(),
             })?;
             let matrix = capability_matrix_for_config(&config);
-            println!("{}", serde_json::to_string_pretty(&matrix)?);
+            write_pretty_json_stdout(&matrix)?;
         }
         Command::Status { config } => {
             let plan = read_runtime_composition(&config)?.into_plan();
             let spool_status = collect_spool_status(&plan);
             let snapshot = build_status_snapshot(&plan, spool_status);
-            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            write_pretty_json_stdout(&snapshot)?;
         }
         Command::Processes { pid, query, limit } => {
             let snapshot = process_list_snapshot(
                 &ProcessCatalog::from_proc_processes_only(),
                 ProcessListFilter { pid, query, limit },
             );
-            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            write_pretty_json_stdout(&snapshot)?;
         }
         Command::Tui {
             config,
@@ -281,7 +284,7 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             detail_scroll,
         } => {
             if snapshot {
-                run_tui_snapshot(TuiSnapshotOptions {
+                let snapshot = render_tui_snapshot(TuiSnapshotOptions {
                     config,
                     width,
                     height,
@@ -290,6 +293,10 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
                     detail_scroll,
                 })
                 .await?;
+                write_stdout(snapshot.output.as_bytes())?;
+                if let Some(error) = snapshot.cleanup_error {
+                    return Err(error.into());
+                }
             } else {
                 run_tui(TuiOptions {
                     config,
@@ -466,7 +473,14 @@ impl CheckCommandOutput {
 }
 
 fn emit_check_command_output(output: CheckCommandOutput) -> Result<(), AgentError> {
-    println!("{}", output.stdout());
+    emit_check_command_output_with(output, |text| write_stdout_line(text))
+}
+
+fn emit_check_command_output_with(
+    output: CheckCommandOutput,
+    mut emit: impl FnMut(&str) -> Result<(), AgentError>,
+) -> Result<(), AgentError> {
+    emit(output.stdout())?;
     match output {
         CheckCommandOutput::Success { .. } => Ok(()),
         CheckCommandOutput::InvalidConfig { validation, .. } => Err(AgentError::Runtime(
@@ -593,12 +607,12 @@ async fn replay(command: ReplayCommand) -> Result<(), AgentError> {
     )
     .with_enforcement_planner(&mut enforcement_planner);
     let summary = pipeline.run_provider(&mut replay_provider)?;
-    println!(
+    write_stdout_line(format!(
         "replay pipeline journaled {} ingress records, processed {} ingress records, and stored {} export events",
         summary.ingress_records_journaled,
         summary.ingress_records_processed,
         summary.export_events_written
-    );
+    ))?;
 
     if let Some(endpoint) = command.webhook {
         drain_replay_webhook(&spool, &command.agent_id, endpoint, command.codec).await?;
@@ -694,7 +708,10 @@ fn synthetic_replay_process() -> ProcessContext {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::symlink};
+    use std::{
+        fs,
+        os::unix::fs::{PermissionsExt, symlink},
+    };
 
     use capture::{CaptureEvent, CapturedBytes};
     use probe_config::{CaptureSelection, EnforcementPolicySourceConfig, PolicyConfig};
@@ -709,12 +726,6 @@ mod tests {
                 config: Some(config),
                 max_events,
             },
-        }
-    }
-
-    fn check_cli(config: PathBuf) -> Cli {
-        Cli {
-            command: Command::Check { config },
         }
     }
 
@@ -1023,6 +1034,7 @@ protective_actions = ["alert"]
 "#,
         )?;
         let mut config = AgentConfig::default();
+        use_test_admin_socket(&mut config, &temp);
         config.capture.selection = CaptureSelection::PlaintextFeed;
         config.capture.plaintext_feed.path = Some(missing_feed_path);
         config.storage.path = spool_path.clone();
@@ -1063,6 +1075,7 @@ protective_actions = ["alert"]
         let missing_feed_path = temp.join("missing-feed.jsonl");
 
         let mut config = AgentConfig::default();
+        use_test_admin_socket(&mut config, &temp);
         config.capture.selection = CaptureSelection::PlaintextFeed;
         config.capture.plaintext_feed.path = Some(missing_feed_path);
         config.storage.path = spool_path.clone();
@@ -1133,6 +1146,7 @@ end
 "#,
         )?;
         let mut config = AgentConfig::default();
+        use_test_admin_socket(&mut config, &temp);
         config.capture.selection = CaptureSelection::PlaintextFeed;
         config.capture.plaintext_feed.path = Some(feed_path);
         config.storage.path = spool_path.clone();
@@ -1196,6 +1210,7 @@ protective_actions = ["deny"]
 "#,
         )?;
         let mut config = AgentConfig::default();
+        use_test_admin_socket(&mut config, &temp);
         config.capture.selection = CaptureSelection::Replay;
         config.storage.path = spool_path.clone();
         config.enforcement.mode = EnforcementMode::Enforce;
@@ -1252,6 +1267,7 @@ protective_actions = ["alert"]
 "#,
         )?;
         let mut config = AgentConfig::default();
+        use_test_admin_socket(&mut config, &temp);
         config.capture.selection = CaptureSelection::Replay;
         config.storage.path = spool_path.clone();
         config.enforcement.mode = EnforcementMode::Enforce;
@@ -1305,6 +1321,7 @@ protective_actions = ["alert"]
 "#,
         )?;
         let mut config = AgentConfig::default();
+        use_test_admin_socket(&mut config, &temp);
         config.capture.selection = CaptureSelection::Replay;
         config.storage.path = spool_path.clone();
         config.enforcement.mode = EnforcementMode::Enforce;
@@ -1314,9 +1331,7 @@ protective_actions = ["alert"]
         fs::write(&config_path, toml::to_string(&config)?)?;
 
         let output = build_check_command_output(config).await?;
-        let CheckCommandOutput::InvalidConfig { stdout, .. } = output else {
-            panic!("runtime validation failure must produce invalid_config output")
-        };
+        let stdout = output.stdout().to_string();
         let value: serde_json::Value = serde_json::from_str(&stdout)?;
         assert_eq!(value["kind"], "invalid_config");
         let reason = value["validation"]["violations"][0]["reason"]
@@ -1337,10 +1352,15 @@ protective_actions = ["alert"]
             "check output builder must not open spool before runtime validation passes"
         );
 
-        let error = run(check_cli(config_path))
-            .await
-            .expect_err("check must fail closed when runtime validation fails");
+        let mut emitted = Vec::new();
+        let error = emit_check_command_output_with(output, |text| {
+            emitted.extend_from_slice(text.as_bytes());
+            emitted.push(b'\n');
+            Ok(())
+        })
+        .expect_err("check must fail closed when runtime validation fails");
 
+        assert_eq!(String::from_utf8(emitted)?, format!("{stdout}\n"));
         assert!(
             matches!(&error, AgentError::Runtime(_)),
             "unexpected error: {error:?}"
@@ -1367,6 +1387,7 @@ protective_actions = ["alert"]
         let spool_path = temp.join("spool");
 
         let mut config = config_with_unopenable_libpcap(spool_path.clone());
+        use_test_admin_socket(&mut config, &temp);
         config.enforcement.policy.source = EnforcementPolicySourceConfig::Remote {
             endpoint: "http://127.0.0.1:1/enforcement".to_string(),
             max_body_bytes: None,
@@ -1439,6 +1460,7 @@ end
 "#,
         )?;
         let mut config = AgentConfig::default();
+        use_test_admin_socket(&mut config, &temp);
         config.capture.selection = CaptureSelection::PlaintextFeed;
         config.capture.plaintext_feed.path = Some(feed_path);
         config.storage.path = spool_path.clone();
@@ -1503,6 +1525,10 @@ end
         config
     }
 
+    fn use_test_admin_socket(config: &mut AgentConfig, temp: &Path) {
+        config.admin.socket_path = temp.join("admin.sock");
+    }
+
     fn test_dir(name: &str) -> Result<PathBuf, std::io::Error> {
         let path = std::env::temp_dir().join(format!(
             "traffic-probe-main-{name}-{}-{}",
@@ -1513,6 +1539,7 @@ end
             fs::remove_dir_all(&path)?;
         }
         fs::create_dir_all(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
         Ok(path)
     }
 

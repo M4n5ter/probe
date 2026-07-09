@@ -30,5 +30,5 @@ mod wire;
 
 pub(crate) use app::TuiTab;
 pub(crate) use config_edit::TuiError;
-pub(crate) use snapshot::{TuiSnapshotOptions, run_tui_snapshot};
+pub(crate) use snapshot::{TuiSnapshotOptions, render_tui_snapshot};
 pub(crate) use terminal::{TuiOptions, run_tui};

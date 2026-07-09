@@ -5,10 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use probe_config::{
-    AgentConfig, ConfigError, DEFAULT_RUNTIME_RELOAD_WATCH_DEBOUNCE_MS, default_admin_socket_path,
-    default_storage_path,
-};
+use probe_config::{AgentConfig, ConfigError, DEFAULT_RUNTIME_RELOAD_WATCH_DEBOUNCE_MS};
 use rustix::{
     fs::{FlockOperation, Gid, Mode, OFlags, Uid, fchmod, fchown, flock},
     process::geteuid,
@@ -122,7 +119,16 @@ pub(crate) fn load_or_create_config(path: &Path) -> Result<LoadedTuiConfig, TuiE
 }
 
 fn create_minimal_config(path: &Path) -> Result<LoadedTuiConfig, TuiError> {
-    let source = minimal_config_source();
+    create_minimal_config_with_local_profile(path, &LocalProbeProfile::default())
+}
+
+fn create_minimal_config_with_local_profile(
+    path: &Path,
+    profile: &LocalProbeProfile,
+) -> Result<LoadedTuiConfig, TuiError> {
+    let source = minimal_config_source(profile);
+    let config = AgentConfig::from_toml_str(&source)?;
+    ensure_generated_local_paths(&config, profile)?;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -156,11 +162,10 @@ fn create_minimal_config(path: &Path) -> Result<LoadedTuiConfig, TuiError> {
             source,
         })?;
     sync_directory(parent)?;
-    let config = AgentConfig::from_toml_str(&source)?;
     Ok(LoadedTuiConfig { source, config })
 }
 
-fn minimal_config_source() -> String {
+fn minimal_config_source(profile: &LocalProbeProfile) -> String {
     format!(
         r#"agent_id = "traffic-probe"
 config_version = "local"
@@ -186,9 +191,9 @@ backend = "none"
 enabled = true
 socket_path = "{}"
 "#,
-        default_storage_path().display(),
+        profile.storage.display(),
         DEFAULT_RUNTIME_RELOAD_WATCH_DEBOUNCE_MS,
-        default_admin_socket_path().display()
+        profile.admin_socket.display()
     )
 }
 
@@ -991,13 +996,14 @@ codec = "zstd"
     {
         let temp = TempDir::new()?;
         let path = temp.path().join("nested").join("agent.toml");
+        let profile = LocalProbeProfile::with_root(temp.path());
 
-        let loaded = load_or_create_config(&path)?;
+        let loaded = create_minimal_config_with_local_profile(&path, &profile)?;
 
         assert_eq!(fs::read_to_string(&path)?, loaded.source);
         assert_eq!(loaded.config.agent_id, "traffic-probe");
         assert_eq!(loaded.config.capture.selection, CaptureSelection::Auto);
-        assert_eq!(loaded.config.storage.path, default_storage_path());
+        assert_eq!(loaded.config.storage.path, profile.storage);
         assert!(loaded.config.exporters.is_empty());
         assert!(loaded.config.runtime_reload.watch_config);
         assert_eq!(
@@ -1006,10 +1012,17 @@ codec = "zstd"
         );
         assert_eq!(loaded.config.enforcement.mode, EnforcementMode::AuditOnly);
         assert!(loaded.config.admin.enabled);
-        assert_eq!(loaded.config.admin.socket_path, default_admin_socket_path());
+        assert_eq!(loaded.config.admin.socket_path, profile.admin_socket);
         assert!(loaded.source.contains("[runtime_reload]"));
         assert!(loaded.source.contains("[admin]"));
         assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(profile.admin_socket.parent().expect("admin socket parent"))?
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
         loaded.config.validate_basic()?;
         Ok(())
     }

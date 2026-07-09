@@ -67,6 +67,7 @@ struct SharedManagedAgent {
     reload_candidate_path: PathBuf,
     socket_path: PathBuf,
     log_path: PathBuf,
+    shutdown_on_stop: bool,
     last_probe: Option<Instant>,
 }
 
@@ -284,10 +285,18 @@ impl TuiAgentSupervisor {
         }
     }
 
-    pub(crate) async fn stop(self) {
+    pub(crate) async fn stop(self) -> Result<(), TuiError> {
         match self.mode {
-            TuiAgentMode::Existing(agent) => cleanup_existing_agent(agent),
-            TuiAgentMode::SharedManaged(_) => {}
+            TuiAgentMode::Existing(agent) => {
+                cleanup_existing_agent(agent);
+                Ok(())
+            }
+            TuiAgentMode::SharedManaged(agent) => {
+                if agent.shutdown_on_stop {
+                    request_shared_managed_shutdown(&agent).await?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -309,7 +318,10 @@ impl ExistingAgent {
 }
 
 impl SharedManagedAgent {
-    fn from_layout(layout: &ManagedRuntimeLayout) -> Result<Self, TuiError> {
+    fn from_layout(
+        layout: &ManagedRuntimeLayout,
+        shutdown_on_stop: bool,
+    ) -> Result<Self, TuiError> {
         let reload_dir = layout
             .runtime_dir
             .join("reload")
@@ -322,6 +334,7 @@ impl SharedManagedAgent {
             reload_dir,
             socket_path: layout.socket_path.clone(),
             log_path: layout.log_path.clone(),
+            shutdown_on_stop,
             last_probe: None,
         })
     }
@@ -432,7 +445,9 @@ async fn spawn_managed_agent_with_locked_config(
         AdminSocketProbe::Responding => {
             if shared_managed_runtime_matches(config, &layout)? {
                 return Ok(TuiAgentSupervisor {
-                    mode: TuiAgentMode::SharedManaged(SharedManagedAgent::from_layout(&layout)?),
+                    mode: TuiAgentMode::SharedManaged(SharedManagedAgent::from_layout(
+                        &layout, false,
+                    )?),
                 });
             }
             request_shared_managed_shutdown_path(&layout.socket_path).await?;
@@ -495,7 +510,7 @@ async fn spawn_managed_agent_with_locked_config(
     startup_guard.disarm();
     child.detach();
     Ok(TuiAgentSupervisor {
-        mode: TuiAgentMode::SharedManaged(SharedManagedAgent::from_layout(&layout)?),
+        mode: TuiAgentMode::SharedManaged(SharedManagedAgent::from_layout(&layout, true)?),
     })
 }
 
@@ -1126,6 +1141,7 @@ mod tests {
                 reload_candidate_path: reload_candidate_path.clone(),
                 socket_path: socket_path.clone(),
                 log_path: temp.path().join("agent.log"),
+                shutdown_on_stop: false,
                 last_probe: None,
             }),
         };
@@ -1168,6 +1184,7 @@ mod tests {
                 reload_candidate_path: reload_dir.join("agent.toml"),
                 socket_path: socket_path.clone(),
                 log_path: log_path.clone(),
+                shutdown_on_stop: false,
                 last_probe: None,
             }),
         };
@@ -1329,6 +1346,88 @@ mod tests {
             error,
             TuiError::ManagedAgentShutdownTimeout { socket_path: _ }
         ));
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stop_requests_shared_managed_shutdown_and_cleans_session_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let socket_path = temp.path().join("admin.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path)?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept shutdown request");
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            let mut request = String::new();
+            {
+                let mut reader = BufReader::new(&mut stream);
+                reader
+                    .read_line(&mut request)
+                    .await
+                    .expect("read shutdown request");
+            }
+            let request: serde_json::Value =
+                serde_json::from_str(&request).expect("shutdown request should be JSON");
+            assert_eq!(request["command"], "shutdown");
+            stream
+                .write_all(b"{\"kind\":\"shutdown\",\"requested\":true}\n")
+                .await
+                .expect("write shutdown response");
+        });
+        let reload_dir = temp.path().join("reload");
+        fs::create_dir_all(&reload_dir)?;
+        let reload_candidate_path = reload_dir.join("agent.toml");
+        fs::write(&reload_candidate_path, "reload")?;
+        let supervisor = TuiAgentSupervisor {
+            mode: TuiAgentMode::SharedManaged(SharedManagedAgent {
+                boot_config_path: temp.path().join("boot-agent.toml"),
+                config_apply_lock_path: temp.path().join("config-apply.lock"),
+                reload_dir: reload_dir.clone(),
+                reload_candidate_path: reload_candidate_path.clone(),
+                socket_path,
+                log_path: temp.path().join("agent.log"),
+                shutdown_on_stop: true,
+                last_probe: None,
+            }),
+        };
+
+        supervisor.stop().await?;
+        server.await?;
+
+        assert!(!reload_candidate_path.exists());
+        assert!(!reload_dir.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stop_keeps_attached_shared_managed_runtime_running()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let socket_path = temp.path().join("admin.sock");
+        let server = spawn_persistent_admin_test_server(socket_path.clone())?;
+        let reload_dir = temp.path().join("reload");
+        fs::create_dir_all(&reload_dir)?;
+        let reload_candidate_path = reload_dir.join("agent.toml");
+        fs::write(&reload_candidate_path, "reload")?;
+        let supervisor = TuiAgentSupervisor {
+            mode: TuiAgentMode::SharedManaged(SharedManagedAgent {
+                boot_config_path: temp.path().join("boot-agent.toml"),
+                config_apply_lock_path: temp.path().join("config-apply.lock"),
+                reload_dir: reload_dir.clone(),
+                reload_candidate_path: reload_candidate_path.clone(),
+                socket_path: socket_path.clone(),
+                log_path: temp.path().join("agent.log"),
+                shutdown_on_stop: false,
+                last_probe: None,
+            }),
+        };
+
+        supervisor.stop().await?;
+
+        assert!(admin_socket_responds(&socket_path).await);
+        assert!(!reload_candidate_path.exists());
+        assert!(!reload_dir.exists());
         server.abort();
         Ok(())
     }

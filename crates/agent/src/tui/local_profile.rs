@@ -3,11 +3,12 @@ use std::path::PathBuf;
 use probe_config::{
     default_admin_socket_path, default_enforcement_policy_path, default_export_file_path,
     default_mitm_ca_certificate_path, default_mitm_ca_private_key_path,
-    default_mitm_plaintext_bridge_path, default_mitm_tls_root,
+    default_mitm_plaintext_bridge_path, default_mitm_tls_root, default_storage_path,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LocalProbeProfile {
+    pub(super) storage: PathBuf,
     pub(super) export_file: PathBuf,
     pub(super) admin_socket: PathBuf,
     pub(super) mitm: LocalMitmProfile,
@@ -25,6 +26,7 @@ pub(super) struct LocalMitmProfile {
 impl Default for LocalProbeProfile {
     fn default() -> Self {
         Self {
+            storage: default_storage_path(),
             export_file: default_export_file_path(),
             admin_socket: default_admin_socket_path(),
             mitm: LocalMitmProfile::default(),
@@ -48,6 +50,7 @@ impl LocalProbeProfile {
     #[cfg(test)]
     pub(super) fn with_root(root: &std::path::Path) -> Self {
         Self {
+            storage: root.join("spool"),
             export_file: root.join("export").join("events.jsonl"),
             admin_socket: root.join("run").join("admin.sock"),
             mitm: LocalMitmProfile::with_root(root),

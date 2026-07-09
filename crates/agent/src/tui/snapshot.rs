@@ -1,8 +1,4 @@
-use std::{
-    convert::Infallible,
-    io::{self, Write},
-    path::PathBuf,
-};
+use std::{convert::Infallible, path::PathBuf};
 
 use probe_config::default_config_path;
 use ratatui::{
@@ -37,7 +33,15 @@ pub(crate) struct TuiSnapshotOptions {
     pub(crate) detail_scroll: usize,
 }
 
-pub(crate) async fn run_tui_snapshot(options: TuiSnapshotOptions) -> Result<(), TuiError> {
+#[derive(Debug)]
+pub(crate) struct TuiSnapshotRender {
+    pub(crate) output: String,
+    pub(crate) cleanup_error: Option<TuiError>,
+}
+
+pub(crate) async fn render_tui_snapshot(
+    options: TuiSnapshotOptions,
+) -> Result<TuiSnapshotRender, TuiError> {
     let (width, height) = options.size();
     let config_path = resolve_config_path(options.config);
     let loaded = load_or_create_config(&config_path)?;
@@ -74,12 +78,15 @@ pub(crate) async fn run_tui_snapshot(options: TuiSnapshotOptions) -> Result<(), 
     } else {
         render_snapshot_text(&mut app, width, height)
     };
-    if let Some(supervisor) = supervisor.take() {
-        supervisor.stop().await;
-    }
+    let cleanup_error = match supervisor.take() {
+        Some(supervisor) => supervisor.stop().await.err(),
+        None => None,
+    };
 
-    io::stdout().write_all(output.as_bytes())?;
-    Ok(())
+    Ok(TuiSnapshotRender {
+        output,
+        cleanup_error,
+    })
 }
 
 impl TuiSnapshotOptions {
