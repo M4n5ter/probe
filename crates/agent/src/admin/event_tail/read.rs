@@ -145,7 +145,7 @@ struct TailRecordAccumulator {
     truncated: bool,
     truncated_at_sequence: Option<u64>,
     events: Vec<EventTailRecord>,
-    latest_candidates: VecDeque<TailRecordCandidate>,
+    latest_candidates: VecDeque<TailResponseCandidate>,
     omissions: Vec<EventTailOmission>,
 }
 
@@ -178,11 +178,8 @@ impl TailRecordAccumulator {
         payload_schema: String,
         payload_bytes: usize,
     ) -> Result<bool, EventTailError> {
-        let candidate = TailRecordCandidate {
-            record,
-            payload_schema,
-            payload_bytes,
-        };
+        let candidate =
+            TailResponseCandidate::from_matched_record(record, payload_schema, payload_bytes);
         if self.latest_filtered {
             if self.latest_candidates.len() >= self.limit {
                 self.latest_candidates.pop_front();
@@ -207,31 +204,46 @@ impl TailRecordAccumulator {
 
     fn push_response_candidate(
         &mut self,
-        candidate: TailRecordCandidate,
+        candidate: TailResponseCandidate,
     ) -> Result<bool, EventTailError> {
-        let record_bytes = tail_record_budget_bytes(&candidate.record)?;
+        let record = candidate.record;
+        let record_bytes = tail_record_budget_bytes(&record)?;
         if self.included_record_bytes.saturating_add(record_bytes) > MAX_TAIL_RECORD_BYTES {
             self.omissions.push(EventTailOmission {
-                sequence: candidate.record.sequence,
-                stored_at_unix_ns: candidate.record.stored_at_unix_ns,
+                sequence: record.sequence,
+                stored_at_unix_ns: record.stored_at_unix_ns,
                 payload_schema: candidate.payload_schema,
                 payload_bytes: candidate.payload_bytes,
                 reason: EventTailOmissionReason::ResponseBudgetExceeded,
             });
             self.truncated = true;
-            self.truncated_at_sequence = Some(candidate.record.sequence);
+            self.truncated_at_sequence = Some(record.sequence);
             return Ok(true);
         }
         self.included_record_bytes = self.included_record_bytes.saturating_add(record_bytes);
-        self.events.push(candidate.record);
+        self.events.push(record);
         Ok(self.events.len() >= self.limit)
     }
 }
 
-struct TailRecordCandidate {
+struct TailResponseCandidate {
     record: EventTailRecord,
     payload_schema: String,
     payload_bytes: usize,
+}
+
+impl TailResponseCandidate {
+    fn from_matched_record(
+        record: EventTailRecord,
+        payload_schema: String,
+        payload_bytes: usize,
+    ) -> Self {
+        Self {
+            record: record.into_compact_response(),
+            payload_schema,
+            payload_bytes,
+        }
+    }
 }
 
 fn effective_after_sequence(
@@ -584,6 +596,144 @@ mod tests {
                 EventTailKind::HttpBodyChunk(chunk) if chunk.data_len >= 16 * 1024
             ),
             "tail should preserve body length metadata without serializing body bytes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tail_events_compact_process_cmdline_after_selector_matching()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempdir()?;
+        let spool = FjallSpool::open(temp.path())?;
+        let cmdline = vec![
+            "/usr/bin/python3".to_string(),
+            "--tenant".to_string(),
+            "managed".to_string(),
+            "x".repeat(128 * 1024),
+        ];
+        let event = event_with_cmdline(
+            "/usr/bin/python3",
+            cmdline.clone(),
+            EventKind::HttpRequestHeaders(HttpHeaders {
+                direction: Direction::Outbound,
+                stream_sequence: 1,
+                method: Some("GET".to_string()),
+                target: Some("/".to_string()),
+                status: None,
+                reason: None,
+                version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+            }),
+        );
+        ExportEventWriter::new(&spool).append_occurrence(&event)?;
+
+        let tail = read_event_tail(
+            &spool,
+            EventTailRequest {
+                selector: Some(Selector::term(
+                    ProcessSelector {
+                        cmdline_regexes: vec!["--tenant managed".to_string()],
+                        ..ProcessSelector::default()
+                    },
+                    TrafficSelector::default(),
+                )),
+                ..tail_request()
+            },
+        )?;
+
+        assert_eq!(tail.events.len(), 1);
+        let tail_flow = tail.events[0]
+            .event
+            .flow
+            .as_ref()
+            .expect("tail event should keep flow identity");
+        assert!(
+            tail_flow.process.cmdline.is_empty(),
+            "tail response should not repeat raw argv"
+        );
+        assert!(
+            tail.budget.included_record_bytes < 4096,
+            "tail response should budget the compact record"
+        );
+
+        let detail = read_event_detail(&spool, 1)?;
+        assert_eq!(
+            detail
+                .event
+                .flow()
+                .expect("detail should keep flow identity")
+                .process
+                .cmdline,
+            cmdline
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn latest_filtered_accumulator_keeps_compact_response_candidates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cmdline = vec![
+            "/usr/bin/python3".to_string(),
+            "--tenant".to_string(),
+            "managed".to_string(),
+            "x".repeat(128 * 1024),
+        ];
+        let event = event_with_cmdline(
+            "/usr/bin/python3",
+            cmdline,
+            EventKind::HttpRequestHeaders(HttpHeaders {
+                direction: Direction::Outbound,
+                stream_sequence: 1,
+                method: Some("GET".to_string()),
+                target: Some("/".to_string()),
+                status: None,
+                reason: None,
+                version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+            }),
+        );
+        let mut tail = TailRecordAccumulator::new(16, true);
+
+        tail.push_record(
+            EventTailRecord {
+                sequence: 1,
+                stored_at_unix_ns: 1,
+                event: EventTailEvent::from_envelope(&event),
+            },
+            SpoolPayloadSchema::EventEnvelopeSubjectOriginJson
+                .as_str()
+                .to_string(),
+            0,
+        )?;
+
+        let candidate = tail
+            .latest_candidates
+            .front()
+            .expect("latest-filtered tail should retain the matched candidate");
+        assert!(
+            candidate
+                .record
+                .event
+                .flow
+                .as_ref()
+                .expect("candidate should keep flow identity")
+                .process
+                .cmdline
+                .is_empty(),
+            "latest-filtered accumulator must not retain raw argv"
+        );
+
+        let tail = tail.into_response()?;
+        assert_eq!(tail.events.len(), 1);
+        assert!(
+            tail.events[0]
+                .event
+                .flow
+                .as_ref()
+                .expect("response should keep flow identity")
+                .process
+                .cmdline
+                .is_empty()
         );
         Ok(())
     }
@@ -945,6 +1095,21 @@ mod tests {
                 data: vec![b'a'; min_body_len].into(),
                 end_stream: true,
             }),
+        )
+    }
+
+    fn event_with_cmdline(exe_path: &str, cmdline: Vec<String>, kind: EventKind) -> EventEnvelope {
+        let mut flow = flow_for_exe(exe_path);
+        flow.process.cmdline = cmdline;
+        EventEnvelope::from_flow(
+            Timestamp {
+                monotonic_ns: 1,
+                wall_time_unix_ns: 1,
+            },
+            flow,
+            CaptureOrigin::from_source(CaptureSource::Replay),
+            "test",
+            kind,
         )
     }
 

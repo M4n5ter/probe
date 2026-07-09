@@ -37,6 +37,13 @@ pub(crate) struct EventTailRecord {
     pub event: EventTailEvent,
 }
 
+impl EventTailRecord {
+    pub(super) fn into_compact_response(mut self) -> Self {
+        self.event.compact_for_response();
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct EventTailEvent {
     pub id: EventId,
@@ -50,6 +57,12 @@ pub(crate) struct EventTailEvent {
 }
 
 impl EventTailEvent {
+    fn compact_for_response(&mut self) {
+        if let Some(flow) = &mut self.flow {
+            flow.process.cmdline = Vec::new();
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn from_envelope(event: &EventEnvelope) -> Self {
         Self {
