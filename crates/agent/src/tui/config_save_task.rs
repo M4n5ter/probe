@@ -300,7 +300,9 @@ fn apply_successful_save(
 
 #[cfg(test)]
 mod tests {
-    use super::{super::processes::ProcessCatalog, *};
+    use crate::process_catalog::ProcessCatalog;
+
+    use super::*;
     use crate::tui::app::StatusKind;
 
     #[tokio::test]

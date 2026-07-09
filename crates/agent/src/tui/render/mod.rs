@@ -520,10 +520,10 @@ mod tests {
             controls::{ControlId, TRAFFIC_FILTER_CONTROLS, TRAFFIC_VIEW_CONTROLS},
             fields::FieldId,
             hit::ScrollTarget,
-            processes::{ProcessCatalog, ProcessEntry},
         },
         *,
     };
+    use crate::process_catalog::{ProcessCatalog, ProcessEntry};
 
     #[test]
     fn render_overview_exposes_config_and_status() -> Result<(), Box<dyn std::error::Error>> {

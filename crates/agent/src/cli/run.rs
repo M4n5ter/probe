@@ -19,6 +19,7 @@ use probe_core::{
 };
 use probe_io::{BoundedFileError, BoundedFileErrorKind};
 use runtime::EMBEDDED_PRODUCT_PROXY_COMMAND;
+use serde::Serialize;
 use storage::FjallSpool;
 
 use crate::{
@@ -27,6 +28,7 @@ use crate::{
     error::AgentError,
     export::drain_replay_webhook,
     live_agent::{ReadinessSignal, RunOptions, run_live_agent},
+    process_catalog::{ProcessCatalog, ProcessEntry},
     runtime_composition::{
         build_runtime_composition, build_runtime_composition_with_diagnostics,
         capability_matrix_for_config,
@@ -69,6 +71,14 @@ enum Command {
     Status {
         #[arg(long)]
         config: PathBuf,
+    },
+    Processes {
+        #[arg(long)]
+        pid: Option<u32>,
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
     },
     Tui {
         #[arg(long)]
@@ -254,6 +264,13 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
             let snapshot = build_status_snapshot(&plan, spool_status);
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
         }
+        Command::Processes { pid, query, limit } => {
+            let snapshot = process_list_snapshot(
+                &ProcessCatalog::from_proc_processes_only(),
+                ProcessListFilter { pid, query, limit },
+            );
+            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        }
         Command::Tui {
             config,
             snapshot,
@@ -309,6 +326,79 @@ async fn run(cli: Cli) -> Result<(), AgentError> {
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ProcessListFilter {
+    pid: Option<u32>,
+    query: Option<String>,
+    limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ProcessListSnapshot {
+    entries: Vec<ProcessListEntry>,
+    total: usize,
+    matched: usize,
+    returned: usize,
+    truncated: bool,
+    diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ProcessListEntry {
+    pid: u32,
+    process_key: String,
+    observation_key: String,
+    name: String,
+    exe_path: Option<String>,
+    argv: Vec<String>,
+    uid: u32,
+    gid: u32,
+    cgroup_path: Option<String>,
+}
+
+fn process_list_snapshot(
+    catalog: &ProcessCatalog,
+    filter: ProcessListFilter,
+) -> ProcessListSnapshot {
+    let query = filter.query.as_deref().unwrap_or_default();
+    let matched = catalog
+        .entries()
+        .iter()
+        .filter(|entry| filter.pid.is_none_or(|pid| entry.pid == pid))
+        .filter(|entry| entry.matches_query(query))
+        .collect::<Vec<_>>();
+    let entries = matched
+        .iter()
+        .take(filter.limit)
+        .map(|entry| process_list_entry(entry))
+        .collect::<Vec<_>>();
+    ProcessListSnapshot {
+        total: catalog.entries().len(),
+        matched: matched.len(),
+        returned: entries.len(),
+        truncated: matched.len() > entries.len(),
+        diagnostics: catalog.diagnostics().to_vec(),
+        entries,
+    }
+}
+
+fn process_list_entry(entry: &ProcessEntry) -> ProcessListEntry {
+    ProcessListEntry {
+        pid: entry.pid,
+        process_key: entry.process_key.clone(),
+        observation_key: entry.observation_key(),
+        name: entry.name.clone(),
+        exe_path: entry
+            .exe_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        argv: entry.argv.clone(),
+        uid: entry.uid,
+        gid: entry.gid,
+        cgroup_path: entry.cgroup_path.clone(),
+    }
 }
 
 fn resolve_admin_socket(socket: Option<PathBuf>) -> PathBuf {
@@ -697,6 +787,70 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(args).is_err());
         }
+    }
+
+    #[test]
+    fn processes_cli_accepts_filters() {
+        let cli = Cli::try_parse_from([
+            "traffic-probe",
+            "processes",
+            "--pid",
+            "42",
+            "--query",
+            "backend",
+            "--limit",
+            "10",
+        ])
+        .expect("processes command should accept filters");
+
+        let Command::Processes { pid, query, limit } = cli.command else {
+            panic!("expected processes command");
+        };
+
+        assert_eq!(pid, Some(42));
+        assert_eq!(query.as_deref(), Some("backend"));
+        assert_eq!(limit, 10);
+    }
+
+    #[test]
+    fn process_list_snapshot_serializes_operator_contract() {
+        let catalog = ProcessCatalog::from_entries([
+            process_entry(41, "backend-alpha", "/usr/bin/backend-alpha"),
+            process_entry(42, "backend-beta", "/app/backend-beta"),
+        ])
+        .with_diagnostics(["procfs process 99 failed: permission denied".to_string()]);
+
+        let snapshot = process_list_snapshot(
+            &catalog,
+            ProcessListFilter {
+                pid: None,
+                query: Some("backend".to_string()),
+                limit: 1,
+            },
+        );
+        let output = serde_json::to_value(&snapshot).expect("snapshot should serialize");
+
+        assert_eq!(
+            output,
+            serde_json::json!({
+                "entries": [{
+                    "pid": 41,
+                    "process_key": "process-key-41",
+                    "observation_key": "process:process-key-41",
+                    "name": "backend-alpha",
+                    "exe_path": "/usr/bin/backend-alpha",
+                    "argv": ["backend-alpha"],
+                    "uid": 1000,
+                    "gid": 1000,
+                    "cgroup_path": "system.slice/backend-alpha.service"
+                }],
+                "total": 2,
+                "matched": 2,
+                "returned": 1,
+                "truncated": true,
+                "diagnostics": ["procfs process 99 failed: permission denied"]
+            })
+        );
     }
 
     #[test]
@@ -1376,5 +1530,18 @@ hooks = ["on_http_request_headers"]
         )?;
         fs::write(path.join("main.lua"), source)?;
         Ok(())
+    }
+
+    fn process_entry(pid: u32, name: &str, exe_path: &str) -> ProcessEntry {
+        ProcessEntry {
+            pid,
+            process_key: format!("process-key-{pid}"),
+            name: name.to_string(),
+            exe_path: Some(PathBuf::from(exe_path)),
+            argv: vec![name.to_string()],
+            uid: 1000,
+            gid: 1000,
+            cgroup_path: Some(format!("system.slice/{name}.service")),
+        }
     }
 }

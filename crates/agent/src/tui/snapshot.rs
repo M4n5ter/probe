@@ -11,12 +11,13 @@ use ratatui::{
     buffer::{Buffer, CellWidth},
 };
 
+use crate::process_catalog::ProcessCatalog;
+
 use super::{
     agent::TuiAgentSupervisor,
     app::{TuiAction, TuiApp, TuiTab, load_traffic_refresh_with_diagnostics},
     config_edit::{TuiError, load_or_create_config},
     hit::ScrollTarget,
-    processes::ProcessCatalog,
     render::draw,
     traffic::load_traffic_detail,
 };

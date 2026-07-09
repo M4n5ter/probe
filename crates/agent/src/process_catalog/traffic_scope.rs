@@ -5,7 +5,7 @@ use probe_core::Selector;
 
 use crate::admin::UnknownProcessCandidateSelector;
 
-use super::processes::selector_for_exe_path;
+use super::catalog::selector_for_exe_path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProcessTrafficSelector {

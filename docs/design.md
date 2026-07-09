@@ -324,8 +324,13 @@ Operator TUI 能力事实：
   diagnostic，强 process-key selector 继续生效。TUI 发送 `tail_events` 前还会对完整 admin request
   执行大小预检；若强 selector 与弱候选组合超过 admin request budget，则丢弃弱候选后重试，强 selector
   本身超过预算时才报告 request-too-large 错误。
+- `agent processes` 暴露同一 procfs process identity 模型的非交互式 JSON 视图。`process_key`
+  是 scoped capture selector 中 `process_keys = [...]` 使用的值；`observation_key`
+  是 TUI watch profile 使用的稳定注册 key。该命令只执行进程身份扫描，不构建 listener port
+  index，因此不依赖 `ps`、`ss` 或 active admin socket，适合在远端排查 TUI watch、
+  process-scoped capture selector 与 live eBPF 深度观测是否指向同一个进程身份。
 - Processes tab 提供同级键盘/鼠标浏览和搜索。`/`、`Ctrl-F` 与 `[Search]` 进入同一 process
-  search edit session，按 PID、进程名和 executable path 过滤；`[Clear]` 清除过滤。选择和滚动基于过滤后的
+  search edit session，按 PID、进程名、executable path 和 argv 过滤；`[Clear]` 清除过滤。选择和滚动基于过滤后的
   viewport offset，移动选中项时保留上下文行，而不是把选中行固定到列表顶部。
 - Traffic tab 通过 admin Unix socket 调用 `tail_events`，从 durable export queue 读取 bounded event tail。
   该路径返回完整 `EventEnvelope` 给 admin client，但 TUI 只保留事件表展示摘要，不在 TUI model 中保留 raw argv。
@@ -5469,6 +5474,9 @@ benchmark 参数：
   `tail-events`、`reload-runtime-actions`、`reload-policies` 或 `reload-enforcement-policy`。
 - `replay`：用 pcap/spool 样本跑 parser/policy/exporter。
 - `capabilities`：输出 capability matrix；可选 `--config` 时按配置中的 provider-specific 输入做能力探测，否则使用默认配置。
+- `processes`：输出本机 procfs process catalog 的 JSON 视图，支持 `--pid`、`--query` 和 `--limit`。
+  每个 entry 包含 `process_key`、`observation_key`、argv、uid/gid、executable path 和 cgroup path。
+  该命令只证明 process identity 与 selector material，不读取 admin socket，也不把 listener-port 弱候选当成强归因。
 
 `replay` 是关键能力，因为 parser、Lua 策略和 exporter schema 都需要可重复验证。
 

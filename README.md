@@ -243,14 +243,17 @@ The TUI is a config workbench for common server operations. It reads `/proc`
 through the same procfs attribution model used by the agent and shows readable
 processes. Keyboard and mouse are equal interaction modes: every common action
 is modeled once and exposed through both key bindings and rendered hit targets.
-Process scopes are written only when the process has a readable executable path;
-argv is not retained by the TUI model, and the process table shows only a
-redacted argv count. The Processes tab supports keyboard and mouse browsing plus
-process search. Use `/`, `Ctrl-F`, or `[Search]` to filter by PID, process
-name, or executable path; `[Clear]` removes the filter. Save takes an advisory
-lock, refuses stale files, validates the rendered config, and uses an atomic
-same-directory write. The config path must be a direct file path; symlink paths
-are rejected so save never replaces a link with a regular file.
+Process scopes are written as stable process-key selectors, not bare PIDs or
+process names. If a process identity cannot be represented safely, scoped
+capture/enforcement actions fail closed. The process catalog keeps argv for
+search and detail views, escapes control characters before rendering, and
+applies bounded summaries in tables. The Processes tab supports keyboard and
+mouse browsing plus process search. Use `/`, `Ctrl-F`, or `[Search]` to filter
+by PID, process name, executable path, or argv; `[Clear]` removes the filter.
+Save takes an advisory lock, refuses stale files, validates the rendered config,
+and uses an atomic same-directory write. The config path must be a direct file
+path; symlink paths are rejected so save never replaces a link with a regular
+file.
 
 The workbench can add a default exporter, switch exporter transport, edit
 webhook endpoints, file paths, Unix HTTP socket paths, exporter compression,
@@ -278,13 +281,30 @@ is not mutated just because the TUI needs a runtime admin socket. If managed
 startup fails, the TUI error includes the log path and a short tail so the real
 agent startup error is visible.
 
+For non-interactive process identity inspection, use:
+
+```bash
+cargo run -p agent --locked -- processes --query backend --limit 20
+cargo run -p agent --locked -- processes --pid 1234 --limit 1
+```
+
+The command prints JSON entries with `process_key` and `observation_key`.
+`process_key` is the value used in TOML selectors such as
+`process_keys = ["..."]`; `observation_key` is the corresponding TUI watch
+profile key. Operators can verify the exact process identity before applying a
+live observation profile. The command reads procfs directly and does not require
+an admin socket or distro-specific tools such as `ps` or `ss`.
+
 The Traffic tab tails parsed export events from the active agent admin surface.
-It uses the selected process executable-path selector when available; if the
-selected process has no readable executable path, traffic filtering fails closed
-instead of showing unrelated host traffic. The TUI keeps only display summaries
-for the event table and does not retain raw process argv. When a bounded tail
-row needs full payload detail, the detail popup loads the retained event through
-the admin surface in the background.
+It uses stable process-key selectors for watched processes. If the selected
+process cannot provide a stable identity, process-scoped traffic filtering fails
+closed instead of falling back to broad process-name matching. When libpcap can
+only produce unknown-process events, the TUI may include listener-port weak
+candidates for display, but those rows remain marked as weak attribution. The
+TUI keeps only display summaries for the event table and does not retain raw
+process argv in traffic rows. When a bounded tail row needs full payload detail,
+the detail popup loads the retained event through the admin surface in the
+background.
 Traffic can be viewed as HTTP exchanges, WebSocket sessions, or raw events.
 Live traffic is presented newest-first so fresh requests remain visible at the
 top while older rows remain reachable by scrolling. The HTTP view groups request

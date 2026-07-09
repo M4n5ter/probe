@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 use probe_config::AgentConfig;
 
+use crate::process_catalog::{ProcessCatalog, ProcessEntry, ProcessTrafficSelector};
+
 use super::controls::{ControlId, FocusTarget, focus_targets_for_tab};
 use super::data_path::{
     DataPathCompactSummary, DataPathDiagnosticsView, DataPathOverviewLine,
@@ -16,9 +18,7 @@ use super::observation_setup::{
     ProcessObservationMode, process_observation_selectors, remove_process_observation,
     replace_process_observations_with, upsert_process_observation,
 };
-use super::process_traffic_scope::ProcessTrafficSelector;
 use super::process_view::ProcessViewState;
-use super::processes::{ProcessCatalog, ProcessEntry};
 use super::runtime_attachment::RuntimeAttachment;
 use super::runtime_status::{
     ActiveRuntimeGeneration, RuntimeGenerationReloadObservation, TrafficRuntimeDiagnostics,
@@ -477,12 +477,10 @@ impl TuiApp {
     }
 
     pub(crate) fn process_is_monitored(&self, index: usize) -> bool {
-        self.processes
-            .entries()
-            .get(index)
-            .and_then(|process| process.selector_key())
-            .as_deref()
-            .is_some_and(|key| self.process_view.monitors_process(Some(key)))
+        self.processes.entries().get(index).is_some_and(|process| {
+            self.process_view
+                .monitors_process(&process.observation_key())
+        })
     }
 
     pub(crate) fn hovered_process_argv(&self) -> Option<ProcessArgvHover> {
@@ -1297,10 +1295,8 @@ impl TuiApp {
             self.status = StatusMessage::warning("No selected process");
             return None;
         };
-        let Some((key, selector)) = process.selector_key().zip(process.selector()) else {
-            self.status = StatusMessage::warning("Selected process cannot be observed");
-            return None;
-        };
+        let key = process.observation_key();
+        let selector = process.selector();
         let process_name = process.name.clone();
         match monitor_mode {
             MonitorMode::Keep => {
@@ -1328,10 +1324,7 @@ impl TuiApp {
             self.status = StatusMessage::warning("No selected process");
             return None;
         };
-        let Some(key) = process.selector_key() else {
-            self.status = StatusMessage::warning("Selected process cannot be observed");
-            return None;
-        };
+        let key = process.observation_key();
         let process_name = process.name.clone();
         self.process_view.select(index, &self.processes);
         if !remove_process_observation(&mut self.config, &key) {
@@ -1483,7 +1476,7 @@ impl TuiApp {
     }
 
     fn selected_process_selector(&self) -> Option<probe_core::Selector> {
-        self.selected_process().and_then(ProcessEntry::selector)
+        self.selected_process().map(ProcessEntry::selector)
     }
 
     fn selected_process(&self) -> Option<&ProcessEntry> {
@@ -1845,13 +1838,13 @@ mod tests {
         super::{
             controls::{ControlId, FocusTarget},
             copy::MITM_PLAINTEXT_COVERAGE,
-            processes::{ProcessCatalog, ProcessEntry, selector_for_pid},
             runtime_attachment::RuntimeAttachment,
             text::INLINE_TEXT_MAX_CHARS,
             traffic::TrafficStatusKind,
         },
         *,
     };
+    use crate::process_catalog::{ProcessCatalog, ProcessEntry, selector_for_pid};
 
     #[test]
     fn detach_agent_stores_terminal_safe_runtime_status() {
@@ -2720,7 +2713,7 @@ mod tests {
     }
 
     #[test]
-    fn traffic_view_uses_all_processes_when_selected_process_has_no_selector() {
+    fn traffic_view_uses_all_processes_without_explicit_watch() {
         let config = AgentConfig::default();
         let mut app = TuiApp::new(
             PathBuf::from("/tmp/agent.toml"),
@@ -2760,7 +2753,7 @@ mod tests {
             ProcessTrafficSelector::all_processes()
         );
 
-        let unavailable = TuiApp::new(
+        let selected_process = TuiApp::new(
             PathBuf::from("/tmp/agent.toml"),
             AgentConfig::default(),
             ProcessCatalog::from_entries([ProcessEntry {
@@ -2775,7 +2768,7 @@ mod tests {
             }]),
         );
         assert_eq!(
-            unavailable.traffic_filter_selector(),
+            selected_process.traffic_filter_selector(),
             ProcessTrafficSelector::all_processes()
         );
     }

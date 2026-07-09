@@ -4,7 +4,7 @@ use attribution::{ProcessAttributor, ProcfsAttributor};
 use probe_core::ProcessContext;
 use probe_core::{ProcessSelector, Selector, TrafficSelector};
 
-use super::process_traffic_scope::{ProcessTrafficScope, ProcessTrafficSelector};
+use super::traffic_scope::{ProcessTrafficScope, ProcessTrafficSelector};
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ProcessEntry {
@@ -35,12 +35,12 @@ impl fmt::Debug for ProcessEntry {
 }
 
 impl ProcessEntry {
-    pub(crate) fn selector_key(&self) -> Option<String> {
-        Some(process_observation_key_for_process_key(&self.process_key))
+    pub(crate) fn observation_key(&self) -> String {
+        process_observation_key_for_process_key(&self.process_key)
     }
 
-    pub(crate) fn selector(&self) -> Option<Selector> {
-        Some(selector_for_process_key(self.process_key.clone()))
+    pub(crate) fn selector(&self) -> Selector {
+        selector_for_process_key(self.process_key.clone())
     }
 
     pub(crate) fn observation_scope_label(&self) -> &'static str {
@@ -184,6 +184,10 @@ impl ProcessCatalog {
         catalog
     }
 
+    pub(crate) fn from_proc_processes_only() -> Self {
+        Self::from_attributor(&ProcfsAttributor::new())
+    }
+
     fn from_attributor(attributor: &ProcfsAttributor) -> Self {
         let pids = match attributor.process_ids() {
             Ok(pids) => pids,
@@ -232,6 +236,10 @@ impl ProcessCatalog {
         &self.entries
     }
 
+    pub(crate) fn diagnostics(&self) -> &[String] {
+        &self.diagnostics
+    }
+
     pub(crate) fn traffic_selector_for_observations(
         &self,
         observations: impl IntoIterator<Item = (String, Selector)>,
@@ -278,6 +286,15 @@ impl ProcessCatalog {
             diagnostics: Vec::new(),
             traffic_scope: ProcessTrafficScope::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_diagnostics(
+        mut self,
+        diagnostics: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.diagnostics = diagnostics.into_iter().collect();
+        self
     }
 
     #[cfg(test)]
@@ -345,10 +362,7 @@ fn exe_paths_for_keys(entries: &[ProcessEntry], keys: &[&str]) -> Vec<String> {
         .iter()
         .filter(|process| {
             let pid_key = process_observation_key_for_pid(process.pid);
-            process
-                .selector_key()
-                .as_deref()
-                .is_some_and(|key| requested.contains(key))
+            requested.contains(process.observation_key().as_str())
                 || requested.contains(pid_key.as_str())
         })
         .filter_map(process_exe_path)
@@ -438,10 +452,7 @@ mod tests {
             cgroup_path: None,
         };
 
-        let Some(selector) = entry.selector() else {
-            panic!("process entry should produce a process-key selector");
-        };
-
+        let selector = entry.selector();
         let Selector::Match { term } = selector else {
             panic!("process entry should create a match selector");
         };
@@ -464,7 +475,7 @@ mod tests {
             cgroup_path: None,
         };
 
-        let Some(Selector::Match { term }) = entry.selector() else {
+        let Selector::Match { term } = entry.selector() else {
             panic!("process entry should create a process-key selector");
         };
         assert!(term.process.pids.is_empty());

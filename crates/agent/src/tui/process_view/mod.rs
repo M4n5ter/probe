@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 
-use super::{processes::ProcessCatalog, scrollbar::drag_position_to_scroll};
+use crate::process_catalog::ProcessCatalog;
+
+use super::scrollbar::drag_position_to_scroll;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProcessViewState {
@@ -40,8 +42,8 @@ impl ProcessViewState {
         self.monitored_process_keys.len()
     }
 
-    pub(crate) fn monitors_process(&self, selector_key: Option<&str>) -> bool {
-        selector_key.is_some_and(|key| self.monitored_process_keys.contains(key))
+    pub(crate) fn monitors_process(&self, observation_key: &str) -> bool {
+        self.monitored_process_keys.contains(observation_key)
     }
 
     pub(crate) fn replace_monitors(
@@ -54,7 +56,7 @@ impl ProcessViewState {
             && let Some(index) = catalog
                 .entries()
                 .iter()
-                .position(|entry| self.monitors_process(entry.selector_key().as_deref()))
+                .position(|entry| self.monitors_process(&entry.observation_key()))
         {
             self.selected_index = Some(index);
             self.keep_selected_visible(catalog);
@@ -90,13 +92,10 @@ impl ProcessViewState {
     }
 
     pub(crate) fn set_single_monitor(&mut self, index: usize, catalog: &ProcessCatalog) -> bool {
-        let Some(key) = catalog
-            .entries()
-            .get(index)
-            .and_then(|entry| entry.selector_key())
-        else {
+        let Some(process) = catalog.entries().get(index) else {
             return false;
         };
+        let key = process.observation_key();
         self.monitored_process_keys.clear();
         self.monitored_process_keys.insert(key);
         self.select(index, catalog);
@@ -108,10 +107,7 @@ impl ProcessViewState {
         index: usize,
         catalog: &ProcessCatalog,
     ) -> Option<bool> {
-        let key = catalog
-            .entries()
-            .get(index)
-            .and_then(|entry| entry.selector_key())?;
+        let key = catalog.entries().get(index)?.observation_key();
         let monitored = if self.monitored_process_keys.remove(&key) {
             false
         } else {
@@ -219,7 +215,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::tui::processes::ProcessEntry;
+    use crate::process_catalog::ProcessEntry;
 
     #[test]
     fn replace_monitors_selects_and_reveals_configured_process() {
@@ -236,7 +232,7 @@ mod tests {
 
         assert_eq!(view.selected_index(), Some(3));
         assert_eq!(view.scroll(), 2);
-        assert!(view.monitors_process(Some("process:process-key-4")));
+        assert!(view.monitors_process("process:process-key-4"));
     }
 
     #[test]

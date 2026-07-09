@@ -16,6 +16,8 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 use probe_config::{AgentConfig, default_config_path};
 
+use crate::process_catalog::ProcessCatalog;
+
 use super::{
     agent::TuiAgentSupervisor,
     app::{
@@ -30,7 +32,6 @@ use super::{
         STARTUP_BACKGROUND_STATUS, apply_process_catalog_load_result,
         cancel_pending_process_catalog, spawn_process_catalog_load, take_finished_process_catalog,
     },
-    processes::ProcessCatalog,
     render::draw,
     runtime_reconcile::{
         PendingRuntimeReconcile, QueuedRuntimeReconcile, apply_runtime_reconcile_result,
@@ -708,7 +709,6 @@ mod tests {
         super::{
             app::{StatusKind, StatusMessage, TuiAction, TuiApp, TuiTab},
             hit::{HitArea, HitMap, HitTarget, ScrollTarget},
-            processes::{ProcessCatalog, ProcessEntry},
             render::draw,
             runtime_reconcile::{
                 completed_blocking_saved_runtime_reconcile_for_test,
@@ -718,6 +718,7 @@ mod tests {
         },
         *,
     };
+    use crate::process_catalog::{ProcessCatalog, ProcessEntry};
 
     #[test]
     fn key_events_translate_to_tui_actions() {

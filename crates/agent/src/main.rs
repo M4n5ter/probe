@@ -23,6 +23,7 @@ mod plaintext_feed;
 mod policy_reload;
 mod policy_reload_poller;
 mod policy_reload_watcher;
+mod process_catalog;
 mod reload_watcher;
 mod remote_source;
 mod runtime_composition;

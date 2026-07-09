@@ -124,7 +124,7 @@ mod tests {
     use probe_config::AgentConfig;
 
     use super::*;
-    use crate::tui::{processes::ProcessCatalog, runtime_attachment::RuntimeAttachment};
+    use crate::{process_catalog::ProcessCatalog, tui::runtime_attachment::RuntimeAttachment};
 
     #[tokio::test]
     async fn detail_task_pool_drains_all_finished_tasks_without_blocking_pending_tasks() {

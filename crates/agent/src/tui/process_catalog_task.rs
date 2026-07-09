@@ -1,7 +1,6 @@
-use super::{
-    app::{StatusKind, StatusMessage, TuiApp},
-    processes::ProcessCatalog,
-};
+use crate::process_catalog::ProcessCatalog;
+
+use super::app::{StatusKind, StatusMessage, TuiApp};
 
 pub(super) const STARTUP_BACKGROUND_STATUS: &str =
     "Loading process list and starting or attaching TUI agent in background";
@@ -97,10 +96,9 @@ mod tests {
 
     use probe_config::AgentConfig;
 
-    use super::{
-        super::processes::{ProcessCatalog, ProcessEntry},
-        *,
-    };
+    use crate::process_catalog::{ProcessCatalog, ProcessEntry};
+
+    use super::*;
 
     #[test]
     fn process_catalog_load_does_not_hide_agent_errors() {

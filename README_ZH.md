@@ -220,9 +220,12 @@ cargo run -p agent --locked -- tui
 
 TUI 是面向常见服务器操作的配置工作台。它通过 agent 共用的 procfs attribution
 模型读取 `/proc`，展示可读进程。键盘和鼠标是同级交互方式：常见 action 只建模
-一次，并同时通过 key binding 和 rendered hit target 暴露。只有进程具备可读
-executable path 时才会写入 process scope；进程表默认只展示隐藏后的 argv count，
-TUI model 不保留 raw argv。保存会获取 advisory lock，拒绝已被外部修改的配置文件，
+一次，并同时通过 key binding 和 rendered hit target 暴露。进程 scope 写入的是
+stable process-key selector，不使用裸 PID 或进程名。进程身份无法安全表达时，
+scoped capture/enforcement action 会 fail closed。process catalog 保留 argv 供搜索和详情查看，
+渲染前会转义控制字符，并在表格中使用有界摘要。Processes tab 支持键盘和鼠标浏览、
+搜索；`/`、`Ctrl-F` 或 `[Search]` 可以按 PID、进程名、executable path 或 argv 过滤，
+`[Clear]` 清除过滤。保存会获取 advisory lock，拒绝已被外部修改的配置文件，
 校验渲染后的配置，并使用同目录原子写入。配置路径必须是 direct file path；
 symlink path 会被拒绝，避免保存时把链接替换成普通文件。
 
@@ -243,11 +246,26 @@ agent；该子进程使用 `PROBE_HOME/run/tui/` 下的 runtime overlay、私有
 不会因为 TUI 需要运行期 socket 而改写用户配置。托管启动失败时，TUI 会显示 `agent.log` 路径和短 tail，
 让真实启动错误可见。
 
+非交互式进程身份检查可以使用：
+
+```bash
+cargo run -p agent --locked -- processes --query backend --limit 20
+cargo run -p agent --locked -- processes --pid 1234 --limit 1
+```
+
+该命令输出包含 `process_key` 和 `observation_key` 的 JSON。`process_key`
+是 `process_keys = ["..."]` 这类 TOML selector 使用的值；`observation_key`
+是对应的 TUI watch profile key。operator 可以在应用 live observation profile
+前确认目标进程身份。该命令直接读取 procfs，不需要 admin socket，也不依赖
+`ps`、`ss` 等发行版工具。
+
 当配置中的 admin socket 已启用且 live agent 正在运行时，Traffic tab 会通过在线
-admin surface tail 已解析的 export event。它优先使用选中进程的 executable-path
-selector；如果选中进程没有可读 executable path，流量过滤会 fail closed，不会退回展示无关的全机流量。
-TUI 的事件表只保留展示摘要，不保留进程 raw argv。bounded tail row 需要完整 payload
-详情时，详情弹窗会通过 admin surface 在后台加载仍被保留的事件。
+admin surface tail 已解析的 export event。被 watch 的进程使用 stable process-key selector；
+进程没有可安全表达的 stable identity 时，进程级流量过滤会 fail closed，不会退回 broad
+process-name matching。libpcap 只能产生 unknown-process event 时，TUI 可以把 listener-port
+弱候选纳入展示，但这些行会保留 weak attribution 标记。TUI 的事件表只保留展示摘要，
+不在 traffic row 中保留进程 raw argv。bounded tail row 需要完整 payload 详情时，
+详情弹窗会通过 admin surface 在后台加载仍被保留的事件。
 Traffic 可以按 HTTP exchange、WebSocket session 或 raw event 三种视图查看。live traffic
 按最新优先展示，让新请求保持在表格顶部，旧行仍可通过滚动查看。HTTP 视图会把 request headers、
 request body chunks、response headers 和 response body chunks 组织成同一条 exchange，并在详情弹窗中保留

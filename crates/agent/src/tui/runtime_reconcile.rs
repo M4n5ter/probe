@@ -855,11 +855,11 @@ mod tests {
     use super::{
         super::{
             app::{StatusKind, StatusMessage, TuiAction, TuiApp},
-            processes::ProcessCatalog,
             runtime_attachment::RuntimeAttachment,
         },
         *,
     };
+    use crate::process_catalog::ProcessCatalog;
 
     #[test]
     fn saved_runtime_success_preserves_warning_severity() {
