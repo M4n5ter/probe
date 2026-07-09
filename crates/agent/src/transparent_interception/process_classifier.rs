@@ -262,7 +262,7 @@ impl ProcessScopeMatcherExpression {
     ) -> Result<Self, TransparentInterceptionError> {
         match expression {
             TransparentInterceptionProcessScopeExpression::Match { process } => {
-                Selector::term(process.clone(), TrafficSelector::default())
+                Selector::term(process.as_ref().clone(), TrafficSelector::default())
                     .compile()
                     .map(Self::Match)
                     .map_err(|error| {
@@ -793,7 +793,7 @@ mod tests {
         )? {
             TransparentInterceptionSetupPlan::RequiresProcessClassifier {
                 process_scope, ..
-            } => Ok(process_scope),
+            } => Ok(*process_scope),
             plan => panic!("expected process classifier setup plan: {plan:?}"),
         }
     }

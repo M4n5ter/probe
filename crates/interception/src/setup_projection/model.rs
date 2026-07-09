@@ -36,7 +36,7 @@ pub struct TransparentInterceptionProcessScope {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransparentInterceptionProcessScopeExpression {
-    Match { process: ProcessSelector },
+    Match { process: Box<ProcessSelector> },
     All { expressions: Vec<Self> },
     Any { expressions: Vec<Self> },
 }
@@ -57,7 +57,7 @@ pub enum TransparentInterceptionSetupPlan {
     HostRules(TransparentInterceptionHostRuleSet),
     RequiresProcessClassifier {
         host_rule_boundary: TransparentInterceptionHostRuleBoundary,
-        process_scope: TransparentInterceptionProcessScope,
+        process_scope: Box<TransparentInterceptionProcessScope>,
         reason: String,
     },
     RequiresFlowClassifier {
@@ -595,6 +595,7 @@ impl Default for TransparentInterceptionRemoteAddressScope {
 
 pub(crate) fn process_selector_has_constraints(process: &ProcessSelector) -> bool {
     !process.pids.is_empty()
+        || !process.process_keys.is_empty()
         || !process.uids.is_empty()
         || !process.gids.is_empty()
         || !process.names.is_empty()

@@ -312,14 +312,16 @@ Operator TUI 能力事实：
   文本编辑是同一 action model 的一等状态：键盘 Enter/Space/Right 和鼠标字段点击进入同一个 edit session，
   输入、提交和取消都通过 typed action 处理，鼠标 Apply/Cancel 使用 hit target 驱动。
 - TUI 通过 `ProcfsAttributor` 生成 process catalog，不依赖 `ps`、`ss` 或发行版额外命令。
-  进程选择只写入 executable path selector；无法读取 executable path 时 fail-closed，
-  不退回 process name selector。TUI model 不保留 raw argv；进程表只展示 redacted argv entry 数量。
+  进程选择写入 stable process key selector，用于 eBPF 深度观测、Traffic watch 和 runtime reload；
+  stable key 来自 process identity，不把裸 PID 当作进程生命周期身份。事件缺少 stable identity 证据时
+  fail-closed，不退回 process name selector。TUI 保留 procfs argv 用于进程搜索、摘要和 hover/detail 展示；
+  渲染前会做控制字符转义和长度约束。
   procfs 全局扫描失败或单进程读取失败会进入 catalog diagnostics，不与“确实没有进程”混淆。
   process catalog 同时从 procfs socket table 建立 listener port index；该 index 只用于 libpcap
   无法归因到进程时的弱候选匹配，不把端口流量提升为强进程归因。docker-proxy listener 会同时索引宿主发布端口和容器
   target port，使 DNAT 前后观察到的明文 HTTP 都能作为候选流量展示。
   listener port index 有明确 admin request budget：弱候选端口集超过上限时禁用该进程的弱候选匹配并报告 catalog
-  diagnostic，强 executable-path selector 继续生效。TUI 发送 `tail_events` 前还会对完整 admin request
+  diagnostic，强 process-key selector 继续生效。TUI 发送 `tail_events` 前还会对完整 admin request
   执行大小预检；若强 selector 与弱候选组合超过 admin request budget，则丢弃弱候选后重试，强 selector
   本身超过预算时才报告 request-too-large 错误。
 - Processes tab 提供同级键盘/鼠标浏览和搜索。`/`、`Ctrl-F` 与 `[Search]` 进入同一 process
@@ -332,11 +334,11 @@ Operator TUI 能力事实：
   Traffic 状态行与 Data Path 详情。
   Traffic tab 不把进程表光标当作过滤范围。没有显式 watched process 时，tail 查询省略强 selector
   (`selector = null`)，让用户先看到 live data path 是否真实产出事件；点击 Traffic 左侧进程、`[Watch]`、
-  `[Auto]`、`[eBPF]` 或 `[libpcap]` 后，查询范围才收敛到相应 executable-path selector。选中进程无法形成 executable-path
+  `[Auto]`、`[eBPF]` 或 `[libpcap]` 后，查询范围才收敛到相应 process-key selector。选中进程无法形成 stable key
   selector 时，只拒绝写入 watch/observe 配置，不把 process name 当作替代身份。
   当 libpcap fallback 只能提供 unknown-process 事件时，Traffic tab 会把 watched process 的 listener ports
   作为 `unknown_process_candidate_selector.listener_ports` 传给 `tail_events`。该 selector 只在 admin tail 以
-  IncludeUnknownProcess 模式读取 libpcap unknown-process event 时生效；强归因事件仍必须匹配 executable-path
+  IncludeUnknownProcess 模式读取 libpcap unknown-process event 时生效；强归因事件仍必须匹配 process-key
   selector。TUI 行会保留 weak/unknown candidate attribution，避免把候选流量伪装成确定的进程归因。
   Traffic tab 有三个观察层级：HTTP exchange、WebSocket session 和 raw event。HTTP exchange
   将 request/response headers 和 body chunks 合并成面向请求/响应的行；WebSocket session 将
@@ -496,6 +498,9 @@ managed backend 的 feed openability 在 backend readiness 后、透明规则安
   - 已实现：host probe、`aya-obj` object preflight、strict process artifact contract、shared ABI。
   - 已实现：kernel connect enter/exit、accept/accept4、close/plain close_range、process exit/exec 和 payload tracepoint observation。
   - 已实现：userspace `aya` loader、ringbuf decoder、TGID+thread PID+fd lookup 到 `ConnectionOpened` bridge。
+  - 已实现：accept/accept4 fallback 优先使用 accepted fd procfs 解析；accepted fd 不能解析但 accept event
+    携带 remote endpoint 时，listen fd TCP 解析可以补足本地监听端点并建立 degraded accepted flow。
+    accept event 没有 remote endpoint 时不伪造 TCP flow。
   - 已实现：`capture.deep_observe_selector` 命中 flow 后，userspace 将 descriptor lease
     `(tgid, fd, flow-start fd-table epoch, per-fd generation, read/write direction mask)` 写入 allow map。
   - 已实现：kernel object 在 connect/accept 时为 `(tgid, fd)` 分配 per-fd generation；payload allow gate 同时校验
@@ -1872,7 +1877,7 @@ selector 应支持的维度：
 
 | 维度 | 示例 | 作用 |
 | --- | --- | --- |
-| 进程身份 | PID/TGID、进程名、可执行路径 glob、cmdline regex/hash。 | 绑定受管进程和短生命周期任务。 |
+| 进程身份 | stable process key、PID/TGID、进程名、可执行路径 glob、cmdline regex/hash。 | 绑定受管进程和短生命周期任务；stable process key 由进程复合身份生成，事件缺少稳定身份证据时 fail-closed。 |
 | 服务身份 | systemd service、cgroup path prefix、container id、namespace。 | 把应用/服务作为稳定防护边界。 |
 | 流量身份 | 监听端口、本地端口、远端地址、方向、协议族。 | 限定需要深度解析或防护的连接范围。 |
 | 复用与组合 | 命名 selector、`any`、`all`、`not`、`ref`。 | 避免配置复制，允许全局边界和下发边界合成。 |
@@ -7284,7 +7289,7 @@ P2 不允许默认全机 MITM；plaintext bridge hardening 属于显式 MITM bac
 | 当前目标 | 先完成观测闭环；真实阻断不默认启用，只能通过显式 backend 和能力门控进入执行路径 | 第 4、18 节 |
 | 部署模型 | Linux Host Agent | 第 5 节 |
 | 采集范围 | 全机采集 + selector 深度过滤 | 第 7 节 |
-| selector 维度 | PID、进程名、路径、service、端口、地址、容器基础元数据 | 第 7 节 |
+| selector 维度 | stable process key、PID、进程名、路径、service、端口、地址、容器基础元数据 | 第 7 节 |
 | 进程身份 | PID 不能单独作为稳定身份，使用复合身份 | 第 8 节 |
 | flow identity | 使用 composite stable id | 第 8 节 |
 | eBPF 技术栈 | Aya | 第 9 节 |

@@ -553,6 +553,7 @@ fn process_selector_table(term: &SelectorTerm) -> Table {
     let process = &term.process;
     let mut table = Table::new();
     table.insert("pids", value(array_u32(&process.pids)));
+    table.insert("process_keys", value(array_strings(&process.process_keys)));
     table.insert("uids", value(array_u32(&process.uids)));
     table.insert("gids", value(array_u32(&process.gids)));
     table.insert("names", value(array_strings(&process.names)));
@@ -789,6 +790,7 @@ selection = "auto"
         let mut config = AgentConfig::from_toml_str(source)?;
         config.capture.deep_observe_selector = Some(Selector::term(
             ProcessSelector {
+                process_keys: vec!["stable-process-key".to_string()],
                 exe_path_globs: vec!["/usr/bin/curl".to_string()],
                 ..ProcessSelector::default()
             },
@@ -800,6 +802,7 @@ selection = "auto"
         assert!(rendered.contains("[capture.deep_observe_selector]"));
         assert!(rendered.contains("op = \"match\""));
         assert!(rendered.contains("[capture.deep_observe_selector.term.process]"));
+        assert!(rendered.contains("process_keys = [\"stable-process-key\"]"));
         assert!(rendered.contains("exe_path_globs = [\"/usr/bin/curl\"]"));
         AgentConfig::from_toml_str(&rendered)?.validate_basic()?;
         Ok(())

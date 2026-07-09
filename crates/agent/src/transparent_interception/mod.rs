@@ -183,7 +183,7 @@ fn executable_host_rule_scope(
             .executable_host_rule_scope(
                 reason,
                 host_rule_boundary,
-                process_scope,
+                process_scope.as_ref().clone(),
                 &classification.process_classifier,
             )
             .map(TransparentInterceptionActivationScope::host_rules),

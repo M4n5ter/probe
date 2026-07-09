@@ -47,7 +47,7 @@ impl TransparentInterceptionSetupPlan {
             Some(SetupClassifierRequirement::Process { expression }) => {
                 Ok(Self::RequiresProcessClassifier {
                     host_rule_boundary: host_rule_boundary_from_terms(host_terms, direction)?,
-                    process_scope: TransparentInterceptionProcessScope::new(expression)?,
+                    process_scope: Box::new(TransparentInterceptionProcessScope::new(*expression)?),
                     reason: PROCESS_CLASSIFIER_REASON.to_string(),
                 })
             }
@@ -72,7 +72,7 @@ struct SelectorSetupAnalysis {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SetupClassifierRequirement {
     Process {
-        expression: TransparentInterceptionProcessScopeExpression,
+        expression: Box<TransparentInterceptionProcessScopeExpression>,
     },
     Flow {
         reason: String,
@@ -211,7 +211,7 @@ impl AnyBranchHostBoundary {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum CanonicalProcessScopeExpression {
-    Match(CanonicalProcessSelector),
+    Match(Box<CanonicalProcessSelector>),
     All(Vec<Self>),
     Any(Vec<Self>),
 }
@@ -219,6 +219,7 @@ enum CanonicalProcessScopeExpression {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct CanonicalProcessSelector {
     pids: BTreeSet<u32>,
+    process_keys: BTreeSet<String>,
     uids: BTreeSet<u32>,
     gids: BTreeSet<u32>,
     names: BTreeSet<String>,
@@ -233,7 +234,7 @@ impl CanonicalProcessScopeExpression {
     fn from_expression(expression: &TransparentInterceptionProcessScopeExpression) -> Self {
         match expression {
             TransparentInterceptionProcessScopeExpression::Match { process } => {
-                Self::Match(CanonicalProcessSelector::from_selector(process))
+                Self::Match(Box::new(CanonicalProcessSelector::from_selector(process)))
             }
             TransparentInterceptionProcessScopeExpression::All { expressions } => {
                 Self::All(canonical_process_expression_set(expressions))
@@ -249,6 +250,7 @@ impl CanonicalProcessSelector {
     fn from_selector(process: &ProcessSelector) -> Self {
         Self {
             pids: process.pids.iter().copied().collect(),
+            process_keys: process.process_keys.iter().cloned().collect(),
             uids: process.uids.iter().copied().collect(),
             gids: process.gids.iter().copied().collect(),
             names: process.names.iter().cloned().collect(),
@@ -382,7 +384,7 @@ fn analyze_all_selector(
                 flow_reason.get_or_insert(reason);
             }
             Some(SetupClassifierRequirement::Process { expression }) => {
-                process_expressions.push(expression);
+                process_expressions.push(*expression);
             }
             None => {}
         }
@@ -454,7 +456,7 @@ fn project_any_selector_process_classifier(
         let Some(SetupClassifierRequirement::Process { expression }) = &analysis.classifier else {
             return Ok(None);
         };
-        process_expressions.push(expression.clone());
+        process_expressions.push(expression.as_ref().clone());
         let Some(host_terms) = analysis.host_terms.terms() else {
             return Ok(None);
         };
@@ -475,7 +477,7 @@ fn project_any_selector_process_classifier(
                     }),
             ),
             classifier: Some(SetupClassifierRequirement::Process {
-                expression: process_any_expression(process_expressions),
+                expression: Box::new(process_any_expression(process_expressions)),
             }),
         }));
     }
@@ -489,10 +491,12 @@ fn project_any_selector_process_classifier(
         return Ok(Some(SelectorSetupAnalysis {
             host_terms: ProjectableHostTerms::budgeted(host_terms),
             classifier: Some(SetupClassifierRequirement::Process {
-                expression: process_expressions
-                    .into_iter()
-                    .next()
-                    .expect("process expressions should be non-empty"),
+                expression: Box::new(
+                    process_expressions
+                        .into_iter()
+                        .next()
+                        .expect("process expressions should be non-empty"),
+                ),
             }),
         }));
     }
@@ -709,9 +713,9 @@ fn process_setup_projection(
         socket_owners,
         socket_cgroups,
         classifier: Some(SetupClassifierRequirement::Process {
-            expression: TransparentInterceptionProcessScopeExpression::Match {
-                process: process.clone(),
-            },
+            expression: Box::new(TransparentInterceptionProcessScopeExpression::Match {
+                process: Box::new(process.clone()),
+            }),
         }),
     })
 }
@@ -765,10 +769,12 @@ fn process_classifier_requirement_from_expressions(
     match expressions.as_slice() {
         [] => None,
         [expression] => Some(SetupClassifierRequirement::Process {
-            expression: expression.clone(),
+            expression: Box::new(expression.clone()),
         }),
         _ => Some(SetupClassifierRequirement::Process {
-            expression: TransparentInterceptionProcessScopeExpression::All { expressions },
+            expression: Box::new(TransparentInterceptionProcessScopeExpression::All {
+                expressions,
+            }),
         }),
     }
 }

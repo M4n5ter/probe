@@ -232,11 +232,11 @@ mod tests {
         let mut view = ProcessViewState::default();
         view.set_viewport_rows(2, &catalog);
 
-        view.replace_monitors(["pid:4".to_string()], &catalog);
+        view.replace_monitors(["process:process-key-4".to_string()], &catalog);
 
         assert_eq!(view.selected_index(), Some(3));
         assert_eq!(view.scroll(), 2);
-        assert!(view.monitors_process(Some("pid:4")));
+        assert!(view.monitors_process(Some("process:process-key-4")));
     }
 
     #[test]
@@ -259,6 +259,7 @@ mod tests {
     fn process(pid: u32, name: &str, exe_path: &str) -> ProcessEntry {
         ProcessEntry {
             pid,
+            process_key: format!("process-key-{pid}"),
             name: name.to_string(),
             exe_path: Some(PathBuf::from(exe_path)),
             argv: Vec::new(),

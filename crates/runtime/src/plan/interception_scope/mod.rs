@@ -86,7 +86,7 @@ pub struct TransparentInterceptionProcessScopePlan {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum TransparentInterceptionProcessScopeExpressionPlan {
     Match {
-        process: ProcessSelector,
+        process: Box<ProcessSelector>,
     },
     All {
         expressions: Vec<TransparentInterceptionProcessScopeExpressionPlan>,
@@ -279,7 +279,7 @@ impl TransparentInterceptionProcessScopeExpressionPlan {
     fn from_expression(expression: &TransparentInterceptionProcessScopeExpression) -> Self {
         match expression {
             TransparentInterceptionProcessScopeExpression::Match { process } => Self::Match {
-                process: process.clone(),
+                process: Box::new(process.as_ref().clone()),
             },
             TransparentInterceptionProcessScopeExpression::All { expressions } => Self::All {
                 expressions: expressions.iter().map(Self::from_expression).collect(),

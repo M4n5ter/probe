@@ -831,6 +831,7 @@ mod tests {
             ProcessCatalog::from_entries([
                 ProcessEntry {
                     pid: 42,
+                    process_key: "process-key-42".to_string(),
                     name: "curl".to_string(),
                     exe_path: Some(PathBuf::from("/usr/bin/curl")),
                     argv: vec!["curl".to_string()],
@@ -842,6 +843,7 @@ mod tests {
                 },
                 ProcessEntry {
                     pid: 43,
+                    process_key: "process-key-43".to_string(),
                     name: "nginx".to_string(),
                     exe_path: Some(PathBuf::from("/usr/sbin/nginx")),
                     argv: vec!["nginx".to_string()],
@@ -1212,6 +1214,7 @@ mod tests {
             AgentConfig::default(),
             ProcessCatalog::from_entries([ProcessEntry {
                 pid: 42,
+                process_key: "process-key-42".to_string(),
                 name: "curl".to_string(),
                 exe_path: Some(PathBuf::from("/usr/bin/curl")),
                 argv: vec!["curl".to_string(), "https://example.com".to_string()],
@@ -1228,6 +1231,7 @@ mod tests {
             AgentConfig::default(),
             ProcessCatalog::from_entries((0..count).map(|index| ProcessEntry {
                 pid: 1_000 + index,
+                process_key: format!("process-key-{}", 1_000 + index),
                 name: format!("process-{index}"),
                 exe_path: Some(PathBuf::from(format!("/usr/bin/process-{index}"))),
                 argv: vec![format!("process-{index}")],

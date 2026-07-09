@@ -144,6 +144,8 @@ pub struct ProcessSelector {
     #[serde(default)]
     pub pids: Vec<u32>,
     #[serde(default)]
+    pub process_keys: Vec<String>,
+    #[serde(default)]
     pub uids: Vec<u32>,
     #[serde(default)]
     pub gids: Vec<u32>,
@@ -614,9 +616,15 @@ impl CompiledSelectorTerm {
 
     fn matches_observed_process(&self, process: &ProcessContext) -> Option<bool> {
         let spec = &self.term.process;
+        let stable_process_key = process.identity.stable_key();
         all_selector_matches(
             [
                 Some(spec.pids.is_empty() || spec.pids.contains(&process.identity.pid)),
+                match_string_list(
+                    &spec.process_keys,
+                    &stable_process_key,
+                    unknown_stable_process_key(process),
+                ),
                 Some(spec.uids.is_empty() || spec.uids.contains(&process.identity.uid)),
                 Some(spec.gids.is_empty() || spec.gids.contains(&process.identity.gid)),
                 Some(spec.names.is_empty() || spec.names.contains(&process.name)),
@@ -633,9 +641,15 @@ impl CompiledSelectorTerm {
     fn matches_process_with_unknowns(&self, process: &ProcessContext) -> Option<bool> {
         let spec = &self.term.process;
         let unknown_numeric_identity = process.identity.pid == 0;
+        let stable_process_key = process.identity.stable_key();
         all_selector_matches(
             [
                 match_u32_list(&spec.pids, process.identity.pid, process.identity.pid == 0),
+                match_string_list(
+                    &spec.process_keys,
+                    &stable_process_key,
+                    unknown_stable_process_key(process),
+                ),
                 match_u32_list(&spec.uids, process.identity.uid, unknown_numeric_identity),
                 match_u32_list(&spec.gids, process.identity.gid, unknown_numeric_identity),
                 match_string_list(
@@ -882,6 +896,14 @@ fn unknown_cmdline(process: &ProcessContext) -> bool {
     unknown_process_string(&process.identity.cmdline_hash) || process.cmdline.is_empty()
 }
 
+fn unknown_stable_process_key(process: &ProcessContext) -> bool {
+    process.identity.pid == 0
+        || process.identity.start_time_ticks == 0
+        || unknown_process_string(&process.identity.boot_id)
+        || unknown_process_string(&process.identity.exe_path)
+        || unknown_process_string(&process.identity.cmdline_hash)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -935,6 +957,28 @@ mod tests {
         let flow = demo_flow();
         assert!(selector.matches_flow_without_direction(&flow));
         assert!(!other_uid.matches_flow_without_direction(&flow));
+        Ok(())
+    }
+
+    #[test]
+    fn selector_process_key_rejects_pid_reuse() -> Result<(), Box<dyn std::error::Error>> {
+        let flow = demo_flow();
+        let selector = Selector::term(
+            ProcessSelector {
+                process_keys: vec![flow.process.identity.stable_key()],
+                ..ProcessSelector::default()
+            },
+            TrafficSelector::default(),
+        )
+        .compile()?;
+        let mut reused_pid = flow.clone();
+        reused_pid.process.identity.start_time_ticks += 1;
+        let mut unknown_identity = flow.clone();
+        unknown_identity.process.identity.boot_id.clear();
+
+        assert!(selector.matches_flow_without_direction(&flow));
+        assert!(!selector.matches_flow_without_direction(&reused_pid));
+        assert!(!selector.matches_flow_without_direction(&unknown_identity));
         Ok(())
     }
 

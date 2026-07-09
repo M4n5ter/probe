@@ -1326,6 +1326,7 @@ mod tests {
     fn process(pid: u32, name: &str, exe_path: &str) -> ProcessEntry {
         ProcessEntry {
             pid,
+            process_key: format!("process-key-{pid}"),
             name: name.to_string(),
             exe_path: Some(PathBuf::from(exe_path)),
             argv: vec![name.to_string()],

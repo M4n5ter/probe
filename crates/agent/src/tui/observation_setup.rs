@@ -58,27 +58,31 @@ pub(crate) fn remove_process_observation(config: &mut AgentConfig, key: &str) ->
     config.observations.len() != before
 }
 
-pub(crate) fn process_observation_pids(config: &AgentConfig) -> Vec<u32> {
+pub(crate) fn process_observation_selectors(config: &AgentConfig) -> Vec<(String, Selector)> {
     config
         .observations
         .iter()
-        .filter_map(simple_process_observation_pid)
+        .filter_map(|observation| {
+            simple_process_observation_key(observation)
+                .map(|key| (key, observation.selector.clone()))
+        })
         .collect()
 }
 
 pub(crate) fn process_observation_id(key: &str) -> String {
-    key.to_string()
+    key.strip_prefix("process:")
+        .map(|process_key| {
+            let short_key = process_key.chars().take(16).collect::<String>();
+            format!("process:{short_key}")
+        })
+        .unwrap_or_else(|| key.to_string())
 }
 
 fn simple_process_observation_key(observation: &ProcessObservationConfig) -> Option<String> {
-    simple_process_observation_pid(observation).map(|pid| format!("pid:{pid}"))
-}
-
-fn simple_process_observation_pid(observation: &ProcessObservationConfig) -> Option<u32> {
     let Selector::Match { term } = &observation.selector else {
         return None;
     };
-    simple_process_selector_pid(term)
+    simple_process_selector_key(term)
 }
 
 fn retained_process_observation_id(config: &AgentConfig, key: &str) -> String {
@@ -136,15 +140,21 @@ fn process_observation(
     }
 }
 
-fn simple_process_selector_pid(term: &SelectorTerm) -> Option<u32> {
+fn simple_process_selector_key(term: &SelectorTerm) -> Option<String> {
     simple_process_selector(&term.process).and_then(|process| {
-        let pid = process.pids.first().copied()?;
-        simple_traffic_selector(&term.traffic).then_some(pid)
+        if !simple_traffic_selector(&term.traffic) {
+            return None;
+        }
+        if let Some(process_key) = process.process_keys.first() {
+            return Some(format!("process:{process_key}"));
+        }
+        process.pids.first().map(|pid| format!("pid:{pid}"))
     })
 }
 
 fn simple_process_selector(process: &ProcessSelector) -> Option<&ProcessSelector> {
-    (process.pids.len() == 1
+    (((process.process_keys.len() == 1 && process.pids.is_empty())
+        || (process.pids.len() == 1 && process.process_keys.is_empty()))
         && process.uids.is_empty()
         && process.gids.is_empty()
         && process.names.is_empty()
@@ -168,14 +178,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn process_observation_pids_ignore_non_pid_observations() {
+    fn process_observation_selectors_ignore_non_managed_process_observations() {
         let mut config = AgentConfig::default();
         config
             .observations
             .push(observation_with_exe_glob("wildcard", "/app/*"));
         config.observations.push(observation_with_pid("exact", 42));
 
-        assert_eq!(process_observation_pids(&config), [42]);
+        assert_eq!(
+            process_observation_selectors(&config)
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>(),
+            ["pid:42"]
+        );
     }
 
     #[test]
@@ -199,7 +215,13 @@ mod tests {
                 .iter()
                 .any(|observation| observation.id == "wildcard")
         );
-        assert_eq!(process_observation_pids(&config), [42]);
+        assert_eq!(
+            process_observation_selectors(&config)
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>(),
+            ["pid:42"]
+        );
     }
 
     #[test]

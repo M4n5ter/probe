@@ -105,6 +105,7 @@ fn selector_contains_negative_match(selector: &Selector) -> bool {
 
 fn process_selector_has_constraint(process: &ProcessSelector) -> bool {
     !process.pids.is_empty()
+        || !process.process_keys.is_empty()
         || !process.uids.is_empty()
         || !process.gids.is_empty()
         || !process.names.is_empty()
@@ -192,6 +193,33 @@ mod tests {
                 term: Box::new(SelectorTerm {
                     process: ProcessSelector {
                         exe_path_globs: vec!["/usr/bin/curl".to_string()],
+                        ..ProcessSelector::default()
+                    },
+                    traffic: TrafficSelector::default(),
+                }),
+            },
+            data_path: ObservationDataPathMode::Auto,
+            directions: vec![Direction::Inbound, Direction::Outbound],
+        };
+        let mut violations = Vec::new();
+
+        validate(
+            &[observation],
+            &SelectorRegistry::default(),
+            &mut violations,
+        );
+
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn observation_accepts_process_key_scope() {
+        let observation = ProcessObservationConfig {
+            id: "selected-process".to_string(),
+            selector: Selector::Match {
+                term: Box::new(SelectorTerm {
+                    process: ProcessSelector {
+                        process_keys: vec!["stable-process-key".to_string()],
                         ..ProcessSelector::default()
                     },
                     traffic: TrafficSelector::default(),
