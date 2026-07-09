@@ -467,9 +467,15 @@ fn combine_diagnostic_messages(
         (None, None) => None,
         (Some(message), None) | (None, Some(message)) => Some(message),
         (Some(primary), Some(secondary)) => {
+            let overrides_empty_filter = primary.overrides_empty_filter_status()
+                || secondary.overrides_empty_filter_status();
             let kind = primary.max_kind(&secondary);
             let text = format!("{}; {}", primary.into_text(), secondary.into_text());
-            Some(CaptureDiagnosticMessage::from_kind(kind, text))
+            Some(CaptureDiagnosticMessage::from_kind_and_empty_filter_policy(
+                kind,
+                overrides_empty_filter,
+                text,
+            ))
         }
     }
 }
@@ -519,13 +525,25 @@ fn mitm_tls_http_visibility_line() -> String {
 pub(crate) enum CaptureDiagnosticMessage {
     Info(String),
     Warning(String),
+    WarningOverridesEmptyFilter(String),
     Error(String),
 }
 
 impl CaptureDiagnosticMessage {
-    fn from_kind(kind: CaptureDiagnosticMessageKind, text: String) -> Self {
+    pub(crate) fn overrides_empty_filter_status(&self) -> bool {
+        matches!(self, Self::WarningOverridesEmptyFilter(_))
+    }
+
+    fn from_kind_and_empty_filter_policy(
+        kind: CaptureDiagnosticMessageKind,
+        overrides_empty_filter: bool,
+        text: String,
+    ) -> Self {
         match kind {
             CaptureDiagnosticMessageKind::Info => Self::Info(text),
+            CaptureDiagnosticMessageKind::Warning if overrides_empty_filter => {
+                Self::WarningOverridesEmptyFilter(text)
+            }
             CaptureDiagnosticMessageKind::Warning => Self::Warning(text),
             CaptureDiagnosticMessageKind::Error => Self::Error(text),
         }
@@ -538,7 +556,9 @@ impl CaptureDiagnosticMessage {
     fn kind(&self) -> CaptureDiagnosticMessageKind {
         match self {
             Self::Info(_) => CaptureDiagnosticMessageKind::Info,
-            Self::Warning(_) => CaptureDiagnosticMessageKind::Warning,
+            Self::Warning(_) | Self::WarningOverridesEmptyFilter(_) => {
+                CaptureDiagnosticMessageKind::Warning
+            }
             Self::Error(_) => CaptureDiagnosticMessageKind::Error,
         }
     }
@@ -546,12 +566,18 @@ impl CaptureDiagnosticMessage {
     fn into_text(self) -> String {
         match self {
             Self::Info(text) | Self::Warning(text) | Self::Error(text) => text,
+            Self::WarningOverridesEmptyFilter(text) => text,
         }
     }
 
     fn with_prefix(self, prefix: String) -> Self {
+        let overrides_empty_filter = self.overrides_empty_filter_status();
         let kind = self.kind();
-        Self::from_kind(kind, format!("{prefix}{}", self.into_text()))
+        Self::from_kind_and_empty_filter_policy(
+            kind,
+            overrides_empty_filter,
+            format!("{prefix}{}", self.into_text()),
+        )
     }
 }
 
@@ -705,6 +731,62 @@ mod tests {
             lines.iter().any(|line| line == expected),
             "missing detail line: {expected}"
         );
+    }
+
+    fn empty_filter_override_warning_text(message: Option<CaptureDiagnosticMessage>) -> String {
+        match message {
+            Some(CaptureDiagnosticMessage::WarningOverridesEmptyFilter(text)) => text,
+            other => panic!("expected empty-filter override warning, got {other:?}"),
+        }
+    }
+
+    fn ebpf_payload_projection(
+        selector_configured: bool,
+        scanned_processes: u64,
+        matched_processes: u64,
+        allowed_processes: u64,
+        counters: Value,
+    ) -> Value {
+        let allowance = json!({
+            "selector_configured": selector_configured,
+            "scanned_processes": scanned_processes,
+            "matched_processes": matched_processes,
+            "allowed_processes": allowed_processes
+        });
+        json!({
+            "kind": "traffic_status",
+            "projection": {
+                "capture": {
+                    "selection": "auto",
+                    "selected_backend": "ebpf",
+                    "selected_input_source": "live_host",
+                    "provider_runtime_mode": "available",
+                    "mode": "live",
+                    "reason": null,
+                    "candidates": [],
+                    "open_failures": [],
+                    "provider": {
+                        "kind": "ebpf_process_observation",
+                        "process_payload_allowance": allowance.clone(),
+                        "payload_gate_counters": {
+                            "mode": "available",
+                            "total_count": 0,
+                            "reason": "payload gate counters available",
+                            "counters": counters.clone()
+                        }
+                    },
+                    "ebpf_process_payload": {
+                        "process_payload_allowance": allowance,
+                        "payload_gate_counters": {
+                            "mode": "available",
+                            "total_count": 0,
+                            "reason": "payload gate counters available",
+                            "counters": counters
+                        }
+                    }
+                }
+            }
+        })
     }
 
     #[test]
@@ -1425,10 +1507,7 @@ mod tests {
 
         let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
 
-        let Some(CaptureDiagnosticMessage::Warning(message)) = diagnostics.status_message(true)
-        else {
-            panic!("expected eBPF payload authorization warning");
-        };
+        let message = empty_filter_override_warning_text(diagnostics.status_message(true));
         assert!(message.contains("eBPF payload tracepoints are active"));
         assert!(message.contains("PID namespace mapping"));
         let lines = diagnostics.detail_lines();
@@ -1439,6 +1518,59 @@ mod tests {
         assert_detail_line(
             &lines,
             "eBPF payload gates: read_attempt=10, read_process_allowance=0, read_submitted=0, read_no_allowance=10",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_warn_when_ebpf_has_no_process_observation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = ebpf_payload_projection(false, 83, 0, 0, json!([]));
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+
+        let message = empty_filter_override_warning_text(diagnostics.status_message(true));
+        assert!(message.contains("no process observation is configured"));
+        assert!(message.contains("Watch/Auto"));
+        assert!(message.contains("libpcap"));
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_warn_when_ebpf_observation_matches_no_live_process()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = ebpf_payload_projection(true, 83, 0, 0, json!([]));
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+
+        let message = empty_filter_override_warning_text(diagnostics.status_message(true));
+        assert!(message.contains("has not authorized any live process"));
+        assert!(message.contains("scanned=83, matched=0"));
+        assert!(message.contains("reapply observation"));
+        Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_do_not_warn_scope_after_payload_is_authorized()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = ebpf_payload_projection(
+            true,
+            83,
+            0,
+            0,
+            json!([
+                {"name": "read_attempt", "count": 1},
+                {"name": "read_process_allowance", "count": 1},
+            ]),
+        );
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+
+        assert_eq!(
+            diagnostics.status_message(true),
+            Some(CaptureDiagnosticMessage::Info(
+                "Capture ebpf active; no matching events yet".to_string()
+            ))
         );
         Ok(())
     }

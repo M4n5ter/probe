@@ -969,6 +969,7 @@ impl TrafficState {
                 self.apply_empty_filter_diagnostics(snapshot.empty_filter_diagnostics);
             }
             Err(error) => {
+                self.empty_filter_diagnostics = None;
                 self.status = TrafficStatus::error(error);
             }
         }
@@ -1111,12 +1112,20 @@ impl TrafficState {
         let Some(message) = message else {
             return;
         };
+        let should_override_empty_filter = self.empty_filter_diagnostics.is_some()
+            && self.status.kind != TrafficStatusKind::Error
+            && message.overrides_empty_filter_status();
         let status = match message {
             CaptureDiagnosticMessage::Info(message) => TrafficStatus::idle(message),
-            CaptureDiagnosticMessage::Warning(message) => TrafficStatus::warning(message),
+            CaptureDiagnosticMessage::Warning(message)
+            | CaptureDiagnosticMessage::WarningOverridesEmptyFilter(message) => {
+                TrafficStatus::warning(message)
+            }
             CaptureDiagnosticMessage::Error(message) => TrafficStatus::error(message),
         };
-        if should_apply_runtime_status(status.kind, self.status.kind) {
+        if should_override_empty_filter
+            || should_apply_runtime_status(status.kind, self.status.kind)
+        {
             self.status = status;
         }
     }
@@ -2088,6 +2097,7 @@ mod tests {
         UNKNOWN_PROCESS_LABEL, WebSocketHandoff, WebSocketMessage, WebSocketMessageOpcode,
     };
     use runtime::{CaptureEvidenceMode, CaptureInputSource, CapturePlanMode};
+    use serde_json::json;
 
     use super::*;
     use crate::{
@@ -2311,6 +2321,52 @@ mod tests {
             traffic.status().text,
             "Parsed view is empty; capture is seeing connection lifecycle events but no parsed HTTP/WebSocket payload"
         );
+    }
+
+    #[test]
+    fn ebpf_payload_scope_warning_from_runtime_diagnostics_overwrites_empty_filter_warning() {
+        let mut traffic = TrafficState::default();
+        let empty_filtered = empty_tail_snapshot(2);
+        let empty_diagnostics = EmptyFilterDiagnostics::from_snapshot(
+            "Parsed",
+            tail_snapshot_with_connection_lifecycle_events(1..=2),
+        );
+        let runtime_diagnostics = ebpf_payload_diagnostics_without_process_observation();
+
+        traffic.apply_snapshot(empty_filtered);
+        traffic.apply_empty_filter_diagnostics(empty_diagnostics);
+        traffic.apply_runtime_diagnostic_message(runtime_diagnostics.status_message(true));
+
+        assert_eq!(traffic.status().kind, TrafficStatusKind::Warning);
+        assert_eq!(
+            traffic.status().text,
+            "eBPF capture is selected, but no process observation is configured for payload sampling; select a process with Watch/Auto or switch to libpcap for all-process packet capture"
+        );
+    }
+
+    #[test]
+    fn ebpf_payload_scope_warning_does_not_overwrite_refresh_error() {
+        let mut traffic = TrafficState::default();
+        let empty_filtered = empty_tail_snapshot(2);
+        let empty_diagnostics = EmptyFilterDiagnostics::from_snapshot(
+            "Parsed",
+            tail_snapshot_with_connection_lifecycle_events(1..=2),
+        );
+        let runtime_diagnostics = ebpf_payload_diagnostics_without_process_observation();
+
+        traffic.apply_snapshot(empty_filtered);
+        traffic.apply_empty_filter_diagnostics(empty_diagnostics);
+        let request = traffic.begin_refresh(PathBuf::from("/tmp/admin.sock"), None, None, None);
+        assert!(
+            traffic.apply_refresh_result(TrafficRefreshResult::failed_from_request_for_test(
+                &request,
+                "tail_events failed",
+            ))
+        );
+        traffic.apply_runtime_diagnostic_message(runtime_diagnostics.status_message(true));
+
+        assert_eq!(traffic.status().kind, TrafficStatusKind::Error);
+        assert_eq!(traffic.status().text, "tail_events failed");
     }
 
     #[test]
@@ -3630,6 +3686,54 @@ mod tests {
             ebpf_process_payload: None,
             input_activity: None,
         }
+    }
+
+    fn ebpf_payload_diagnostics_without_process_observation() -> TrafficRuntimeDiagnostics {
+        TrafficRuntimeDiagnostics::from_admin_response_for_test(json!({
+            "kind": "traffic_status",
+            "projection": {
+                "capture": {
+                    "selection": "auto",
+                    "selected_backend": "ebpf",
+                    "selected_input_source": "live_host",
+                    "provider_runtime_mode": "available",
+                    "mode": "live",
+                    "reason": null,
+                    "candidates": [],
+                    "open_failures": [],
+                    "provider": {
+                        "kind": "ebpf_process_observation",
+                        "process_payload_allowance": {
+                            "selector_configured": false,
+                            "scanned_processes": 83,
+                            "matched_processes": 0,
+                            "allowed_processes": 0
+                        },
+                        "payload_gate_counters": {
+                            "mode": "available",
+                            "total_count": 0,
+                            "reason": "payload gate counters available",
+                            "counters": []
+                        }
+                    },
+                    "ebpf_process_payload": {
+                        "process_payload_allowance": {
+                            "selector_configured": false,
+                            "scanned_processes": 83,
+                            "matched_processes": 0,
+                            "allowed_processes": 0
+                        },
+                        "payload_gate_counters": {
+                            "mode": "available",
+                            "total_count": 0,
+                            "reason": "payload gate counters available",
+                            "counters": []
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("eBPF payload diagnostics should parse")
     }
 
     fn active_mitm_bridge_capture_snapshot() -> CaptureStatusSnapshot {

@@ -131,7 +131,7 @@ impl CaptureDiagnostics {
                 self.selected_backend_label()
             )));
         }
-        if traffic_empty && let Some(message) = self.ebpf_payload_authorization_status_message() {
+        if traffic_empty && let Some(message) = self.ebpf_payload_status_message() {
             return Some(message);
         }
         if traffic_empty && let Some(message) = self.capture_loss_status_message() {
@@ -338,17 +338,24 @@ impl CaptureDiagnostics {
         )))
     }
 
-    fn ebpf_payload_authorization_status_message(&self) -> Option<CaptureDiagnosticMessage> {
-        if self.snapshot.selected_backend != Some(CaptureBackend::Ebpf) {
+    fn ebpf_payload_status_message(&self) -> Option<CaptureDiagnosticMessage> {
+        if self.snapshot.selected_backend != Some(CaptureBackend::Ebpf)
+            || self.snapshot.mode != CapturePlanMode::Live
+        {
             return None;
         }
         let payload = self.ebpf_payload.as_ref()?;
-        if !payload.has_payload_attempts() || payload.has_authorized_payload() {
+        if payload.has_authorized_payload() {
             return None;
         }
-        Some(CaptureDiagnosticMessage::Warning(
-            payload.authorization_warning(),
-        ))
+        if payload.has_payload_attempts() {
+            return Some(CaptureDiagnosticMessage::WarningOverridesEmptyFilter(
+                payload.authorization_warning(),
+            ));
+        }
+        payload
+            .scope_warning()
+            .map(CaptureDiagnosticMessage::WarningOverridesEmptyFilter)
     }
 
     pub(super) fn using_live_host(&self) -> bool {
@@ -524,11 +531,26 @@ impl EbpfPayloadDiagnostics {
             || self.read_submitted > 0
     }
 
+    fn scope_warning(&self) -> Option<String> {
+        if !self.selector_configured {
+            return Some(
+                "eBPF capture is selected, but no process observation is configured for payload sampling; select a process with Watch/Auto or switch to libpcap for all-process packet capture"
+                    .to_string(),
+            );
+        }
+        (self.allowed_processes == 0).then(|| {
+            format!(
+                "eBPF capture is selected, but the current process observation has not authorized any live process; scanned={}, matched={}; verify the selected process is still running or reapply observation after it starts",
+                self.scanned_processes, self.matched_processes
+            )
+        })
+    }
+
     fn authorization_warning(&self) -> String {
         let reason = if self.selector_configured {
             "process selector matched startup processes, but kernel payload syscalls are not matching the authorized process keys"
         } else {
-            "no process selector is configured for payload sampling"
+            "no process observation is configured for payload sampling; select a process with Watch/Auto or switch to libpcap for all-process packet capture"
         };
         format!(
             "eBPF payload tracepoints are active but no payload samples are authorized; {reason}; check the selected process, PID namespace mapping, or reapply observation after the target process starts"
