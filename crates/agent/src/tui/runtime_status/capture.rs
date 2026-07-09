@@ -29,6 +29,40 @@ enum CaptureDiagnosticsSource {
     AdminStatus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureReadiness {
+    Unavailable,
+    Planned,
+    Starting,
+    Ready,
+}
+
+impl CaptureReadiness {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::Planned => "planned",
+            Self::Starting => "starting",
+            Self::Ready => "ready",
+        }
+    }
+
+    fn detail(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable; no capture provider can be opened from this plan",
+            Self::Planned => "planned; local config projection has no live runtime attachment",
+            Self::Starting => {
+                "starting; admin socket is active but capture provider has not reported runtime details"
+            }
+            Self::Ready => "ready; capture provider runtime details or input activity are reported",
+        }
+    }
+
+    fn is_starting(self) -> bool {
+        self == Self::Starting
+    }
+}
+
 impl CaptureDiagnostics {
     pub(super) fn new(snapshot: CaptureStatusSnapshot) -> Self {
         let provider_reported = snapshot.provider.is_some();
@@ -69,6 +103,9 @@ impl CaptureDiagnostics {
         traffic_empty: bool,
         mitm_next_step: &str,
     ) -> Option<CaptureDiagnosticMessage> {
+        if let Some(message) = self.starting_status_message() {
+            return Some(message);
+        }
         if self.using_mitm_plaintext_bridge() {
             if let Some(message) = self.mitm_bridge_passive_context_message() {
                 return Some(message);
@@ -94,12 +131,6 @@ impl CaptureDiagnostics {
                 self.selected_backend_label()
             )));
         }
-        if traffic_empty && self.runtime_provider_pending() {
-            return Some(CaptureDiagnosticMessage::Info(format!(
-                "Capture {} is starting; waiting for provider",
-                self.selected_backend_label()
-            )));
-        }
         if traffic_empty && let Some(message) = self.ebpf_payload_authorization_status_message() {
             return Some(message);
         }
@@ -112,6 +143,19 @@ impl CaptureDiagnostics {
                 self.selected_backend_label()
             ))
         })
+    }
+
+    pub(super) fn starting_status_message(&self) -> Option<CaptureDiagnosticMessage> {
+        self.readiness()
+            .is_starting()
+            .then(|| CaptureDiagnosticMessage::Warning(self.starting_status_text()))
+    }
+
+    fn starting_status_text(&self) -> String {
+        format!(
+            "Capture {} is starting; waiting for provider",
+            self.selected_backend_label()
+        )
     }
 
     pub(super) fn local_status_message(
@@ -174,6 +218,7 @@ impl CaptureDiagnostics {
             ),
             format!("selected: {}", self.selected_backend_label()),
             format!("mode: {}", capture_plan_mode_name(self.snapshot.mode)),
+            format!("readiness: {}", self.readiness().detail()),
             self.ebpf_expected_contract_line(),
         ];
         if self.using_mitm_plaintext_bridge() {
@@ -237,7 +282,8 @@ impl CaptureDiagnostics {
     pub(super) fn overview_line(&self) -> String {
         if self.using_mitm_plaintext_bridge() {
             return format!(
-                "{} selected for {}",
+                "{}: {} selected for {}",
+                self.readiness().label(),
                 self.selected_backend_label(),
                 MITM_PLAINTEXT_COVERAGE
             );
@@ -246,7 +292,8 @@ impl CaptureDiagnostics {
             return format!("unavailable: {}", self.failure_summary());
         }
         let mut line = format!(
-            "{} selected, mode={}",
+            "{}: {} selected, mode={}",
+            self.readiness().label(),
             self.selected_backend_label(),
             capture_plan_mode_name(self.snapshot.mode)
         );
@@ -261,11 +308,19 @@ impl CaptureDiagnostics {
             || self.snapshot.mode == CapturePlanMode::Unavailable
     }
 
-    fn runtime_provider_pending(&self) -> bool {
-        self.using_live_host()
-            && self.snapshot.provider_runtime_mode.is_some()
-            && !self.provider_reported
-            && !self.input_activity_reported
+    fn readiness(&self) -> CaptureReadiness {
+        if self.unavailable() {
+            return CaptureReadiness::Unavailable;
+        }
+        match self.source {
+            CaptureDiagnosticsSource::LocalProjection => CaptureReadiness::Planned,
+            CaptureDiagnosticsSource::AdminStatus
+                if self.provider_reported || self.input_activity_reported =>
+            {
+                CaptureReadiness::Ready
+            }
+            CaptureDiagnosticsSource::AdminStatus => CaptureReadiness::Starting,
+        }
     }
 
     fn capture_loss_status_message(&self) -> Option<CaptureDiagnosticMessage> {

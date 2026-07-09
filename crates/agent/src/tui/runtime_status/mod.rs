@@ -179,6 +179,9 @@ impl TrafficRuntimeDiagnostics {
         traffic_empty: bool,
         mitm_next_step: &str,
     ) -> Option<CaptureDiagnosticMessage> {
+        if let Some(message) = self.capture.starting_status_message() {
+            return Some(message);
+        }
         let capture_context = self.capture.mitm_bridge_passive_context_message();
         let mitm_message = self.mitm_data_path_status_message(traffic_empty);
         combine_diagnostic_messages(capture_context, mitm_message)
@@ -600,8 +603,8 @@ fn parse_traffic_runtime_diagnostics_response(
                 .get("capture")
                 .cloned()
                 .ok_or(RuntimeStatusClientError::MissingCapture)?;
-            let provider_reported = json_field_present(&capture, "provider");
-            let input_activity_reported = json_field_present(&capture, "input_activity");
+            let provider_reported = json_field_non_null(&capture, "provider");
+            let input_activity_reported = json_field_non_null(&capture, "input_activity");
             let capture = serde_json::from_value::<CaptureStatusSnapshot>(capture)
                 .map_err(RuntimeStatusClientError::Json)?;
             let tls = projection.get("tls").cloned();
@@ -634,7 +637,7 @@ fn parse_traffic_runtime_diagnostics_response(
     }
 }
 
-fn json_field_present(value: &Value, field: &str) -> bool {
+fn json_field_non_null(value: &Value, field: &str) -> bool {
     value.get(field).is_some_and(|value| !value.is_null())
 }
 
@@ -664,11 +667,12 @@ mod tests {
         TransparentInterceptionStrategyConfig,
     };
     use probe_core::{
-        CapabilityKind, CapabilityState, Direction, EnforcementMode, ProcessSelector, Selector,
-        TrafficSelector,
+        CapabilityKind, CapabilityState, Direction, EnforcementMode, ProcessSelector, RuntimeMode,
+        Selector, TrafficSelector,
     };
     use runtime::{
-        CaptureProviderBuilder, CaptureProviderDescriptor, ProviderRegistry, RuntimePlan,
+        CaptureEvidenceMode, CaptureInputSource, CapturePlanMode, CaptureProviderBuilder,
+        CaptureProviderDescriptor, ProviderRegistry, RuntimePlan,
     };
     use serde_json::{Value, json};
 
@@ -1007,6 +1011,7 @@ mod tests {
                     "reason": null,
                     "candidates": [],
                     "open_failures": [],
+                    "input_activity": capture_input_activity_json(),
                     "auto_mitm_plaintext_bridge_candidate": {
                         "backend": "capture_event_feed",
                         "runtime_mode": "available",
@@ -1064,7 +1069,8 @@ mod tests {
                     "mode": "live",
                     "reason": null,
                     "candidates": [],
-                    "open_failures": []
+                    "open_failures": [],
+                    "input_activity": capture_input_activity_json()
                 }
             }
         });
@@ -1118,7 +1124,8 @@ mod tests {
                     "mode": "live",
                     "reason": null,
                     "candidates": [],
-                    "open_failures": []
+                    "open_failures": [],
+                    "input_activity": capture_input_activity_json()
                 }
             }
         });
@@ -1204,7 +1211,9 @@ mod tests {
                     "mode": "live",
                     "reason": null,
                     "candidates": [],
-                    "open_failures": []
+                    "open_failures": [],
+                    "provider": null,
+                    "input_activity": null
                 }
             }
         });
@@ -1213,11 +1222,26 @@ mod tests {
 
         assert_eq!(
             diagnostics.status_message(true),
-            Some(CaptureDiagnosticMessage::Info(
+            Some(CaptureDiagnosticMessage::Warning(
                 "Capture ebpf is starting; waiting for provider".to_string()
             ))
         );
-        assert_eq!(diagnostics.status_message(false), None);
+        assert_eq!(
+            diagnostics.status_message(false),
+            Some(CaptureDiagnosticMessage::Warning(
+                "Capture ebpf is starting; waiting for provider".to_string()
+            ))
+        );
+        assert!(
+            diagnostics
+                .detail_lines()
+                .iter()
+                .any(|line| line == "readiness: starting; admin socket is active but capture provider has not reported runtime details")
+        );
+        assert_eq!(
+            diagnostics.capture_overview_line(),
+            "starting: ebpf selected, mode=live"
+        );
         Ok(())
     }
 
@@ -1262,7 +1286,75 @@ mod tests {
                 "Capture ebpf active; no matching events yet".to_string()
             ))
         );
+        assert_eq!(
+            diagnostics.capture_overview_line(),
+            "ready: ebpf selected, mode=live"
+        );
         Ok(())
+    }
+
+    #[test]
+    fn traffic_diagnostics_reports_non_live_capture_provider_starting()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "kind": "traffic_status",
+            "projection": {
+                "capture": {
+                    "selection": "capture_event_feed",
+                    "selected_backend": "capture_event_feed",
+                    "selected_input_source": "configured_capture_event_feed",
+                    "provider_runtime_mode": "available",
+                    "mode": "capture_event_feed",
+                    "reason": null,
+                    "candidates": [],
+                    "open_failures": [],
+                    "provider": null,
+                    "input_activity": null
+                }
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+
+        assert_eq!(
+            diagnostics.status_message(false),
+            Some(CaptureDiagnosticMessage::Warning(
+                "Capture capture_event_feed is starting; waiting for provider".to_string()
+            ))
+        );
+        assert_eq!(
+            diagnostics.capture_overview_line(),
+            "starting: capture_event_feed selected, mode=capture_event_feed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn local_capture_projection_reports_planned_not_starting() {
+        let diagnostics = TrafficRuntimeDiagnostics::from_capture_snapshot(CaptureStatusSnapshot {
+            selection: CaptureSelection::Auto,
+            selected_backend: Some(CaptureBackend::Ebpf),
+            selected_input_source: Some(CaptureInputSource::LiveHost),
+            ebpf_expected_contract: None,
+            provider_runtime_mode: Some(RuntimeMode::Available),
+            mode: CapturePlanMode::Live,
+            reason: None,
+            evidence_mode: Some(CaptureEvidenceMode::Nominal),
+            evidence_reason: None,
+            candidates: Vec::new(),
+            auto_mitm_plaintext_bridge_candidate: None,
+            open_failures: Vec::new(),
+            provider: None,
+            ebpf_process_payload: None,
+            input_activity: None,
+        });
+
+        assert_eq!(
+            diagnostics.capture_overview_line(),
+            "planned: ebpf selected, mode=live"
+        );
+        assert!(diagnostics.detail_lines().iter().any(|line| line
+            == "readiness: planned; local config projection has no live runtime attachment"));
     }
 
     #[test]
@@ -1439,7 +1531,8 @@ mod tests {
                     "mode": "live",
                     "reason": null,
                     "candidates": [],
-                    "open_failures": []
+                    "open_failures": [],
+                    "input_activity": capture_input_activity_json()
                 },
                 "enforcement": enforcement,
                 "tls": mitm_tls_material_status_json("available", None, "available", None)
@@ -1478,7 +1571,8 @@ mod tests {
                     "mode": "live",
                     "reason": null,
                     "candidates": [],
-                    "open_failures": []
+                    "open_failures": [],
+                    "input_activity": capture_input_activity_json()
                 },
                 "enforcement": enforcement
             }
@@ -1886,7 +1980,8 @@ mod tests {
                             "backend": "ebpf",
                             "reason": "permission denied"
                         }
-                    ]
+                    ],
+                    "input_activity": capture_input_activity_json()
                 },
                 "enforcement": enforcement
             }
@@ -1920,7 +2015,8 @@ mod tests {
                             "backend": "ebpf",
                             "reason": "permission denied"
                         }
-                    ]
+                    ],
+                    "input_activity": capture_input_activity_json()
                 }
             }
         });
@@ -1967,7 +2063,8 @@ mod tests {
                         "evidence_mode": "nominal",
                         "reason": null,
                         "evidence_reason": null
-                    }
+                    },
+                    "input_activity": capture_input_activity_json()
                 },
                 "enforcement": configured_mitm_enforcement_status_json()?
             }
@@ -2037,7 +2134,8 @@ mod tests {
                         "evidence_mode": "nominal",
                         "reason": null,
                         "evidence_reason": null
-                    }
+                    },
+                    "input_activity": capture_input_activity_json()
                 },
                 "tls": mitm_tls_material_status_json("available", None, "available", None),
                 "enforcement": configured_mitm_enforcement_status_json()?
@@ -2077,6 +2175,34 @@ mod tests {
         ));
         assert_eq!(message.matches("no matching events yet").count(), 1);
         assert!(!message.contains("reliable MITM proxy data path active"));
+        Ok(())
+    }
+
+    #[test]
+    fn mitm_bridge_starting_status_does_not_claim_active_data_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = json!({
+            "kind": "traffic_status",
+            "projection": {
+                "capture": mitm_bridge_starting_capture_status_json(),
+                "enforcement": configured_mitm_enforcement_status_json()?
+            }
+        });
+
+        let diagnostics = parse_traffic_runtime_diagnostics_response(&response)?;
+
+        assert_eq!(
+            diagnostics.status_message(true),
+            Some(CaptureDiagnosticMessage::Warning(format!(
+                "Capture {MITM_PROXY_DATA_PATH_LABEL} is starting; waiting for provider"
+            )))
+        );
+        assert_eq!(
+            diagnostics.capture_overview_line(),
+            format!(
+                "starting: {MITM_PROXY_DATA_PATH_LABEL} selected for {MITM_PLAINTEXT_COVERAGE}"
+            )
+        );
         Ok(())
     }
 
@@ -2184,7 +2310,8 @@ mod tests {
                     "mode": "capture_event_feed",
                     "reason": null,
                     "candidates": [],
-                    "open_failures": []
+                    "open_failures": [],
+                    "input_activity": capture_input_activity_json()
                 }
             }
         });
@@ -2248,7 +2375,8 @@ mod tests {
                         "evidence_mode": "nominal",
                         "reason": null,
                         "evidence_reason": null
-                    }
+                    },
+                    "input_activity": capture_input_activity_json()
                 },
                 "enforcement": configured_mitm_enforcement_status_json()?
             }
@@ -2283,7 +2411,8 @@ mod tests {
                             "backend": "ebpf",
                             "reason": "object path is not configured"
                         }
-                    ]
+                    ],
+                    "input_activity": capture_input_activity_json()
                 },
                 "enforcement": configured_mitm_enforcement_status_json()?
             }
@@ -2329,7 +2458,39 @@ mod tests {
             "mode": "capture_event_feed",
             "reason": null,
             "candidates": [],
-            "open_failures": []
+            "open_failures": [],
+            "input_activity": capture_input_activity_json()
+        })
+    }
+
+    fn mitm_bridge_starting_capture_status_json() -> Value {
+        json!({
+            "selection": "auto",
+            "selected_backend": "capture_event_feed",
+            "selected_input_source": "mitm_plaintext_bridge",
+            "mode": "capture_event_feed",
+            "reason": null,
+            "candidates": [],
+            "open_failures": [],
+            "provider": null,
+            "input_activity": null
+        })
+    }
+
+    fn capture_input_activity_json() -> Value {
+        json!({
+            "polls": {
+                "total": 0,
+                "events": 0,
+                "progress": 0,
+                "idle": 0,
+                "finished": 0
+            },
+            "capture_events": 0,
+            "output_loss_events": 0,
+            "lost_events": 0,
+            "providers": [],
+            "last_signal": null
         })
     }
 

@@ -2314,6 +2314,24 @@ mod tests {
     }
 
     #[test]
+    fn runtime_warning_overwrites_active_tail_status() {
+        let mut traffic = TrafficState::default();
+        traffic.apply_snapshot(tail_snapshot_with_body_events(1..=1));
+
+        assert_eq!(traffic.status().kind, TrafficStatusKind::Active);
+
+        traffic.apply_runtime_diagnostic_message(Some(CaptureDiagnosticMessage::Warning(
+            "Capture ebpf is starting; waiting for provider".to_string(),
+        )));
+
+        assert_eq!(traffic.status().kind, TrafficStatusKind::Warning);
+        assert_eq!(
+            traffic.status().text,
+            "Capture ebpf is starting; waiting for provider"
+        );
+    }
+
+    #[test]
     fn event_filter_defaults_to_parsed_application_events_and_cycles_with_tail_reset() {
         let mut traffic = TrafficState::default();
         traffic.apply_snapshot(tail_snapshot_with_response_budget_omission());

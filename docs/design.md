@@ -337,6 +337,11 @@ Operator TUI 能力事实：
   每轮刷新先读取 `traffic_status` projection，该 projection 同时包含 capture、enforcement、TLS 和
   `runtime_generation`，因此 data-path generation pending、applying 和 failed outcome 会直接进入
   Traffic 状态行与 Data Path 详情。
+  Traffic readiness 不把 admin socket 可连接视为 capture data path ready。Traffic TUI 从
+  `traffic_status.capture` 派生 readiness：admin runtime 中 provider details 和 input activity
+  均未上报时展示为 `starting`；provider details 或 input activity 出现后展示为 `ready`。
+  `starting` 是 warning 级别状态，即使 durable tail 中仍有旧 rows，也要覆盖 active tail 状态，
+  避免 operator 把 retained events 误读为当前 capture provider 已经开始采集。
   Traffic tab 不把进程表光标当作过滤范围。没有显式 watched process 时，tail 查询省略强 selector
   (`selector = null`)，让用户先看到 live data path 是否真实产出事件；点击 Traffic 左侧进程、`[Watch]`、
   `[Auto]`、`[eBPF]` 或 `[libpcap]` 后，查询范围才收敛到相应 process-key selector。选中进程无法形成 stable key
