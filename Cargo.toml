@@ -4,6 +4,7 @@ members = [
     "crates/attribution",
     "crates/capture",
     "crates/config",
+    "crates/control",
     "crates/core",
     "crates/ebpf-abi",
     "crates/ebpf-object",
