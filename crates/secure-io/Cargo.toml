@@ -1,0 +1,15 @@
+[package]
+name = "secure-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rustix = { version = "1.1", features = ["fs", "process"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3.27"

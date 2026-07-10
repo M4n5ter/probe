@@ -23,6 +23,8 @@ members = [
     "crates/probe-io",
     "crates/proto",
     "crates/runtime",
+    "crates/secure-io",
+    "crates/store",
     "crates/storage",
     "crates/transparent-linux",
     "crates/xtask",
