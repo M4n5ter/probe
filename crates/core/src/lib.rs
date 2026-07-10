@@ -1,5 +1,6 @@
 mod attribution;
 mod cancellation;
+mod canonical;
 mod capability;
 mod cgroup;
 mod event;
@@ -18,6 +19,15 @@ pub use attribution::{
     LIBPCAP_FALLBACK_RUNTIME_HINT, UNKNOWN_PROCESS_LABEL, is_libpcap_unknown_process_candidate,
 };
 pub use cancellation::CancellationToken;
+pub use canonical::{
+    AttributionEvidenceId, AttributionSnapshotDigest, AuthorizationAuditId, AuthorizationId,
+    AuthorizationIssuerId, AuthorizationNonce, BootId, CalibratedInterval, CalibratedValidity,
+    CandidateSetDigest, CanonicalIdError, CaptureSelectorDigest, CaptureStageId, CgroupId,
+    ClockCalibrationId, FlowId, HostAuthorizationDigest, MonotonicInstant, NetworkNamespaceId,
+    ObservationIntentId, ProcessId, Revision, RevisionError, SelectionProofId, SocketId,
+    SourceEpochId, SourceInstanceId, SubjectId, TimeInterval, TimeIntervalError, ValidityInterval,
+    ValidityIntervalError, WorkloadId,
+};
 pub use capability::{
     CapabilityKind, CapabilityMatrix, CapabilityRequirement, CapabilityState, RuntimeMode,
 };

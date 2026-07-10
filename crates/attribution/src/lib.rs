@@ -1,4 +1,5 @@
 mod procfs;
+pub mod proof;
 
 pub use procfs::{
     AttributionError, ProcessAttributor, ProcfsAttributor, ProcfsSocketResolver,
