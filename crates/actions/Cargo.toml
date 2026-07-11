@@ -1,0 +1,19 @@
+[package]
+name = "actions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+blake3 = "1.8"
+probe-core = { path = "../core" }
+rustix = { version = "1.1", features = ["time"] }
+store = { version = "0.1.0", path = "../store" }
+zeroize = "1.9"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3.27"

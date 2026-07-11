@@ -1,8 +1,10 @@
+mod durable;
 mod layout;
 mod metadata;
 mod runtime;
 mod segment;
 
+pub use durable::{DurableDirectory, DurableFileError, PreallocatedFile};
 pub(crate) use layout::StoreLayout;
 pub use layout::StoreLayoutError;
 pub(crate) use metadata::MetadataStore;

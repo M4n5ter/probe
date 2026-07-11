@@ -1,5 +1,7 @@
 use std::{fmt, num::NonZeroU64};
 
+use uuid::Uuid;
+
 macro_rules! canonical_ids {
     ($($name:ident),+ $(,)?) => {
         $(
@@ -61,18 +63,32 @@ macro_rules! canonical_digests {
 }
 
 canonical_ids!(
+    ActionAuditId,
+    ActionAuthorizationId,
+    ActionBackendId,
+    ActionExecutionId,
+    ActionId,
+    ActionJournalId,
+    ActionRequestId,
+    ActionScopeProofId,
     AttributionEvidenceId,
     AuthorizationAuditId,
     AuthorizationId,
     AuthorizationIssuerId,
     AuthorizationNonce,
     BootId,
+    BpfLinkId,
     CaptureStageId,
     CgroupId,
     ClockCalibrationId,
+    EffectiveStateRevisionId,
     FlowId,
+    InterceptionAuthorizationId,
+    InterceptionConversationId,
     NetworkNamespaceId,
     ObservationIntentId,
+    PolicyRevisionId,
+    PreparedActionId,
     ProcessId,
     SelectionProofId,
     SocketId,
@@ -83,11 +99,51 @@ canonical_ids!(
 );
 
 canonical_digests!(
+    ActionAuthorizationDigest,
+    ActionEffectDigest,
+    ActionIntentDigest,
+    ActionParametersDigest,
+    ActionResultDigest,
     AttributionSnapshotDigest,
     CandidateSetDigest,
     CaptureSelectorDigest,
+    CapabilitySnapshotDigest,
     HostAuthorizationDigest,
+    PolicyDigest,
 );
+
+impl std::str::FromStr for BootId {
+    type Err = BootIdParseError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let uuid = Uuid::parse_str(input.trim()).map_err(BootIdParseError::InvalidUuid)?;
+        Self::new(*uuid.as_bytes()).map_err(|_| BootIdParseError::Nil)
+    }
+}
+
+#[derive(Debug)]
+pub enum BootIdParseError {
+    InvalidUuid(uuid::Error),
+    Nil,
+}
+
+impl fmt::Display for BootIdParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidUuid(error) => write!(formatter, "invalid Linux boot UUID: {error}"),
+            Self::Nil => formatter.write_str("Linux boot UUID must not be nil"),
+        }
+    }
+}
+
+impl std::error::Error for BootIdParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidUuid(error) => Some(error),
+            Self::Nil => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CanonicalIdError;
@@ -145,5 +201,23 @@ mod tests {
         assert_eq!(SubjectId::new([0; 16]), Err(CanonicalIdError));
         assert_eq!(Revision::new(0), Err(RevisionError));
         assert_eq!(Revision::new(7).expect("revision").get(), 7);
+    }
+
+    #[test]
+    fn linux_boot_id_parses_canonical_uuid_text() {
+        let boot: BootId = "00112233-4455-6677-8899-aabbccddeeff"
+            .parse()
+            .expect("boot ID");
+        assert_eq!(
+            boot.as_bytes(),
+            &[
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ]
+        );
+        assert!(matches!(
+            "00000000-0000-0000-0000-000000000000".parse::<BootId>(),
+            Err(BootIdParseError::Nil)
+        ));
     }
 }

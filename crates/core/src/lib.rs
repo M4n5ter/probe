@@ -20,13 +20,18 @@ pub use attribution::{
 };
 pub use cancellation::CancellationToken;
 pub use canonical::{
+    ActionAuditId, ActionAuthorizationDigest, ActionAuthorizationId, ActionBackendId,
+    ActionEffectDigest, ActionExecutionId, ActionId, ActionIntentDigest, ActionJournalId,
+    ActionParametersDigest, ActionRequestId, ActionResultDigest, ActionScopeProofId,
     AttributionEvidenceId, AttributionSnapshotDigest, AuthorizationAuditId, AuthorizationId,
-    AuthorizationIssuerId, AuthorizationNonce, BootId, CalibratedInterval, CalibratedValidity,
-    CandidateSetDigest, CanonicalIdError, CaptureSelectorDigest, CaptureStageId, CgroupId,
-    ClockCalibrationId, FlowId, HostAuthorizationDigest, MonotonicInstant, NetworkNamespaceId,
-    ObservationIntentId, ProcessId, Revision, RevisionError, SelectionProofId, SocketId,
-    SourceEpochId, SourceInstanceId, SubjectId, TimeInterval, TimeIntervalError, ValidityInterval,
-    ValidityIntervalError, WorkloadId,
+    AuthorizationIssuerId, AuthorizationNonce, BootId, BootIdParseError, BootScopedInstant,
+    BpfLinkId, CalibratedInterval, CalibratedValidity, CandidateSetDigest, CanonicalIdError,
+    CapabilitySnapshotDigest, CaptureSelectorDigest, CaptureStageId, CgroupId, ClockCalibrationId,
+    EffectiveStateRevisionId, FlowId, HostAuthorizationDigest, InterceptionAuthorizationId,
+    InterceptionConversationId, MonotonicInstant, NetworkNamespaceId, ObservationIntentId,
+    PolicyDigest, PolicyRevisionId, PreparedActionId, ProcessId, Revision, RevisionError,
+    SelectionProofId, SocketId, SourceEpochId, SourceInstanceId, SubjectId, TimeInterval,
+    TimeIntervalError, ValidityInterval, ValidityIntervalError, WorkloadId,
 };
 pub use capability::{
     CapabilityKind, CapabilityMatrix, CapabilityRequirement, CapabilityState, RuntimeMode,

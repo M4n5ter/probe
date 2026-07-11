@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/actions",
     "crates/agent",
     "crates/attribution",
     "crates/capture",

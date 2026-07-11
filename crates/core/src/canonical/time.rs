@@ -1,5 +1,7 @@
 use std::fmt;
 
+use super::BootId;
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct MonotonicInstant(u64);
 
@@ -10,6 +12,26 @@ impl MonotonicInstant {
 
     pub const fn as_nanos(self) -> u64 {
         self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BootScopedInstant {
+    boot: BootId,
+    instant: MonotonicInstant,
+}
+
+impl BootScopedInstant {
+    pub const fn new(boot: BootId, instant: MonotonicInstant) -> Self {
+        Self { boot, instant }
+    }
+
+    pub const fn boot(self) -> BootId {
+        self.boot
+    }
+
+    pub const fn instant(self) -> MonotonicInstant {
+        self.instant
     }
 }
 
